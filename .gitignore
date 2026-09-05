@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # WordPress Plugin: Alegra Connector
 # https://github.com/djdang3r/wp-alegra-connector
 # =============================================================================
@@ -34,9 +34,8 @@ $RECYCLE.BIN/
 # -----------------------------------------------------------------------------
 # Build artifacts (NEVER commit)
 # -----------------------------------------------------------------------------
-# Releases are built from tagged commits via CI
-# If you need them locally, they're already excluded here
-/releases/*.zip
+# Releases are tracked in this repo (binary files for distribution)
+# Note: *.zip elsewhere is still excluded (see below)
 
 # Compiled/optimized assets (if any)
 /.cache/
@@ -162,7 +161,6 @@ $RECYCLE.BIN/
 # -----------------------------------------------------------------------------
 # Archives (don't commit, regenerate via build process)
 # -----------------------------------------------------------------------------
-*.zip
 *.tar.gz
 *.tar
 *.tgz
