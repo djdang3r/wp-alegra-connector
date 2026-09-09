@@ -1,0 +1,73 @@
+# .distignore — WordPress.org / git archive exclude rules for release ZIPs
+# Patterns here are excluded from the production ZIP built by scripts/build-release.sh.
+# Reference: https://developer.wordpress.org/plugins/wordpress-org/how-to-use-subversion/#directory-and-file-excludes
+# Complement to .gitignore (do NOT duplicate — this is for release packaging).
+
+# Version control
+.git/
+.gitattributes
+.github/
+.gitignore
+.gitkeep
+
+# Build / release tooling (NEVER shipped in the plugin ZIP)
+.distignore
+scripts/
+temp_pkg/
+tests/
+
+# Dependencies (if/when added — keep out of the ZIP)
+/vendor/
+/node_modules/
+composer.json
+composer.lock
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Developer docs (not shipped to end users)
+docs/
+CHANGELOG.md
+README.md
+phpunit.xml*
+.phpunit.result.cache
+phpcs.xml*
+.eslintrc*
+.stylelintrc*
+.scrutinizer.yml
+.travis.yml
+.gitlab-ci.yml
+.circleci/
+
+# Logs / runtime / temp files
+*.log
+*.log.*
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+*.zip
+*.tar.gz
+*.tar
+*.tgz
+*.rar
+*.7z
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# IDE / editor
+.idea/
+.vscode/
+.history/
+*.iml
+*.sublime-project
+*.sublime-workspace
