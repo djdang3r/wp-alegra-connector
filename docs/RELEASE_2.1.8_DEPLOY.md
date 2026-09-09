@@ -81,27 +81,45 @@ slug. **Use Option A.**
 
 ---
 
-## Step 3 — Upload the 2.1.8 ZIP (5 min, server-side)
+## Step 3 — Upload the 2.1.8 ZIP (5 min)
 
-### 3a. Upload the ZIP
+### 3a. Recommended: WP Admin "Subir plugin" (no SSH needed)
 
-Via cPanel File Manager:
-1. Navigate to `/home/tuntvxpm/public_html/wp-content/plugins/`
+This is the simplest path — WordPress handles unzip, validation, and placement.
+
+1. Open `https://<test-site>/wp-admin/`
+2. Sidebar → **Plugins** → **Añadir nuevo** (`/wp-admin/plugin-install.php`)
+3. Click the **Subir plugin** tab
+4. Click **Elegir archivo** → select `alegra-connector-v2.1.8.zip` (154 KB)
+5. Click **Instalar ahora**
+6. WordPress will:
+   - Validate the ZIP integrity
+   - Validate the plugin header (`Version: 2.1.8` recognized by WP)
+   - Extract into `wp-content/plugins/alegra-connector/`
+   - Show "Plugin uploaded and installed successfully"
+7. Click **Activar plugin**
+
+If you see "El archivo subido excede la directiva `upload_max_filesize`", your hosting has a restrictive `php.ini` (typical default is 2-8 MB — should be fine for 154 KB). Fall back to method 3b below.
+
+### 3b. Fallback: cPanel File Manager (if 3a fails on upload size)
+
+1. cPanel → File Manager → navigate to `/home/tuntvxpm/public_html/wp-content/plugins/`
 2. Upload `alegra-connector-v2.1.8.zip` to that directory
-3. Right-click the ZIP → **Extract**
-4. This creates `alegra-connector/` (the plugin slug directory)
-5. **Delete the ZIP** from the server after extracting (cleanup)
+3. Right-click the ZIP → **Extract** → creates `alegra-connector/` subdirectory
+4. **Delete the ZIP** from the server (cleanup)
+5. Continue to Step 4 (activate via WP admin)
 
-Via SFTP/SCP:
+### 3c. Last-resort: SFTP/SCP (only if both 3a and 3b fail)
+
 ```bash
-scp dist/alegra-connector-v2.1.8.zip user@server:/tmp/
+scp alegra-connector-v2.1.8.zip user@server:/tmp/
 ssh user@server
 cd /home/tuntvxpm/public_html/wp-content/plugins/
 unzip /tmp/alegra-connector-v2.1.8.zip
 rm /tmp/alegra-connector-v2.1.8.zip
 ```
 
-### 3b. Verify on disk
+### 3d. Verify on disk (after any method)
 
 ```bash
 ls /home/tuntvxpm/public_html/wp-content/plugins/alegra-connector/
