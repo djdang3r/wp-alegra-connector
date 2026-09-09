@@ -3,7 +3,7 @@
  * Plugin Name: Alegra Connector
  * Plugin URI: https://github.com/example/alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
- * Versión: 2.1.7
+ * Version: 2.1.8
  * Author: Script Develop
  * Author URI: https://scriptdevelop.com.co
  * License: GPL v2 or later
@@ -25,13 +25,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-// Explicit requires for critical classes (avoids autoloader edge cases on
-// some shared hosting environments where the autoloader may not find files
-// in non-standard locations like the lowercase `logger/` directory).
-require_once __DIR__ . '/logger/Logger/Logger.php';
-
 // Plugin constants
-define('ALEGRA_CONNECTOR_VERSION', '2.1.7');
+define('ALEGRA_CONNECTOR_VERSION', '2.1.8');
 define('ALEGRA_CONNECTOR_PATH', plugin_dir_path(__FILE__));
 define('ALEGRA_CONNECTOR_URL', plugin_dir_url(__FILE__));
 define('ALEGRA_CONNECTOR_BASENAME', plugin_basename(__FILE__));
@@ -54,7 +49,19 @@ add_action('before_woocommerce_init', function (): void {
 });
 
 /**
- * PSR-4 Autoloader for Alegra\Connector\* classes
+ * PSR-4 Autoloader for Alegra\Connector\* classes.
+ *
+ * Resolution order (priority top-to-bottom):
+ *   1. Dedicated fast-path for the Logger namespace — fixes the regression
+ *      that caused the 2.1.7 activation fatal on shared hosting where the
+ *      lowercase `logger/` directory was missed by the generic candidates.
+ *   2. includes/<Subdir>/ (Webhooks, Sync, API).
+ *   3. Generic fallbacks: includes/, admin/, public/, logger/.
+ *
+ * History: previously had an explicit `require_once __DIR__ . '/logger/Logger/Logger.php';`
+ * at the top of the file as a workaround. That fragile include was removed in
+ * 2.1.8 — the Logger fast-path below replaces it without the side effect of
+ * throwing a hard fatal if the file is missing.
  */
 spl_autoload_register(function (string $class): void {
     $prefix = 'Alegra\\Connector\\';
@@ -66,8 +73,20 @@ spl_autoload_register(function (string $class): void {
     $relative_class = substr($class, $len);
     $relative_path = str_replace('\\', '/', $relative_class) . '.php';
 
-    // Search subdirectories of includes/ first (e.g., Webhooks/, Sync/, API/)
-    $subdirs = ['Webhooks', 'Sync', 'API', 'Logger'];
+    // Fast-path for the Logger namespace. Must come first to guarantee correct
+    // resolution on hosting environments where the lowercase `logger/`
+    // directory was historically missed by the generic candidates loop.
+    if (strpos($class, 'Alegra\\Connector\\Logger\\') === 0) {
+        $candidate = __DIR__ . '/logger/' . $relative_path;
+        if (file_exists($candidate)) {
+            require_once $candidate;
+            return;
+        }
+    }
+
+    // Search includes/<Subdir>/ (e.g., Webhooks/, Sync/, API/).
+    // NOTE: 'Logger' was removed from this list — handled by the fast-path above.
+    $subdirs = ['Webhooks', 'Sync', 'API'];
     foreach ($subdirs as $subdir) {
         $subdir_path = __DIR__ . '/includes/' . $subdir . '/' . $relative_path;
         if (file_exists($subdir_path)) {
@@ -76,7 +95,7 @@ spl_autoload_register(function (string $class): void {
         }
     }
 
-    // Then search top-level plugin directories
+    // Generic fallbacks across the plugin's top-level directories.
     $candidates = [
         __DIR__ . '/includes/' . $relative_path,
         __DIR__ . '/admin/' . $relative_path,
@@ -157,6 +176,29 @@ final class Alegra_Connector
 
         // Tombstone hook: track products deleted in WC
         add_action('before_delete_post', [\Alegra\Connector\Tombstone_Manager::class, 'on_post_delete']);
+
+        // Self-check fallback: if the critical Logger class is still not
+        // resolvable after everything else has loaded (typical when the
+        // lowercase `logger/` directory was missing from the release ZIP),
+        // surface a clear Spanish admin notice AND auto-deactivate the
+        // plugin. Replaces the 2.1.7 behavior of crashing with a fatal.
+        // Priority 999 — runs after every other plugins_loaded listener.
+        add_action('plugins_loaded', function (): void {
+            if (class_exists(\Alegra\Connector\Logger\Logger::class, false)) {
+                return;
+            }
+            add_action('admin_notices', static function (): void {
+                echo '<div class="notice notice-error"><p>';
+                echo esc_html__(
+                    'Alegra Connector: no se pudo cargar la clase Logger. El directorio logger/ parece estar incompleto en esta instalación. El plugin fue desactivado para evitar errores. Por favor, reinstala el plugin completo o contacta al soporte.',
+                    'alegra-connector'
+                );
+                echo '</p></div>';
+            });
+            if (function_exists('deactivate_plugins')) {
+                deactivate_plugins(ALEGRA_CONNECTOR_BASENAME);
+            }
+        }, 999);
     }
 
     /**
