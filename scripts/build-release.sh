@@ -86,7 +86,10 @@ else
     echo "warning: scripts/smoke-test.sh missing or not executable; skipping pre-release gate" >&2
 fi
 
-DIST_DIR="$REPO_ROOT/dist"
+# Output goes to releases/ (tracked in git, alongside prior version ZIPs).
+# This matches the repo's existing convention — see commit history "Add
+# release zips for v1.0.1 through v2.1.7" — and is what the user expects.
+DIST_DIR="$REPO_ROOT/releases"
 STAGING_DIR="$(mktemp -d -t alegra-release-XXXXXX)"
 trap 'rm -rf "$STAGING_DIR"' EXIT
 mkdir -p "$DIST_DIR"
