@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Alegra Connector
- * Plugin URI: https://github.com/example/alegra-connector
+ * Plugin URI: https://github.com/djdang3r/wp-alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
  * Version: 2.1.8
  * Author: Script Develop
