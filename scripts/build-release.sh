@@ -105,11 +105,20 @@ if [[ ! -f "$DISTIGNORE" ]]; then
     exit 5
 fi
 
-# Build a list of exclude patterns (skip blank lines and # comments)
+# Build a list of exclude patterns (skip blank lines and # comments).
+# Strip leading and trailing slashes so prefix matching works in bash:
+# `[[ "scripts/build-release.sh" == scripts/* ]]` matches while
+# `[[ "scripts/build-release.sh" == scripts//* ]]` (trailing-slash literal) does not.
 EXCLUDES=()
 while IFS= read -r line; do
     [[ -z "$line" || "$line" =~ ^# ]] && continue
-    # Strip leading slash for path prefix matching, keep regex otherwise
+    # Trim leading and trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    # Normalize: strip leading slash, strip trailing slash (keep patterns like *.log intact)
+    if [[ "$line" == /* ]]; then line="${line#/}"; fi
+    if [[ "$line" == */ ]]; then line="${line%/}"; fi
     EXCLUDES+=("$line")
 done < "$DISTIGNORE"
 
@@ -117,8 +126,17 @@ done < "$DISTIGNORE"
 is_excluded() {
     local path="$1"
     for pat in "${EXCLUDES[@]}"; do
-        # Match against the full path AND a leading-anchored variant
-        if [[ "$path" == $pat ]] || [[ "$path" == */$pat ]] || [[ "$path" == $pat/* ]]; then
+        # Exact match
+        if [[ "$path" == "$pat" ]]; then
+            return 0
+        fi
+        # Path under a directory pattern: docs/DOCUMENTACION.md matches "docs"
+        if [[ "$path" == "$pat"/* ]]; then
+            return 0
+        fi
+        # File matches a glob pattern: foo.log matches "*.log"
+        # bash's == does glob matching against the RHS
+        if [[ "$path" == $pat ]]; then
             return 0
         fi
     done
