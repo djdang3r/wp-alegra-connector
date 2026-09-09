@@ -2,6 +2,44 @@
 
 All notable changes to Alegra Connector.
 
+## [2.1.8] - 2026-09-09
+
+### 🐛 Critical Fix — Activation Fatal
+
+- **FIX: Activation no longer crashes with `PHP Fatal error: Failed opening required '.../logger/Logger/Logger.php'`.** The plugin was crashing on activation whenever the lowercase `logger/` directory was missing from the release ZIP — which happened because the previous release process could ship incomplete archives without surfacing the problem. Release 2.1.7 (and 2.1.6, 2.1.7-1) all failed to activate on production with this same fatal.
+- **Removed fragile `require_once` workaround.** The `require_once __DIR__ . '/logger/Logger/Logger.php';` line that was a workaround for an autoloader edge case is gone. The PSR-4 autoloader below it now resolves the Logger class correctly without any explicit include.
+- **Hardened PSR-4 autoloader.** Added a dedicated fast-path for the `Alegra\Connector\Logger\*` namespace that checks `__DIR__ . '/logger/'` first, before any other candidate. This is the resolution order that fixes the regression permanently — the previous order buried `logger/` as the LAST generic candidate, which is why some shared-hosting setups missed it.
+- **Readable fallback when Logger is still missing.** If a future release somehow ships without `logger/`, the plugin now (a) surfaces a clear Spanish admin notice (`"Alegra Connector: no se pudo cargar la clase Logger..."`) in `/wp-admin/`, (b) auto-deactivates itself to prevent leaving the install in a half-broken state. Replaces the silent fatal with a clear, recoverable signal.
+
+### 🔧 Refactor — Bootstrap Hardening
+
+- **No more fragile explicit `require_once`.** `alegra-connector.php` line 31 deleted.
+- **Logger fast-path.** New branch in the `spl_autoload_register` closure that resolves `Alegra\Connector\Logger\*` from `__DIR__ . '/logger/'` first.
+- **Removed redundant `Logger` from subdirs list.** The `$subdirs = ['Webhooks', 'Sync', 'API'];` array no longer scans `includes/Logger/` (which never existed) — the real path is handled by the fast-path.
+
+### 📦 Release Pipeline — Reproducible ZIPs
+
+- **NEW: `scripts/build-release.sh`** — portable Bash script (Ubuntu, Git Bash, WSL, macOS) that builds a deterministic release ZIP. Uses `git ls-files` filtered through `.distignore` (the standard WordPress release exclude mechanism). Computes SHA-256 sidecar. Runs `scripts/smoke-test.sh` as a pre-release gate.
+- **NEW: `.distignore`** — checked into the repo. Excludes `.git/`, `scripts/`, `temp_pkg/`, `tests/`, `vendor/`, `node_modules/`, `composer.json`, dev docs, IDE files, etc. from release ZIPs. Verified not to exclude `logger/` or any other runtime file.
+- **NEW: `scripts/smoke-test.sh`** + **`scripts/smoke-load.php`** — pre-release gate. Asserts (a) no fragile `require_once` in the main file, (b) `Alegra\Connector\Logger\Logger` is reachable via autoloader alone, (c) `Alegra\Connector\Alegra_Connector` singleton loads, (d) `logger/` directory tree is complete on disk, (e) `php -l` passes on every `.php` in the extracted ZIP. Exits non-zero on any failure — aborts the build before shipping.
+
+### 📝 Technical
+
+- Plugin version: **2.1.7 → 2.1.8**
+- Plugin header fixed: `Versión: 2.1.7` (Spanish, with tilde — WP ignored it) → `Version: 2.1.8` (English, recognized by WP).
+- Constant `ALEGRA_CONNECTOR_VERSION` bumped to `'2.1.8'`.
+- `README.md` version line bumped to `2.1.8`.
+- Files added: `.distignore`, `scripts/build-release.sh`, `scripts/smoke-test.sh`, `scripts/smoke-load.php`.
+- Files modified: `alegra-connector.php` only (bootstrap refactor + header + constant).
+- Total plugin source code touched: 0 files in `includes/`, `admin/`, `public/`, `templates/`, `languages/`, `uninstall.php`.
+
+### ✅ Upgrade Notes
+
+- **Safe to upgrade from 2.1.7 over the broken install.** Upload the 2.1.8 ZIP via WP admin → Plugins → Add New → Upload Plugin, or replace the existing `wp-content/plugins/alegra-connector/` (or `alegra-connector-v2.1.7/`) directory via SFTP. Activate. The autoloader will resolve the Logger class from the freshly uploaded `logger/` directory.
+- **If upgrading from a working pre-2.1.6 install:** credentials, settings, mappings, logs, cron, and tombstones are all preserved (the deactivate handler in 2.1.0+ already cleans transients and cron on each deactivation, but preserves user options).
+
+---
+
 ## [2.1.0] - 2026-09-02
 
 ### 🖥️ Monitor de Procesos (Sección G)
