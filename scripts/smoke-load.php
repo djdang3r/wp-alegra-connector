@@ -113,6 +113,40 @@ check(
     '— every required file in the logger/ tree must be present'
 );
 
+// ---- Assertion 7: token-log leak regression (2.1.9) ----
+echo "\n[7] Regression check: error_log in get_auth_header() must be REMOVED\n";
+$api_src = file_get_contents($plugin_root . 'includes/API/Client.php');
+$api_stripped = preg_replace('!/\*.*?\*/!s', '', $api_src);
+$api_stripped = preg_replace('![ \t]*//.*$!m', '', $api_stripped);
+$has_error_log_in_auth = (bool) preg_match(
+    '/function\s+get_auth_header\s*\([^)]*\)\s*:\s*string\s*\{[^}]*error_log/s',
+    $api_stripped
+);
+check(
+    'no error_log inside get_auth_header() body',
+    !$has_error_log_in_auth,
+    '— the error_log that leaked token length must be removed (regression guard)'
+);
+
+// ---- Assertion 8: webhook delete-item tombstone regression (2.1.9) ----
+echo "\n[8] Regression check: handle_delete_item() must NOT call delete_post_meta for _alegra_item_id\n";
+$hooks_src = file_get_contents($plugin_root . 'includes/Webhooks/Handlers.php');
+preg_match(
+    '/function\s+handle_delete_item\s*\([^)]*\)\s*:\s*void\s*\{(.*?)\n    \}/s',
+    $hooks_src,
+    $matches
+);
+$handle_delete_body = $matches[1] ?? '';
+$has_meta_delete = (bool) preg_match(
+    "/delete_post_meta\s*\([^)]*_alegra_item_id/s",
+    $handle_delete_body
+);
+check(
+    'handle_delete_item() writes tombstone instead of deleting _alegra_item_id meta',
+    !$has_meta_delete,
+    '— the webhook handler must use Tombstone_Manager::create() (regression guard)'
+);
+
 // ---- Done ----
 echo "\n";
 if ($failures) {
