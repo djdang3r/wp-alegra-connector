@@ -1190,6 +1190,13 @@ class Admin_Dashboard
         $page = ((int) ($state['page'] ?? 0)) + 1;
         $type = $state['type'];
         $per_page = 30; // Max allowed by Alegra API
+
+        // Lock the per-type sync so cron + this chunked AJAX can't both pull.
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($type);
+        if ($lock === false) {
+            wp_send_json_error(['message' => __('Another sync is in progress. Please wait.', 'alegra-connector')]);
+        }
+        try {
         $this->api->reload_credentials();
         @set_time_limit(60);
         wp_raise_memory_limit();
@@ -1295,6 +1302,9 @@ class Admin_Dashboard
             'processed' => $processed, 'percent' => $pct, 'done' => $done,
             'message' => sprintf('%d/%d items — Pag. %d/%d', $processed, (int)($state['total_items'] ?? 0), $page, $tp),
         ]);
+        } finally {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+        }
     }
     public function ajax_import_csv(): void
     {
@@ -2515,20 +2525,32 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Tipo de importacion invalido.', 'alegra-connector')]);
         }
 
-        $sync_controller = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
-        $result = $sync_controller->import_from_alegra($import_type);
-
-        if (is_wp_error($result)) {
-            wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+        // Lock the per-type sync so cron + this AJAX import can't both pull.
+        // Customers::import_from_alegra has its own internal lock too; this
+        // outer lock protects the Products and Categories code paths and
+        // gives consistent UX (single error message) across all types.
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($import_type);
+        if ($lock === false) {
+            wp_send_json_error(['message' => __('Another sync is in progress. Please wait.', 'alegra-connector')]);
         }
+        try {
+            $sync_controller = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
+            $result = $sync_controller->import_from_alegra($import_type);
 
-        $imported = (int) ($result['imported'] ?? 0);
-        $updated = (int) ($result['updated'] ?? 0);
+            if (is_wp_error($result)) {
+                wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+            }
 
-        wp_send_json_success([
-            'message' => sprintf(__('Importación completada: %d nuevos, %d actualizados.', 'alegra-connector'), $imported, $updated),
-            'data' => $result,
-        ]);
+            $imported = (int) ($result['imported'] ?? 0);
+            $updated = (int) ($result['updated'] ?? 0);
+
+            wp_send_json_success([
+                'message' => sprintf(__('Importación completada: %d nuevos, %d actualizados.', 'alegra-connector'), $imported, $updated),
+                'data' => $result,
+            ]);
+        } finally {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
+        }
     }
 
     private function get_sync_stats(): array
