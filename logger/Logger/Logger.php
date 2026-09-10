@@ -74,9 +74,10 @@ class Logger
                 throw new \RuntimeException('Cannot open log file: ' . $this->log_file);
             }
 
-            // Use LOCK_NB so we never block the import flow on a stuck lock.
-            // If another process holds it, fall through to error_log() instead of waiting.
-            $locked = @flock($handle, LOCK_EX | LOCK_NB);
+            // Use LOCK_EX (blocking) so log entries are never silently dropped.
+            // Contention is rare (log writes are infrequent) and the worst-case wait
+            // is a few ms — invisible next to the API call that triggered the log.
+            $locked = flock($handle, LOCK_EX);
             if ($locked) {
                 fwrite($handle, $log_entry);
                 fflush($handle);
@@ -85,7 +86,8 @@ class Logger
             fclose($handle);
 
             if (!$locked) {
-                throw new \RuntimeException('Could not acquire non-blocking lock on log file');
+                // Fallback if flock() returned false (rare — only on filesystem errors).
+                error_log('[Alegra Logger] flock failed: ' . $log_entry);
             }
         } catch (\Throwable $e) {
             // Fallback: never let a logging failure break the import flow.
