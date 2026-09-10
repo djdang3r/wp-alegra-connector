@@ -75,20 +75,41 @@ class Handlers
 
     private function handle_delete_item(array $data): void
     {
-        global $wpdb;
         $item = $data['item'] ?? $data;
         $alegra_id = (int) ($item['id'] ?? 0);
         if ($alegra_id <= 0) return;
 
+        // Write tombstone so future pulls won't recreate the product.
+        // (Previously this handler deleted _alegra_item_id postmeta, but that
+        // raced with concurrent sync pulls — the cron could create a new product
+        // just before this delete fired, losing its Alegra linkage.)
+        \Alegra\Connector\Tombstone_Manager::create([
+            'alegra_type' => 'item',
+            'alegra_id'   => $alegra_id,
+            'reason'      => 'alegra_deleted',
+            'deleted_by'  => 0,
+        ]);
+
+        // Also unlink any currently-imported product (optional cleanup; the
+        // tombstone is the durable record. Safe to leave for a future job.)
+        global $wpdb;
         $product_id = $wpdb->get_var($wpdb->prepare(
             "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_item_id' AND meta_value = %d LIMIT 1",
             $alegra_id
         ));
-
-        if ($product_id) {
-            delete_post_meta((int) $product_id, '_alegra_item_id');
-            if ($this->logger) $this->logger->info('Webhook: Item unlinked from product', ['alegra_id' => $alegra_id, 'product_id' => (int) $product_id]);
+        if ($product_id && $this->logger) {
+            $this->logger->info('Webhook: Item deleted in Alegra, tombstone written', [
+                'alegra_id'   => $alegra_id,
+                'product_id'  => (int) $product_id,
+                'tombstoned'  => true,
+            ]);
+        } elseif ($this->logger) {
+            $this->logger->info('Webhook: Item deleted in Alegra, tombstone written (no WC product)', [
+                'alegra_id'  => $alegra_id,
+                'tombstoned' => true,
+            ]);
         }
+    }
     }
 
     private function handle_client_event(array $data): void

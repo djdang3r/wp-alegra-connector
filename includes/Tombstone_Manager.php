@@ -1,9 +1,15 @@
 <?php
 /**
- * Tombstone_Manager — Records products deleted in WC to prevent recreation.
+ * Tombstone_Manager — Records entities deleted (in WC or in Alegra) to prevent recreation.
  *
- * When a user deletes a product in WooCommerce, we record a "tombstone" so that
- * future pulls from Alegra won't recreate it.
+ * When a user deletes a product in WooCommerce, OR when Alegra sends a
+ * delete-item webhook, we record a "tombstone" so that future pulls from
+ * Alegra won't recreate the corresponding WC entity.
+ *
+ * Tombstone `reason` values:
+ *   - 'manual_wc'      : user deleted the product/customer in WP admin
+ *   - 'alegra_deleted' : webhook received from Alegra that the item/client
+ *                        was deleted in Alegra (added in 2.1.9)
  *
  * @package Alegra\Connector
  */
