@@ -334,57 +334,104 @@ class Products
      */
     public function sync_inventory_from_alegra(): array
     {
-        $result = ['updated' => 0, 'errors' => 0];
+        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false];
 
-        $items = $this->api->get_items(['limit' => 30]);
-        if (is_wp_error($items)) {
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
+        if ($lock === false) {
+            $this->logger->info('Inventory sync skipped: another sync is running');
+            $result['locked'] = true;
             return $result;
         }
 
-        foreach ($items as $item) {
-            if (!isset($item['inventory']['availableQuantity'])) {
-                continue;
-            }
+        try {
+            $max_pages = 200;
+            set_time_limit(300);
 
-            $product_id = $this->get_product_by_alegra_id((int) $item['id']);
-            if (!$product_id) {
-                continue;
-            }
+            for ($p = 1; $p <= $max_pages; $p++) {
+                if (get_transient('alegra_sync_cancelled')) {
+                    delete_transient('alegra_sync_cancelled');
+                    $this->logger->info('Inventory sync cancelled by user');
+                    break;
+                }
 
-            $product = wc_get_product($product_id);
-            if (!$product) {
-                continue;
-            }
+                set_transient('alegra_sync_progress', [
+                    'type' => 'inventory',
+                    'current_page' => $p,
+                    'items_processed' => $result['updated'] + $result['errors'],
+                    'updated' => $result['updated'],
+                    'errors' => $result['errors'],
+                    'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p),
+                ], 120);
 
-            $new_qty = (int) $item['inventory']['availableQuantity'];
-            if ($product->get_manage_stock()) {
-                try {
-                    $old_qty = $product->get_stock_quantity();
-                    $product->set_stock_quantity($new_qty);
-                    $product->save();
-                    $result['updated']++;
+                $items = $this->api->get_items([
+                    'start' => ($p - 1) * 30,
+                    'limit' => 30,
+                ]);
 
-                    if ($old_qty !== $new_qty) {
-                        $this->logger->info('Inventory updated from Alegra', [
+                if (is_wp_error($items)) {
+                    $this->logger->error('Inventory sync: API error', ['error' => $items->get_error_message()]);
+                    break;
+                }
+                if (empty($items)) {
+                    break;
+                }
+
+                foreach ($items as $item) {
+                    if (!isset($item['inventory']['availableQuantity'])) {
+                        continue;
+                    }
+
+                    $product_id = $this->get_product_by_alegra_id((int) $item['id']);
+                    if (!$product_id) {
+                        continue;
+                    }
+
+                    $product = wc_get_product($product_id);
+                    if (!$product) {
+                        continue;
+                    }
+
+                    $new_qty = (int) $item['inventory']['availableQuantity'];
+                    if (!$product->get_manage_stock()) {
+                        continue;
+                    }
+
+                    try {
+                        $old_qty = $product->get_stock_quantity();
+                        $product->set_stock_quantity($new_qty);
+                        $product->save();
+                        $result['updated']++;
+
+                        if ($old_qty !== $new_qty) {
+                            $this->logger->info('Inventory updated from Alegra', [
+                                'product_id' => $product_id,
+                                'alegra_id' => $item['id'],
+                                'old_qty' => $old_qty,
+                                'new_qty' => $new_qty,
+                            ]);
+                        }
+                    } catch (\Exception $e) {
+                        $result['errors']++;
+                        $this->logger->error('Failed to update inventory', [
                             'product_id' => $product_id,
-                            'alegra_id' => $item['id'],
-                            'old_qty' => $old_qty,
-                            'new_qty' => $new_qty,
+                            'error' => $e->getMessage(),
                         ]);
                     }
-                } catch (\Exception $e) {
-                    $result['errors']++;
-                    $this->logger->error('Failed to update inventory', [
-                        'product_id' => $product_id,
-                        'error' => $e->getMessage(),
-                    ]);
+                }
+
+                $result['pages'] = $p;
+
+                if (count($items) < 30) {
+                    break;
                 }
             }
+
+            $this->logger->info('Inventory sync from Alegra completed', $result);
+
+            return $result;
+        } finally {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $lock);
         }
-
-        $this->logger->info('Inventory sync from Alegra completed', $result);
-
-        return $result;
     }
 
     public function sync_all(): array|\WP_Error
