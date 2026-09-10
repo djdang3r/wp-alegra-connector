@@ -719,7 +719,7 @@ class Client
     private function increment_rate_limit(): void
     {
         $rate_limit = (int) get_transient('alegra_connector_rate_limit');
-        set_transient('alegra_connector_rate_limit', $rate_limit + 1, 60);
+        set_transient('alegra_connector_rate_limit', $rate_limit + 1, 60, 'no');
     }
 
     /**
