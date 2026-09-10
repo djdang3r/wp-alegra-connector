@@ -147,6 +147,57 @@ check(
     '— the webhook handler must use Tombstone_Manager::create() (regression guard)'
 );
 
+// ---- Assertion 9: customers pagination regression (2.2.0) ----
+echo "\n[9] Regression check: Customers::sync_all() must NOT use 'number' => -1\n";
+$customers_src = file_get_contents($plugin_root . 'includes/Sync/Customers.php');
+$customers_stripped = preg_replace('!/\*.*?\*/!s', '', $customers_src);
+$customers_stripped = preg_replace('![ \t]*//.*$!m', '', $customers_stripped);
+$has_unbounded_fetch = (bool) preg_match(
+    "/sync_all\s*\([^)]*\)\s*:[^{]*\{[^}]*'number'\s*=>\s*-1/s",
+    $customers_stripped
+);
+check(
+    'Customers::sync_all() paginates instead of fetching all customers',
+    !$has_unbounded_fetch,
+    '— must use number + paged to avoid OOM on large stores (regression guard)'
+);
+
+// ---- Assertion 10: LOCK_NB regression (2.2.0) ----
+echo "\n[10] Regression check: LOCK_NB must NOT be used in Logger::write()\n";
+$logger_src = file_get_contents($plugin_root . 'logger/Logger/Logger.php');
+$has_lock_nb = (bool) preg_match('/flock\s*\(\s*\$handle\s*,\s*LOCK_EX\s*\|\s*LOCK_NB\s*\)/', $logger_src);
+check(
+    'logger uses LOCK_EX (blocking), not LOCK_NB',
+    !$has_lock_nb,
+    '— non-blocking flock silently drops logs under contention (regression guard)'
+);
+
+// ---- Assertion 11: uninstall.php log cleanup (2.2.0) ----
+echo "\n[11] Regression check: uninstall.php must clean up log directory\n";
+$uninstall_src = file_get_contents($plugin_root . 'uninstall.php');
+$has_log_cleanup = (bool) preg_match(
+    "/alegra-logs|'alegra-logs'|rmdir_recursive\s*\(\s*\\\$log_dir/s",
+    $uninstall_src
+);
+check(
+    'uninstall.php removes wp-content/uploads/alegra-logs/',
+    $has_log_cleanup,
+    '— log directory must be cleaned on plugin uninstall (privacy + disk space)'
+);
+
+// ---- Assertion 12: rate-limit transient autoload (2.2.0) ----
+echo "\n[12] Regression check: rate-limit transient must use autoload='no'\n";
+$api_src_2 = file_get_contents($plugin_root . 'includes/API/Client.php');
+$has_autoload_no = (bool) preg_match(
+    "/set_transient\s*\(\s*'alegra_connector_rate_limit'\s*,\s*\\\$rate_limit\s*\+\s*1\s*,\s*60\s*,\s*'no'\s*\)/",
+    $api_src_2
+);
+check(
+    'rate-limit transient uses autoload=no (4th arg)',
+    $has_autoload_no,
+    '— operational transients must not bloat wp_options autoload cache'
+);
+
 // ---- Done ----
 echo "\n";
 if ($failures) {
