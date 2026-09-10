@@ -3,7 +3,7 @@
  * Plugin Name: Alegra Connector
  * Plugin URI: https://github.com/djdang3r/wp-alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
- * Version: 2.1.9
+ * Version: 2.2.0
  * Author: Script Develop
  * Author URI: https://scriptdevelop.com.co
  * License: GPL v2 or later
@@ -26,7 +26,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('ALEGRA_CONNECTOR_VERSION', '2.1.9');
+define('ALEGRA_CONNECTOR_VERSION', '2.2.0');
 define('ALEGRA_CONNECTOR_PATH', plugin_dir_path(__FILE__));
 define('ALEGRA_CONNECTOR_URL', plugin_dir_url(__FILE__));
 define('ALEGRA_CONNECTOR_BASENAME', plugin_basename(__FILE__));

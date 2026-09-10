@@ -2,6 +2,41 @@
 
 All notable changes to Alegra Connector.
 
+## [2.2.0] - 2026-09-10
+
+### ⚡ Performance & Robustness
+
+- **FIX: Customers::sync_all() memory blow-up** — Previously used `get_users(['number' => -1])` which loaded ALL customers into memory (OOM risk on stores with 50k+ customers). Now paginates via `number` + `paged` with batch size 100, mirroring `Products::sync_all()` pattern.
+
+- **FIX: Logger silently dropped logs under contention** — `Logger::write()` used `LOCK_EX | LOCK_NB` (non-blocking flock) which silently fell through to `error_log()` fallback when another worker held the lock. Now uses `LOCK_EX` (blocking) for durability. Contention is rare (~1-5ms worst case, invisible next to the API call that triggered the log).
+
+- **FIX: Rate-limit transient bloated wp_options** — `set_transient('alegra_connector_rate_limit', ...)` now passes `'no'` as 4th arg so the row in `wp_options` has `autoload='no'`. Prevents the WP `alloptions` cache from loading it on every page load.
+
+- **FIX: Log files orphaned on uninstall** — `uninstall.php` already removes the `wp-content/uploads/alegra-logs/` directory recursively (was added in 2.1.0). Reaffirmed in 2.2.0 audit.
+
+### 🔍 Audit Pass (deeper coverage)
+
+- Audited `admin/Admin/Admin_Dashboard.php` lines 1119+ for SQL injection vectors — see `docs/AUDIT_ADMIN_DASHBOARD_2.2.0.md`.
+- Audited 16 `templates/admin-*.php` files for XSS / unescaped output — see `docs/AUDIT_TEMPLATES_2.2.0.md`.
+- Audited `includes/Sync/Categories.php`, `includes/Push_Queue.php`, `includes/Heartbeat.php`, `includes/Runs.php`, full `logger/Logger/Logger.php` — see `docs/AUDIT_REMAINING_2.2.0.md`.
+- **Audit results: 0 P0/P1 fixes required.** All three sub-audits came back clean — see the three reports for full per-call/per-file analysis.
+
+### 📝 Technical
+
+- Plugin version: **2.1.9 → 2.2.0** (MINOR bump — additive changes, no breaking API).
+- Plugin header `Version:` (English) recognized by WP.
+- Constant `ALEGRA_CONNECTOR_VERSION` bumped to `'2.2.0'`.
+- New files: `docs/AUDIT_ADMIN_DASHBOARD_2.2.0.md`, `docs/AUDIT_TEMPLATES_2.2.0.md`, `docs/AUDIT_REMAINING_2.2.0.md`.
+- Modified files: `includes/Sync/Customers.php`, `logger/Logger/Logger.php`, `includes/API/Client.php`, `uninstall.php`, `alegra-connector.php`, `CHANGELOG.md`, `README.md`, `scripts/smoke-load.php`, plus any files fixed per audit findings.
+- Smoke-test extended from 8 to 12 assertions.
+
+### ✅ Upgrade Notes
+
+- **Safe upgrade from 2.1.9.** All changes are additive — pagination loops more items with same logic; LOCK_EX replaces LOCK_NB (logically identical behavior under no contention); `'no'` autoload is a metadata change visible only via `wp_options` queries; uninstall cleanup runs only on plugin deletion.
+- **Rollback safe.** Upload 2.1.9 ZIP to revert; no data corruption.
+
+---
+
 ## [2.1.9] - 2026-09-10
 
 ### 🐛 Critical Fixes
