@@ -123,28 +123,40 @@ class Customers
 
     public function sync_all(): array|\WP_Error
     {
-        $result = ['synced' => 0, 'errors' => 0];
+        $result = ['synced' => 0, 'errors' => 0, 'pages' => 0];
+        $page = 1;
+        $per_page = 100;
 
-        $args = [
-            'role' => 'customer',
-            'orderby' => 'ID',
-            'order' => 'ASC',
-            'number' => -1,
-        ];
+        while (true) {
+            $args = [
+                'role' => 'customer',
+                'orderby' => 'ID',
+                'order' => 'ASC',
+                'number' => $per_page,
+                'paged' => $page,
+            ];
 
-        $customers = get_users($args);
+            $customers = get_users($args);
 
-        foreach ($customers as $customer) {
-            $sync_result = $this->sync_to_alegra($customer);
-            if (is_wp_error($sync_result)) {
-                $result['errors']++;
-                $this->logger->error('Failed to sync customer', [
-                    'customer_id' => $customer->ID,
-                    'error' => $sync_result->get_error_message(),
-                ]);
-            } else {
-                $result['synced']++;
+            if (empty($customers)) break;
+
+            foreach ($customers as $customer) {
+                $sync_result = $this->sync_to_alegra($customer);
+                if (is_wp_error($sync_result)) {
+                    $result['errors']++;
+                    $this->logger->error('Failed to sync customer', [
+                        'customer_id' => $customer->ID,
+                        'error' => $sync_result->get_error_message(),
+                    ]);
+                } else {
+                    $result['synced']++;
+                }
             }
+
+            $result['pages'] = $page;
+
+            if (count($customers) < $per_page) break;
+            $page++;
         }
 
         $this->logger->info('Customers sync completed', $result);
