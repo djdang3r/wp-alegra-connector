@@ -2,6 +2,36 @@
 
 All notable changes to Alegra Connector.
 
+## [2.1.9] - 2026-09-10
+
+### 🐛 Critical Fixes
+
+- **FIX: Token length leak in API client logs** — Removed `error_log()` call in `includes/API/Client.php:50-52` (`get_auth_header()`) that logged token/email length info to PHP error stream. The method now returns `'Basic '` silently when credentials are missing; auth failures are reported through the structured logger only.
+
+- **FIX: Webhook delete-item race condition** — When Alegra sends a `delete-item` webhook, the plugin now writes a tombstone (`includes/Webhooks/Handlers.php:76-110`) instead of deleting `_alegra_item_id` postmeta. Previous behavior could lose product linkage when a concurrent sync pull was creating the product. The tombstone blocks future re-imports via `Tombstone_Manager::exists()`. New tombstone `reason` value: `'alegra_deleted'`.
+
+### ⚡ Performance & Robustness
+
+- **NEW: Transient-based sync lock** — Added `acquire_sync_lock()` / `release_sync_lock()` helpers to `Controller`. Cron sync, manual AJAX sync, and the inventory sync method now acquire a 5-minute transient lock (`alegra_sync_running_{type}`) before starting. Concurrent syncs abort cleanly with a clear error instead of duplicating products/invoices. Public static wrappers exposed for cross-class use.
+
+- **FIX: Inventory pagination bug** — `Products::sync_inventory_from_alegra()` previously hardcoded `limit: 30` and only synced the first 30 products. Now paginates through all items (up to 200 pages × 30 = 6000 per run) using the same loop pattern as `import_from_alegra()`. Includes cancel detection and progress reporting.
+
+### 📝 Technical
+
+- Plugin version: **2.1.8 → 2.1.9**
+- Plugin header `Version:` (English) recognized by WP — `Versión` (Spanish) placeholder bug remains fixed.
+- Constant `ALEGRA_CONNECTOR_VERSION` bumped to `'2.1.9'`.
+- Files modified: `includes/API/Client.php`, `includes/Webhooks/Handlers.php`, `includes/Sync/Controller.php`, `includes/Sync/Products.php`, `includes/Sync/Customers.php`, `admin/Admin/Admin_Dashboard.php`, `CHANGELOG.md`, `README.md`.
+- New file: `docs/RELEASE_2.1.9_DEPLOY.md`, `scripts/smoke-load.php` extended with 2 regression assertions.
+- Total plugin source code touched: 6 files in `includes/`, 1 in `admin/`.
+
+### ✅ Upgrade Notes
+
+- **Safe upgrade from 2.1.8.** All changes are additive: tombstones write new rows in `wp_alegra_tombstones`; lock is a transient check; pagination loops more items with the same logic.
+- **Rollback safe.** Upload 2.1.8 ZIP to revert; no data corruption.
+
+---
+
 ## [2.1.8] - 2026-09-09
 
 ### 🐛 Critical Fix — Activation Fatal
