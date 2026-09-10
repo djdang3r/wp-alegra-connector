@@ -88,10 +88,19 @@ class Controller
                 $this->logger->info('Cron sync stopped by user during products');
                 return;
             }
-            $import_result = $this->products->import_from_alegra();
-            if (!is_wp_error($import_result)) {
-                $result['products'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
+            $lock = $this->acquire_sync_lock('products');
+            if ($lock === false) {
+                $this->logger->info('Cron sync skipped products: another sync is running');
             } else {
+                try {
+                    $import_result = $this->products->import_from_alegra();
+                } finally {
+                    $this->release_sync_lock('products', $lock);
+                }
+            }
+            if (isset($import_result) && !is_wp_error($import_result)) {
+                $result['products'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
+            } elseif (isset($import_result) && is_wp_error($import_result)) {
                 $result['errors']['products'] = $import_result->get_error_message();
             }
         }
@@ -104,10 +113,19 @@ class Controller
                 $this->logger->info('Cron sync stopped by user during customers');
                 return;
             }
-            $import_result = $this->customers->import_from_alegra();
-            if (!is_wp_error($import_result)) {
-                $result['customers'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
+            $lock = $this->acquire_sync_lock('customers');
+            if ($lock === false) {
+                $this->logger->info('Cron sync skipped customers: another sync is running');
             } else {
+                try {
+                    $import_result = $this->customers->import_from_alegra();
+                } finally {
+                    $this->release_sync_lock('customers', $lock);
+                }
+            }
+            if (isset($import_result) && !is_wp_error($import_result)) {
+                $result['customers'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
+            } elseif (isset($import_result) && is_wp_error($import_result)) {
                 $result['errors']['customers'] = $import_result->get_error_message();
             }
         }
@@ -120,10 +138,19 @@ class Controller
                 $this->logger->info('Cron sync stopped by user during categories');
                 return;
             }
-            $categories_result = $this->categories->import_from_alegra();
-            if (!is_wp_error($categories_result)) {
-                $result['categories'] = ($categories_result['imported'] ?? 0) + ($categories_result['updated'] ?? 0);
+            $lock = $this->acquire_sync_lock('categories');
+            if ($lock === false) {
+                $this->logger->info('Cron sync skipped categories: another sync is running');
             } else {
+                try {
+                    $categories_result = $this->categories->import_from_alegra();
+                } finally {
+                    $this->release_sync_lock('categories', $lock);
+                }
+            }
+            if (isset($categories_result) && !is_wp_error($categories_result)) {
+                $result['categories'] = ($categories_result['imported'] ?? 0) + ($categories_result['updated'] ?? 0);
+            } elseif (isset($categories_result) && is_wp_error($categories_result)) {
                 $result['errors']['categories'] = $categories_result->get_error_message();
             }
         }
@@ -253,5 +280,65 @@ class Controller
             default:
                 return new \WP_Error('unknown_type', 'Unknown import type: ' . $type);
         }
+    }
+
+    /**
+     * Try to acquire a transient lock for the given sync type.
+     *
+     * Returns a unique token string on success, or false if another process
+     * already holds the lock. TTL is 300 seconds (5 min) so a crashed run
+     * cannot block future runs forever.
+     *
+     * @param string $type One of: 'products', 'customers', 'categories'.
+     * @return string|false Token on success, false if locked.
+     */
+    private function acquire_sync_lock(string $type): string|false
+    {
+        $key = "alegra_sync_running_{$type}";
+        $existing = get_transient($key);
+        if ($existing !== false) {
+            return false;
+        }
+        $token = wp_generate_password(20, false);
+        set_transient($key, $token, 300);
+        $winner = get_transient($key);
+        if ($winner !== $token) {
+            return false;
+        }
+        return $token;
+    }
+
+    /**
+     * Release a transient lock — only if the token matches.
+     *
+     * This prevents a stale process from accidentally releasing a fresh lock
+     * after a 5-min TTL turnover.
+     *
+     * @param string $type  Sync type (same key as acquire).
+     * @param string $token Token from acquire_sync_lock().
+     */
+    private function release_sync_lock(string $type, string $token): void
+    {
+        $key = "alegra_sync_running_{$type}";
+        $current = get_transient($key);
+        if ($current === $token) {
+            delete_transient($key);
+        }
+    }
+
+    /**
+     * Public wrapper for acquire_sync_lock — for use from other sync classes.
+     */
+    public static function acquire_sync_lock_public(string $type): string|false
+    {
+        return (new self(null, null))->acquire_sync_lock($type);
+    }
+
+    /**
+     * Public wrapper for release_sync_lock — for use from other sync classes.
+     */
+    public static function release_sync_lock_public(string $type, string $token): void
+    {
+        (new self(null, null))->release_sync_lock($type, $token);
     }
 }

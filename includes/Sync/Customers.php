@@ -154,65 +154,75 @@ class Customers
 
     public function import_from_alegra(int $page = 1, int $per_page = 30): array|\WP_Error
     {
-        $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
-        $current_page = $page;
-        $max_pages = 200;
-        set_time_limit(300);
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('customers');
+        if ($lock === false) {
+            $this->logger->info('Customers import skipped: another sync is running');
+            return new \WP_Error('sync_in_progress', 'Another sync is already running.');
+        }
 
-        for ($p = 1; $p <= $max_pages; $p++) {
-            if (get_transient('alegra_sync_cancelled')) {
-                delete_transient('alegra_sync_cancelled');
-                $this->logger->info('Customers import cancelled by user');
-                break;
+        try {
+            $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
+            $current_page = $page;
+            $max_pages = 200;
+            set_time_limit(300);
+
+            for ($p = 1; $p <= $max_pages; $p++) {
+                if (get_transient('alegra_sync_cancelled')) {
+                    delete_transient('alegra_sync_cancelled');
+                    $this->logger->info('Customers import cancelled by user');
+                    break;
+                }
+
+                set_transient('alegra_sync_progress', [
+                    'type' => 'customers',
+                    'current_page' => $p,
+                    'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
+                    'imported' => $result['imported'],
+                    'updated' => $result['updated'],
+                    'message' => sprintf(__('Procesando clientes... Página %d', 'alegra-connector'), $p),
+                ], 120);
+
+                $alegra_contacts = $this->api->get_contacts([
+                    'start' => ($current_page - 1) * $per_page,
+                    'limit' => $per_page,
+                    'type' => 'client',
+                ]);
+
+                if (is_wp_error($alegra_contacts)) {
+                    delete_transient('alegra_sync_progress');
+                    if ($current_page === 1) return $alegra_contacts;
+                    break;
+                }
+
+                if (empty($alegra_contacts)) break;
+
+                foreach ($alegra_contacts as $contact) {
+                    $r = $this->import_single_contact($contact);
+                    if ($r === true) $result['imported']++;
+                    elseif ($r === 'updated') $result['updated']++;
+                    else $result['errors']++;
+                }
+
+                if (count($alegra_contacts) < $per_page) break;
+                $current_page++;
             }
 
             set_transient('alegra_sync_progress', [
                 'type' => 'customers',
-                'current_page' => $p,
+                'current_page' => $current_page,
                 'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
                 'imported' => $result['imported'],
                 'updated' => $result['updated'],
-                'message' => sprintf(__('Procesando clientes... Página %d', 'alegra-connector'), $p),
-            ], 120);
+                'done' => true,
+                'message' => sprintf(__('Completado: %d importados, %d actualizados', 'alegra-connector'), $result['imported'], $result['updated']),
+            ], 60);
 
-            $alegra_contacts = $this->api->get_contacts([
-                'start' => ($current_page - 1) * $per_page,
-                'limit' => $per_page,
-                'type' => 'client',
-            ]);
+            $this->logger->info('Customers import from Alegra completed', $result);
 
-            if (is_wp_error($alegra_contacts)) {
-                delete_transient('alegra_sync_progress');
-                if ($current_page === 1) return $alegra_contacts;
-                break;
-            }
-
-            if (empty($alegra_contacts)) break;
-
-            foreach ($alegra_contacts as $contact) {
-                $r = $this->import_single_contact($contact);
-                if ($r === true) $result['imported']++;
-                elseif ($r === 'updated') $result['updated']++;
-                else $result['errors']++;
-            }
-
-            if (count($alegra_contacts) < $per_page) break;
-            $current_page++;
+            return $result;
+        } finally {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('customers', $lock);
         }
-
-        set_transient('alegra_sync_progress', [
-            'type' => 'customers',
-            'current_page' => $current_page,
-            'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
-            'imported' => $result['imported'],
-            'updated' => $result['updated'],
-            'done' => true,
-            'message' => sprintf(__('Completado: %d importados, %d actualizados', 'alegra-connector'), $result['imported'], $result['updated']),
-        ], 60);
-
-        $this->logger->info('Customers import from Alegra completed', $result);
-
-        return $result;
     }
 
     private function import_single_contact(array $contact): bool|string
