@@ -48,7 +48,6 @@ class Client
     private function get_auth_header(): string
     {
         if (empty($this->email) || empty($this->token)) {
-            error_log('[Alegra DEBUG] get_auth_header: email or token empty. Email length=' . strlen($this->email) . ' Token length=' . strlen($this->token));
             return 'Basic ';
         }
         $credentials = $this->email . ':' . $this->token;
