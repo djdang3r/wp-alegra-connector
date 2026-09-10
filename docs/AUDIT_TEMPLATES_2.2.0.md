@@ -1,94 +1,94 @@
-# Audit Report — `templates/admin-*.php` (XSS / unescaped output)
+# Audit: templates/admin-*.php — XSS scan
 
-**Scope**: All `templates/admin-*.php` files. Audit every `echo`, `print`, `<?= ?>` of user-controlled data without `esc_html()`, `esc_attr()`, `esc_url()`, `wp_kses_post()`, `esc_textarea()`, or `esc_url_raw()`.
+**Date**: 2026-09-10
+**Scope**: All 16 `templates/admin-*.php` files (2623 LOC total)
+**Method**: Read each file, inspect every `echo`/`print`/`<?= ?>` output for missing escaping of user-controlled data.
 
-**Files audited**: 16 (total 2623 LOC).
-**Total echo / `<?= ?>` sites inspected**: 120 across 15 files (admin-monitor.php has only JS `$()` jQuery selectors, not PHP output).
+## Findings
 
----
+No P0 or P1 findings. One P3 finding noted below.
 
-## Methodology
+### P0 findings: 0
+None. No template outputs raw user input without escaping.
 
-1. `grep -n 'echo \$\|<?=\s*\$'` across all `templates/admin-*.php` to enumerate every variable-output site.
-2. For each match, read 5–30 lines of surrounding context to identify:
-   - Is the variable pre-escaped (e.g. `$code = esc_attr(...)` before echo)?
-   - Or is it raw user data (post title, option value, request param) output directly?
-3. Classified each as:
-   - **SAFE** (escaped with WP escaping fn, or static value, or boolean comparison).
-   - **VULNERABLE** (raw user data to HTML without escaping).
+### P1 findings: 0
+None. Indirect user input (post titles, option values, request params) is consistently escaped via `esc_html()` / `esc_attr()` / `esc_url()` / `wp_kses_post()` / `esc_js()`.
 
----
+### P2 findings: 0
+None.
 
-## Per-file audit summary
+### P3 findings
 
-### `admin-orders.php` (55 lines)
-- Line 14: `<?php echo $total_orders>0?esc_html(round(($synced_orders/$total_orders)*100,1).'%'):'0%';?>` — math + esc_html. **SAFE**
-- Lines 25-27: `<?php echo $filter==='all'?'ac-btn-primary':'';?>` — boolean literal comparison. **SAFE**
-- Line 50: `'<span class="ac-badge...">'.esc_html__(...).'</span>'` — pre-escaped translation. **SAFE**
-- All other echoes pre-escape variables or use `esc_html_e()` / `esc_html()`. **No XSS**.
+#### Finding 1: `showNotice()` builds DOM via innerHTML concatenation [P3]
+- **Files**: `templates/admin-push-queue.php:179-185`, `templates/admin-monitor.php:324-330`
+- **Code** (`admin-monitor.php:324-330`):
+  ```js
+  function showNotice(msg, type) {
+      type = type || 'info';
+      var $n = $('<div class="ac-notice ' + type + '" style="display:none;margin:8px 0 14px 0;">' + msg + '</div>');
+      $('.alegra-connector-wrap').first().prepend($n);
+      ...
+  }
+  ```
+- **Issue**: `msg` originates from `r.data.message` (server JSON), which in PHP is composed via `__()` translations or `WP_Error::get_error_message()`. The current call sites (admin-push-queue.php:217, 227, 230, 250, 254; admin-monitor.php:218, 219, 226, 234, 258, 261, 267, 284, 287, 293, 309, 312, 318) pass server-controlled strings. Not exploitable today, but the pattern allows injected HTML if any future WP_Error message ever embeds raw user data.
+- **Fix (defensive)**: switch to `$n.text(msg)` (or build the div, then `$n.find('.text').text(msg)`). Not required for 2.2.0 release.
 
-### `admin-import.php` (159 lines)
-- Lines 126-148: matches are JavaScript `$()` jQuery selectors, not PHP output. **No PHP XSS**.
-- All other echoes use `esc_html()` or `esc_attr()`. **SAFE**
+## Per-file review notes
 
-### `admin-settings.php` (251 lines)
-- Lines 105-106: `$code = esc_attr($cur['code'] ?? ''); $name = esc_html(...)` — pre-escaped in foreach before echo. **SAFE**
-- Lines 167-168: bank accounts — `$id = (int)(...)` then `esc_attr($id)` / `esc_html(...)`. **SAFE**
-- Lines 183-184: payment terms — same pattern. **SAFE**
-- Line 230: `$ev = esc_html(...); $sid = esc_html(...);` pre-escaped before echo. **SAFE**
-- All webhook secrets (line 210) wrapped in `esc_attr()`. **SAFE**
+### `admin-orders.php` — CLEAN
+All `echo`/`<?= ?>` statements use `esc_html()` / `esc_attr()` / `esc_url()`. Lines 13-16 (KPIs), 25-27 (filter links), 28 (status select), 35 (search input), 47-52 (table rows) — all properly escaped.
 
-### `admin-logs.php` (137 lines)
-- Line 59-61: `$bc`, `$rowBg`, `$rowBorder` are static CSS string builders (no user input). **SAFE**
-- Line 63: `<?php echo esc_html($e['level']);?>` — escaped. **SAFE**
-- Line 82, 89-92, 107, 109: all use `esc_html()` on log entries. **SAFE**
+### `admin-settings.php` — CLEAN
+Tokens, URLs, options, webhook secrets all wrapped in `esc_attr()`. Lines 105-106, 167-168, 183-184, 210, 230 — pre-escaped in `foreach` loops before echo. Safe.
 
-### `admin-docs.php` (145 lines)
-- Line 81: `preg_match(...)` — PHP code, not output. **SAFE**
+### `admin-docs.php` — CLEAN
+`ac_md_to_html()` (lines 7-85) calls `esc_html($md)` first (line 17) then restores pre-escaped code blocks. URL scheme guard at lines 34, 43 blocks `javascript:` / `data:` / `vbscript:` / `file:` schemes. Safe.
 
-### `admin-wizard.php` (150 lines)
-- Lines 40-43: `<?php echo $i <= $step ? 'var(--ac-success)' : 'var(--ac-warning)';?>` — boolean literal comparison. **SAFE**
-- Line 111: `data-step="<?php echo $step; ?>"` — `$step` is cast `(int)` before reaching template (verified in caller). **SAFE**
+### `admin-order-detail.php` — CLEAN
+All order fields (`get_id`, `get_billing_first_name`, `get_date_created`, etc.) and Alegra API response fields (`$alegra_data['id']`, `['number']`, `['date']`, `['dueDate']`, `['status']`) escaped via `esc_html()` / `esc_url()`. Safe.
 
-### `admin-products.php` (264 lines)
-- Line 188: `$detail_url = esc_url(admin_url(...))` — pre-escaped. **SAFE**
-- Lines 178-183: `$ti` built from `esc_html__()` only. **SAFE**
-- Lines 191-199: `$alegra_cell`, `$status_cell`, `$import_button`, `$sync_button_label` all pre-escaped in foreach. **SAFE**
-- Lines 217, 225, 226, 240-242: uses `esc_html()`, `esc_url()`, `esc_attr()`, `wp_kses_post()`. **SAFE**
+### `admin-mapping.php` — CLEAN
+Lines 33, 42, 50, 86, 125, 126, 134, 168, 184 — all pre-escaped via `esc_attr()` / `esc_html()` / `esc_html__()`. Safe.
 
-### `admin-product-detail.php` (80 lines)
-- Line 25: `data-id="<?php echo esc_attr($product->get_id()); ?>"` — escaped. **SAFE**
+### `admin-wizard.php` — CLEAN
+`$step` cast `(int)` before reaching template (line 22). All other outputs use `esc_html()` / `esc_url()` / `esc_js()` / `esc_attr()`. JS-side `json_encode(wp_create_nonce(...))` (line 124) is HTML-safe in `<script>` context. Safe.
 
-### `admin-customers.php` (49 lines)
-- Lines 27-29: `<?php echo $filter==='all'?'ac-btn-primary':'';?>` — boolean literal. **SAFE**
+### `admin-customers.php` — CLEAN
+Lines 27-29 use boolean literal comparisons. Lines 46 (table row) all properly escaped. Safe.
 
-### `admin-order-detail.php` (157 lines)
-- Lines 132-134: `<?php echo $alegra_payment_data ? esc_html(...) : '--'; ?>` — escaped. **SAFE**
+### `admin-statistics.php` — CLEAN
+JS-side `json_encode(...)` (lines 87-93) for chart data is HTML-safe in `<script>` context. Numerical values cast `(int)` (line 93). Safe.
 
-### `admin-dashboard.php` (271 lines)
-- Line 71: `<?php echo $is_connected ? 'var(--ac-success)' : 'var(--ac-warning)';?>` — boolean literal. **SAFE**
-- Line 74: `<?php echo $is_connected ? 'success' : 'warning';?>` — boolean literal. **SAFE**
-- Line 98: `<?php echo $last_sync ? esc_html(human_time_diff($last_sync, time()) . ' ' . __('atras', 'alegra-connector')) : esc_html__('Nunca', 'alegra-connector');?>` — `esc_html()`. **SAFE**
-- Line 186: `<?php echo $is_connected ? esc_html($company_name) : ...;?>` — escaped. **SAFE**
+### `admin-import.php` — CLEAN
+All echo statements use `esc_html()` / `esc_attr()`. The `$connected` boolean check at line 73 / 77 / 81 uses ternary on internal option. Safe.
 
-### `admin-statistics.php` (93 lines)
-- Line 49: all outputs escaped with `esc_html()` or `esc_html__()`. **SAFE**
+### `admin-logs.php` — CLEAN
+Log entries, sizes, dates all `esc_html()`-wrapped. `$rowBg`, `$rowBorder`, `$bc` (lines 55-60) are static CSS string builders. Safe.
 
-### `admin-customer-detail.php` (71 lines)
-- Line 25: `data-id="<?php echo esc_attr($customer->ID); ?>"` — escaped. **SAFE**
+### `admin-products.php` — CLEAN
+Lines 191-199 build `$alegra_cell`, `$status_cell`, `$import_button`, `$sync_button_label` with `esc_html()` / `esc_attr()`. Image URLs at line 208 use `esc_url()`. Safe.
 
-### `admin-monitor.php` (343 lines)
-- All matches are JavaScript `$()` jQuery selectors and `.data('...')` reads — not PHP output. **No PHP XSS**.
+### `admin-customer-detail.php` — CLEAN
+All WC and Alegra customer fields escaped. Safe.
 
-### `admin-push-queue.php` (260 lines)
-- All matches are JavaScript — not PHP output. **No PHP XSS**.
+### `admin-push-queue.php` — CLEAN except P3 finding 1
+PHP outputs are all properly escaped. JS-side `showNotice()` has the P3 defensive concern (see Finding 1).
 
----
+### `admin-product-detail.php` — CLEAN
+Image URLs use `esc_url()` (line 59). All other fields use `esc_html()`. Safe.
+
+### `admin-dashboard.php` — CLEAN
+KPIs use `(int)` cast. Options use `esc_html(get_option(...))` or `esc_attr()`. Safe.
+
+### `admin-monitor.php` — CLEAN except P3 finding 1
+JS-side `escapeHtml()` function (lines 98-103) handles `&<>"'` — used consistently in `renderRunning` / `renderCron` / `renderRecent`. The P3 `showNotice` pattern at lines 324-330 is the only soft spot (see Finding 1).
 
 ## Summary
-
-**No XSS vectors found in `templates/admin-*.php`** — all output of user-controlled data is properly escaped with WordPress's standard escaping functions (`esc_html`, `esc_attr`, `esc_url`, `wp_kses_post`).
-
-Pre-escaping pattern used correctly throughout: variables are assigned with escaping (`$x = esc_html($y)`) inside foreach blocks, then echoed raw — this is idiomatic WP template style and is safe.
-
-No P0/P1/P2/P3 findings. No fixes required for these templates in 2.2.0.
+- Total files reviewed: 16
+- Total LOC: 2623
+- Clean files: 16 (no P0/P1/P2)
+- Files with findings: 2 (`admin-monitor.php`, `admin-push-queue.php` — both share the same P3 `showNotice` pattern)
+- Total P0 findings: 0
+- Total P1 findings: 0
+- Total P2 findings: 0
+- Total P3 findings: 1
