@@ -812,8 +812,9 @@ class Products
             update_term_meta($term_id, 'alegra_category_id', $alegra_cat_id);
         }
 
-        // Assign (fix B-8: check the result)
-        $result = wp_set_object_terms($product_id, [$term_id], 'product_cat', false);
+        // Assign. Append=true so re-imports ADD the Alegra category instead of
+        // replacing the merchant's manual WooCommerce categorization.
+        $result = wp_set_object_terms($product_id, [$term_id], 'product_cat', true);
         if (is_wp_error($result)) {
             $this->logger->warning('Failed to assign category to product', [
                 'product_id' => $product_id,

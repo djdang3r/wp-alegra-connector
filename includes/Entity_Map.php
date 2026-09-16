@@ -38,7 +38,7 @@ class Entity_Map
             return (int) $id;
         }
 
-        // 2. Fallback to postmeta (legacy data)
+        // 2. Fallback to postmeta/usermeta (legacy data)
         if ($wc_entity_type === 'product') {
             $meta_key = '_alegra_item_id';
             $table = $wpdb->postmeta;
@@ -48,9 +48,11 @@ class Entity_Map
             $table = $wpdb->usermeta;
             $id_col = 'user_id';
         } elseif ($wc_entity_type === 'order') {
+            // Orders live in wc_orders_meta on HPOS, postmeta on legacy. Pick the
+            // storage that actually holds the data so this fallback works on both.
             $meta_key = '_alegra_invoice_id';
-            $table = $wpdb->postmeta;
-            $id_col = 'post_id';
+            $table = HPOS::get_order_meta_table();
+            $id_col = HPOS::is_enabled() ? 'order_id' : 'post_id';
         } else {
             return null;
         }
@@ -122,9 +124,11 @@ class Entity_Map
             $stats['customers']++;
         }
 
-        // Orders (only those with invoice linked)
+        // Orders (only those with invoice linked). HPOS-safe storage selection.
+        $meta_table = HPOS::get_order_meta_table();
+        $id_col = HPOS::is_enabled() ? 'order_id' : 'post_id';
         $orders = $wpdb->get_results(
-            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+            "SELECT {$id_col} AS post_id, meta_value FROM {$meta_table}
              WHERE meta_key = '_alegra_invoice_id' AND meta_value > ''"
         );
         foreach ($orders as $row) {

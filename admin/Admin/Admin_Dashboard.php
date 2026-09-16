@@ -339,6 +339,26 @@ class Admin_Dashboard
             'default' => false,
         ]);
 
+        // Product push category strategy (read by Products::resolve_alegra_category_id()).
+        register_setting('alegra_connector_settings', 'alegra_connector_push_category_strategy', [
+            'sanitize_callback' => function ($value) {
+                $allowed = ['first', 'deepest', 'specific'];
+                return in_array($value, $allowed, true) ? $value : 'deepest';
+            },
+            'default' => 'deepest',
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_push_category_id', ['sanitize_callback' => 'intval']);
+        // Parent term for categories imported from Alegra (read by Categories/Products).
+        register_setting('alegra_connector_settings', 'alegra_connector_import_category_parent', ['sanitize_callback' => 'intval']);
+        // Manual Consumidor Final override (read by Consumidor_Final::get_id()).
+        register_setting('alegra_connector_settings', 'alegra_connector_consumidor_final_manual_override', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_consumidor_final_manual_id', [
+            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_consumidor_final_manual_id'),
+        ]);
+
         // Per-field billing toggles. Group A (Obligatorios) is force-enabled here
         // so an admin can never break e-invoicing from the UI.
         register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
@@ -772,7 +792,7 @@ class Admin_Dashboard
         $sync_stats = [
             'products_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_item_id'"),
             'products_total' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type='product' AND post_status='publish'"),
-            'orders_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_invoice_id'"),
+            'orders_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$meta_table} WHERE meta_key='_alegra_invoice_id'"),
             'orders_total' => $orders_total,
             'customers_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_key='alegra_contact_id' AND meta_value != ''"),
             'customers_total' => $total_customers,
@@ -1055,6 +1075,7 @@ class Admin_Dashboard
 
         $orders = wc_get_orders($args);
         $orders_table = HPOS::get_orders_table();
+        $meta_table = HPOS::get_order_meta_table();
         if (HPOS::is_enabled()) {
             $total_orders = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$orders_table} WHERE type='shop_order'");
         } else {
@@ -1062,8 +1083,8 @@ class Admin_Dashboard
         }
         $total_pages = (int) ceil($total_orders / $per_page);
 
-        $synced_orders = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_invoice_id' AND meta_value != ''");
-        $payment_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_payment_id' AND meta_value != ''");
+        $synced_orders = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$meta_table} WHERE meta_key='_alegra_invoice_id' AND meta_value != ''");
+        $payment_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$meta_table} WHERE meta_key='_alegra_payment_id' AND meta_value != ''");
 
         $header_color = 'amber';
 

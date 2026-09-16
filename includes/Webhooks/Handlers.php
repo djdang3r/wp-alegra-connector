@@ -158,14 +158,18 @@ class Handlers
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
         if ($status === 'paid' && $balance <= 0 && $should_complete) {
-            global $wpdb;
-            $order_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_invoice_id' AND meta_value = %s LIMIT 1",
-                $alegra_invoice_id
-            ));
+            // HPOS-safe order lookup: wc_get_orders() reads the correct storage
+            // (wc_orders_meta on HPOS, postmeta on legacy) through the CRUD API.
+            $found = wc_get_orders([
+                'meta_key'   => '_alegra_invoice_id',
+                'meta_value' => $alegra_invoice_id,
+                'limit'      => 1,
+                'return'     => 'ids',
+            ]);
+            $order_id = !empty($found) ? (int) $found[0] : 0;
 
             if ($order_id) {
-                $order = wc_get_order((int) $order_id);
+                $order = wc_get_order($order_id);
                 if ($order && $order->get_status() !== 'completed') {
                     $order->add_order_note(sprintf(
                         __('[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),

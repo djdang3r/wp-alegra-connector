@@ -102,6 +102,27 @@ class Checkout_Integration
         }, 20);
 
         add_action('wp_enqueue_scripts', [self::class, 'enqueue_scripts']);
+
+        self::register_cache_invalidation();
+    }
+
+    /**
+     * Invalidate the cached checkout type when the checkout page or its content
+     * changes, so a merchant switching between the Checkout Block and the
+     * shortcode checkout never gets a stale detection for up to an hour.
+     */
+    private static function register_cache_invalidation(): void
+    {
+        add_action('update_option_woocommerce_checkout_page_id', [self::class, 'clear_cache']);
+
+        add_action('save_post_page', static function (int $post_id): void {
+            if (!function_exists('wc_get_page_id')) {
+                return;
+            }
+            if ($post_id === (int) wc_get_page_id('checkout')) {
+                self::clear_cache();
+            }
+        });
     }
 
     /**
@@ -172,12 +193,16 @@ class Checkout_Integration
         $type_map = ['select' => 'select', 'textarea' => 'text', 'text' => 'text'];
         $type = $type_map[(string) ($field['type'] ?? 'text')] ?? 'text';
 
+        // Only `require_data` hard-blocks checkout. In `auto`/`always_generic`
+        // the fields stay optional so the Consumidor Final fallback can run.
+        $require_mode = Billing_Fields::is_require_data_mode();
+
         $args = [
             'id'       => self::FIELD_NAMESPACE . '/' . $key,
             'label'    => (string) $field['label'],
             'location' => 'address',
             'type'     => $type,
-            'required' => !empty($field['required']),
+            'required' => $require_mode && !empty($field['required']),
         ];
 
         if ($type === 'select') {
@@ -186,7 +211,7 @@ class Checkout_Integration
 
         $condition = self::condition_for($key);
         if ($condition !== null) {
-            $args['required'] = $condition['required'];
+            $args['required'] = $require_mode ? $condition['required'] : false;
             $args['hidden'] = $condition['hidden'];
         }
 

@@ -98,6 +98,30 @@
 <label><input type="checkbox" name="alegra_connector_push_products_enabled" value="1" <?php checked(get_option('alegra_connector_push_products_enabled',false));?>> <strong><?php esc_html_e('Activar envio automatico de productos y clientes a Alegra','alegra-connector');?></strong></label>
 <p class="description" style="margin:2px 0 0 24px;"><?php esc_html_e('PRECAUCION: Al activar, cada vez que crees o actualices un producto o cliente en WooCommerce, se enviara automaticamente a Alegra. Esto puede sobrescribir datos existentes. Por defecto esta desactivado. Cuando este toggle esta apagado, solo puedes subir productos a Alegra manualmente desde los botones "Actualizar" de la pagina de detalle del producto, o usando los botones "Enviar seleccionados" del listado de productos.','alegra-connector');?></p>
 </fieldset></td></tr>
+<?php $ac_product_cats = get_terms(['taxonomy'=>'product_cat','hide_empty'=>false]); if(is_wp_error($ac_product_cats))$ac_product_cats=[]; ?>
+<tr><th><label for="alegra_connector_push_category_strategy"><?php esc_html_e('Categoría a enviar a Alegra:','alegra-connector');?></label></th><td>
+<select id="alegra_connector_push_category_strategy" name="alegra_connector_push_category_strategy">
+<option value="deepest" <?php selected(get_option('alegra_connector_push_category_strategy','deepest'),'deepest');?>><?php esc_html_e('La más específica (recomendado)','alegra-connector');?></option>
+<option value="first" <?php selected(get_option('alegra_connector_push_category_strategy'),'first');?>><?php esc_html_e('La primera','alegra-connector');?></option>
+<option value="specific" <?php selected(get_option('alegra_connector_push_category_strategy'),'specific');?>><?php esc_html_e('Una categoría específica','alegra-connector');?></option>
+</select>
+<select name="alegra_connector_push_category_id" style="margin-left:8px;">
+<option value="0"><?php esc_html_e('-- Seleccionar categoría --','alegra-connector');?></option>
+<?php foreach($ac_product_cats as $ac_cat):?>
+<option value="<?php echo esc_attr((string)$ac_cat->term_id);?>" <?php selected((int)get_option('alegra_connector_push_category_id',0),(int)$ac_cat->term_id);?>><?php echo esc_html($ac_cat->name);?></option>
+<?php endforeach;?>
+</select>
+<p class="description"><?php esc_html_e('Cuando un producto tiene varias categorías, define cuál se envía a Alegra. "La más específica" usa la hoja del árbol; "Una categoría específica" solo se usa si el producto la tiene asignada.','alegra-connector');?></p>
+</td></tr>
+<tr><th><label for="alegra_connector_import_category_parent"><?php esc_html_e('Categoría padre al importar:','alegra-connector');?></label></th><td>
+<select id="alegra_connector_import_category_parent" name="alegra_connector_import_category_parent">
+<option value="0"><?php esc_html_e('-- Sin padre (nivel superior) --','alegra-connector');?></option>
+<?php foreach($ac_product_cats as $ac_cat):?>
+<option value="<?php echo esc_attr((string)$ac_cat->term_id);?>" <?php selected((int)get_option('alegra_connector_import_category_parent',0),(int)$ac_cat->term_id);?>><?php echo esc_html($ac_cat->name);?></option>
+<?php endforeach;?>
+</select>
+<p class="description"><?php esc_html_e('Las categorías creadas al importar productos desde Alegra se colgarán de esta categoría.','alegra-connector');?></p>
+</td></tr>
 </table>
 </div>
 
@@ -172,6 +196,14 @@ $ac_resolution_mode = get_option('alegra_connector_customer_resolution_mode','au
 <li><strong><?php esc_html_e('Siempre Consumidor Final:','alegra-connector');?></strong> <?php esc_html_e('Todas las facturas se emiten al Consumidor Final. El cliente no recibe factura a su nombre.','alegra-connector');?></li>
 <li><strong><?php esc_html_e('Exigir datos al cliente:','alegra-connector');?></strong> <?php esc_html_e('No se puede pagar sin NIT/cédula. No se factura al Consumidor Final.','alegra-connector');?></li>
 </ul>
+</td></tr>
+
+<!-- 1a-bis. Manual Consumidor Final override -->
+<tr><th><?php esc_html_e('Consumidor Final manual:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_consumidor_final_manual_override" value="1" <?php checked(get_option('alegra_connector_consumidor_final_manual_override',false));?>> <?php esc_html_e('Usar un contacto específico como Consumidor Final','alegra-connector');?></label>
+<p class="description"><?php esc_html_e('Por defecto el plugin busca en Alegra el contacto "Consumidor Final" por su identificación. Actívalo para forzar otro contacto.','alegra-connector');?></p>
+<input type="text" name="alegra_connector_consumidor_final_manual_id" value="<?php echo esc_attr(get_option('alegra_connector_consumidor_final_manual_id',''));?>" class="regular-text" placeholder="<?php esc_attr_e('ID del contacto en Alegra','alegra-connector');?>">
+<p class="description"><?php esc_html_e('ID (o UUID) del contacto en Alegra que se usará como Consumidor Final. Solo aplica si la casilla está marcada.','alegra-connector');?></p>
 </td></tr>
 
 <!-- 1b. DIAN stamp toggle -->

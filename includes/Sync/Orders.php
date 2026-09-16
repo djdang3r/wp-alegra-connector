@@ -518,7 +518,8 @@ class Orders
         $customer = $order->get_user();
 
         // Customer resolution mode: auto (default) | always_generic | require_data.
-        // `require_data` is enforced at checkout (validation), so here it behaves like `auto`.
+        // `require_data` is enforced at checkout and disables the Consumidor
+        // Final fallback here (see step 6).
         $mode = (string) get_option('alegra_connector_customer_resolution_mode', 'auto');
 
         // Mode: always use the generic client (Consumidor Final).
@@ -627,14 +628,20 @@ class Orders
             }
         }
 
-        // Step 6 — Consumidor Final fallback.
-        $cf = \Alegra\Connector\Consumidor_Final::get_id();
-        if ($cf !== false && $cf !== '') {
-            $this->persist_contact_id($order, $customer, (string) $cf);
-            $this->logger->info('Using Consumidor Final for order', ['order_id' => $order_id]);
-            return (string) $cf;
+        // Step 6 — Consumidor Final fallback. Disabled in `require_data` mode so
+        // the invoice aborts with `customer_unresolved` instead of silently
+        // invoicing a generic consumer.
+        if ($mode !== 'require_data') {
+            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            if ($cf !== false && $cf !== '') {
+                $this->persist_contact_id($order, $customer, (string) $cf);
+                $this->logger->info('Using Consumidor Final for order', ['order_id' => $order_id]);
+                return (string) $cf;
+            }
+            $this->logger->error('Consumidor Final could not be resolved', ['order_id' => $order_id]);
+        } else {
+            $this->logger->error('Customer data required but could not be resolved', ['order_id' => $order_id]);
         }
-        $this->logger->error('Consumidor Final could not be resolved', ['order_id' => $order_id]);
         return '';
     }
 

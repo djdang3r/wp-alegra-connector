@@ -184,6 +184,21 @@ class Billing_Fields
         add_action('woocommerce_checkout_update_order_meta', static function (int $order_id): void {
             self::save_checkout($order_id);
         }, 10, 1);
+        // Checkout Blocks / Store API path: WooCommerce persists additional
+        // checkout fields through CheckoutFields and fires this action for each
+        // value it saves. Mirrors the value into the `billing_alegra_*` shape.
+        add_action('woocommerce_set_additional_field_value', static function ($key, $value, $group, $wc_object): void {
+            self::save_additional_field((string) $key, $value, (string) $group, $wc_object);
+        }, 10, 4);
+        // Checkout Blocks: address additional fields arrive inside the
+        // `billing_address` request param. This runs before the order is saved,
+        // so mirroring here covers guests too (the action above only sees the
+        // order when WC syncs a logged-in customer's fields).
+        add_action('woocommerce_store_api_checkout_update_order_from_request', static function ($order, $request): void {
+            if ($order instanceof \WC_Order && $request instanceof \WP_REST_Request) {
+                self::save_blocks_checkout($order, $request);
+            }
+        }, 10, 2);
         add_action('woocommerce_save_account_details', static function (int $user_id): void {
             self::save_account($user_id);
         }, 10, 1);
@@ -200,6 +215,18 @@ class Billing_Fields
         }
 
         return !empty($opts[$key]);
+    }
+
+    /**
+     * Whether the store requires billing data at checkout (`require_data` mode).
+     *
+     * In `auto` mode an incomplete form falls back to Consumidor Final and in
+     * `always_generic` the data is ignored, so only `require_data` may hard-block
+     * checkout.
+     */
+    public static function is_require_data_mode(): bool
+    {
+        return (string) get_option('alegra_connector_customer_resolution_mode', 'auto') === 'require_data';
     }
 
     /**
@@ -458,12 +485,16 @@ class Billing_Fields
             // `required` server-side regardless of the JS visibility toggle, which
             // would block natural persons on the `company` field. They are enforced
             // by self::validate() on woocommerce_checkout_process instead.
+            //
+            // `required` is also gated on `require_data`: in `auto` mode an
+            // incomplete form must reach the Consumidor Final fallback instead of
+            // being blocked at checkout.
             $is_conditional = (string) ($field['render_when'] ?? 'always') !== 'always';
 
             $entry = [
                 'type' => $wc_type,
                 'label' => (string) $field['label'],
-                'required' => !empty($field['required']) && !$is_conditional,
+                'required' => self::is_require_data_mode() && !empty($field['required']) && !$is_conditional,
                 'class' => [
                     'form-row-wide',
                     'alegra-billing-field',
@@ -635,7 +666,23 @@ class Billing_Fields
             return;
         }
 
-        $result = self::validate(self::collect_posted_values());
+        // Only `require_data` blocks checkout. In `auto` mode an incomplete form
+        // falls back to Consumidor Final, and `always_generic` ignores the data
+        // entirely, so blocking there would contradict the UI.
+        if (!self::is_require_data_mode()) {
+            return;
+        }
+
+        $values = self::collect_posted_values();
+        if (!self::has_critical_data($values)) {
+            wc_add_notice(
+                __('Para completar la compra necesitás ingresar tu tipo y número de documento.', 'alegra-connector'),
+                'error'
+            );
+            return;
+        }
+
+        $result = self::validate($values);
         if (is_wp_error($result)) {
             wc_add_notice($result->get_error_message(), 'error');
         }
@@ -681,6 +728,118 @@ class Billing_Fields
         if ($order instanceof \WC_Order) {
             $order->save();
         }
+    }
+
+    /**
+     * Hook callback for `woocommerce_set_additional_field_value` (Checkout Blocks).
+     *
+     * WooCommerce stores Block-checkout additional fields under a namespaced key
+     * (`_wc_billing/alegra-connector/<key>`, see CheckoutFieldsStorage), which is
+     * NOT where the invoice builder looks. This mirrors each submitted value into
+     * the `billing_alegra_<key>` shape shared by both checkout paths, so Block
+     * orders no longer fall back to Consumidor Final.
+     *
+     * @param string                 $key       Registered field id, e.g. `alegra-connector/idtype`.
+     * @param mixed                  $value     The submitted value.
+     * @param string                 $group     Group being saved: billing|shipping|other.
+     * @param \WC_Order|\WC_Customer $wc_object The order/customer the value is saved for.
+     */
+    private static function save_additional_field(string $key, $value, string $group, $wc_object): void
+    {
+        $namespace = 'alegra-connector/';
+        if (strpos($key, $namespace) !== 0) {
+            return;
+        }
+
+        // Address fields are persisted once per group (billing + shipping); the
+        // invoice only uses the billing copy.
+        if ($group !== 'billing') {
+            return;
+        }
+
+        $catalog_key = substr($key, strlen($namespace));
+        if (!isset(self::CATALOG[$catalog_key])) {
+            return;
+        }
+
+        $field = self::CATALOG[$catalog_key];
+        $meta_key = (string) $field['meta_key'];
+        $sanitized = self::sanitize_value($field, $value);
+
+        if ($wc_object instanceof \WC_Order) {
+            $wc_object->update_meta_data('_' . $meta_key, $sanitized);
+        } elseif ($wc_object instanceof \WC_Customer && (int) $wc_object->get_id() > 0) {
+            update_user_meta((int) $wc_object->get_id(), $meta_key, $sanitized);
+        }
+    }
+
+    /**
+     * Hook callback for `woocommerce_store_api_checkout_update_order_from_request`
+     * (Checkout Blocks).
+     *
+     * Address additional fields arrive inside the `billing_address` request param.
+     * This mirrors them into `billing_alegra_<key>` before WC saves the order, so
+     * the invoice builder reads the same shape as on the classic checkout. Runs
+     * for guests too, unlike the `woocommerce_set_additional_field_value` action
+     * (which only reaches the order after a logged-in customer sync).
+     *
+     * @param \WC_Order        $order   The order being processed.
+     * @param \WP_REST_Request $request Full checkout request.
+     */
+    private static function save_blocks_checkout(\WC_Order $order, \WP_REST_Request $request): void
+    {
+        $billing = $request['billing_address'] ?? [];
+        if (!is_array($billing)) {
+            $billing = [];
+        }
+
+        $user_id = (int) $order->get_customer_id();
+
+        foreach (self::CATALOG as $key => $field) {
+            $raw = self::block_field_value('alegra-connector/' . $key, $billing, $order);
+            if ($raw === null) {
+                continue;
+            }
+
+            $sanitized = self::sanitize_value($field, $raw);
+            $meta_key = (string) $field['meta_key'];
+
+            $order->update_meta_data('_' . $meta_key, $sanitized);
+            if ($user_id > 0) {
+                update_user_meta($user_id, $meta_key, $sanitized);
+            }
+        }
+    }
+
+    /**
+     * Resolve a Block-checkout additional field value from the checkout request,
+     * the order meta, or the session customer, in that order.
+     *
+     * @param array<string, mixed> $billing Decoded `billing_address` request param.
+     * @return mixed|null Null when no source carries the field.
+     */
+    private static function block_field_value(string $field_id, array $billing, \WC_Order $order)
+    {
+        if (array_key_exists($field_id, $billing)) {
+            return $billing[$field_id];
+        }
+
+        // WC persists address fields under `_wc_billing/<namespace>/<field>`.
+        $meta_key = '_wc_billing/' . $field_id;
+
+        $value = $order->get_meta($meta_key, true);
+        if ($value !== '' && $value !== null) {
+            return $value;
+        }
+
+        if (function_exists('WC') && WC()->customer instanceof \WC_Customer) {
+            $value = WC()->customer->get_meta($meta_key, true);
+            if ($value !== '' && $value !== null) {
+                return $value;
+            }
+        }
+
+        return null;
     }
 
     /**
