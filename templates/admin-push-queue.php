@@ -178,7 +178,9 @@ $recent = \Alegra\Connector\Push_Queue::get_all(20);
 
     function showNotice(msg, type) {
         type = type || 'info';
-        var $n = $('<div class="ac-notice ' + type + '" style="display:none;margin:8px 0;">' + msg + '</div>');
+        // Build the node and inject the message with .text() — never concatenate
+        // a server/Alegra-derived string into HTML.
+        var $n = $('<div>').addClass('ac-notice').addClass(type).css({display: 'none', margin: '8px 0'}).text(msg);
         $('.alegra-connector-wrap').first().prepend($n);
         $n.slideDown(200);
         setTimeout(function() { $n.slideUp(300, function() { $(this).remove(); }); }, 5000);

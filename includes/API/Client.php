@@ -201,7 +201,18 @@ class Client
 
             if ($code >= 400) {
                 $error_data = json_decode($body, true);
-                $message = is_array($error_data) ? ($error_data['message'] ?? $error_data['code'] ?? 'API Error') : 'API Error';
+                // Alegra error bodies use `message` or `error`; keep the raw value
+                // defensive (it can be an array) and strip any markup BEFORE it
+                // becomes a WP_Error message that the admin JS renders. The
+                // templates build DOM nodes, but this is defence in depth: a
+                // remote-influenced string must never carry HTML.
+                $message = is_array($error_data)
+                    ? ($error_data['message'] ?? $error_data['error'] ?? $error_data['code'] ?? 'API Error')
+                    : 'API Error';
+                if (is_array($message) || is_object($message)) {
+                    $message = wp_json_encode($message);
+                }
+                $message = wp_strip_all_tags((string) $message);
                 if ($this->logger) $this->logger->error('API Error response', ['code' => $code, 'message' => $message]);
                 return new \WP_Error('api_error', $message, ['code' => $code, 'response' => $error_data]);
             }

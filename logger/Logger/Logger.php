@@ -19,6 +19,18 @@ class Logger
     private string $log_file;
     private int $retention_days = 30;
 
+    /**
+     * Logs live under wp-content/uploads/alegra-logs/ and contain customer PII.
+     *
+     * The directory ships an Apache `.htaccess` deny and an `index.php` stub, but
+     * **Nginx ignores `.htaccess`**. On Nginx (or any server that does not honour
+     * `.htaccess`) add an explicit location deny, for example:
+     *
+     *     location ^~ /wp-content/uploads/alegra-logs/ { deny all; }
+     *
+     * As defence in depth the log filename also carries a random per-install
+     * suffix so the path is not guessable.
+     */
     public function __construct()
     {
         $upload_dir = wp_upload_dir();
@@ -26,22 +38,57 @@ class Logger
 
         if (!is_dir($this->log_dir)) {
             wp_mkdir_p($this->log_dir);
-
-            // Add .htaccess to prevent direct access (Apache 2.4 compatible)
-            $htaccess = $this->log_dir . '/.htaccess';
-            if (!file_exists($htaccess)) {
-                @file_put_contents($htaccess, "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n");
-            }
-
-            // Add index.php for extra security
-            $index = $this->log_dir . '/index.php';
-            if (!file_exists($index)) {
-                @file_put_contents($index, "<?php // Silence is golden.\n");
-            }
         }
 
-        $this->log_file = $this->log_dir . '/alegra-sync-' . date('Y-m-d') . '.log';
+        // Re-assert the deny files on EVERY boot, not only when the directory is
+        // first created: a pre-existing directory — or one where the files were
+        // deleted — would otherwise be publicly accessible.
+        $this->protect_log_dir();
+
+        $this->log_file = $this->log_dir . '/alegra-sync-' . $this->get_log_suffix() . '-' . date('Y-m-d') . '.log';
         $this->retention_days = (int) get_option('alegra_connector_log_retention_days', 30);
+    }
+
+    /**
+     * (Re)write the .htaccess deny and the index.php stub when missing.
+     */
+    private function protect_log_dir(): void
+    {
+        if (!is_dir($this->log_dir)) {
+            return;
+        }
+
+        // Apache 2.2 + 2.4 compatible deny.
+        $htaccess = $this->log_dir . '/.htaccess';
+        if (!file_exists($htaccess)) {
+            @file_put_contents($htaccess, "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n");
+        }
+
+        // Directory listing / direct execution guard.
+        $index = $this->log_dir . '/index.php';
+        if (!file_exists($index)) {
+            @file_put_contents($index, "<?php // Silence is golden.\n");
+        }
+    }
+
+    /**
+     * Stable random per-install suffix used to make the log path non-guessable.
+     */
+    private function get_log_suffix(): string
+    {
+        $suffix = (string) get_option('alegra_connector_log_suffix', '');
+        if (preg_match('/^[a-f0-9]{12}$/', $suffix)) {
+            return $suffix;
+        }
+
+        try {
+            $suffix = substr(bin2hex(random_bytes(6)), 0, 12);
+        } catch (\Throwable $e) {
+            $suffix = substr(md5((string) (defined('AUTH_SALT') ? AUTH_SALT : __FILE__) . microtime()), 0, 12);
+        }
+
+        update_option('alegra_connector_log_suffix', $suffix, false);
+        return $suffix;
     }
 
     private function write(string $level, string $message, array $context = []): void
@@ -86,12 +133,18 @@ class Logger
             fclose($handle);
 
             if (!$locked) {
-                // Fallback if flock() returned false (rare — only on filesystem errors).
-                error_log('[Alegra Logger] flock failed: ' . $log_entry);
+                // Fallback if flock() returned false (rare — only on filesystem
+                // errors). Gated by WP_DEBUG so it cannot flood the server log.
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log('[Alegra Logger] flock failed: ' . $log_entry);
+                }
             }
         } catch (\Throwable $e) {
             // Fallback: never let a logging failure break the import flow.
-            error_log('[Alegra Logger] ' . $e->getMessage() . ' | ' . trim($log_entry));
+            // Gated by WP_DEBUG so an unwritable uploads dir cannot flood logs.
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log('[Alegra Logger] ' . $e->getMessage() . ' | ' . trim($log_entry));
+            }
         }
     }
 
@@ -211,7 +264,8 @@ class Logger
     public function download_log(string $filename = ''): void
     {
         if (empty($filename)) {
-            $filename = 'alegra-sync-' . date('Y-m-d') . '.log';
+            // $this->log_file carries the randomized per-install suffix.
+            $filename = $this->log_file;
         }
 
         $file_path = $this->log_dir . '/' . basename($filename);

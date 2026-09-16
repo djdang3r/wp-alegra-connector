@@ -123,7 +123,7 @@ function downloadTemplate(type){
 }
 
 jQuery(function($){
-    function showNotice(msg,type){var n=$('<div class="ac-notice '+(type||'info')+'">'+msg+'</div>').hide();$('.alegra-connector-wrap').first().prepend(n);n.slideDown(200);setTimeout(function(){n.slideUp(300,function(){$(this).remove();});},6000);}
+    function showNotice(msg,type){var $n=$('<div>').addClass('ac-notice').addClass(type||'info').text(msg).hide();$('.alegra-connector-wrap').first().prepend($n);$n.slideDown(200);setTimeout(function(){$n.slideUp(300,function(){$(this).remove();});},6000);}
     function safeMsg(r,f){return(r&&r.data&&r.data.message)||f||'Error desconocido';}
 
     $('#alegra-import-btn').on('click',function(){

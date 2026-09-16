@@ -28,9 +28,10 @@
 <tr><th><label for="alegra_connector_email"><?php esc_html_e('Email de la cuenta:','alegra-connector');?></label></th><td><input type="email" id="alegra_connector_email" name="alegra_connector_email" value="<?php echo esc_attr(get_option('alegra_connector_email',''));?>" class="regular-text" placeholder="tu@email.com"><p class="description"><?php esc_html_e('El mismo email con el que inicias sesion en Alegra.','alegra-connector');?></p></td></tr>
 <tr><th><label for="alegra_connector_token"><?php esc_html_e('Token API:','alegra-connector');?></label></th>
 <td>
-    <input type="password" id="alegra_connector_token" name="alegra_connector_token" value="<?php echo esc_attr(get_option('alegra_connector_token',''));?>" class="regular-text" placeholder="<?php esc_attr_e('Token generado en Alegra','alegra-connector');?>">
+    <?php $ac_token_saved = (string) get_option('alegra_connector_token', ''); ?>
+    <input type="password" id="alegra_connector_token" name="alegra_connector_token" value="" autocomplete="new-password" class="regular-text" placeholder="<?php echo esc_attr($ac_token_saved !== '' ? __('•••••••• (guardado, deja vacio para conservarlo)', 'alegra-connector') : __('Token generado en Alegra', 'alegra-connector')); ?>">
     <button type="button" class="ac-btn ac-btn-sm" id="toggle-token-visibility" style="margin-left:8px;"><?php esc_html_e('Mostrar','alegra-connector');?></button>
-    <p class="description"><?php esc_html_e('El token se almacena en la base de datos de WordPress.','alegra-connector');?></p>
+    <p class="description"><?php esc_html_e('El token se almacena en la base de datos de WordPress. Por seguridad no se vuelve a mostrar: deja el campo vacio para conservar el token guardado.','alegra-connector');?></p>
 </td></tr>
 <tr><th><label for="alegra_connector_api_url"><?php esc_html_e('URL de la API:','alegra-connector');?></label></th><td><input type="text" id="alegra_connector_api_url" name="alegra_connector_api_url" value="<?php echo esc_attr(get_option('alegra_connector_api_url','https://api.alegra.com/api/v1'));?>" class="regular-text" placeholder="https://api.alegra.com/api/v1"><p class="description"><?php esc_html_e('URL base de la API de Alegra. No cambiar a menos que Alegra te indique otra URL.','alegra-connector');?></p></td></tr>
 <tr><th></th><td><button type="button" class="ac-btn ac-btn-primary" id="alegra-test-connection"><?php esc_html_e('Probar Conexión','alegra-connector');?></button> <span id="alegra-connection-status" style="margin-left:8px;font-size:13px;"></span><p class="description"><?php esc_html_e('Verifica que las credenciales sean correctas antes de guardar.','alegra-connector');?></p></td></tr></table>
@@ -323,9 +324,10 @@ $ac_group_badge = ['A'=>'danger','B'=>'warning','C'=>'neutral'];
 
 <tr><th><?php esc_html_e('Webhook Secret:','alegra-connector');?></th>
 <td>
-<input type="password" name="alegra_connector_webhook_secret" id="alegra_connector_webhook_secret" value="<?php echo esc_attr(get_option('alegra_connector_webhook_secret', '')); ?>" class="regular-text" placeholder="<?php esc_attr_e('Clave HMAC para validar webhooks','alegra-connector');?>">
+<?php $ac_secret_saved = (string) get_option('alegra_connector_webhook_secret', ''); ?>
+<input type="password" name="alegra_connector_webhook_secret" id="alegra_connector_webhook_secret" value="" autocomplete="new-password" data-saved="<?php echo $ac_secret_saved !== '' ? '1' : '0'; ?>" class="regular-text" placeholder="<?php echo esc_attr($ac_secret_saved !== '' ? __('•••••••• (guardado, deja vacio para conservarlo)', 'alegra-connector') : __('Clave HMAC para validar webhooks', 'alegra-connector')); ?>">
 <button type="button" class="ac-btn ac-btn-sm" id="toggle-webhook-secret" style="margin-left:4px;"><?php esc_html_e('Mostrar','alegra-connector');?></button>
-<p class="description"><?php esc_html_e('Clave secreta para validar que los webhooks vienen de Alegra (HMAC-SHA256). Debe coincidir con la configurada en Alegra.','alegra-connector');?></p>
+<p class="description"><?php esc_html_e('Clave secreta para validar que los webhooks vienen de Alegra (HMAC-SHA256). Por seguridad no se vuelve a mostrar: deja el campo vacio para conservar la clave guardada.','alegra-connector');?></p>
 </td></tr>
 
 <tr><th><?php esc_html_e('Gestionar suscripciones:','alegra-connector');?></th>

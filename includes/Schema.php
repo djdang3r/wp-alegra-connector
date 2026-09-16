@@ -63,7 +63,17 @@ class Schema
             $null = (stripos((string) $col->Null, 'yes') !== false) ? 'NULL' : 'NOT NULL';
             $wpdb->query("ALTER TABLE {$table} MODIFY {$column} VARCHAR(36) {$null}");
             if ($wpdb->last_error) {
-                error_log('[Alegra Schema] Failed to migrate ' . $table . '.' . $column . ': ' . $wpdb->last_error);
+                // Route through the plugin Logger (respects the managed log and
+                // retention); fall back to error_log only under WP_DEBUG.
+                if (class_exists(\Alegra\Connector\Logger\Logger::class)) {
+                    (new \Alegra\Connector\Logger\Logger())->error('Schema migration failed', [
+                        'table' => $table,
+                        'column' => $column,
+                        'db_error' => $wpdb->last_error,
+                    ]);
+                } elseif (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log('[Alegra Schema] Failed to migrate ' . $table . '.' . $column . ': ' . $wpdb->last_error);
+                }
             }
         }
 

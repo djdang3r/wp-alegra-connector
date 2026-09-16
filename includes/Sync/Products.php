@@ -1005,6 +1005,51 @@ class Products
     }
 
     /**
+     * Hosts allowed as a source for product images (AC-68).
+     *
+     * Alegra serves item images from its own CDN — the documented response
+     * example is `https://cdn3.alegra.com/...` — so the base domain plus every
+     * subdomain is allowed. Extendable via the
+     * `alegra_connector_allowed_image_hosts` filter.
+     *
+     * @return string[]
+     */
+    public static function allowed_image_hosts(): array
+    {
+        $hosts = ['alegra.com'];
+        $filtered = apply_filters('alegra_connector_allowed_image_hosts', $hosts);
+        return is_array($filtered) ? $filtered : $hosts;
+    }
+
+    /**
+     * True only for an https URL whose host is in the image allowlist. Blocks
+     * SSRF via an attacker-controlled Alegra image URL (AC-68).
+     */
+    public static function is_allowed_image_url(string $url): bool
+    {
+        $parts = wp_parse_url($url);
+        if (!is_array($parts) || empty($parts['host'])) {
+            return false;
+        }
+        if (strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+            return false;
+        }
+
+        $host = strtolower((string) $parts['host']);
+        foreach (self::allowed_image_hosts() as $allowed) {
+            $allowed = strtolower(ltrim((string) $allowed, '.'));
+            if ($allowed === '') {
+                continue;
+            }
+            if ($host === $allowed || str_ends_with($host, '.' . $allowed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Download an image from a URL and attach it to a product.
      * Checks for existing attachment by URL (normalized + hash) to avoid duplicates.
      * Uses a process lock to prevent race conditions.
@@ -1013,6 +1058,14 @@ class Products
     private function download_and_attach_image(int $product_id, string $image_url): int
     {
         if (empty($image_url)) return 0;
+
+        if (!self::is_allowed_image_url($image_url)) {
+            $this->logger->warning('Blocked image download from a non-allowlisted host', [
+                'product_id' => $product_id,
+                'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
+            ]);
+            return 0;
+        }
 
         // Normalize URL to strip query params that may differ between syncs
         $normalized_url = $this->normalize_image_url($image_url);
@@ -1188,6 +1241,14 @@ class Products
     private function import_product_image(int $product_id, string $image_url): void
     {
         if (empty($image_url)) return;
+
+        if (!self::is_allowed_image_url($image_url)) {
+            $this->logger->warning('Blocked image download from a non-allowlisted host', [
+                'product_id' => $product_id,
+                'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
+            ]);
+            return;
+        }
 
         require_once ABSPATH . 'wp-admin/includes/media.php';
         require_once ABSPATH . 'wp-admin/includes/file.php';

@@ -6,7 +6,9 @@
 
     function showNotice(msg, type) {
         type = type || 'info';
-        var $n = $('<div class="ac-notice '+type+'" style="display:none;margin:8px 0 14px 0;">'+msg+'</div>');
+        // Build the node and inject the message with .text() — never concatenate
+        // a server/Alegra-derived string into HTML.
+        var $n = $('<div>').addClass('ac-notice').addClass(type).css({display:'none',margin:'8px 0 14px 0'}).text(msg);
         $('.alegra-connector-wrap').first().prepend($n);
         $n.slideDown(200);
         setTimeout(function(){ $n.slideUp(300, function(){ $(this).remove(); }); }, 6000);
@@ -57,19 +59,31 @@
                         $btn.prop('disabled', false).text('Probar Conexion');
                         if (r.success) {
                             var diag = r.data.diagnostics ? r.data.diagnostics.join(', ') : '';
-                            $status.html('<span style="color:var(--ac-success);font-weight:500;">&#10003; Conectado - ' + (r.data.company || 'OK') + '</span>');
-                            $result.show().removeClass('error').addClass('success').html(
-                                '<p style="margin:0;color:var(--ac-success);"><strong>Empresa:</strong> ' + (r.data.company || 'N/A') + ' | <strong>Pais:</strong> ' + (r.data.country || 'N/A') + '</p>' +
-                                '<p style="margin:4px 0 0 0;font-size:11px;color:var(--ac-text-secondary);">Endpoints: ' + diag + '</p>'
+                            // Server-derived strings (company/country/diagnostics) go
+                            // through .text()/DOM nodes, never string-concatenated HTML.
+                            $status.empty().append(
+                                $('<span>').css({color:'var(--ac-success)',fontWeight:'500'}).text('\u2713 Conectado - ' + (r.data.company || 'OK'))
+                            );
+                            $result.show().removeClass('error').addClass('success').empty();
+                            $result.append(
+                                $('<p>').css({margin:0,color:'var(--ac-success)'})
+                                    .append($('<strong>').text('Empresa:')).append(document.createTextNode(' ' + (r.data.company || 'N/A') + ' | '))
+                                    .append($('<strong>').text('Pais:')).append(document.createTextNode(' ' + (r.data.country || 'N/A')))
+                            );
+                            $result.append(
+                                $('<p>').css({margin:'4px 0 0 0',fontSize:'11px',color:'var(--ac-text-secondary)'}).text('Endpoints: ' + diag)
                             );
                             showNotice('Conectado a ' + (r.data.company || 'Alegra') + (diag ? ' - ' + diag : ''), 'success');
                             setTimeout(function(){ location.reload(); }, 2000);
                         } else {
                             var msg = r.data.message || 'Error';
                             var http = r.data.http_code ? ' (HTTP ' + r.data.http_code + ')' : '';
-                            $status.html('<span style="color:var(--ac-danger);font-weight:500;">&#10007; ' + msg + http + '</span>');
+                            $status.empty().append(
+                                $('<span>').css({color:'var(--ac-danger)',fontWeight:'500'}).text('\u2717 ' + msg + http)
+                            );
                             showNotice('Error: ' + msg + http, 'error');
-                            $result.show().removeClass('success').addClass('error').html('<p style="margin:0;color:var(--ac-danger);">' + msg + http + '</p>');
+                            $result.show().removeClass('success').addClass('error').empty();
+                            $result.append($('<p>').css({margin:0,color:'var(--ac-danger)'}).text(msg + http));
                         }
                     },
                     error: function(xhr, status) {
@@ -298,12 +312,13 @@
                     success: function(r) {
                         $btn.prop('disabled', false).text('Verificar Endpoints');
                         if (r.success) {
-                            var badges = '';
+                            $status.empty();
                             $.each(r.data.endpoints || {}, function(k, v) {
+                                v = String(v);
                                 var cls = v.indexOf('OK') === 0 ? 'success' : (v.indexOf('vacio') !== -1 ? 'warning' : 'danger');
-                                badges += '<span class="ac-badge ' + cls + '" style="margin:2px;">' + k + ': ' + v + '</span>';
+                                // k/v are endpoint names + Alegra error text: use .text().
+                                $status.append($('<span>').addClass('ac-badge').addClass(cls).css('margin','2px').text(k + ': ' + v));
                             });
-                            $status.html(badges);
                         } else {
                             $status.html('<span style="color:var(--ac-danger);">Error</span>');
                         }
@@ -317,8 +332,11 @@
             $('#alegra-register-webhooks').on('click', function() {
                 var $btn = $(this).prop('disabled', true).text('Registrando...');
                 var $status = $('#alegra-webhook-status');
-                var secret = $('#alegra_connector_webhook_secret').val();
-                if (!secret) { showNotice('Debes configurar un Webhook Secret primero', 'warning'); $btn.prop('disabled', false).text('Registrar webhooks en Alegra'); return; }
+                var $secretField = $('#alegra_connector_webhook_secret');
+                var secret = $secretField.val();
+                // The field is masked; a saved secret is signalled by data-saved.
+                var hasSavedSecret = String($secretField.data('saved')) === '1';
+                if (!secret && !hasSavedSecret) { showNotice('Debes configurar un Webhook Secret primero', 'warning'); $btn.prop('disabled', false).text('Registrar webhooks en Alegra'); return; }
                 $status.html('');
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',

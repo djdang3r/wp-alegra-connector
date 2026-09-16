@@ -18,6 +18,7 @@ if ($plugin_root === false || $plugin_root === '') {
     $plugin_root = dirname(__DIR__);
 }
 $plugin_root = rtrim($plugin_root, '/\\') . DIRECTORY_SEPARATOR;
+$GLOBALS['alegra_plugin_root'] = $plugin_root;
 
 if (!is_file($plugin_root . 'alegra-connector.php')) {
     fwrite(STDERR, "FATAL: alegra-connector.php not found at $plugin_root\n");
@@ -640,6 +641,96 @@ TestRunner::test('T7.1 the draft invoice id from the error body is persisted and
 
     $notes = implode("\n", $order->get_notes());
     TestRunner::assertStringContains('NO se emitió', $notes, 'the order note must say the invoice was created but not stamped');
+});
+
+// ===========================================================================
+// T8 — Security batch 1a (AC-29, AC-30, AC-32, AC-67)
+// ===========================================================================
+echo "\nT8 — Security batch 1a\n";
+
+TestRunner::test('T8.1 AC-29 remote Alegra error text is stripped of HTML before it reaches a sink', function (): void {
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/items', 400, [
+        'message' => '<img src=x onerror=alert(1)>Alegra rechazó la factura',
+    ]);
+
+    $result = make_api()->get_items();
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'a 400 must surface a WP_Error');
+    $message = $result->get_error_message();
+    TestRunner::assertStringNotContains('<', $message, 'the message must not carry raw HTML');
+    TestRunner::assertStringNotContains('onerror', $message, 'the message must not carry event handlers');
+    TestRunner::assertStringContains('Alegra rechazó', $message, 'the human-readable text must survive');
+
+    // The three admin templates + shared JS must inject the message with .text().
+    foreach ([
+        'templates/admin-import.php',
+        'templates/admin-push-queue.php',
+        'templates/admin-monitor.php',
+        'admin/assets/js/admin.js',
+    ] as $rel) {
+        $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . $rel);
+        TestRunner::assertStringNotContains('$(\'<div class="ac-notice ', $src, "$rel must not build the notice from a concatenated HTML string");
+        TestRunner::assertStringContains('.text(msg)', $src, "$rel must inject the notice with .text(msg)");
+    }
+});
+
+TestRunner::test('T8.2 AC-30 an empty masked-secret submission keeps the stored token; a new one replaces it', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_token', 'stored-token-123');
+
+    $keep = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_masked_secret('', 'alegra_connector_token');
+    TestRunner::assertSame('stored-token-123', $keep, 'an empty submission must keep the stored token');
+
+    $replace = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_masked_secret('new-token-456', 'alegra_connector_token');
+    TestRunner::assertSame('new-token-456', $replace, 'a non-empty submission must replace the token');
+
+    // The settings page must not echo the stored token back into the HTML.
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringNotContains(
+        'name="alegra_connector_token" value="<?php echo esc_attr(get_option(',
+        $tpl,
+        'the token must not be rendered into the page value attribute'
+    );
+    TestRunner::assertStringContains(
+        'name="alegra_connector_token" value=""',
+        $tpl,
+        'the token field must render an empty value'
+    );
+});
+
+TestRunner::test('T8.3 AC-32 a replayed identical webhook is ignored the second time', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $body = json_encode(['subject' => 'unknown-event', 'message' => ['id' => 'x']]);
+
+    $first = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(200, $first->get_status(), 'the first delivery must be accepted');
+    TestRunner::assertFalse((bool) (($first->get_data())['duplicate'] ?? false), 'the first delivery must not be flagged as a duplicate');
+
+    $second = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(200, $second->get_status(), 'the replay must still be acked (so Alegra stops retrying)');
+    TestRunner::assertTrue((bool) (($second->get_data())['duplicate'] ?? false), 'the identical replay must be flagged as a duplicate');
+
+    // A different body is not a replay.
+    $third = $receiver->handle(new WP_REST_Request(json_encode(['subject' => 'unknown-event', 'message' => ['id' => 'y']])));
+    TestRunner::assertFalse((bool) (($third->get_data())['duplicate'] ?? false), 'a different body must not be treated as a replay');
+});
+
+TestRunner::test('T8.4 AC-67 CSV cells starting with a formula trigger are neutralised', function (): void {
+    $safe = [\Alegra\Connector\Admin\Admin_Dashboard::class, 'csv_safe_cell'];
+    TestRunner::assertSame("'=cmd|'/c calc'!A0", $safe('=cmd|\'/c calc\'!A0'), '= must be prefixed');
+    TestRunner::assertSame("'+123", $safe('+123'), '+ must be prefixed');
+    TestRunner::assertSame("'-123", $safe('-123'), '- must be prefixed');
+    TestRunner::assertSame("'@SUM(A1)", $safe('@SUM(A1)'), '@ must be prefixed');
+    TestRunner::assertSame("'\tTAB", $safe("\tTAB"), 'TAB must be prefixed');
+    TestRunner::assertSame('Widget normal', $safe('Widget normal'), 'ordinary text must be untouched');
+    TestRunner::assertSame('', $safe(''), 'empty stays empty');
+
+    // The export must route every cell through the helper.
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("array_map([self::class, 'csv_safe_cell']", $src, 'exports must apply csv_safe_cell');
 });
 
 exit(TestRunner::summary());

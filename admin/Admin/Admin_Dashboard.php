@@ -105,13 +105,22 @@ class Admin_Dashboard
     {
         if (empty($image_url)) return;
 
+        // SSRF guard (AC-68): only fetch https URLs from Alegra's CDN.
+        if (!Sync\Products::is_allowed_image_url($image_url)) {
+            $this->log('warning', 'Blocked image download from a non-allowlisted host', [
+                'product_id' => $product_id,
+                'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
+            ]);
+            return;
+        }
+
         require_once ABSPATH . 'wp-admin/includes/media.php';
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/image.php';
 
         $tmp = download_url($image_url, 15);
         if (is_wp_error($tmp)) {
-            error_log('[Alegra] Image download failed for product ' . $product_id . ': ' . $tmp->get_error_message());
+            $this->log('warning', 'Image download failed for product ' . $product_id, ['error' => $tmp->get_error_message()]);
             return;
         }
 
@@ -124,7 +133,7 @@ class Admin_Dashboard
         if (!is_wp_error($attachment_id)) {
             set_post_thumbnail($product_id, $attachment_id);
         } else {
-            error_log('[Alegra] Image sideload failed: ' . $attachment_id->get_error_message());
+            $this->log('warning', 'Image sideload failed for product ' . $product_id, ['error' => $attachment_id->get_error_message()]);
         }
 
         @unlink($tmp);
@@ -260,6 +269,31 @@ class Admin_Dashboard
         );
     }
 
+    /**
+     * Sanitize a masked secret field. The value is never echoed back into the
+     * settings form, so an empty submission means "keep the stored value"
+     * (not "clear it"). A non-empty submission replaces it.
+     */
+    public static function sanitize_masked_secret(string $value, string $option): string
+    {
+        $value = sanitize_text_field($value);
+        return $value === '' ? (string) get_option($option, '') : $value;
+    }
+
+    /**
+     * Neutralise CSV formula injection (AC-67). Excel/Sheets treat a cell that
+     * starts with =, +, -, @, TAB or CR as a formula; prefixing a single quote
+     * forces it to be read as text.
+     */
+    public static function csv_safe_cell(mixed $value): string
+    {
+        $value = (string) $value;
+        if ($value === '') {
+            return $value;
+        }
+        return preg_match('/^[=+\-@\t\r]/', $value) === 1 ? "'" . $value : $value;
+    }
+
     public function register_settings(): void
     {
         // Alegra migrated all IDs to UUID (VARCHAR(36)) on 2025-01-06.
@@ -279,7 +313,12 @@ class Admin_Dashboard
         };
 
         register_setting('alegra_connector_settings', 'alegra_connector_email', ['sanitize_callback' => 'sanitize_email']);
-        register_setting('alegra_connector_settings', 'alegra_connector_token', ['sanitize_callback' => 'sanitize_text_field']);
+        // The token is masked in the UI (never echoed). An empty submission means
+        // "keep the stored token", not "clear it" — otherwise re-saving any other
+        // setting would wipe the credential.
+        register_setting('alegra_connector_settings', 'alegra_connector_token', [
+            'sanitize_callback' => fn($value) => self::sanitize_masked_secret((string) $value, 'alegra_connector_token'),
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_api_url', [
             'sanitize_callback' => function ($value) {
                 $url = sanitize_url($value);
@@ -312,7 +351,10 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_inactive_products', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images_mode', ['sanitize_callback' => 'sanitize_text_field']);
-        register_setting('alegra_connector_settings', 'alegra_connector_webhook_secret', ['sanitize_callback' => 'sanitize_text_field']);
+        // Same masking rule as the API token: empty submission keeps the stored secret.
+        register_setting('alegra_connector_settings', 'alegra_connector_webhook_secret', [
+            'sanitize_callback' => fn($value) => self::sanitize_masked_secret((string) $value, 'alegra_connector_webhook_secret'),
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_field_mapping', [
             'sanitize_callback' => function ($value) {
                 return is_array($value) ? map_deep($value, 'sanitize_text_field') : [];
@@ -1123,12 +1165,19 @@ class Admin_Dashboard
     {
         check_ajax_referer('alegra_connector_nonce');
 
-        if (!current_user_can('manage_woocommerce')) {
+        // Overwriting the stored API credentials is an admin-level action, not a
+        // shop-manager one (AC-33).
+        if (!current_user_can('manage_options')) {
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
         }
 
         $email = sanitize_email($_POST['email'] ?? '');
         $token = sanitize_text_field($_POST['token'] ?? '');
+
+        // The token field is masked; fall back to the stored token when empty.
+        if ($token === '') {
+            $token = (string) get_option('alegra_connector_token', '');
+        }
 
         if (empty($email) || empty($token)) {
             wp_send_json_error(['message' => __('Email y token son requeridos.', 'alegra-connector')]);
@@ -1136,7 +1185,7 @@ class Admin_Dashboard
 
         $this->log('info', 'Connection test started', ['email' => $email]);
 
-        // Save credentials
+        // Save credentials (never overwrite the token with an empty value).
         update_option('alegra_connector_email', $email);
         update_option('alegra_connector_token', $token);
 
@@ -1407,7 +1456,9 @@ class Admin_Dashboard
     {
         check_ajax_referer('alegra_connector_nonce');
 
-        if (!current_user_can('upload_files')) {
+        // The import creates PUBLISHED products, so it needs a shop-management
+        // capability — `upload_files` is held by Authors (AC-33).
+        if (!current_user_can('manage_woocommerce')) {
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
         }
 
@@ -1611,10 +1662,10 @@ class Admin_Dashboard
             fputcsv($out, ['name', 'sku', 'price', 'stock', 'type', 'alegra_id', 'sync_status']);
             foreach ($products as $p) {
                 $ai = (string) get_post_meta($p->get_id(), '_alegra_item_id', true);
-                fputcsv($out, [
+                fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
                     $p->get_name(), $p->get_sku(), $p->get_price(), $p->get_stock_quantity(),
                     $p->get_type(), $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
-                ]);
+                ]));
             }
             fclose($out);
         } else {
@@ -1625,10 +1676,10 @@ class Admin_Dashboard
             fputcsv($out, ['name', 'email', 'phone', 'alegra_id', 'sync_status']);
             foreach ($customers as $c) {
                 $ai = (string) get_user_meta($c->ID, 'alegra_contact_id', true);
-                fputcsv($out, [
+                fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
                     $c->display_name, $c->user_email, get_user_meta($c->ID, 'billing_phone', true),
                     $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
-                ]);
+                ]));
             }
             fclose($out);
         }
@@ -1731,7 +1782,8 @@ class Admin_Dashboard
     public function ajax_cleanup_placeholders(): void
     {
         check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        // Calls wp_delete_user(): requires the capability to delete users (AC-33).
+        if (!current_user_can('delete_users')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
 
         global $wpdb;
 
@@ -1782,6 +1834,10 @@ class Admin_Dashboard
         }
 
         $secret = sanitize_text_field($_POST['webhook_secret'] ?? '');
+        // The field is masked, so an empty value means "use the stored secret".
+        if ($secret === '') {
+            $secret = (string) get_option('alegra_connector_webhook_secret', '');
+        }
         if (empty($secret)) {
             wp_send_json_error(['message' => __('Webhook Secret es requerido.', 'alegra-connector')]);
         }
@@ -1979,7 +2035,8 @@ class Admin_Dashboard
     public function ajax_disconnect(): void
     {
         check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        // Clears the whole integration config: admin-level (AC-33).
+        if (!current_user_can('manage_options')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
 
         // 1. Activate kill switch IMMEDIATELY so any in-flight request stops
         \Alegra\Connector\Kill_Switch::activate('user_disconnected');
@@ -2817,7 +2874,8 @@ class Admin_Dashboard
     public function ajax_cleanup_duplicate_images(): void
     {
         check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) {
+        // Calls wp_delete_attachment(): requires the capability to delete posts (AC-33).
+        if (!current_user_can('delete_posts')) {
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
         }
 

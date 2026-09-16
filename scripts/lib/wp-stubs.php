@@ -534,6 +534,57 @@ class WP_Term
 }
 
 // ---------------------------------------------------------------------------
+// REST API stubs (used by the webhook Receiver tests)
+// ---------------------------------------------------------------------------
+
+class WP_REST_Request
+{
+    private string $body = '';
+    /** @var array<string,string> */
+    private array $headers = [];
+
+    public function __construct(string $body = '', array $headers = [])
+    {
+        $this->body = $body;
+        foreach ($headers as $name => $value) {
+            $this->headers[strtolower((string) $name)] = (string) $value;
+        }
+    }
+
+    public function get_body(): string
+    {
+        return $this->body;
+    }
+
+    public function get_header(string $name): string
+    {
+        return $this->headers[strtolower($name)] ?? '';
+    }
+}
+
+class WP_REST_Response
+{
+    public mixed $data;
+    public int $status;
+
+    public function __construct(mixed $data = null, int $status = 200)
+    {
+        $this->data = $data;
+        $this->status = $status;
+    }
+
+    public function get_status(): int
+    {
+        return $this->status;
+    }
+
+    public function get_data(): mixed
+    {
+        return $this->data;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WooCommerce stubs
 // ---------------------------------------------------------------------------
 
