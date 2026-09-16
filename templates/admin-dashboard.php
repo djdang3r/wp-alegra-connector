@@ -296,8 +296,9 @@ include __DIR__ . '/header.php';
     'use strict';
     $(document).ready(function() {
         $('#alegra-clear-killswitch').on('click', function() {
-            if (!confirm('Reactivar el plugin ahora?')) return;
-            var $btn = $(this).prop('disabled', true).text('Reactivando...');
+            var S = alegraConnector.strings;
+            if (!confirm(S.confirmReactivate)) return;
+            var $btn = $(this).prop('disabled', true).text(S.reactivating);
             $.ajax({
                 url: alegraConnector.ajaxUrl,
                 type: 'POST',
@@ -306,13 +307,13 @@ include __DIR__ . '/header.php';
                     if (r.success) {
                         location.reload();
                     } else {
-                        alert(r.data.message || 'Error');
-                        $btn.prop('disabled', false).text('Reactivar ahora');
+                        alert(r.data.message || S.error);
+                        $btn.prop('disabled', false).text(S.reactivateNow);
                     }
                 },
                 error: function() {
-                    alert('Error de conexion');
-                    $btn.prop('disabled', false).text('Reactivar ahora');
+                    alert(S.connectionError);
+                    $btn.prop('disabled', false).text(S.reactivateNow);
                 }
             });
         });

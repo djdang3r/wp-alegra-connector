@@ -3,7 +3,7 @@ if(!defined('ABSPATH'))exit;
 $currency=$currency_symbol??get_woocommerce_currency_symbol();
 $growth_class=($growth??0)>=0?'green':'red';
 $growth_arrow=($growth??0)>=0?'&#9650;':'&#9660;';
-$page_title=__('Estadisticas','alegra-connector');
+$page_title=__('Estadísticas','alegra-connector');
 include __DIR__.'/header.php';
 
 // Defaults for empty state
@@ -28,7 +28,7 @@ $growth=$growth??0;
 
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
 <div class="ac-period-bar"><?php
-$periods=['today'=>__('Hoy','alegra-connector'),'7d'=>__('7 dias','alegra-connector'),'30d'=>__('30 dias','alegra-connector'),'90d'=>__('90 dias','alegra-connector'),'this_month'=>__('Este mes','alegra-connector'),'last_month'=>__('Mes pasado','alegra-connector'),'this_year'=>__('Este ano','alegra-connector')];
+$periods=['today'=>__('Hoy','alegra-connector'),'7d'=>__('7 días','alegra-connector'),'30d'=>__('30 días','alegra-connector'),'90d'=>__('90 días','alegra-connector'),'this_month'=>__('Este mes','alegra-connector'),'last_month'=>__('Mes pasado','alegra-connector'),'this_year'=>__('Este año','alegra-connector')];
 $b=admin_url('admin.php?page=alegra-connector-stats');
 foreach($periods as $k=>$lbl):
     $a=($period===$k)?'active':'';
@@ -46,9 +46,9 @@ endforeach;?>
 <!-- KPI Row 1 -->
 <div class="ac-kpi-grid">
 <div class="ac-kpi-card accent-green"><div class="ac-kpi-icon"><span class="dashicons dashicons-chart-area"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Ventas Completadas','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($currency.' '.number_format($revenue['completed'],0));?></span><span class="ac-kpi-sub"><?php echo esc_html($order_counts['completed'].' '.__('pedidos','alegra-connector'));?></span></div></div>
-<div class="ac-kpi-card accent-blue"><div class="ac-kpi-icon"><span class="dashicons dashicons-money-alt"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Facturacion Total','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($currency.' '.number_format($revenue['total'],0));?></span><span class="ac-kpi-sub <?php echo $growth_class;?>"><?php if($growth!=0):echo $growth_arrow.' '.esc_html(abs($growth)).'% '.__('vs periodo anterior','alegra-connector');else:esc_html_e('Sin periodo anterior','alegra-connector');endif;?></span></div></div>
+<div class="ac-kpi-card accent-blue"><div class="ac-kpi-icon"><span class="dashicons dashicons-money-alt"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Facturación Total','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($currency.' '.number_format($revenue['total'],0));?></span><span class="ac-kpi-sub <?php echo $growth_class;?>"><?php if($growth!=0):echo $growth_arrow.' '.esc_html(abs($growth)).'% '.__('vs periodo anterior','alegra-connector');else:esc_html_e('Sin periodo anterior','alegra-connector');endif;?></span></div></div>
 <div class="ac-kpi-card accent-amber"><div class="ac-kpi-icon"><span class="dashicons dashicons-chart-bar"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Ticket Promedio','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($currency.' '.number_format($avg_order,0));?></span><span class="ac-kpi-sub"><?php echo esc_html($order_counts['total'].' '.__('pedidos totales','alegra-connector'));?></span></div></div>
-<div class="ac-kpi-card accent-purple"><div class="ac-kpi-icon"><span class="dashicons dashicons-yes-alt"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Conversion','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($conversion_rate);?>%</span><span class="ac-kpi-sub"><?php echo esc_html($order_counts['completed'].'/'.$order_counts['total'].' '.__('completados','alegra-connector'));?></span></div></div>
+<div class="ac-kpi-card accent-purple"><div class="ac-kpi-icon"><span class="dashicons dashicons-yes-alt"></span></div><div class="ac-kpi-content"><span class="ac-kpi-label"><?php esc_html_e('Conversión','alegra-connector');?></span><span class="ac-kpi-value"><?php echo esc_html($conversion_rate);?>%</span><span class="ac-kpi-sub"><?php echo esc_html($order_counts['completed'].'/'.$order_counts['total'].' '.__('completados','alegra-connector'));?></span></div></div>
 </div>
 
 <!-- KPI Row 2 -->
@@ -80,15 +80,18 @@ endforeach;?>
 
 <?php include __DIR__.'/footer.php'; ?>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
+document.addEventListener('DOMContentLoaded', function() {
+var S=(window.alegraConnector&&window.alegraConnector.strings)||{};
 Chart.defaults.color='#64748b';Chart.defaults.borderColor='#e2e8f0';
 (function(){var c=['#2563eb','#16a34a','#d97706','#9333ea','#dc2626','#0891b2','#4f46e5','#0d9488','#c026d3','#ea580c'];
 var dl=<?php echo json_encode(!empty($daily_sales)?array_keys($daily_sales):[]);?>;
 var dd=<?php echo json_encode(!empty($daily_sales)?array_values(array_column($daily_sales,'total')):[]);?>;
-new Chart(document.getElementById('dailySalesChart'),{type:'bar',data:{labels:dl.length?dl:[<?php echo json_encode(date('Y-m-d'));?>],datasets:[{label:'Ventas',data:dd.length?dd:[0],backgroundColor:'#2563eb',borderRadius:6,borderSkipped:false}]},options:{responsive:!0,maintainAspectRatio:!1,plugins:{legend:{display:!1}},scales:{y:{beginAtZero:!0,grid:{color:'#f1f5f9'},ticks:{callback:function(v){return'<?php echo esc_js($currency);?>'+(v/1000).toFixed(0)+'k'}}},x:{grid:{display:!1}}}}});
+new Chart(document.getElementById('dailySalesChart'),{type:'bar',data:{labels:dl.length?dl:[<?php echo json_encode(date('Y-m-d'));?>],datasets:[{label:S.chartSales,data:dd.length?dd:[0],backgroundColor:'#2563eb',borderRadius:6,borderSkipped:false}]},options:{responsive:!0,maintainAspectRatio:!1,plugins:{legend:{display:!1}},scales:{y:{beginAtZero:!0,grid:{color:'#f1f5f9'},ticks:{callback:function(v){return'<?php echo esc_js($currency);?>'+(v/1000).toFixed(0)+'k'}}},x:{grid:{display:!1}}}}});
 var pl=<?php echo json_encode(!empty($payment_methods)?array_keys($payment_methods):[__('Sin datos','alegra-connector')]);?>;
 var pd=<?php echo json_encode(!empty($payment_methods)?array_values(array_column($payment_methods,'total')):[1]);?>;
 new Chart(document.getElementById('paymentMethodsChart'),{type:'doughnut',data:{labels:pl,datasets:[{data:pd,backgroundColor:pd.length===1?['#e2e8f0']:c,borderWidth:0}]},options:{responsive:!0,maintainAspectRatio:!1,plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:12,font:{size:10}}}}}});
-new Chart(document.getElementById('orderStatusChart'),{type:'bar',data:{labels:['Completado','Procesando','Pendiente','Cancelado','Reembolsado'],datasets:[{label:'Pedidos',data:[<?php echo (int)($order_counts['completed']??0);?>,<?php echo (int)($order_counts['processing']??0);?>,<?php echo (int)($order_counts['pending']??0);?>,<?php echo (int)($order_counts['cancelled']??0);?>,<?php echo (int)($order_counts['refunded']??0);?>],backgroundColor:['#16a34a','#2563eb','#d97706','#dc2626','#9333ea'],borderRadius:6,borderSkipped:!1}]},options:{responsive:!0,maintainAspectRatio:!1,plugins:{legend:{display:!1}},scales:{y:{beginAtZero:!0,ticks:{stepSize:1},grid:{color:'#f1f5f9'}},x:{grid:{display:!1}}}}});
-})();</script>
+new Chart(document.getElementById('orderStatusChart'),{type:'bar',data:{labels:[S.chartCompleted,S.chartProcessing,S.chartPending,S.chartCancelled,S.chartRefunded],datasets:[{label:S.chartOrders,data:[<?php echo (int)($order_counts['completed']??0);?>,<?php echo (int)($order_counts['processing']??0);?>,<?php echo (int)($order_counts['pending']??0);?>,<?php echo (int)($order_counts['cancelled']??0);?>,<?php echo (int)($order_counts['refunded']??0);?>],backgroundColor:['#16a34a','#2563eb','#d97706','#dc2626','#9333ea'],borderRadius:6,borderSkipped:!1}]},options:{responsive:!0,maintainAspectRatio:!1,plugins:{legend:{display:!1}},scales:{y:{beginAtZero:!0,ticks:{stepSize:1},grid:{color:'#f1f5f9'}},x:{grid:{display:!1}}}}});
+})();
+});
+</script>

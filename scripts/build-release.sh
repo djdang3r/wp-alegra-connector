@@ -102,6 +102,28 @@ else
     echo "warning: SKIP_SMOKE=1 set — bypassing execution tests" >&2
 fi
 
+# AC-35a: (re)generate the translation template before packaging. Without a
+# .pot the plugin cannot be translated, so the release must always carry one.
+# The extractor is dependency-free PHP (no WP-CLI / gettext on the build host).
+if [[ -z "${SKIP_SMOKE:-}" ]]; then
+    if ! command -v php >/dev/null 2>&1; then
+        echo "FATAL: php not found — cannot regenerate languages/alegra-connector.pot" >&2
+        exit 8
+    fi
+    echo "--- Generating translation template (.pot) ---"
+    php "$SCRIPT_DIR/make-pot.php"
+    echo "--- .pot OK ---"
+else
+    echo "warning: SKIP_SMOKE=1 set — skipping .pot regeneration" >&2
+fi
+
+POT_FILE="$REPO_ROOT/languages/alegra-connector.pot"
+if [[ ! -s "$POT_FILE" ]]; then
+    echo "FATAL: languages/alegra-connector.pot is missing or empty — refusing to ship." >&2
+    echo "  hint: php scripts/make-pot.php" >&2
+    exit 8
+fi
+
 # Output goes to releases/ (tracked in git, alongside prior version ZIPs).
 # This matches the repo's existing convention — see commit history "Add
 # release zips for v1.0.1 through v2.1.7" — and is what the user expects.

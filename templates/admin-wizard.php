@@ -95,7 +95,7 @@ $step = max(1, min(5, $wizard_step ?: 1));
             <strong><?php esc_html_e('Configuración completa!', 'alegra-connector'); ?></strong>
             <?php esc_html_e('Ya puedes empezar a sincronizar. Recomendamos hacer una primera prueba manual antes de activar sync automatico.', 'alegra-connector'); ?>
         </p>
-        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-dashboard')); ?>" class="ac-btn ac-btn-primary">
+        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector')); ?>" class="ac-btn ac-btn-primary">
             <?php esc_html_e('Ir al Dashboard', 'alegra-connector'); ?>
         </a>
     <?php endif; ?>
@@ -131,12 +131,12 @@ $step = max(1, min(5, $wizard_step ?: 1));
             step: currentStep + 1
         }, function(r) {
             if (r.success) location.reload();
-            else alert('Error al guardar progreso');
+            else alert(alegraConnector.strings.wizardError);
         });
     });
 
     $('#alegra-wizard-skip').on('click', function() {
-        if (!confirm('Saltar el asistente? Puedes volver a iniciarlo desde Dashboard.')) return;
+        if (!confirm(alegraConnector.strings.confirmSkipWizard)) return;
         $.post(alegraConnector.ajaxUrl, {
             action: 'alegra_wizard_skip',
             _ajax_nonce: nonce

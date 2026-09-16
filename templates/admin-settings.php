@@ -380,10 +380,10 @@ $ac_group_badge = ['A'=>'danger','B'=>'warning','C'=>'neutral'];
                 data: { action: 'alegra_enable_all_billing_fields', _ajax_nonce: alegraConnector.nonce },
                 success: function(r){
                     if (r && r.success) {
-                        $status.text(r.data && r.data.message ? r.data.message : 'OK');
+                        $status.text(r.data && r.data.message ? r.data.message : alegraConnector.strings.ok);
                         location.reload();
                     } else {
-                        $status.text(r && r.data && r.data.message ? r.data.message : 'Error');
+                        $status.text(r && r.data && r.data.message ? r.data.message : alegraConnector.strings.error);
                         $btn.prop('disabled', false);
                     }
                 },

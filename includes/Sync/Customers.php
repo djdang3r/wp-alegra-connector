@@ -215,13 +215,13 @@ class Customers
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
             $this->logger->info('Customers import skipped: kill switch active');
-            return new \WP_Error('kill_switch_active', 'Plugin is disconnected or deactivated');
+            return new \WP_Error('kill_switch_active', __('El plugin está desconectado o desactivado', 'alegra-connector'));
         }
 
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('customers');
         if ($lock === false) {
             $this->logger->info('Customers import skipped: another sync is running');
-            return new \WP_Error('sync_in_progress', 'Another sync is already running.');
+            return new \WP_Error('sync_in_progress', __('Ya hay una sincronización en curso.', 'alegra-connector'));
         }
 
         try {
@@ -438,7 +438,7 @@ class Customers
         $alegra_id = get_user_meta($customer_id, 'alegra_contact_id', true);
 
         if (empty($alegra_id)) {
-            return new \WP_Error('not_linked', 'Customer not linked to Alegra');
+            return new \WP_Error('not_linked', __('El cliente no está vinculado con Alegra', 'alegra-connector'));
         }
 
         $result = $this->api->delete_contact((string) $alegra_id);

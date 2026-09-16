@@ -92,7 +92,7 @@ class Categories
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
             $this->logger->info('Categories import skipped: kill switch active');
-            return new \WP_Error('kill_switch_active', 'Plugin is disconnected or deactivated');
+            return new \WP_Error('kill_switch_active', __('El plugin está desconectado o desactivado', 'alegra-connector'));
         }
 
         $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
@@ -304,7 +304,7 @@ class Categories
         $alegra_id = get_term_meta($term_id, 'alegra_category_id', true);
 
         if (empty($alegra_id)) {
-            return new \WP_Error('not_linked', 'Category not linked to Alegra');
+            return new \WP_Error('not_linked', __('La categoría no está vinculada con Alegra', 'alegra-connector'));
         }
 
         $this->logger->info('Category delete from Alegra not implemented via API', [

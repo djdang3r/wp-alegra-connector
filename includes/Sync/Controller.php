@@ -200,7 +200,7 @@ class Controller
     {
         $product = wc_get_product($id);
         if (!$product) {
-            return new \WP_Error('not_found', 'Product not found');
+            return new \WP_Error('not_found', __('Producto no encontrado', 'alegra-connector'));
         }
 
         switch ($action) {
@@ -218,7 +218,7 @@ class Controller
     {
         $customer = get_userdata($id);
         if (!$customer) {
-            return new \WP_Error('not_found', 'Customer not found');
+            return new \WP_Error('not_found', __('Cliente no encontrado', 'alegra-connector'));
         }
 
         switch ($action) {
@@ -236,7 +236,7 @@ class Controller
     {
         $order = wc_get_order($id);
         if (!$order) {
-            return new \WP_Error('not_found', 'Order not found');
+            return new \WP_Error('not_found', __('Pedido no encontrado', 'alegra-connector'));
         }
 
         switch ($action) {
@@ -257,7 +257,7 @@ class Controller
     {
         $term = get_term($id, 'product_cat');
         if (!$term) {
-            return new \WP_Error('not_found', 'Category not found');
+            return new \WP_Error('not_found', __('Categoría no encontrada', 'alegra-connector'));
         }
 
         switch ($action) {

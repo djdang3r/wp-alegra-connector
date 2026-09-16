@@ -159,8 +159,8 @@ class Admin_Dashboard
 
         add_submenu_page(
             'alegra-connector',
-            __('Estad sticas', 'alegra-connector'),
-            __('Estad sticas', 'alegra-connector'),
+            __('Estadísticas', 'alegra-connector'),
+            __('Estadísticas', 'alegra-connector'),
             'manage_woocommerce',
             'alegra-connector-stats',
             [$this, 'render_statistics_page']
@@ -430,7 +430,7 @@ class Admin_Dashboard
         register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping');
         register_setting('alegra_connector_mapping', 'alegra_connector_tax_mapping');
 
-        add_settings_section('alegra_connector_connection', __('Conexi n con Alegra', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
+        add_settings_section('alegra_connector_connection', __('Conexión con Alegra', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_sync_settings', __('Sincronización', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_currency_section', __('Moneda', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_warehouse_section', __('Bodegas', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
@@ -447,23 +447,205 @@ class Admin_Dashboard
         wp_enqueue_style('alegra-connector-admin', ALEGRA_CONNECTOR_URL . 'admin/assets/css/admin.css', [], ALEGRA_CONNECTOR_VERSION);
         wp_enqueue_script('alegra-connector-admin', ALEGRA_CONNECTOR_URL . 'admin/assets/js/admin.js', ['jquery'], ALEGRA_CONNECTOR_VERSION, true);
 
+        // AC-55: Chart.js is vendored locally and enqueued ONLY on the
+        // statistics page. It used to be a raw <script src> to cdn.jsdelivr.net
+        // (third-party request from the admin, no SRI, no local fallback).
+        if (strpos($hook, 'alegra-connector-stats') !== false) {
+            wp_enqueue_script(
+                'alegra-connector-chartjs',
+                ALEGRA_CONNECTOR_URL . 'admin/assets/js/vendor/chart.min.js',
+                [],
+                ALEGRA_CONNECTOR_VERSION,
+                true
+            );
+        }
+
         wp_localize_script('alegra-connector-admin', 'alegraConnector', [
             'ajaxUrl' => admin_url('admin-ajax.php'),
             'nonce' => wp_create_nonce('alegra_connector_nonce'),
-            'strings' => [
-                'testing' => __('Probando conexi n...', 'alegra-connector'),
-                'success' => __('Conexi n exitosa', 'alegra-connector'),
-                'error' => __('Error de conexi n', 'alegra-connector'),
-                'syncing' => __('Sincronizando...', 'alegra-connector'),
-                'importing' => __('Importando...', 'alegra-connector'),
-            ],
+            'strings' => self::get_script_strings(),
         ]);
+
+        // AC-35d: register the script translations so any .json catalogs
+        // generated from the .pot are actually loaded for admin.js.
+        wp_set_script_translations('alegra-connector-admin', 'alegra-connector', ALEGRA_CONNECTOR_PATH . 'languages');
+    }
+
+    /**
+     * AC-35d: every user-facing JS string, localizable from one place.
+     *
+     * Strings that need interpolation use printf-style placeholders and are
+     * rendered by the small format() helper in admin.js.
+     *
+     * @return array<string, string>
+     */
+    private static function get_script_strings(): array
+    {
+        return [
+            // Generic
+            'unknownError'          => __('Error desconocido', 'alegra-connector'),
+            'error'                 => __('Error', 'alegra-connector'),
+            'ok'                    => __('OK', 'alegra-connector'),
+            'testing'               => __('Probando conexión...', 'alegra-connector'),
+            'success'               => __('Conexión exitosa', 'alegra-connector'),
+            'connectionError'       => __('Error de conexión', 'alegra-connector'),
+            'syncing'               => __('Sincronizando...', 'alegra-connector'),
+            'importing'             => __('Importando...', 'alegra-connector'),
+            'networkErrorLabel'     => __('Error de red', 'alegra-connector'),
+
+            // Connection
+            'emailTokenRequired'    => __('Email y token son requeridos', 'alegra-connector'),
+            'testConnection'        => __('Probar Conexión', 'alegra-connector'),
+            'connectedTo'           => __('Conectado a %s', 'alegra-connector'),
+            'connected'             => __('Conectado', 'alegra-connector'),
+            'company'               => __('Empresa:', 'alegra-connector'),
+            'country'               => __('País:', 'alegra-connector'),
+            'endpoints'             => __('Endpoints:', 'alegra-connector'),
+            'timeout'               => __('Timeout: el servidor de Alegra no responde', 'alegra-connector'),
+            'networkError'          => __('Error de red (%s)', 'alegra-connector'),
+            'checkUrl'              => __('Verifica la URL base y tu conexión.', 'alegra-connector'),
+
+            // Sync
+            'fetchingData'          => __('Trayendo datos...', 'alegra-connector'),
+            'gettingCount'          => __('Obteniendo conteo de Alegra...', 'alegra-connector'),
+            'elapsed'               => __('Tiempo: %1$dm %2$ds', 'alegra-connector'),
+            'syncAll'               => __('Sincronizar Todo', 'alegra-connector'),
+            'syncCancelled'         => __('Sincronización cancelada', 'alegra-connector'),
+            'completed'             => __('Completado', 'alegra-connector'),
+            'retry'                 => __('Reintentar', 'alegra-connector'),
+            'startError'            => __('Error al iniciar', 'alegra-connector'),
+            'phase1Total'           => __('[Fase 1] Total: %1$s items en %2$s páginas — Página 1', 'alegra-connector'),
+            'processing'            => __('Procesando...', 'alegra-connector'),
+            'phase1'                => __('[Fase 1] %s', 'alegra-connector'),
+            'importedLabel'         => __('importados', 'alegra-connector'),
+            'updatedLabel'          => __('actualizados', 'alegra-connector'),
+            'skippedLabel'          => __('omitidos', 'alegra-connector'),
+            'errorsLabel'           => __('errores', 'alegra-connector'),
+            'phase2CompletedErrors' => __('[Fase 2] Completado con errores', 'alegra-connector'),
+            'phase2Completed'       => __('[Fase 2] Completado', 'alegra-connector'),
+            'syncSummary'           => __('Total: %1$s items | %2$s nuevos, %3$s actualizados, %4$s omitidos', 'alegra-connector'),
+            'syncSummaryErrors'     => __(', %s errores', 'alegra-connector'),
+            'syncDoneErrors'        => __('Importación completada con errores: %1$s items procesados. %2$s importados, %3$s actualizados, %4$s errores. Revisa el log para más detalle.', 'alegra-connector'),
+            'syncDone'              => __('%1$s items procesados. %2$s importados, %3$s actualizados.', 'alegra-connector'),
+            'retrying'              => __('Reintentando (%1$s/%2$s)...', 'alegra-connector'),
+            'selectOneType'         => __('Selecciona al menos un tipo', 'alegra-connector'),
+
+            // Logs / token / connection management
+            'confirmClearLogs'      => __('¿Eliminar logs antiguos?', 'alegra-connector'),
+            'logsDeleted'           => __('Logs eliminados', 'alegra-connector'),
+            'hideToken'             => __('Ocultar token', 'alegra-connector'),
+            'showToken'             => __('Mostrar token', 'alegra-connector'),
+            'hide'                  => __('Ocultar', 'alegra-connector'),
+            'show'                  => __('Mostrar', 'alegra-connector'),
+            'confirmDisconnect'     => __('¿Desconectar de Alegra? Deberás volver a probar la conexión.', 'alegra-connector'),
+            'disconnecting'         => __('Desconectando...', 'alegra-connector'),
+            'disconnect'            => __('Desconectar', 'alegra-connector'),
+            'verifying'             => __('Verificando...', 'alegra-connector'),
+            'verifyEndpoints'       => __('Verificar Endpoints', 'alegra-connector'),
+
+            // Webhooks
+            'registering'           => __('Registrando...', 'alegra-connector'),
+            'webhookSecretRequired' => __('Debes configurar un Webhook Secret primero', 'alegra-connector'),
+            'registerWebhooks'      => __('Registrar webhooks en Alegra', 'alegra-connector'),
+            'webhooksRegistered'    => __('Webhooks registrados', 'alegra-connector'),
+            'confirmDeleteWebhooks' => __('¿Eliminar todas las suscripciones de webhooks en Alegra?', 'alegra-connector'),
+            'deleting'              => __('Eliminando...', 'alegra-connector'),
+            'deleteWebhooks'        => __('Eliminar webhooks en Alegra', 'alegra-connector'),
+            'webhooksDeleted'       => __('Webhooks eliminados', 'alegra-connector'),
+
+            // Images / bulk / single sync
+            'confirmCleanupImages'  => __('Esto eliminará todos los attachments de imagen duplicados en productos, basándose en la URL normalizada. Las imágenes que quedaron únicas se conservarán. ¿Continuar?', 'alegra-connector'),
+            'cleaning'              => __('Limpiando...', 'alegra-connector'),
+            'cleanupImages'         => __('Limpiar imágenes duplicadas', 'alegra-connector'),
+            'imagesDeleted'         => __('Imágenes duplicadas eliminadas', 'alegra-connector'),
+            'confirmRecordPayment'  => __('¿Registrar pago en Alegra?', 'alegra-connector'),
+            'selectOneItem'         => __('Selecciona al menos un elemento', 'alegra-connector'),
+            'sending'               => __('Enviando...', 'alegra-connector'),
+            'fetching'              => __('Trayendo...', 'alegra-connector'),
+            'updatedSingle'         => __('Actualizado', 'alegra-connector'),
+            'confirmImportFromApi'  => __('¿Traer %s desde Alegra? Esto puede crear o actualizar registros en WooCommerce.', 'alegra-connector'),
+            'downloading'           => __('Descargando...', 'alegra-connector'),
+            'importedSingle'        => __('Importado', 'alegra-connector'),
+            'selectedOne'           => __('seleccionado', 'alegra-connector'),
+            'selectedMany'          => __('seleccionados', 'alegra-connector'),
+
+            // Pending invoices batch
+            'countingPending'       => __('Contando pedidos pendientes...', 'alegra-connector'),
+            'invoicePending'        => __('Facturar pendientes', 'alegra-connector'),
+            'cancelled'             => __('Cancelado', 'alegra-connector'),
+            'noPendingOrders'       => __('No hay pedidos pendientes por facturar', 'alegra-connector'),
+            'invoicingPending'      => __('Facturando %s pedidos pendientes...', 'alegra-connector'),
+            'invoicedLabel'         => __('facturados', 'alegra-connector'),
+            'invoicesCreated'       => __('%1$s facturas creadas. %2$s errores.', 'alegra-connector'),
+
+            // CSV import page
+            'uploadImport'          => __('Subir e Importar', 'alegra-connector'),
+            'selectCsv'             => __('Selecciona un archivo CSV', 'alegra-connector'),
+            'importError'           => __('Error en la importación', 'alegra-connector'),
+            'importCompleted'       => __('Importación completada', 'alegra-connector'),
+            'importingType'         => __('Importando %s...', 'alegra-connector'),
+            'confirmImportApi'      => __('¿Estás seguro de importar desde Alegra? %s?', 'alegra-connector'),
+
+            // Dashboard kill-switch
+            'confirmReactivate'     => __('¿Reactivar el plugin ahora?', 'alegra-connector'),
+            'reactivating'          => __('Reactivando...', 'alegra-connector'),
+            'reactivateNow'         => __('Reactivar ahora', 'alegra-connector'),
+
+            // Monitor page
+            'statusRunning'         => __('Corriendo', 'alegra-connector'),
+            'statusCompleted'       => __('Completado', 'alegra-connector'),
+            'statusFailed'          => __('Fallido', 'alegra-connector'),
+            'statusCancelled'       => __('Cancelado', 'alegra-connector'),
+            'statusKilled'          => __('Detenido', 'alegra-connector'),
+            'noActiveProcesses'     => __('No hay procesos activos.', 'alegra-connector'),
+            'noCronTasks'           => __('No hay tareas cron programadas.', 'alegra-connector'),
+            'noRecentHistory'       => __('Sin historial reciente.', 'alegra-connector'),
+            'thHook'                => __('Hook', 'alegra-connector'),
+            'thNextRun'             => __('Próxima ejecución', 'alegra-connector'),
+            'thFrequency'           => __('Frecuencia', 'alegra-connector'),
+            'thActions'             => __('Acciones', 'alegra-connector'),
+            'thType'                => __('Tipo', 'alegra-connector'),
+            'thStatus'              => __('Estado', 'alegra-connector'),
+            'thStart'               => __('Inicio', 'alegra-connector'),
+            'thEnd'                 => __('Fin', 'alegra-connector'),
+            'thItems'               => __('Items', 'alegra-connector'),
+            'thMemory'              => __('Mem.', 'alegra-connector'),
+            'thError'               => __('Error', 'alegra-connector'),
+            'run'                   => __('Ejecutar', 'alegra-connector'),
+            'runNow'                => __('Ejecutar ahora', 'alegra-connector'),
+            'skipNext'              => __('Saltar la próxima ejecución', 'alegra-connector'),
+            'removeAll'             => __('Eliminar todas las programaciones', 'alegra-connector'),
+            'memory'                => __('Memoria', 'alegra-connector'),
+            'stopProcess'           => __('Detener este proceso', 'alegra-connector'),
+            'confirmStopProcess'    => __('¿Estás seguro de detener este proceso?', 'alegra-connector'),
+            'confirmEmergencyStop'  => __('Esto detendrá TODOS los procesos del plugin y lo desconectará. ¿Continuar?', 'alegra-connector'),
+            'stopping'              => __('Deteniendo...', 'alegra-connector'),
+            'stopAll'               => __('Detener Todos los Procesos', 'alegra-connector'),
+            'confirmSkipCron'       => __('¿Saltar la próxima ejecución de esta tarea cron?', 'alegra-connector'),
+            'confirmRemoveCron'     => __('¿Eliminar TODAS las programaciones de esta tarea cron?', 'alegra-connector'),
+            'taskSkipped'           => __('Tarea saltada', 'alegra-connector'),
+            'taskRemoved'           => __('Tarea eliminada', 'alegra-connector'),
+            'hookExecuted'          => __('Hook ejecutado', 'alegra-connector'),
+
+            // Wizard
+            'wizardError'           => __('Error al guardar progreso', 'alegra-connector'),
+            'confirmSkipWizard'     => __('¿Saltar el asistente? Puedes volver a iniciarlo desde Dashboard.', 'alegra-connector'),
+
+            // Statistics charts
+            'chartSales'            => __('Ventas', 'alegra-connector'),
+            'chartOrders'           => __('Pedidos', 'alegra-connector'),
+            'chartCompleted'        => __('Completado', 'alegra-connector'),
+            'chartProcessing'       => __('Procesando', 'alegra-connector'),
+            'chartPending'          => __('Pendiente', 'alegra-connector'),
+            'chartCancelled'        => __('Cancelado', 'alegra-connector'),
+            'chartRefunded'         => __('Reembolsado', 'alegra-connector'),
+        ];
     }
 
     public function render_dashboard(): void
     {
         if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos para acceder a esta p gina.', 'alegra-connector'));
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
         }
 
         $is_connected = (bool) get_option('alegra_connector_connection_tested');
@@ -478,7 +660,7 @@ class Admin_Dashboard
     public function render_settings_page(): void
     {
         if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos para acceder a esta p gina.', 'alegra-connector'));
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
         }
 
         $connected = (bool) get_option('alegra_connector_connection_tested');
@@ -536,7 +718,7 @@ class Admin_Dashboard
     public function render_logs_page(): void
     {
         if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos para acceder a esta p gina.', 'alegra-connector'));
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
         }
 
         $log_files = $this->logger ? $this->logger->get_log_files() : [];
@@ -560,7 +742,7 @@ class Admin_Dashboard
     public function render_import_page(): void
     {
         if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos para acceder a esta p gina.', 'alegra-connector'));
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
         }
 
         $header_color = 'green';
@@ -571,7 +753,7 @@ class Admin_Dashboard
     public function render_mapping_page(): void
     {
         if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos para acceder a esta p gina.', 'alegra-connector'));
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
         }
 
         $field_mapping = get_option('alegra_connector_field_mapping', []);
@@ -1259,7 +1441,7 @@ class Admin_Dashboard
             wp_send_json_success(['message' => __('Sincronización completa.', 'alegra-connector')]);
         }
         // For specific types, redirect to chunked sync via JS (handled by ajax_sync_start + ajax_sync_page)
-        wp_send_json_success(['message' => 'ok', 'use_chunked' => true, 'type' => $sync_type]);
+        wp_send_json_success(['message' => __('ok', 'alegra-connector'), 'use_chunked' => true, 'type' => $sync_type]);
     }
 
     /**
@@ -1311,7 +1493,7 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
         $state = get_transient('alegra_batch_state');
-        if (!$state) wp_send_json_error(['message' => 'No batch in progress']);
+        if (!$state) wp_send_json_error(['message' => __('No hay un proceso de sincronización en curso.', 'alegra-connector')]);
 
         $page = ((int) ($state['page'] ?? 0)) + 1;
         $type = $state['type'];
@@ -1429,7 +1611,7 @@ class Admin_Dashboard
             'page' => $page, 'total_pages' => $tp, 'total_items' => (int)($state['total_items'] ?? 0),
             'imported' => $state['imported'], 'updated' => $state['updated'], 'skipped' => $state['skipped'] ?? 0, 'errors' => $state['errors'],
             'processed' => $processed, 'percent' => $pct, 'done' => $done,
-            'message' => sprintf('%d/%d items — Pag. %d/%d', $processed, (int)($state['total_items'] ?? 0), $page, $tp),
+            'message' => sprintf(__('%d/%d items — Pág. %d/%d', 'alegra-connector'), $processed, (int)($state['total_items'] ?? 0), $page, $tp),
         ]);
         } finally {
             \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
@@ -1446,7 +1628,7 @@ class Admin_Dashboard
         }
 
         if (!isset($_FILES['csv_file'])) {
-            wp_send_json_error(['message' => __('No se encontr  archivo CSV.', 'alegra-connector')]);
+            wp_send_json_error(['message' => __('No se encontró el archivo CSV.', 'alegra-connector')]);
         }
 
         $file = $_FILES['csv_file'];
@@ -1464,7 +1646,7 @@ class Admin_Dashboard
         }
 
         wp_send_json_success([
-            'message' => sprintf(__('Importaci n completada: %d items', 'alegra-connector'), $result['count']),
+            'message' => sprintf(__('Importación completada: %d items', 'alegra-connector'), $result['count']),
             'data' => $result,
         ]);
     }
@@ -1528,7 +1710,7 @@ class Admin_Dashboard
 
         $order_id = (int) ($_POST['order_id'] ?? 0);
         if ($order_id <= 0) {
-            wp_send_json_error(['message' => __('ID de pedido inv lido.', 'alegra-connector')]);
+            wp_send_json_error(['message' => __('ID de pedido inválido.', 'alegra-connector')]);
         }
 
         $order = wc_get_order($order_id);
@@ -1544,7 +1726,7 @@ class Admin_Dashboard
         // Check if payment already recorded
         $existing_payment = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment !== '' && $existing_payment !== null) {
-            wp_send_json_error(['message' => __('El pago ya est  registrado en Alegra.', 'alegra-connector')]);
+            wp_send_json_error(['message' => __('El pago ya está registrado en Alegra.', 'alegra-connector')]);
         }
 
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
@@ -1860,7 +2042,7 @@ class Admin_Dashboard
 
         set_transient('alegra_sync_cancelled', 1, 120);
         delete_transient('alegra_batch_state');
-        wp_send_json_success(['message' => 'Sync cancelled']);
+        wp_send_json_success(['message' => __('Sincronización cancelada', 'alegra-connector')]);
     }
 
     public function ajax_register_webhooks(): void
@@ -2014,7 +2196,7 @@ class Admin_Dashboard
         $state = get_transient('alegra_pending_invoice_batch');
         if (!$state || empty($state['order_ids'])) {
             delete_transient('alegra_pending_invoice_batch');
-            wp_send_json_error(['message' => 'No pending orders']);
+            wp_send_json_error(['message' => __('No hay pedidos pendientes', 'alegra-connector')]);
         }
 
         $orders_sync = new Sync\Orders($this->api, $this->logger);
@@ -2047,7 +2229,7 @@ class Admin_Dashboard
             'errors' => $state['errors'],
             'percent' => $pct,
             'done' => $done,
-            'message' => sprintf('%d/%d facturas — %d ok, %d errores', $state['processed'], $state['total'], $state['synced'], $state['errors']),
+            'message' => sprintf(__('%d/%d facturas — %d ok, %d errores', 'alegra-connector'), $state['processed'], $state['total'], $state['synced'], $state['errors']),
         ]);
     }
 
@@ -2626,7 +2808,7 @@ class Admin_Dashboard
 
         if ($headers === false) {
             fclose($handle);
-            return new \WP_Error('invalid_csv', __('Archivo CSV inv lido.', 'alegra-connector'));
+            return new \WP_Error('invalid_csv', __('Archivo CSV inválido.', 'alegra-connector'));
         }
 
         $headers = array_map('trim', $headers);
@@ -2638,7 +2820,7 @@ class Admin_Dashboard
             if (count($row) !== count($headers)) {
                 $errors[] = sprintf(
                     /* translators: %d: line number */
-                    __('L nea %d: n mero de columnas no coincide con el encabezado.', 'alegra-connector'),
+                    __('Línea %d: número de columnas no coincide con el encabezado.', 'alegra-connector'),
                     $line
                 );
                 continue;
@@ -2648,7 +2830,7 @@ class Admin_Dashboard
             if ($data === false) {
                 $errors[] = sprintf(
                     /* translators: %d: line number */
-                    __('L nea %d: error al procesar la fila.', 'alegra-connector'),
+                    __('Línea %d: error al procesar la fila.', 'alegra-connector'),
                     $line
                 );
                 continue;
@@ -2661,7 +2843,7 @@ class Admin_Dashboard
                 } else {
                     $errors[] = sprintf(
                         /* translators: %d: line number */
-                        __('L nea %d: no se pudo importar el producto.', 'alegra-connector'),
+                        __('Línea %d: no se pudo importar el producto.', 'alegra-connector'),
                         $line
                     );
                 }

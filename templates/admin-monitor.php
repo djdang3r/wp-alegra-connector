@@ -81,17 +81,19 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
     var pollInterval = null;
     var monitorNonce = <?php echo json_encode($monitor_nonce); ?>;
+    // Populated on DOM ready: alegraConnector is printed with the footer scripts.
+    var S = {};
 
     function statusBadge(status) {
         var cls = 'neutral';
         // Escape the fallback too: an unknown status is server data.
         var label = escapeHtml(status);
         switch (status) {
-            case 'running':   cls = 'warning'; label = 'Corriendo'; break;
-            case 'completed': cls = 'success'; label = 'Completado'; break;
-            case 'failed':    cls = 'danger';  label = 'Fallido';   break;
-            case 'cancelled': cls = 'neutral'; label = 'Cancelado'; break;
-            case 'killed':    cls = 'danger';  label = 'Detenido';  break;
+            case 'running':   cls = 'warning'; label = S.statusRunning;   break;
+            case 'completed': cls = 'success'; label = S.statusCompleted; break;
+            case 'failed':    cls = 'danger';  label = S.statusFailed;    break;
+            case 'cancelled': cls = 'neutral'; label = S.statusCancelled; break;
+            case 'killed':    cls = 'danger';  label = S.statusKilled;    break;
         }
         return '<span class="ac-badge ' + cls + '">' + label + '</span>';
     }
@@ -105,7 +107,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
     function renderRunning(running) {
         if (!running || running.length === 0) {
-            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">No hay procesos activos.</p></div>';
+            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">' + escapeHtml(S.noActiveProcesses) + '</p></div>';
         }
         var html = '';
         for (var i = 0; i < running.length; i++) {
@@ -124,10 +126,10 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 html += '<div style="font-size:11px;color:var(--ac-text-muted);">' + r.items_done + ' / ' + r.total_items + ' (' + pct + '%)</div>';
             }
             html += '<div style="font-size:11px;color:var(--ac-text-muted);margin-top:6px;">';
-            if (r.memory_mb != null) html += '<span style="margin-right:12px;">Memoria: ' + r.memory_mb.toFixed(1) + ' MB</span>';
+            if (r.memory_mb != null) html += '<span style="margin-right:12px;">' + escapeHtml(S.memory) + ': ' + r.memory_mb.toFixed(1) + ' MB</span>';
             if (r.cpu_load != null) html += '<span style="margin-right:12px;">CPU: ' + r.cpu_load.toFixed(2) + '</span>';
             html += '</div>';
-            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-danger" data-stop-run="' + r.id + '" style="margin-top:8px;">Detener este proceso</button>';
+            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-danger" data-stop-run="' + r.id + '" style="margin-top:8px;">' + escapeHtml(S.stopProcess) + '</button>';
             html += '</div>';
         }
         return html;
@@ -135,11 +137,11 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
     function renderCron(cron) {
         if (!cron || cron.length === 0) {
-            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">No hay tareas cron programadas.</p></div>';
+            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">' + escapeHtml(S.noCronTasks) + '</p></div>';
         }
         var html = '<table class="widefat striped"><thead><tr>' +
-            '<th>Hook</th><th>Proxima ejecucion</th><th>Frecuencia</th>' +
-            '<th style="width:240px;">Acciónes</th></tr></thead><tbody>';
+            '<th>' + escapeHtml(S.thHook) + '</th><th>' + escapeHtml(S.thNextRun) + '</th><th>' + escapeHtml(S.thFrequency) + '</th>' +
+            '<th style="width:240px;">' + escapeHtml(S.thActions) + '</th></tr></thead><tbody>';
         for (var i = 0; i < cron.length; i++) {
             var c = cron[i];
             var dt = new Date(c.next_run * 1000);
@@ -150,13 +152,13 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             html += '<td>' + escapeHtml(dt.toLocaleString()) + '<br><small style="color:var(--ac-text-muted);">en ' + escapeHtml(c.next_run_human) + '</small></td>';
             html += '<td>' + escapeHtml(c.schedule) + '</td>';
             html += '<td class="ac-cron-actions">';
-            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-primary ac-cron-run" data-hook="' + hookAttr + '" title="Ejecutar ahora">' +
-                    '<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> Ejecutar' +
+            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-primary ac-cron-run" data-hook="' + hookAttr + '" title="' + escapeHtml(S.runNow) + '">' +
+                    '<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> ' + escapeHtml(S.run) +
                     '</button> ';
-            html += '<button type="button" class="ac-btn ac-btn-xs ac-cron-skip" data-hook="' + hookAttr + '" data-timestamp="' + tsAttr + '" title="Saltar la proxima ejecucion">' +
+            html += '<button type="button" class="ac-btn ac-btn-xs ac-cron-skip" data-hook="' + hookAttr + '" data-timestamp="' + tsAttr + '" title="' + escapeHtml(S.skipNext) + '">' +
                     '<span class="dashicons dashicons-controls-skipforward" style="font-size:12px;width:12px;height:12px;"></span>' +
                     '</button> ';
-            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-danger ac-cron-remove" data-hook="' + hookAttr + '" title="Eliminar todas las programaciones">' +
+            html += '<button type="button" class="ac-btn ac-btn-xs ac-btn-danger ac-cron-remove" data-hook="' + hookAttr + '" title="' + escapeHtml(S.removeAll) + '">' +
                     '<span class="dashicons dashicons-trash" style="font-size:12px;width:12px;height:12px;"></span>' +
                     '</button>';
             html += '</td>';
@@ -168,9 +170,9 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
     function renderRecent(recent) {
         if (!recent || recent.length === 0) {
-            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">Sin historial reciente.</p></div>';
+            return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">' + escapeHtml(S.noRecentHistory) + '</p></div>';
         }
-        var html = '<table class="widefat striped"><thead><tr><th>#</th><th>Tipo</th><th>Estado</th><th>Inicio</th><th>Fin</th><th>Items</th><th>Mem.</th><th>Error</th></tr></thead><tbody>';
+        var html = '<table class="widefat striped"><thead><tr><th>#</th><th>' + escapeHtml(S.thType) + '</th><th>' + escapeHtml(S.thStatus) + '</th><th>' + escapeHtml(S.thStart) + '</th><th>' + escapeHtml(S.thEnd) + '</th><th>' + escapeHtml(S.thItems) + '</th><th>' + escapeHtml(S.thMemory) + '</th><th>' + escapeHtml(S.thError) + '</th></tr></thead><tbody>';
         for (var i = 0; i < recent.length; i++) {
             var r = recent[i];
             html += '<tr>';
@@ -209,7 +211,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
     function setupHandlers() {
         $(document).on('click', '[data-stop-run]', function() {
-            if (!confirm('Estas seguro de detener este proceso?')) return;
+            if (!confirm(S.confirmStopProcess)) return;
             var runId = $(this).data('stop-run');
             $.ajax({
                 url: alegraConnector.ajaxUrl,
@@ -217,15 +219,15 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 data: { action: 'alegra_kill_run', _ajax_nonce: monitorNonce, run_id: runId },
                 success: function(r) {
                     if (r.success) showNotice(r.data.message, 'success');
-                    else showNotice(r.data.message || 'Error', 'error');
+                    else showNotice(r.data.message || S.error, 'error');
                     refresh();
                 }
             });
         });
 
         $(document).on('click', '#alegra-emergency-stop', function() {
-            if (!confirm('Esto detendra TODOS los procesos del plugin y lo desconectara. Continuar?')) return;
-            var $btn = $(this).prop('disabled', true).text('Deteniendo...');
+            if (!confirm(S.confirmEmergencyStop)) return;
+            var $btn = $(this).prop('disabled', true).text(S.stopping);
             $.ajax({
                 url: alegraConnector.ajaxUrl,
                 type: 'POST',
@@ -235,13 +237,13 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                         showNotice(r.data.message, 'warning');
                         setTimeout(function() { location.reload(); }, 1500);
                     } else {
-                        showNotice(r.data.message || 'Error', 'error');
-                        $btn.prop('disabled', false).text('Detener Todos los Procesos');
+                        showNotice(r.data.message || S.error, 'error');
+                        $btn.prop('disabled', false).text(S.stopAll);
                     }
                 },
                 error: function() {
-                    showNotice('Error de conexion', 'error');
-                    $btn.prop('disabled', false).text('Detener Todos los Procesos');
+                    showNotice(S.connectionError, 'error');
+                    $btn.prop('disabled', false).text(S.stopAll);
                 }
             });
         });
@@ -256,23 +258,23 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 data: { action: 'alegra_run_cron_now', _ajax_nonce: monitorNonce, hook: hook },
                 success: function(r) {
                     if (r.success) {
-                        showNotice(r.data.message || 'Hook ejecutado', 'success');
+                        showNotice(r.data.message || S.hookExecuted, 'success');
                         setTimeout(refresh, 1500);
                     } else {
-                        showNotice(r.data.message || 'Error', 'error');
+                        showNotice(r.data.message || S.error, 'error');
                     }
-                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> Ejecutar');
+                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> ' + escapeHtml(S.run));
                 },
                 error: function() {
-                    showNotice('Error de conexion', 'error');
-                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> Ejecutar');
+                    showNotice(S.connectionError, 'error');
+                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-controls-play" style="font-size:12px;width:12px;height:12px;"></span> ' + escapeHtml(S.run));
                 }
             });
         });
 
         // Skip cron next run
         $(document).on('click', '.ac-cron-skip', function() {
-            if (!confirm('Saltar la proxima ejecucion de esta tarea cron?')) return;
+            if (!confirm(S.confirmSkipCron)) return;
             var $btn = $(this).prop('disabled', true);
             var hook = $(this).data('hook');
             var timestamp = $(this).data('timestamp');
@@ -282,15 +284,15 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 data: { action: 'alegra_skip_cron_next', _ajax_nonce: monitorNonce, hook: hook, timestamp: timestamp },
                 success: function(r) {
                     if (r.success) {
-                        showNotice(r.data.message || 'Tarea saltada', 'success');
+                        showNotice(r.data.message || S.taskSkipped, 'success');
                         setTimeout(refresh, 1000);
                     } else {
-                        showNotice(r.data.message || 'Error', 'error');
+                        showNotice(r.data.message || S.error, 'error');
                         $btn.prop('disabled', false);
                     }
                 },
                 error: function() {
-                    showNotice('Error de conexion', 'error');
+                    showNotice(S.connectionError, 'error');
                     $btn.prop('disabled', false);
                 }
             });
@@ -298,7 +300,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
 
         // Remove cron entirely
         $(document).on('click', '.ac-cron-remove', function() {
-            if (!confirm('Eliminar TODAS las programaciones de esta tarea cron?')) return;
+            if (!confirm(S.confirmRemoveCron)) return;
             var $btn = $(this).prop('disabled', true);
             var hook = $(this).data('hook');
             $.ajax({
@@ -307,15 +309,15 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 data: { action: 'alegra_unschedule_cron', _ajax_nonce: monitorNonce, hook: hook },
                 success: function(r) {
                     if (r.success) {
-                        showNotice(r.data.message || 'Tarea eliminada', 'warning');
+                        showNotice(r.data.message || S.taskRemoved, 'warning');
                         setTimeout(refresh, 1000);
                     } else {
-                        showNotice(r.data.message || 'Error', 'error');
+                        showNotice(r.data.message || S.error, 'error');
                         $btn.prop('disabled', false);
                     }
                 },
                 error: function() {
-                    showNotice('Error de conexion', 'error');
+                    showNotice(S.connectionError, 'error');
                     $btn.prop('disabled', false);
                 }
             });
@@ -333,6 +335,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     }
 
     $(document).ready(function() {
+        S = (window.alegraConnector && window.alegraConnector.strings) || {};
         setupHandlers();
         refresh();
         // Poll every 5 seconds

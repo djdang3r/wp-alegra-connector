@@ -336,7 +336,7 @@ class Orders
         $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
         if ($alegra_invoice_id === '') {
-            return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
+            return new \WP_Error('no_invoice', __('El pedido no tiene una factura de Alegra vinculada', 'alegra-connector'));
         }
 
         // Idempotency: never issue a second credit note for the same order.
@@ -480,7 +480,7 @@ class Orders
 
         $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
         if ($invoice_id === '') {
-            return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
+            return new \WP_Error('no_invoice', __('El pedido no tiene una factura de Alegra vinculada', 'alegra-connector'));
         }
 
         // Idempotency: this specific refund was already credited.
@@ -616,12 +616,12 @@ class Orders
         $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
         if ($alegra_invoice_id === '') {
-            return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
+            return new \WP_Error('no_invoice', __('El pedido no tiene una factura de Alegra vinculada', 'alegra-connector'));
         }
 
         $result = $this->api->void_invoice(
             $alegra_invoice_id,
-            sprintf('Cancelled via WooCommerce - Order #%d', $order->get_id())
+            sprintf(__('Cancelada desde WooCommerce - Pedido #%d', 'alegra-connector'), $order->get_id())
         );
 
         if (!is_wp_error($result)) {

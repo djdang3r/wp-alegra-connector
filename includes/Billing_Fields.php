@@ -321,7 +321,7 @@ class Billing_Fields
         if (self::is_field_enabled('kindofperson') && !in_array($kind, ['PERSON_ENTITY', 'LEGAL_ENTITY'], true)) {
             return new \WP_Error(
                 'invalid_kindofperson',
-                'Seleccione un tipo de persona válido (Persona Natural o Persona Jurídica).'
+                __('Seleccione un tipo de persona válido (Persona Natural o Persona Jurídica).', 'alegra-connector')
             );
         }
 
@@ -330,13 +330,13 @@ class Billing_Fields
         if (self::is_field_enabled('idtype') && ($idtype === '' || !isset($valid_id_types[$idtype]))) {
             return new \WP_Error(
                 'invalid_idtype',
-                'Seleccione un tipo de documento válido para el tipo de persona.'
+                __('Seleccione un tipo de documento válido para el tipo de persona.', 'alegra-connector')
             );
         }
 
         $identification = trim(self::as_string($values['identification']));
         if (self::is_field_enabled('identification') && $identification === '') {
-            return new \WP_Error('missing_identification', 'El número de documento es obligatorio.');
+            return new \WP_Error('missing_identification', __('El número de documento es obligatorio.', 'alegra-connector'));
         }
 
         if ($identification !== '' && $idtype !== '') {
@@ -351,26 +351,26 @@ class Billing_Fields
             if (!preg_match('/^\d$/', $dv)) {
                 return new \WP_Error(
                     'invalid_dv',
-                    'El dígito de verificación (DV) debe ser un solo dígito (0-9)'
+                    __('El dígito de verificación (DV) debe ser un solo dígito (0-9)', 'alegra-connector')
                 );
             }
         } elseif ($dv !== '') {
             return new \WP_Error(
                 'unexpected_dv',
-                'El dígito de verificación (DV) solo aplica para NIT.'
+                __('El dígito de verificación (DV) solo aplica para NIT.', 'alegra-connector')
             );
         }
 
         $regime = self::as_string($values['regime']);
         $valid_regimes = self::regimes($kind);
         if (self::is_field_enabled('regime') && ($regime === '' || !isset($valid_regimes[$regime]))) {
-            return new \WP_Error('invalid_regime', 'Seleccione un régimen tributario válido.');
+            return new \WP_Error('invalid_regime', __('Seleccione un régimen tributario válido.', 'alegra-connector'));
         }
 
         if (self::is_field_enabled('company') && $kind === 'LEGAL_ENTITY' && trim(self::as_string($values['company'])) === '') {
             return new \WP_Error(
                 'missing_company',
-                'La razón social es obligatoria para persona jurídica'
+                __('La razón social es obligatoria para persona jurídica', 'alegra-connector')
             );
         }
 
@@ -1002,7 +1002,7 @@ class Billing_Fields
                 if (!preg_match('/^\d{6,10}$/', $identification)) {
                     return new \WP_Error(
                         'invalid_identification_cc',
-                        'El número de documento para Cédula de Ciudadanía debe contener solo dígitos'
+                        __('El número de documento para Cédula de Ciudadanía debe contener solo dígitos', 'alegra-connector')
                     );
                 }
                 break;
@@ -1010,7 +1010,7 @@ class Billing_Fields
                 if (!preg_match('/^\d{9}$/', $identification)) {
                     return new \WP_Error(
                         'invalid_identification_nit',
-                        'El número de documento para NIT debe contener 9 dígitos'
+                        __('El número de documento para NIT debe contener 9 dígitos', 'alegra-connector')
                     );
                 }
                 break;
@@ -1019,7 +1019,7 @@ class Billing_Fields
                 if (!preg_match('/^[A-Za-z0-9]{1,10}$/', $identification)) {
                     return new \WP_Error(
                         'invalid_identification_ce',
-                        'El número de documento debe contener entre 1 y 10 caracteres alfanuméricos'
+                        __('El número de documento debe contener entre 1 y 10 caracteres alfanuméricos', 'alegra-connector')
                     );
                 }
                 break;
@@ -1027,13 +1027,13 @@ class Billing_Fields
                 if (!preg_match('/^[A-Za-z0-9]{1,20}$/', $identification)) {
                     return new \WP_Error(
                         'invalid_identification_pp',
-                        'El número de pasaporte debe contener entre 1 y 20 caracteres alfanuméricos'
+                        __('El número de pasaporte debe contener entre 1 y 20 caracteres alfanuméricos', 'alegra-connector')
                     );
                 }
                 break;
             default:
                 if ($identification === '') {
-                    return new \WP_Error('missing_identification', 'El número de documento es obligatorio.');
+                    return new \WP_Error('missing_identification', __('El número de documento es obligatorio.', 'alegra-connector'));
                 }
                 break;
         }
@@ -1053,7 +1053,7 @@ class Billing_Fields
         if (!self::has_critical_data($values)) {
             return new \WP_Error(
                 'incomplete_billing_data',
-                'El cliente no tiene los datos de facturación electrónica completos (tipo de persona, tipo y número de documento).'
+                __('El cliente no tiene los datos de facturación electrónica completos (tipo de persona, tipo y número de documento).', 'alegra-connector')
             );
         }
 
@@ -1066,7 +1066,7 @@ class Billing_Fields
         if ($kind === '' || $idtype === '' || (string) $values['identification'] === '') {
             return new \WP_Error(
                 'incomplete_billing_data',
-                'El cliente no tiene los datos de facturación electrónica completos (tipo de persona, tipo y número de documento).'
+                __('El cliente no tiene los datos de facturación electrónica completos (tipo de persona, tipo y número de documento).', 'alegra-connector')
             );
         }
 

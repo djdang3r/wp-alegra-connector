@@ -123,37 +123,39 @@ function downloadTemplate(type){
 }
 
 jQuery(function($){
+    var S=(window.alegraConnector&&window.alegraConnector.strings)||{};
     function showNotice(msg,type){var $n=$('<div>').addClass('ac-notice').addClass(type||'info').text(msg).hide();$('.alegra-connector-wrap').first().prepend($n);$n.slideDown(200);setTimeout(function(){$n.slideUp(300,function(){$(this).remove();});},6000);}
-    function safeMsg(r,f){return(r&&r.data&&r.data.message)||f||'Error desconocido';}
+    function safeMsg(r,f){return(r&&r.data&&r.data.message)||f||S.unknownError;}
+    function fmt(tpl,arg){return String(tpl==null?'':tpl).replace('%s',arg);}
 
     $('#alegra-import-btn').on('click',function(){
         var $btn=$(this);
         var fileInput=$('#csv-file')[0];
-        if(!fileInput.files.length){showNotice('Seleccióna un archivo CSV','warning');return;}
+        if(!fileInput.files.length){showNotice(S.selectCsv,'warning');return;}
         var formData=new FormData();
         formData.append('action','alegra_import_csv');formData.append('_ajax_nonce',alegraConnector.nonce);
         formData.append('import_type',$('#import-type').val());formData.append('csv_file',fileInput.files[0]);
-        $btn.prop('disabled',true).text('Importando...');
+        $btn.prop('disabled',true).text(S.importing);
         $('#alegra-import-progress').show();$('#alegra-import-bar').css('width','30%');
         $.ajax({url:alegraConnector.ajaxUrl,type:'POST',data:formData,processData:false,contentType:false,
             success:function(r){$('#alegra-import-bar').css('width','100%');
-                if(r.success){$('#alegra-import-status').text(safeMsg(r,'Importación completada'));}
-                else{showNotice(safeMsg(r,'Error en la importacion'),'error');$('#alegra-import-status').text('Error');}
-                $btn.prop('disabled',false).text('Subir e Importar');},
-            error:function(){showNotice('Error de conexion','error');$btn.prop('disabled',false).text('Subir e Importar');}
+                if(r.success){$('#alegra-import-status').text(safeMsg(r,S.importCompleted));}
+                else{showNotice(safeMsg(r,S.importError),'error');$('#alegra-import-status').text(S.error);}
+                $btn.prop('disabled',false).text(S.uploadImport);},
+            error:function(){showNotice(S.connectionError,'error');$btn.prop('disabled',false).text(S.uploadImport);}
         });
     });
 
     $('.alegra-import-from-api').on('click',function(){
         var $btn=$(this);var type=$(this).data('type');
-        if(!confirm('Estas seguro de importar desde Alegra? '+type+'?'))return;
-        $btn.prop('disabled',true);$('#alegra-api-import-status').show().text('Importando '+type+'...');
+        if(!confirm(fmt(S.confirmImportApi,type)))return;
+        $btn.prop('disabled',true);$('#alegra-api-import-status').show().text(fmt(S.importingType,type));
         $.ajax({url:alegraConnector.ajaxUrl,type:'POST',
             data:{action:'alegra_import_from_api',_ajax_nonce:alegraConnector.nonce,import_type:type},
-            success:function(r){$('#alegra-api-import-status').text(safeMsg(r,'Importación completada'));
-                if(r.success)setTimeout(function(){location.reload();},2000);else showNotice(safeMsg(r,'Error'),'error');
+            success:function(r){$('#alegra-api-import-status').text(safeMsg(r,S.importCompleted));
+                if(r.success)setTimeout(function(){location.reload();},2000);else showNotice(safeMsg(r,S.error),'error');
                 $btn.prop('disabled',false);},
-            error:function(){showNotice('Error de conexion','error');$btn.prop('disabled',false);}
+            error:function(){showNotice(S.connectionError,'error');$btn.prop('disabled',false);}
         });
     });
 });

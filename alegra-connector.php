@@ -175,24 +175,38 @@ final class Alegra_Connector
         // Self-check fallback: if the critical Logger class is still not
         // resolvable after everything else has loaded (typical when the
         // lowercase `logger/` directory was missing from the release ZIP),
-        // surface a clear Spanish admin notice AND auto-deactivate the
-        // plugin. Replaces the 2.1.7 behavior of crashing with a fatal.
+        // surface a clear Spanish admin notice. Replaces the 2.1.7 behavior
+        // of crashing with a fatal.
+        //
+        // AC-53: this MUST NOT auto-deactivate. A missing class is a
+        // deployment problem the administrator has to see and fix; silently
+        // disabling a fiscal integration because of a false positive (an
+        // autoloader ordering issue, a transient file-permission glitch)
+        // removes the store's invoicing without warning and re-runs on every
+        // request until it sticks. Notice only.
+        //
+        // class_exists() is called with the default $autoload = true so the
+        // registered autoloader gets a chance to load the class. With
+        // $autoload = false the check reported a false negative for a class
+        // that WOULD load, which is exactly what could trigger the old
+        // deactivation.
+        //
         // Priority 999 — runs after every other plugins_loaded listener.
         add_action('plugins_loaded', function (): void {
-            if (class_exists(\Alegra\Connector\Logger\Logger::class, false)) {
+            if (class_exists(\Alegra\Connector\Logger\Logger::class)) {
                 return;
             }
             add_action('admin_notices', static function (): void {
+                if (!current_user_can('activate_plugins')) {
+                    return;
+                }
                 echo '<div class="notice notice-error"><p>';
                 echo esc_html__(
-                    'Alegra Connector: no se pudo cargar la clase Logger. El directorio logger/ parece estar incompleto en esta instalación. El plugin fue desactivado para evitar errores. Por favor, reinstala el plugin completo o contacta al soporte.',
+                    'Alegra Connector: no se pudo cargar la clase Logger. El directorio logger/ parece estar incompleto en esta instalación. El plugin no puede registrar eventos hasta que reinstales el plugin completo o contactes al soporte.',
                     'alegra-connector'
                 );
                 echo '</p></div>';
             });
-            if (function_exists('deactivate_plugins')) {
-                deactivate_plugins(ALEGRA_CONNECTOR_BASENAME);
-            }
         }, 999);
     }
 

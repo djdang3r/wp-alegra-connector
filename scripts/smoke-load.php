@@ -591,6 +591,53 @@ check(
     '— Dry Run must short-circuit all write verbs at the single choke point'
 );
 
+// ---- 35: i18n — .pot exists and has entries (AC-35a) ----
+echo "\n[35] i18n: languages/alegra-connector.pot exists with entries\n";
+$pot_path = $plugin_root . 'languages/alegra-connector.pot';
+$pot_src = file_source($pot_path);
+$pot_msgids = (int) preg_match_all('/^msgid\s+"[^"]+"/m', $pot_src);
+check(
+    'languages/alegra-connector.pot exists with translation entries',
+    is_file($pot_path) && $pot_msgids >= 100,
+    '— a .pot is required for the plugin to be translatable (found ' . $pot_msgids . ' msgids)'
+);
+
+// ---- 36: i18n — no mojibake'd (space-for-accent) source strings (AC-35b) ----
+echo "\n[36] i18n: no mojibake'd (space-for-accent) source strings\n";
+$mojibake_hits = [];
+$mojibake_words = '/(Estad sticas|Conexi n|conexi n|p gina|inv lido|L nea|n mero|Importaci n|Configuraci n|Sincronizaci n)/u';
+$double_space = '/([\'"])[^\'"]*[a-z]  [a-z][^\'"]*\1/u';
+$rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($plugin_root, FilesystemIterator::SKIP_DOTS));
+foreach ($rii as $file) {
+    $path = $file->getPathname();
+    $rel = ltrim(str_replace($plugin_root, '', $path), '/');
+    $guarded = ['/.git/', '/scripts/', '/releases/', '/.omo/', '/languages/', '/vendor/'];
+    $skip = false;
+    foreach ($guarded as $g) {
+        if (strpos('/' . $rel, $g) !== false) {
+            $skip = true;
+            break;
+        }
+    }
+    if ($skip || strpos($rel, '.min.js') !== false) {
+        continue;
+    }
+    if (!in_array(strtolower($file->getExtension()), ['php', 'js'], true)) {
+        continue;
+    }
+    $lines = file($path);
+    foreach ($lines as $n => $line) {
+        if (preg_match($mojibake_words, $line) || preg_match($double_space, $line)) {
+            $mojibake_hits[] = $rel . ':' . ($n + 1);
+        }
+    }
+}
+check(
+    'no source string uses a space where an accent belongs',
+    $mojibake_hits === [],
+    '— mojibake found: ' . implode(', ', array_slice($mojibake_hits, 0, 10))
+);
+
 // ---- Done ----
 echo "\n";
 if ($failures) {

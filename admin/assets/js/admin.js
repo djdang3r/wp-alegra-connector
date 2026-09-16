@@ -1,8 +1,26 @@
 /**
  * Alegra Connector Admin JavaScript
+ *
+ * AC-35d: every user-facing string lives in the wp_localize_script payload
+ * (alegraConnector.strings, built in Admin_Dashboard::get_script_strings()).
+ * Nothing here is hardcoded, so the strings are translatable.
  */
 (function($) {
     'use strict';
+
+    var S = (window.alegraConnector && window.alegraConnector.strings) || {};
+
+    /**
+     * Minimal printf-style formatter: supports %s, %d, %1$s, %2$d.
+     */
+    function fmt(tpl, ...args) {
+        var auto = 0;
+        return String(tpl == null ? '' : tpl).replace(/%(\d+\$)?[sd]/g, function(match, pos) {
+            var idx = pos ? (parseInt(pos, 10) - 1) : auto++;
+            var value = args[idx];
+            return value == null ? '' : String(value);
+        });
+    }
 
     function showNotice(msg, type) {
         type = type || 'info';
@@ -15,7 +33,7 @@
     }
 
     function safeMsg(response, fallback) {
-        return (response && response.data && response.data.message) || fallback || 'Error desconocido';
+        return (response && response.data && response.data.message) || fallback || S.unknownError;
     }
 
     var AlegraConnector = {
@@ -48,49 +66,49 @@
                 var $result = $('#alegra-connection-result');
                 var email = $('#alegra_connector_email').val();
                 var token = $('#alegra_connector_token').val();
-                if (!email || !token) { showNotice('Email y token son requeridos', 'warning'); return; }
-                $btn.prop('disabled', true).text(alegraConnector.strings.testing);
+                if (!email || !token) { showNotice(S.emailTokenRequired, 'warning'); return; }
+                $btn.prop('disabled', true).text(S.testing);
                 $status.html('');
                 $result.hide();
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST', timeout: 15000,
                     data: { action: 'alegra_test_connection', _ajax_nonce: alegraConnector.nonce, email: email, token: token },
                     success: function(r) {
-                        $btn.prop('disabled', false).text('Probar Conexion');
+                        $btn.prop('disabled', false).text(S.testConnection);
                         if (r.success) {
                             var diag = r.data.diagnostics ? r.data.diagnostics.join(', ') : '';
                             // Server-derived strings (company/country/diagnostics) go
                             // through .text()/DOM nodes, never string-concatenated HTML.
                             $status.empty().append(
-                                $('<span>').css({color:'var(--ac-success)',fontWeight:'500'}).text('\u2713 Conectado - ' + (r.data.company || 'OK'))
+                                $('<span>').css({color:'var(--ac-success)',fontWeight:'500'}).text('\u2713 ' + S.connected + ' - ' + (r.data.company || S.ok))
                             );
                             $result.show().removeClass('error').addClass('success').empty();
                             $result.append(
                                 $('<p>').css({margin:0,color:'var(--ac-success)'})
-                                    .append($('<strong>').text('Empresa:')).append(document.createTextNode(' ' + (r.data.company || 'N/A') + ' | '))
-                                    .append($('<strong>').text('Pais:')).append(document.createTextNode(' ' + (r.data.country || 'N/A')))
+                                    .append($('<strong>').text(S.company)).append(document.createTextNode(' ' + (r.data.company || 'N/A') + ' | '))
+                                    .append($('<strong>').text(S.country)).append(document.createTextNode(' ' + (r.data.country || 'N/A')))
                             );
                             $result.append(
-                                $('<p>').css({margin:'4px 0 0 0',fontSize:'11px',color:'var(--ac-text-secondary)'}).text('Endpoints: ' + diag)
+                                $('<p>').css({margin:'4px 0 0 0',fontSize:'11px',color:'var(--ac-text-secondary)'}).text(S.endpoints + ' ' + diag)
                             );
-                            showNotice('Conectado a ' + (r.data.company || 'Alegra') + (diag ? ' - ' + diag : ''), 'success');
+                            showNotice(fmt(S.connectedTo, (r.data.company || 'Alegra')) + (diag ? ' - ' + diag : ''), 'success');
                             setTimeout(function(){ location.reload(); }, 2000);
                         } else {
-                            var msg = r.data.message || 'Error';
+                            var msg = r.data.message || S.error;
                             var http = r.data.http_code ? ' (HTTP ' + r.data.http_code + ')' : '';
                             $status.empty().append(
                                 $('<span>').css({color:'var(--ac-danger)',fontWeight:'500'}).text('\u2717 ' + msg + http)
                             );
-                            showNotice('Error: ' + msg + http, 'error');
+                            showNotice(S.error + ': ' + msg + http, 'error');
                             $result.show().removeClass('success').addClass('error').empty();
                             $result.append($('<p>').css({margin:0,color:'var(--ac-danger)'}).text(msg + http));
                         }
                     },
                     error: function(xhr, status) {
-                        $btn.prop('disabled', false).text('Probar Conexion');
-                        var msg = status === 'timeout' ? 'Timeout: el servidor de Alegra no responde' : 'Error de red (' + status + ')';
+                        $btn.prop('disabled', false).text(S.testConnection);
+                        var msg = status === 'timeout' ? S.timeout : fmt(S.networkError, status);
                         $status.html('<span style="color:var(--ac-danger);">&#10007; ' + msg + '</span>');
-                        showNotice(msg + '. Verifica la URL base y tu conexion.', 'error');
+                        showNotice(msg + '. ' + S.checkUrl, 'error');
                     }
                 });
             });
@@ -111,15 +129,15 @@
                 var $elapsed = $('#sync-elapsed');
                 var startTime = Date.now();
                 var cancelled = false;
-                
-                $label.text(types === 'all' ? 'Trayendo datos...' : 'Obteniendo conteo de Alegra...');
+
+                $label.text(types === 'all' ? S.fetchingData : S.gettingCount);
                 $fill.css('width', '2%');
                 $counters.text('');
                 $elapsed.text('');
                 cancelled = false;
                 $modal.show();
                 $('body').addClass('ac-modal-open');
-                
+
                 var currentRequest = null;
 
                 // Cancel button - abort current request and cleanup server state
@@ -136,45 +154,45 @@
                         error: function() {}
                     });
                     cleanup();
-                    $btn.prop('disabled', false).text('Sincronizar Todo');
-                    showNotice('Sincronizacion cancelada', 'warning');
+                    $btn.prop('disabled', false).text(S.syncAll);
+                    showNotice(S.syncCancelled, 'warning');
                 });
-                
+
                 // Timer
                 var timerInterval = setInterval(function() {
                     var elapsed = Math.floor((Date.now() - startTime) / 1000);
                     var m = Math.floor(elapsed / 60), s = elapsed % 60;
-                    $elapsed.text('Tiempo: ' + m + 'm ' + s + 's');
+                    $elapsed.text(fmt(S.elapsed, m, s));
                 }, 1000);
-                
+
                 var cleanup = function() {
                     clearInterval(timerInterval);
                     $modal.hide();
                     $('body').removeClass('ac-modal-open');
                 };
-                
+
                 var processNext = function() { return; }; // Placeholder
-                
+
                 var doAllSync = function() {
                     $.ajax({
                         url: alegraConnector.ajaxUrl, type: 'POST',
                         data: { action: 'alegra_sync_now', _ajax_nonce: alegraConnector.nonce, sync_type: 'all' },
                         success: function(r) {
                             cleanup();
-                            if(r.success) { showNotice(r.data.message || 'Completado','success'); setTimeout(function(){location.reload();},1500); }
-                            else { showNotice(safeMsg(r,'Error'),'error'); $btn.prop('disabled',false).text('Reintentar'); }
+                            if(r.success) { showNotice(r.data.message || S.completed,'success'); setTimeout(function(){location.reload();},1500); }
+                            else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).text(S.retry); }
                         },
-                        error: function() { cleanup(); showNotice('Error','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                        error: function() { cleanup(); showNotice(S.error,'error'); $btn.prop('disabled',false).text(S.retry); }
                     });
                 };
-                
+
                 if (types === 'all') { doAllSync(); return; }
-                
+
                 // Chunked sync for specific types
                 var phase = 'init'; // init | fetching | importing | done
                 var retries = 0;
                 var maxRetries = 2;
-                
+
                 currentRequest = $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_sync_start', _ajax_nonce: alegraConnector.nonce, sync_type: types },
@@ -182,52 +200,47 @@
                         currentRequest = null;
                         if (!r.success || cancelled) { cleanup(); return; }
                         var d = r.data || {};
-                        $label.text('[Fase 1] Total: ' + (d.total_items || '?') + ' items en ' + (d.total_pages || '?') + ' paginas — Pagina 1');
-                        $counters.text('Procesando...');
+                        $label.text(fmt(S.phase1Total, (d.total_items || '?'), (d.total_pages || '?')));
+                        $counters.text(S.processing);
                         processPage(1);
                     },
-                    error: function() { cleanup(); showNotice('Error al iniciar','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                    error: function() { cleanup(); showNotice(S.startError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
-                
+
                 var processPage = function(page) {
                     if (cancelled) { cleanup(); return; }
-                    
+
                     currentRequest = $.ajax({
                         url: alegraConnector.ajaxUrl, type: 'POST',
                         data: { action: 'alegra_sync_page', _ajax_nonce: alegraConnector.nonce },
                         success: function(r) {
                             currentRequest = null;
                             retries = 0;
-                            if (!r.success || cancelled) { cleanup(); $btn.prop('disabled',false).text('Reintentar'); return; }
+                            if (!r.success || cancelled) { cleanup(); $btn.prop('disabled',false).text(S.retry); return; }
                             var d = r.data;
                             var pct = d.percent || Math.min(95, 5 + (page * 2));
                             $fill.css('width', pct + '%');
-                            $label.text('[Fase 1] ' + d.message);
-                            $counters.text(d.imported + ' importados | ' + d.updated + ' actualizados | ' + (d.skipped || 0) + ' omitidos | ' + d.errors + ' errores');
-                            
+                            $label.text(fmt(S.phase1, d.message));
+                            $counters.text(d.imported + ' ' + S.importedLabel + ' | ' + d.updated + ' ' + S.updatedLabel + ' | ' + (d.skipped || 0) + ' ' + S.skippedLabel + ' | ' + d.errors + ' ' + S.errorsLabel);
+
                             if (d.done) {
                                 $fill.css('width', '100%');
                                 var hasErrors = d.errors > 0;
-                                $label.text(hasErrors ? '[Fase 2] Completado con errores' : '[Fase 2] Completado');
+                                $label.text(hasErrors ? S.phase2CompletedErrors : S.phase2Completed);
                                 $counters.text(
-                                    'Total: ' + d.processed + ' items | ' +
-                                    d.imported + ' nuevos, ' + d.updated + ' actualizados, ' +
-                                    (d.skipped || 0) + ' omitidos' +
-                                    (hasErrors ? ', ' + d.errors + ' errores' : '')
+                                    fmt(S.syncSummary, d.processed, d.imported, d.updated, (d.skipped || 0)) +
+                                    (hasErrors ? fmt(S.syncSummaryErrors, d.errors) : '')
                                 ).css('color', hasErrors ? 'var(--ac-warning)' : '');
                                 setTimeout(function() {
                                     cleanup();
                                     if (hasErrors) {
                                         showNotice(
-                                            'Importacion completada con errores: ' + d.processed + ' items procesados. ' +
-                                            d.imported + ' importados, ' + d.updated + ' actualizados, ' +
-                                            d.errors + ' errores. Revisa el log para mas detalle.',
+                                            fmt(S.syncDoneErrors, d.processed, d.imported, d.updated, d.errors),
                                             'warning'
                                         );
                                     } else {
                                         showNotice(
-                                            d.processed + ' items procesados. ' +
-                                            d.imported + ' importados, ' + d.updated + ' actualizados.',
+                                            fmt(S.syncDone, d.processed, d.imported, d.updated),
                                             'success'
                                         );
                                     }
@@ -240,10 +253,10 @@
                         error: function() {
                             retries++;
                             if (retries <= maxRetries) {
-                                $counters.text('Reintentando (' + retries + '/' + maxRetries + ')...');
+                                $counters.text(fmt(S.retrying, retries, maxRetries));
                                 setTimeout(function() { processPage(page); }, 2000);
                             } else {
-                                cleanup(); $btn.prop('disabled',false).text('Reintentar');
+                                cleanup(); $btn.prop('disabled',false).text(S.retry);
                             }
                         }
                     });
@@ -256,14 +269,14 @@
                 $('input[name="sync_customers"]:checked').length && syncTypes.push('customers');
                 $('input[name="sync_orders"]:checked').length && syncTypes.push('orders');
                 $('input[name="sync_categories"]:checked').length && syncTypes.push('categories');
-                if (!syncTypes.length) { showNotice('Selecciona al menos un tipo','warning'); return; }
+                if (!syncTypes.length) { showNotice(S.selectOneType,'warning'); return; }
                 var $modal = $('#alegra-sync-modal');
-                var $status = $modal.find('.alegra-sync-status').text(alegraConnector.strings.syncing);
+                var $status = $modal.find('.alegra-sync-status').text(S.syncing);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_sync_now', _ajax_nonce: alegraConnector.nonce, sync_type: syncTypes.join(',') },
-                    success: function(r) { if(r.success){$status.text(safeMsg(r,'Completado'));setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r,'Error'),'error');} },
-                    error: function() { showNotice('Error de conexion','error'); }
+                    success: function(r) { if(r.success){$status.text(safeMsg(r, S.completed));setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r, S.error),'error');} },
+                    error: function() { showNotice(S.connectionError,'error'); }
                 });
             });
             $('#alegra-sync-cancel').on('click', function() { $('#alegra-sync-modal').hide(); });
@@ -272,11 +285,11 @@
         initLogManagement: function() {
             $('#alegra-refresh-logs').on('click', function() { location.reload(); });
             $('#alegra-clear-logs').on('click', function() {
-                if(!confirm('Eliminar logs antiguos?')) return;
+                if(!confirm(S.confirmClearLogs)) return;
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_clear_logs', _ajax_nonce: alegraConnector.nonce },
-                    success: function(r) { if(r.success){showNotice(safeMsg(r,'Logs eliminados'),'success');setTimeout(function(){location.reload();},1000);} }
+                    success: function(r) { if(r.success){showNotice(safeMsg(r, S.logsDeleted),'success');setTimeout(function(){location.reload();},1000);} }
                 });
             });
         },
@@ -284,33 +297,33 @@
         initTokenVisibility: function() {
             $('#toggle-token-visibility').on('click', function() {
                 var $t = $('#alegra_connector_token');
-                if ($t.attr('type') === 'password') { $t.attr('type', 'text'); $(this).text('Ocultar token'); }
-                else { $t.attr('type', 'password'); $(this).text('Mostrar token'); }
+                if ($t.attr('type') === 'password') { $t.attr('type', 'text'); $(this).text(S.hideToken); }
+                else { $t.attr('type', 'password'); $(this).text(S.showToken); }
             });
             $('#toggle-webhook-secret').on('click', function() {
                 var $t = $('#alegra_connector_webhook_secret');
-                if ($t.attr('type') === 'password') { $t.attr('type', 'text'); $(this).text('Ocultar'); }
-                else { $t.attr('type', 'password'); $(this).text('Mostrar'); }
+                if ($t.attr('type') === 'password') { $t.attr('type', 'text'); $(this).text(S.hide); }
+                else { $t.attr('type', 'password'); $(this).text(S.show); }
             });
             $('#alegra-disconnect').on('click', function() {
-                if (!confirm('Desconectar de Alegra? Deberas volver a probar la conexion.')) return;
-                var $btn = $(this).prop('disabled', true).text('Desconectando...');
+                if (!confirm(S.confirmDisconnect)) return;
+                var $btn = $(this).prop('disabled', true).text(S.disconnecting);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_disconnect', _ajax_nonce: alegraConnector.nonce },
                     success: function() { location.reload(); },
-                    error: function() { $btn.prop('disabled', false).text('Desconectar'); }
+                    error: function() { $btn.prop('disabled', false).text(S.disconnect); }
                 });
             });
             $('#alegra-check-endpoints').on('click', function() {
-                var $btn = $(this).prop('disabled', true).text('Verificando...');
+                var $btn = $(this).prop('disabled', true).text(S.verifying);
                 var $status = $('#alegra-endpoints-status');
                 $status.html('');
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_check_endpoints', _ajax_nonce: alegraConnector.nonce },
                     success: function(r) {
-                        $btn.prop('disabled', false).text('Verificar Endpoints');
+                        $btn.prop('disabled', false).text(S.verifyEndpoints);
                         if (r.success) {
                             $status.empty();
                             $.each(r.data.endpoints || {}, function(k, v) {
@@ -320,60 +333,60 @@
                                 $status.append($('<span>').addClass('ac-badge').addClass(cls).css('margin','2px').text(k + ': ' + v));
                             });
                         } else {
-                            $status.html('<span style="color:var(--ac-danger);">Error</span>');
+                            $status.html('<span style="color:var(--ac-danger);">' + S.error + '</span>');
                         }
                     },
-                    error: function() { $btn.prop('disabled', false).text('Verificar Endpoints'); $status.html('<span style="color:var(--ac-danger);">Error de red</span>'); }
+                    error: function() { $btn.prop('disabled', false).text(S.verifyEndpoints); $status.html('<span style="color:var(--ac-danger);">' + S.networkErrorLabel + '</span>'); }
                 });
             });
         },
 
         initWebhookManagement: function() {
             $('#alegra-register-webhooks').on('click', function() {
-                var $btn = $(this).prop('disabled', true).text('Registrando...');
+                var $btn = $(this).prop('disabled', true).text(S.registering);
                 var $status = $('#alegra-webhook-status');
                 var $secretField = $('#alegra_connector_webhook_secret');
                 var secret = $secretField.val();
                 // The field is masked; a saved secret is signalled by data-saved.
                 var hasSavedSecret = String($secretField.data('saved')) === '1';
-                if (!secret && !hasSavedSecret) { showNotice('Debes configurar un Webhook Secret primero', 'warning'); $btn.prop('disabled', false).text('Registrar webhooks en Alegra'); return; }
+                if (!secret && !hasSavedSecret) { showNotice(S.webhookSecretRequired, 'warning'); $btn.prop('disabled', false).text(S.registerWebhooks); return; }
                 $status.html('');
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_register_webhooks', _ajax_nonce: alegraConnector.nonce, webhook_secret: secret },
                     success: function(r) {
-                        $btn.prop('disabled', false).text('Registrar webhooks en Alegra');
+                        $btn.prop('disabled', false).text(S.registerWebhooks);
                         if (r.success) {
-                            showNotice(r.data.message || 'Webhooks registrados', 'success');
+                            showNotice(r.data.message || S.webhooksRegistered, 'success');
                             setTimeout(function(){ location.reload(); }, 2000);
                         } else {
-                            showNotice(r.data.message || 'Error', 'error');
-                            $status.html('<span style="color:var(--ac-danger);">Error</span>');
+                            showNotice(r.data.message || S.error, 'error');
+                            $status.html('<span style="color:var(--ac-danger);">' + S.error + '</span>');
                         }
                     },
-                    error: function() { $btn.prop('disabled', false).text('Registrar webhooks en Alegra'); showNotice('Error de conexion', 'error'); }
+                    error: function() { $btn.prop('disabled', false).text(S.registerWebhooks); showNotice(S.connectionError, 'error'); }
                 });
             });
 
             $('#alegra-delete-webhooks').on('click', function() {
-                if (!confirm('Eliminar todas las suscripciones de webhooks en Alegra?')) return;
-                var $btn = $(this).prop('disabled', true).text('Eliminando...');
+                if (!confirm(S.confirmDeleteWebhooks)) return;
+                var $btn = $(this).prop('disabled', true).text(S.deleting);
                 var $status = $('#alegra-webhook-status');
                 $status.html('');
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_delete_webhooks', _ajax_nonce: alegraConnector.nonce },
                     success: function(r) {
-                        $btn.prop('disabled', false).text('Eliminar webhooks en Alegra');
+                        $btn.prop('disabled', false).text(S.deleteWebhooks);
                         if (r.success) {
-                            showNotice(r.data.message || 'Webhooks eliminados', 'success');
+                            showNotice(r.data.message || S.webhooksDeleted, 'success');
                             setTimeout(function(){ location.reload(); }, 2000);
                         } else {
-                            showNotice(r.data.message || 'Error', 'error');
-                            $status.html('<span style="color:var(--ac-danger);">Error</span>');
+                            showNotice(r.data.message || S.error, 'error');
+                            $status.html('<span style="color:var(--ac-danger);">' + S.error + '</span>');
                         }
                     },
-                    error: function() { $btn.prop('disabled', false).text('Eliminar webhooks en Alegra'); showNotice('Error de conexion', 'error'); }
+                    error: function() { $btn.prop('disabled', false).text(S.deleteWebhooks); showNotice(S.connectionError, 'error'); }
                 });
             });
         },
@@ -381,22 +394,22 @@
 
         initCleanupDuplicateImages: function() {
             $('.alegra-cleanup-duplicate-images').on('click', function() {
-                if (!confirm('Esto eliminara todos los attachments de imagen duplicados en productos, basandose en la URL normalizada. Las imagenes que quedaron unicas se conservaran. Continuar?')) return;
+                if (!confirm(S.confirmCleanupImages)) return;
                 var $btn = $(this);
-                $btn.prop('disabled', true).text('Limpiando...');
+                $btn.prop('disabled', true).text(S.cleaning);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_cleanup_duplicate_images', _ajax_nonce: alegraConnector.nonce },
                     success: function(r) {
-                        $btn.prop('disabled', false).text('Limpiar imagenes duplicadas');
+                        $btn.prop('disabled', false).text(S.cleanupImages);
                         if (r.success) {
-                            showNotice(r.data.message || 'Imagenes duplicadas eliminadas', 'success');
+                            showNotice(r.data.message || S.imagesDeleted, 'success');
                             setTimeout(function(){ location.reload(); }, 2000);
                         } else {
-                            showNotice(r.data.message || 'Error', 'error');
+                            showNotice(r.data.message || S.error, 'error');
                         }
                     },
-                    error: function() { $btn.prop('disabled', false).text('Limpiar imagenes duplicadas'); showNotice('Error de conexion', 'error'); }
+                    error: function() { $btn.prop('disabled', false).text(S.cleanupImages); showNotice(S.connectionError, 'error'); }
                 });
             });
         },
@@ -405,12 +418,12 @@
             $('.alegra-sync-single').on('click', function() {
                 var $btn = $(this).prop('disabled', true);
                 var origText = $btn.text();
-                $btn.html('<span class="dashicons dashicons-update ac-spin" style="font-size:14px;width:14px;height:14px;"></span> Sincronizando...');
+                $btn.html('<span class="dashicons dashicons-update ac-spin" style="font-size:14px;width:14px;height:14px;"></span> ' + S.syncing);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_sync_single', _ajax_nonce: alegraConnector.nonce, entity_type: $btn.data('type'), entity_id: $btn.data('id') },
-                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r,'Error'),'error'); $btn.prop('disabled',false).html(origText); } },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).html(origText); }
+                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).html(origText); } },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).html(origText); }
                 });
             });
         },
@@ -418,13 +431,13 @@
         initRecordPayment: function() {
             $('.alegra-record-payment').on('click', function() {
                 var $btn = $(this);
-                if(!confirm('Registrar pago en Alegra?')) return;
-                $btn.prop('disabled', true).text('Registrando...');
+                if(!confirm(S.confirmRecordPayment)) return;
+                $btn.prop('disabled', true).text(S.registering);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_record_payment', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
-                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r,'Error'),'error'); $btn.prop('disabled',false).text('Reintentar'); } },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).text(S.retry); } },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
             });
         },
@@ -439,20 +452,20 @@
             });
             function updateSelectedCount() {
                 var count = $('.alegra-bulk-check:checked').length;
-                $('.ac-selected-count').text(count > 0 ? count + ' ' + (count === 1 ? 'seleccionado' : 'seleccionados') : '');
+                $('.ac-selected-count').text(count > 0 ? count + ' ' + (count === 1 ? S.selectedOne : S.selectedMany) : '');
             }
-            
+
             // Push selected WC → Alegra
             $('.alegra-bulk-sync').on('click', function() {
                 var type = $(this).data('type');
                 var ids = $('.alegra-bulk-check:checked').map(function(){ return $(this).val(); }).get();
-                if (!ids.length) { showNotice('Selecciona al menos un elemento','warning'); return; }
-                var $btn = $(this).prop('disabled', true).text('Enviando...');
+                if (!ids.length) { showNotice(S.selectOneItem,'warning'); return; }
+                var $btn = $(this).prop('disabled', true).text(S.sending);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_bulk_sync', _ajax_nonce: alegraConnector.nonce, entity_type: type, ids: ids },
-                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r,'Error'),'error'); $btn.prop('disabled',false).text('Reintentar'); } },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).text(S.retry); } },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
             });
 
@@ -460,13 +473,13 @@
             $('.alegra-bulk-import').on('click', function() {
                 var type = $(this).data('type');
                 var ids = $('.alegra-bulk-check:checked').map(function(){ return $(this).val(); }).get();
-                if (!ids.length) { showNotice('Selecciona al menos un elemento','warning'); return; }
-                var $btn = $(this).prop('disabled', true).text('Trayendo...');
+                if (!ids.length) { showNotice(S.selectOneItem,'warning'); return; }
+                var $btn = $(this).prop('disabled', true).text(S.fetching);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_bulk_import', _ajax_nonce: alegraConnector.nonce, entity_type: type, ids: ids },
-                    success: function(r) { if(r.success){showNotice(safeMsg(r,'Completado'),'success');setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r,'Error'),'error');$btn.prop('disabled',false).text('Reintentar');} },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                    success: function(r) { if(r.success){showNotice(safeMsg(r, S.completed),'success');setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r, S.error),'error');$btn.prop('disabled',false).text(S.retry);} },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
             });
 
@@ -474,25 +487,25 @@
             $('.alegra-import-single').on('click', function() {
                 var $btn = $(this).prop('disabled', true);
                 var origText = $btn.text();
-                $btn.html('<span class="dashicons dashicons-update ac-spin" style="font-size:14px;width:14px;height:14px;"></span> Trayendo...');
+                $btn.html('<span class="dashicons dashicons-update ac-spin" style="font-size:14px;width:14px;height:14px;"></span> ' + S.fetching);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_import_single', _ajax_nonce: alegraConnector.nonce, entity_type: $btn.data('type'), entity_id: $btn.data('id') },
-                    success: function(r) { if(r.success){showNotice(safeMsg(r,'Actualizado'),'success');setTimeout(function(){location.reload();},1000);} else {showNotice(safeMsg(r,'Error'),'error');$btn.prop('disabled',false).html(origText);} },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).html(origText); }
+                    success: function(r) { if(r.success){showNotice(safeMsg(r, S.updatedSingle),'success');setTimeout(function(){location.reload();},1000);} else {showNotice(safeMsg(r, S.error),'error');$btn.prop('disabled',false).html(origText);} },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).html(origText); }
                 });
             });
 
             // Import from Alegra buttons (also used on Products/Customers list pages)
             $('.alegra-import-from-api').on('click', function() {
                 var $btn = $(this), type = $btn.data('type');
-                if (!confirm('Traer ' + type + ' desde Alegra? Esto puede crear o actualizar registros en WooCommerce.')) return;
-                $btn.prop('disabled', true).text('Descargando...');
+                if (!confirm(fmt(S.confirmImportFromApi, type))) return;
+                $btn.prop('disabled', true).text(S.downloading);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_import_from_api', _ajax_nonce: alegraConnector.nonce, import_type: type },
-                    success: function(r) { if(r.success){showNotice(safeMsg(r,'Importado'),'success');setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r,'Error'),'error');$btn.prop('disabled',false).text('Reintentar');} },
-                    error: function() { showNotice('Error de conexion','error'); $btn.prop('disabled',false).text('Reintentar'); }
+                    success: function(r) { if(r.success){showNotice(safeMsg(r, S.importedSingle),'success');setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r, S.error),'error');$btn.prop('disabled',false).text(S.retry);} },
+                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
             });
 
@@ -507,7 +520,7 @@
                 var startTime = Date.now();
                 var cancelled = false;
 
-                $label.text('Contando pedidos pendientes...');
+                $label.text(S.countingPending);
                 $fill.css('width', '5%');
                 $counters.text('');
                 $elapsed.text('');
@@ -517,7 +530,7 @@
 
                 var timerInterval = setInterval(function() {
                     var e = Math.floor((Date.now() - startTime) / 1000);
-                    $elapsed.text('Tiempo: ' + Math.floor(e / 60) + 'm ' + (e % 60) + 's');
+                    $elapsed.text(fmt(S.elapsed, Math.floor(e / 60), (e % 60)));
                 }, 1000);
 
                 var cleanup = function() { clearInterval(timerInterval); $modal.hide(); $('body').removeClass('ac-modal-open'); };
@@ -525,8 +538,8 @@
                 $modal.find('.sync-cancel-btn').off('click').on('click', function() {
                     cancelled = true;
                     cleanup();
-                    $btn.prop('disabled', false).text('Facturar pendientes');
-                    showNotice('Cancelado', 'warning');
+                    $btn.prop('disabled', false).text(S.invoicePending);
+                    showNotice(S.cancelled, 'warning');
                 });
 
                 // Phase 1: count pending
@@ -534,17 +547,17 @@
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: { action: 'alegra_sync_pending_start', _ajax_nonce: alegraConnector.nonce },
                     success: function(r) {
-                        if (!r.success || cancelled) { cleanup(); $btn.prop('disabled', false).text('Facturar pendientes'); return; }
+                        if (!r.success || cancelled) { cleanup(); $btn.prop('disabled', false).text(S.invoicePending); return; }
                         var total = r.data.total;
                         if (total === 0) {
-                            cleanup(); $btn.prop('disabled', false).text('Facturar pendientes');
-                            showNotice('No hay pedidos pendientes por facturar', 'info');
+                            cleanup(); $btn.prop('disabled', false).text(S.invoicePending);
+                            showNotice(S.noPendingOrders, 'info');
                             return;
                         }
-                        $label.text('Facturando ' + total + ' pedidos pendientes...');
+                        $label.text(fmt(S.invoicingPending, total));
                         processPage();
                     },
-                    error: function() { cleanup(); $btn.prop('disabled', false).text('Facturar pendientes'); showNotice('Error', 'error'); }
+                    error: function() { cleanup(); $btn.prop('disabled', false).text(S.invoicePending); showNotice(S.error, 'error'); }
                 });
 
                 function processPage() {
@@ -553,23 +566,23 @@
                         url: alegraConnector.ajaxUrl, type: 'POST',
                         data: { action: 'alegra_sync_pending_page', _ajax_nonce: alegraConnector.nonce },
                         success: function(r) {
-                            if (!r.success || cancelled) { cleanup(); $btn.prop('disabled', false).text('Facturar pendientes'); return; }
+                            if (!r.success || cancelled) { cleanup(); $btn.prop('disabled', false).text(S.invoicePending); return; }
                             var d = r.data;
                             $fill.css('width', d.percent + '%');
                             $label.text(d.message);
-                            $counters.text(d.synced + ' facturados | ' + d.errors + ' errores');
+                            $counters.text(d.synced + ' ' + S.invoicedLabel + ' | ' + d.errors + ' ' + S.errorsLabel);
                             if (d.done) {
                                 $fill.css('width', '100%');
                                 setTimeout(function() {
                                     cleanup();
-                                    showNotice(d.synced + ' facturas creadas. ' + d.errors + ' errores.', 'success');
+                                    showNotice(fmt(S.invoicesCreated, d.synced, d.errors), 'success');
                                     setTimeout(function(){ location.reload(); }, 1500);
                                 }, 1000);
                             } else {
                                 processPage();
                             }
                         },
-                        error: function() { cleanup(); $btn.prop('disabled', false).text('Facturar pendientes'); }
+                        error: function() { cleanup(); $btn.prop('disabled', false).text(S.invoicePending); }
                     });
                 }
             });

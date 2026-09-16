@@ -55,7 +55,7 @@
         var previous = select.value;
         var placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = 'Seleccione…';
+        placeholder.textContent = (cfg.strings && cfg.strings.selectPlaceholder) || 'Seleccione…';
 
         while (select.firstChild) {
             select.removeChild(select.firstChild);
@@ -113,7 +113,7 @@
         details.className = 'alegra-group-c-details';
 
         var summary = document.createElement('summary');
-        summary.textContent = 'Más datos (opcional)';
+        summary.textContent = (cfg.strings && cfg.strings.moreData) || 'Más datos (opcional)';
         details.appendChild(summary);
 
         first.parentNode.insertBefore(details, first);

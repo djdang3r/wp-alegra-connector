@@ -313,6 +313,11 @@ class Checkout_Integration
             'regimesPerson' => Billing_Fields::REGIMES_PERSON,
             'regimesLegal'  => Billing_Fields::REGIMES_LEGAL,
             'prefix'        => 'billing_alegra_',
+            // AC-35d: user-facing strings, no longer hardcoded in the JS file.
+            'strings'       => [
+                'selectPlaceholder' => __('Seleccione…', 'alegra-connector'),
+                'moreData'          => __('Más datos (opcional)', 'alegra-connector'),
+            ],
         ]);
     }
 

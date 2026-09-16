@@ -83,12 +83,12 @@ class State_Sync
 
         try {
             if (!function_exists('wc_get_order')) {
-                return new \WP_Error('woocommerce_missing', 'WooCommerce no está disponible');
+                return new \WP_Error('woocommerce_missing', __('WooCommerce no está disponible', 'alegra-connector'));
             }
 
             $order = wc_get_order($order_id);
             if (!$order instanceof \WC_Order) {
-                return new \WP_Error('invalid_order', 'Pedido no válido');
+                return new \WP_Error('invalid_order', __('Pedido no válido', 'alegra-connector'));
             }
 
             // Idempotency: this specific refund was already credited.
@@ -107,7 +107,7 @@ class State_Sync
 
             $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
             if ($invoice_id === '') {
-                return new \WP_Error('no_invoice', 'El pedido no tiene una factura de Alegra vinculada');
+                return new \WP_Error('no_invoice', __('El pedido no tiene una factura de Alegra vinculada', 'alegra-connector'));
             }
 
             // Cumulative cap: the sum of every refund must not exceed the order total.
@@ -120,7 +120,7 @@ class State_Sync
             if ($refunded_total > (float) $order->get_total()) {
                 return new \WP_Error(
                     'refund_exceeds_total',
-                    'El total de los reembolsos supera el total del pedido'
+                    __('El total de los reembolsos supera el total del pedido', 'alegra-connector')
                 );
             }
 
@@ -135,7 +135,7 @@ class State_Sync
 
             $orders = self::make_orders_handler();
             if ($orders === null) {
-                return new \WP_Error('orders_handler_unavailable', 'No se pudo inicializar el manejador de pedidos.');
+                return new \WP_Error('orders_handler_unavailable', __('No se pudo inicializar el manejador de pedidos.', 'alegra-connector'));
             }
 
             $result = $orders->create_credit_note_for_refund($order_id, $amount, '', $refund_id);
@@ -262,14 +262,14 @@ class State_Sync
 
         if (self::is_multi_payment($order)) {
             self::queue_admin_notice(sprintf(
-                'Pedido #%d tiene pagos múltiples. El método de pago no se sincronizó.',
+                __('Pedido #%d tiene pagos múltiples. El método de pago no se sincronizó.', 'alegra-connector'),
                 $order_id
             ));
             return;
         }
 
         if (!self::is_billing_data_valid((int) $order->get_customer_id())) {
-            self::queue_admin_notice('No se puede actualizar el método de pago en Alegra: faltan datos de facturación.');
+            self::queue_admin_notice(__('No se puede actualizar el método de pago en Alegra: faltan datos de facturación.', 'alegra-connector'));
             return;
         }
 
