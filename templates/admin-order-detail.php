@@ -1,7 +1,7 @@
 <?php
 if (!defined('ABSPATH')) exit;
 
-$payment_id = (string) get_post_meta($order->get_id(), '_alegra_payment_id', true);
+$payment_id = (string) $order->get_meta('_alegra_payment_id', true);
 $payment_synced = $payment_id !== '' && $payment_id !== null;
 
 // Safe defaults (PHP 8+)

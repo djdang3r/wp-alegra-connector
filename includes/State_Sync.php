@@ -77,10 +77,19 @@ class State_Sync
         set_transient($lock_key, 1, 30);
 
         try {
+            if (!function_exists('wc_get_order')) {
+                return new \WP_Error('woocommerce_missing', 'WooCommerce no está disponible');
+            }
+
+            $order = wc_get_order($order_id);
+            if (!$order instanceof \WC_Order) {
+                return new \WP_Error('invalid_order', 'Pedido no válido');
+            }
+
             // Idempotency: this specific refund was already credited.
             if ($refund_id > 0) {
                 $meta_key = sprintf(self::REFUND_META_FMT, $refund_id);
-                $existing = get_post_meta($order_id, $meta_key, true);
+                $existing = $order->get_meta($meta_key, true);
                 if (!empty($existing)) {
                     self::log('info', 'Refund already processed', [
                         'order_id' => $order_id,
@@ -91,16 +100,7 @@ class State_Sync
                 }
             }
 
-            if (!function_exists('wc_get_order')) {
-                return new \WP_Error('woocommerce_missing', 'WooCommerce no está disponible');
-            }
-
-            $order = wc_get_order($order_id);
-            if (!$order instanceof \WC_Order) {
-                return new \WP_Error('invalid_order', 'Pedido no válido');
-            }
-
-            $invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+            $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
             if ($invoice_id === '') {
                 return new \WP_Error('no_invoice', 'El pedido no tiene una factura de Alegra vinculada');
             }
@@ -149,7 +149,8 @@ class State_Sync
 
             $credit_note_id = (string) ($result['id'] ?? '');
             if ($refund_id > 0 && $credit_note_id !== '') {
-                update_post_meta($order_id, sprintf(self::REFUND_META_FMT, $refund_id), $credit_note_id);
+                $order->update_meta_data(sprintf(self::REFUND_META_FMT, $refund_id), $credit_note_id);
+                $order->save();
             }
 
             self::log('info', 'Refund synced to Alegra', [
@@ -227,7 +228,8 @@ class State_Sync
             return;
         }
 
-        if ((string) get_post_meta($order_id, '_alegra_invoice_id', true) === '') {
+        $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        if ($invoice_id === '') {
             return;
         }
 
@@ -265,7 +267,7 @@ class State_Sync
         $orders = new Sync\Orders($api, $logger);
         $payment_method = $orders->getPaymentMethodForGateway($current);
 
-        $result = $api->update_invoice((string) get_post_meta($order_id, '_alegra_invoice_id', true), [
+        $result = $api->update_invoice($invoice_id, [
             'paymentMethod' => $payment_method,
         ]);
 

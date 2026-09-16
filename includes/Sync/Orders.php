@@ -51,7 +51,7 @@ class Orders
         set_transient($lock_key, 1, 30); // 30s lock
 
         try {
-            $alegra_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+            $alegra_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
             if ($alegra_id !== '') {
                 $this->logger->info('Order already has Alegra invoice', [
@@ -88,12 +88,13 @@ class Orders
             }
 
             if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($order_id, '_alegra_invoice_id', (string) $result['id']);
+                $order->update_meta_data('_alegra_invoice_id', (string) $result['id']);
                 $invoice_number = $result['number'] ?? $result['id'];
                 if (isset($result['numberTemplate']['fullNumber'])) {
                     $invoice_number = $result['numberTemplate']['fullNumber'];
                 }
-                update_post_meta($order_id, '_alegra_invoice_number', (string) $invoice_number);
+                $order->update_meta_data('_alegra_invoice_number', (string) $invoice_number);
+                $order->save();
                 // Add note to WC order
                 $order->add_order_note(sprintf(
                     __('Factura Alegra #%s creada.', 'alegra-connector'),
@@ -121,7 +122,7 @@ class Orders
             return $invoice_result;
         }
 
-        $existing_payment_id = (string) get_post_meta($order->get_id(), '_alegra_payment_id', true);
+        $existing_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment_id !== '') {
             return $invoice_result;
         }
@@ -131,10 +132,11 @@ class Orders
         if (!empty($payment_data)) {
             $payment_result = $this->api->create_payment($payment_data);
             if (!is_wp_error($payment_result)) {
-                update_post_meta($order->get_id(), '_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
+                $order->update_meta_data('_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
                 if (!empty($payment_result['number'])) {
-                    update_post_meta($order->get_id(), '_alegra_payment_number', $payment_result['number']);
+                    $order->update_meta_data('_alegra_payment_number', $payment_result['number']);
                 }
+                $order->save();
                 $order->add_order_note(sprintf(
                     __('Pago Alegra #%s registrado.', 'alegra-connector'),
                     $payment_result['number'] ?? $payment_result['id'] ?? ''
@@ -151,7 +153,7 @@ class Orders
 
     public function create_credit_note(\WC_Order $order): array|\WP_Error
     {
-        $alegra_invoice_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
         if ($alegra_invoice_id === '') {
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
@@ -213,7 +215,8 @@ class Orders
 
         if (!is_wp_error($result)) {
             $cn_id = $result['id'] ?? '';
-            update_post_meta($order->get_id(), '_alegra_credit_note_id', (string) $cn_id);
+            $order->update_meta_data('_alegra_credit_note_id', (string) $cn_id);
+            $order->save();
             $this->logger->info('Credit note created in Alegra', [
                 'order_id' => $order->get_id(),
                 'credit_note_id' => $cn_id,
@@ -249,7 +252,7 @@ class Orders
             return new \WP_Error('invalid_order', __('Pedido no válido.', 'alegra-connector'));
         }
 
-        $invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
         if ($invoice_id === '') {
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
         }
@@ -257,7 +260,7 @@ class Orders
         // Idempotency: this specific refund was already credited.
         $refund_meta_key = '_alegra_credit_note_for_refund_' . $refund_id;
         if ($refund_id > 0) {
-            $stored = get_post_meta($order_id, $refund_meta_key, true);
+            $stored = $order->get_meta($refund_meta_key, true);
             if (!empty($stored)) {
                 return ['id' => (string) $stored, 'already_exists' => true];
             }
@@ -275,7 +278,7 @@ class Orders
         }
 
         // Cumulative cap: never credit more than the original invoice total.
-        $credited = (float) get_post_meta($order_id, '_alegra_credited_amount', true);
+        $credited = (float) $order->get_meta('_alegra_credited_amount', true);
         $invoice_total = (!is_wp_error($invoice) && isset($invoice['total']))
             ? (float) $invoice['total']
             : (float) $order->get_total();
@@ -318,7 +321,7 @@ class Orders
 
         $data = [
             'date'     => date('Y-m-d'),
-            'client'   => ['id' => (string) get_post_meta($order_id, '_billing_alegra_contact_id', true)],
+            'client'   => ['id' => (string) $order->get_meta('_billing_alegra_contact_id', true)],
             'invoices' => [[
                 'id'     => $invoice_id,
                 'amount' => round($amount, 2),
@@ -345,10 +348,11 @@ class Orders
 
         $cn_id = (string) ($result['id'] ?? '');
 
-        update_post_meta($order_id, '_alegra_credited_amount', $credited + $amount);
+        $order->update_meta_data('_alegra_credited_amount', $credited + $amount);
         if ($refund_id > 0) {
-            update_post_meta($order_id, $refund_meta_key, $cn_id);
+            $order->update_meta_data($refund_meta_key, $cn_id);
         }
+        $order->save();
 
         $order->add_order_note(sprintf(
             __('Nota de crédito Alegra #%s creada por reembolso de %s.', 'alegra-connector'),
@@ -370,7 +374,7 @@ class Orders
 
     public function void_invoice(\WC_Order $order): array|\WP_Error
     {
-        $alegra_invoice_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
         if ($alegra_invoice_id === '') {
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
@@ -408,7 +412,7 @@ class Orders
         $orders = wc_get_orders($args);
 
         foreach ($orders as $order) {
-            $alegra_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+            $alegra_id = (string) $order->get_meta('_alegra_invoice_id', true);
             if ($alegra_id !== '') {
                 continue;
             }
@@ -528,14 +532,15 @@ class Orders
         }
 
         // Step 1 — cached contact id (order meta, then user meta).
-        $cached = (string) get_post_meta($order_id, '_billing_alegra_contact_id', true);
+        $cached = (string) $order->get_meta('_billing_alegra_contact_id', true);
         if ($cached !== '') {
             return $cached;
         }
         if ($customer) {
             $cached = (string) get_user_meta($customer->ID, 'alegra_contact_id', true);
             if ($cached !== '') {
-                update_post_meta($order_id, '_billing_alegra_contact_id', $cached);
+                $order->update_meta_data('_billing_alegra_contact_id', $cached);
+                $order->save();
                 return $cached;
             }
         }
@@ -560,7 +565,7 @@ class Orders
         if (get_transient($lock_key)) {
             usleep(500000);
             // Re-check cache once after the concurrent request had time to persist.
-            $cached = (string) get_post_meta($order_id, '_billing_alegra_contact_id', true);
+            $cached = (string) $order->get_meta('_billing_alegra_contact_id', true);
             if ($cached !== '') {
                 return $cached;
             }
@@ -569,9 +574,9 @@ class Orders
             set_transient($lock_key, 1, 30);
             try {
                 // Step 3a — lookup by identification (new format).
-                $idtype = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_idtype', true) : (string) get_post_meta($order_id, '_billing_alegra_idtype', true);
-                $idnum  = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_identification', true) : (string) get_post_meta($order_id, '_billing_alegra_identification', true);
-                $dv     = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_dv', true) : (string) get_post_meta($order_id, '_billing_alegra_dv', true);
+                $idtype = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_idtype', true) : (string) $order->get_meta('_billing_alegra_idtype', true);
+                $idnum  = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_identification', true) : (string) $order->get_meta('_billing_alegra_identification', true);
+                $dv     = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_dv', true) : (string) $order->get_meta('_billing_alegra_dv', true);
                 if ($idtype !== '' && $idnum !== '') {
                     $contact = $this->api->find_contact_by_identification($idtype, $idnum, $dv !== '' ? $dv : null);
                     if ($contact && isset($contact['id'])) {
@@ -639,7 +644,8 @@ class Orders
      */
     private function persist_contact_id(\WC_Order $order, ?\WP_User $customer, string $contact_id): void
     {
-        update_post_meta($order->get_id(), '_billing_alegra_contact_id', $contact_id);
+        $order->update_meta_data('_billing_alegra_contact_id', $contact_id);
+        $order->save();
         if ($customer) {
             update_user_meta($customer->ID, 'alegra_contact_id', $contact_id);
         }
@@ -1028,18 +1034,16 @@ class Orders
 
         $order_ids = [];
         foreach ($orders as $o) {
-            $alegra_id = (string) get_post_meta($o->get_id(), '_alegra_invoice_id', true);
+            $alegra_id = (string) $o->get_meta('_alegra_invoice_id', true);
             if ($alegra_id !== '') {
-                $order_ids[] = $o->get_id();
+                $order_ids[$o->get_id()] = $alegra_id;
             }
         }
 
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
-        foreach ($order_ids as $order_id) {
+        foreach ($order_ids as $order_id => $invoice_id) {
             $result['checked']++;
-            $invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
-            if ($invoice_id === '') continue;
 
             $invoice = $this->api->get_invoice($invoice_id);
             if (is_wp_error($invoice)) {

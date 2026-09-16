@@ -1077,9 +1077,9 @@ class Admin_Dashboard
             wp_die(esc_html__('Pedido no encontrado.', 'alegra-connector'));
         }
 
-        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
-        $alegra_invoice_number = get_post_meta($order_id, '_alegra_invoice_number', true);
-        $alegra_payment_id = (string) get_post_meta($order_id, '_alegra_payment_id', true);
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        $alegra_invoice_number = $order->get_meta('_alegra_invoice_number', true);
+        $alegra_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         $alegra_data = null;
         $alegra_error = null;
 
@@ -1481,13 +1481,13 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
         }
 
-        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
         if ($alegra_invoice_id === '' || $alegra_invoice_id === null) {
             wp_send_json_error(['message' => __('Primero crea la factura en Alegra.', 'alegra-connector')]);
         }
 
         // Check if payment already recorded
-        $existing_payment = (string) get_post_meta($order_id, '_alegra_payment_id', true);
+        $existing_payment = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment !== '' && $existing_payment !== null) {
             wp_send_json_error(['message' => __('El pago ya est  registrado en Alegra.', 'alegra-connector')]);
         }
@@ -1521,10 +1521,11 @@ class Admin_Dashboard
         }
 
         $payment_id = (int) ($result['id'] ?? 0);
-        update_post_meta($order_id, '_alegra_payment_id', $payment_id);
+        $order->update_meta_data('_alegra_payment_id', $payment_id);
         if (!empty($result['number'])) {
-            update_post_meta($order_id, '_alegra_payment_number', $result['number']);
+            $order->update_meta_data('_alegra_payment_number', $result['number']);
         }
+        $order->save();
 
         $order->add_order_note(sprintf(
             __('Pago Alegra #%s registrado.', 'alegra-connector'),
@@ -1938,7 +1939,10 @@ class Admin_Dashboard
         $order_id = (int) ($_GET['order_id'] ?? 0);
         if ($order_id <= 0) wp_die(__('Pedido invalido.', 'alegra-connector'));
 
-        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        $order = wc_get_order($order_id);
+        if (!$order) wp_die(__('Pedido invalido.', 'alegra-connector'));
+
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
         if ($alegra_invoice_id === '' || $alegra_invoice_id === null) wp_die(__('Este pedido no tiene factura en Alegra.', 'alegra-connector'));
 
         $result = $this->api->get_invoice_pdf($alegra_invoice_id);
