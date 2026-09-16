@@ -15,6 +15,7 @@
 scripts/
 temp_pkg/
 tests/
+releases/
 
 # Dependencies (if/when added — keep out of the ZIP)
 /vendor/
@@ -53,6 +54,7 @@ phpcs.xml*
 Thumbs.db
 desktop.ini
 *.zip
+*.sha256
 *.tar.gz
 *.tar
 *.tgz
