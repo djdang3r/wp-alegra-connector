@@ -254,9 +254,9 @@ class Checkout_Integration
     {
         $schema = static function (array $properties): array {
             return [
-                'checkout' => [
+                'customer' => [
                     'properties' => [
-                        'additional_fields' => [
+                        'address' => [
                             'properties' => $properties,
                         ],
                     ],

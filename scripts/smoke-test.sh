@@ -13,7 +13,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if ! command -v php >/dev/null 2>&1; then
-    echo "error: php not found in PATH" >&2
+    if command -v docker >/dev/null 2>&1; then
+        echo "info: php not found in PATH; re-running inside php:8.3-cli (docker)..." >&2
+        exec docker run --rm -v "$REPO_ROOT":/app -w /app php:8.3-cli bash scripts/smoke-test.sh "$@"
+    fi
+    echo "error: php not found in PATH (and docker is unavailable)" >&2
     exit 2
 fi
 
