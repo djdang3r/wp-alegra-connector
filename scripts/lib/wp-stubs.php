@@ -317,6 +317,13 @@ function sanitize_textarea_field($text)
     return trim(strip_tags((string) $text));
 }
 function sanitize_key($text) { return preg_replace('/[^a-z0-9_\-]/', '', strtolower((string) $text)); }
+function sanitize_title($title, $fallback_title = '', $context = 'save')
+{
+    $title = strtolower(trim((string) $title));
+    $title = preg_replace('/[^a-z0-9]+/', '-', $title);
+    $title = trim((string) $title, '-');
+    return $title !== '' ? $title : (string) $fallback_title;
+}
 function wp_unslash($value)
 {
     if (is_array($value)) { return array_map('wp_unslash', $value); }
@@ -450,7 +457,13 @@ function get_userdata($user_id)
 }
 function get_users($args = [])
 {
-    return array_values($GLOBALS['wp_users']);
+    $users = array_values($GLOBALS['wp_users']);
+    $number = (int) ($args['number'] ?? -1);
+    $offset = (int) ($args['offset'] ?? 0);
+    if ($number > 0) {
+        $users = array_slice($users, $offset, $number);
+    }
+    return $users;
 }
 function get_user_by($field, $value)
 {
@@ -774,7 +787,16 @@ function wc_get_product($product_id)
     return $GLOBALS['wc_products'][$product_id] ?? false;
 }
 function wc_get_orders($args = []) { return $GLOBALS['wc_orders'] ?? []; }
-function wc_get_products($args = []) { return []; }
+function wc_get_products($args = [])
+{
+    $products = array_values($GLOBALS['wc_products'] ?? []);
+    $limit = (int) ($args['limit'] ?? -1);
+    $page = max(1, (int) ($args['page'] ?? 1));
+    if ($limit > 0) {
+        $products = array_slice($products, ($page - 1) * $limit, $limit);
+    }
+    return $products;
+}
 function wc_get_product_id_by_sku($sku)
 {
     foreach (($GLOBALS['wc_products'] ?? []) as $product) {

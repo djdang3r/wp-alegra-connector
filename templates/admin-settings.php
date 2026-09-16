@@ -90,7 +90,7 @@
 </div>
 <label><input type="checkbox" name="alegra_connector_sync_inactive_products" value="1" <?php checked(get_option('alegra_connector_sync_inactive_products',false));?>> <?php esc_html_e('Productos inactivos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Al activar, tambien se sincronizan los productos inactivos de Alegra. Se importaran como Borrador en WooCommerce. Al desactivar (por defecto), solo se sincronizan productos activos (status=active en Alegra). La API de Alegra permite filtrar por status: active, inactive.','alegra-connector');?></p>
 </fieldset></td></tr>
-<tr><th><?php esc_html_e('Fuente de inventario:','alegra-connector');?></th><td><select name="alegra_connector_inventory_source"><option value="alegra" <?php selected(get_option('alegra_connector_inventory_source','alegra'),'alegra');?>><?php esc_html_e('Alegra (recomendado)','alegra-connector');?></option><option value="woocommerce" <?php selected(get_option('alegra_connector_inventory_source'),'woocommerce');?>><?php esc_html_e('WooCommerce','alegra-connector');?></option></select><p class="description"><?php esc_html_e('Define que sistema es la fuente principal del inventario. Si hay conflicto, gana la fuente seleccionada.','alegra-connector');?></p></td></tr>
+<tr><th><?php esc_html_e('Fuente de inventario:','alegra-connector');?></th><td><select name="alegra_connector_inventory_source"><option value="alegra" <?php selected(get_option('alegra_connector_inventory_source','alegra'),'alegra');?>><?php esc_html_e('Alegra (recomendado)','alegra-connector');?></option><option value="woocommerce" <?php selected(get_option('alegra_connector_inventory_source'),'woocommerce');?>><?php esc_html_e('WooCommerce','alegra-connector');?></option></select><p class="description"><?php esc_html_e('Con "Alegra", la sincronización periódica importa el stock desde Alegra y sobrescribe el de WooCommerce. Con "WooCommerce", el plugin NO toca el stock de WooCommerce (solo gestionas inventario en tu tienda).','alegra-connector');?></p></td></tr>
 <tr><th><?php esc_html_e('Enviar ventas y pagos a Alegra:','alegra-connector');?></th><td><fieldset>
 <label><input type="checkbox" name="alegra_connector_push_orders_enabled" value="1" <?php checked(get_option('alegra_connector_push_orders_enabled',true));?>> <strong><?php esc_html_e('Activar envio automatico de ventas y pagos a Alegra','alegra-connector');?></strong></label>
 <p class="description" style="margin:2px 0 6px 24px;"><?php esc_html_e('Al activar esta opcion, cuando se complete una venta en WooCommerce, se creara automaticamente la factura en Alegra. Si desactivas esta opcion, deberas crear las facturas manualmente desde el dashboard o usando el boton "Facturar pendientes".','alegra-connector');?></p>
@@ -263,13 +263,13 @@ $ac_group_badge = ['A'=>'danger','B'=>'warning','C'=>'neutral'];
 <h2><?php esc_html_e('Configuración Avanzada','alegra-connector');?></h2>
 
 <table class="form-table">
-<!-- Conflict Resolution -->
-<tr><th><?php esc_html_e('Resolucion de conflictos:','alegra-connector');?></th><td>
+<!-- Conflict Resolution (customers only) -->
+<tr><th><?php esc_html_e('Resolucion de conflictos de clientes:','alegra-connector');?></th><td>
 <select name="alegra_connector_conflict_resolution">
     <option value="alegra_wins" <?php selected(get_option('alegra_connector_conflict_resolution','alegra_wins'),'alegra_wins');?>><?php esc_html_e('Alegra gana (recomendado)','alegra-connector');?></option>
     <option value="woocommerce_wins" <?php selected(get_option('alegra_connector_conflict_resolution'),'woocommerce_wins');?>><?php esc_html_e('WooCommerce gana','alegra-connector');?></option>
 </select>
-<p class="description"><?php esc_html_e('Si un producto o cliente se edita en AMBAS plataformas entre sincronizaciones, este ajuste define cual version prevalece. Con "Alegra gana", el sistema contable tiene prioridad.','alegra-connector');?></p></td></tr>
+<p class="description"><?php esc_html_e('Solo aplica a clientes: cuando un cliente ya existe en Alegra (mismo email o NIT), define si se conserva la version de Alegra o la de WooCommerce. No afecta a productos ni pedidos.','alegra-connector');?></p></td></tr>
 
 <!-- Log Retention -->
 <tr><th><?php esc_html_e('Retencion de logs:','alegra-connector');?></th><td>

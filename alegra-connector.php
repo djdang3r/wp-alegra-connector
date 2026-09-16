@@ -414,7 +414,7 @@ final class Alegra_Connector
         );
 
         // 3. Clear ALL cron events with alegra prefix
-        $cron_hooks = ['alegra_connector_cron_sync', 'alegra_connector_process_webhook'];
+        $cron_hooks = ['alegra_connector_cron_sync'];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }

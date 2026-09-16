@@ -27,7 +27,6 @@ class Schema
         self::create_runs_table();
         self::create_push_log_table();
         self::create_entity_map_table();
-        self::create_push_queue_table();
         self::maybe_migrate_alegra_id_columns();
     }
 
@@ -208,34 +207,6 @@ class Schema
             PRIMARY KEY (id),
             UNIQUE KEY uk_mapping (alegra_type, alegra_id, wc_entity_type),
             KEY idx_wc (wc_entity_type, wc_entity_id)
-        ) $charset_collate;";
-
-        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-        dbDelta($sql);
-    }
-
-    public static function create_push_queue_table(): void
-    {
-        global $wpdb;
-        $table = $wpdb->prefix . 'alegra_push_queue';
-        $charset_collate = $wpdb->get_charset_collate();
-
-        $sql = "CREATE TABLE $table (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            entity_type VARCHAR(20) NOT NULL,
-            entity_id BIGINT UNSIGNED NOT NULL,
-            action VARCHAR(20) NOT NULL,
-            payload_json LONGTEXT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
-            detected_at DATETIME NOT NULL,
-            detected_by BIGINT UNSIGNED NULL,
-            reviewed_at DATETIME NULL,
-            reviewed_by BIGINT UNSIGNED NULL,
-            applied_at DATETIME NULL,
-            error_message TEXT NULL,
-            PRIMARY KEY (id),
-            KEY idx_status_detected (status, detected_at),
-            KEY idx_entity (entity_type, entity_id)
         ) $charset_collate;";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';

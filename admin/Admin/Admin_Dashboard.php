@@ -63,11 +63,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_kill_run', [$this, 'ajax_kill_run']);
         add_action('wp_ajax_alegra_kill_all', [$this, 'ajax_kill_all']);
         add_action('wp_ajax_alegra_clear_kill_switch', [$this, 'ajax_clear_kill_switch']);
-        add_action('wp_ajax_alegra_approve_push', [$this, 'ajax_approve_push']);
-        add_action('wp_ajax_alegra_reject_push', [$this, 'ajax_reject_push']);
-        add_action('wp_ajax_alegra_push_queue_status', [$this, 'ajax_push_queue_status']);
         add_action('wp_ajax_alegra_rebuild_image_index', [$this, 'ajax_rebuild_image_index']);
-        add_action('wp_ajax_alegra_save_sync_directions', [$this, 'ajax_save_sync_directions']);
         add_action('wp_ajax_alegra_image_index_stats', [$this, 'ajax_image_index_stats']);
         add_action('wp_ajax_alegra_wizard_advance', [$this, 'ajax_wizard_advance']);
         add_action('wp_ajax_alegra_wizard_skip', [$this, 'ajax_wizard_skip']);
@@ -249,15 +245,6 @@ class Admin_Dashboard
             'manage_woocommerce',
             'alegra-connector-monitor',
             [$this, 'render_monitor_page']
-        );
-
-        add_submenu_page(
-            'alegra-connector',
-            __('Cola de Push', 'alegra-connector'),
-            __('Cola Push', 'alegra-connector'),
-            'manage_woocommerce',
-            'alegra-connector-push-queue',
-            [$this, 'render_push_queue_page']
         );
 
         add_submenu_page(
@@ -536,14 +523,6 @@ class Admin_Dashboard
             wp_die(esc_html__('No tienes permisos.', 'alegra-connector'));
         }
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-monitor.php';
-    }
-
-    public function render_push_queue_page(): void
-    {
-        if (!current_user_can('manage_woocommerce')) {
-            wp_die(esc_html__('No tienes permisos.', 'alegra-connector'));
-        }
-        include ALEGRA_CONNECTOR_PATH . 'templates/admin-push-queue.php';
     }
 
     public function render_wizard_page(): void
@@ -1652,44 +1631,95 @@ class Admin_Dashboard
         wp_send_json_success(['message' => __('Sincronización completada.', 'alegra-connector'), 'data' => $result]);
     }
 
+    /**
+     * Collect every exportable row for the given type, paginated to completion
+     * (AC-64). The previous implementation silently capped at 500 rows.
+     *
+     * @return array<int, array<int, string>>
+     */
+    public static function collect_export_rows(string $type): array
+    {
+        $per_page = 500;
+        $rows = [];
+
+        if ($type === 'products') {
+            $page = 1;
+            while (true) {
+                $products = wc_get_products([
+                    'limit'  => $per_page,
+                    'page'   => $page,
+                    'status' => 'publish',
+                ]);
+                if (empty($products)) {
+                    break;
+                }
+                foreach ($products as $p) {
+                    $ai = (string) get_post_meta($p->get_id(), '_alegra_item_id', true);
+                    $rows[] = array_map([self::class, 'csv_safe_cell'], [
+                        $p->get_name(), $p->get_sku(), $p->get_price(), $p->get_stock_quantity(),
+                        // UUID strings are never > 0 — compare to '' instead.
+                        $p->get_type(), $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
+                    ]);
+                }
+                if (count($products) < $per_page) {
+                    break;
+                }
+                $page++;
+            }
+            return $rows;
+        }
+
+        $offset = 0;
+        while (true) {
+            $customers = get_users([
+                'role'   => 'customer',
+                'number' => $per_page,
+                'offset' => $offset,
+            ]);
+            if (empty($customers)) {
+                break;
+            }
+            foreach ($customers as $c) {
+                $ai = (string) get_user_meta($c->ID, 'alegra_contact_id', true);
+                $rows[] = array_map([self::class, 'csv_safe_cell'], [
+                    $c->display_name, $c->user_email, get_user_meta($c->ID, 'billing_phone', true),
+                    // UUID strings are never > 0 — compare to '' instead.
+                    $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
+                ]);
+            }
+            if (count($customers) < $per_page) {
+                break;
+            }
+            $offset += $per_page;
+        }
+
+        return $rows;
+    }
+
     public function ajax_export_csv(): void
     {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_die();
 
         $type = sanitize_text_field($_GET['export_type'] ?? 'products');
+        $is_products = ($type === 'products');
 
-        if ($type === 'products') {
-            $products = wc_get_products(['limit' => 500, 'status' => 'publish']);
-            header('Content-Type: text/csv; charset=utf-8');
-            header('Content-Disposition: attachment; filename="alegra-productos-' . date('Y-m-d') . '.csv"');
-            $out = fopen('php://output', 'w');
+        header('Content-Type: text/csv; charset=utf-8');
+        header(
+            'Content-Disposition: attachment; filename="'
+            . ($is_products ? 'alegra-productos-' : 'alegra-clientes-') . date('Y-m-d') . '.csv"'
+        );
+
+        $out = fopen('php://output', 'w');
+        if ($is_products) {
             fputcsv($out, ['name', 'sku', 'price', 'stock', 'type', 'alegra_id', 'sync_status']);
-            foreach ($products as $p) {
-                $ai = (string) get_post_meta($p->get_id(), '_alegra_item_id', true);
-                fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
-                    $p->get_name(), $p->get_sku(), $p->get_price(), $p->get_stock_quantity(),
-                    // UUID strings are never > 0 — compare to '' instead.
-                    $p->get_type(), $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
-                ]));
-            }
-            fclose($out);
         } else {
-            $customers = get_users(['role' => 'customer', 'number' => 500]);
-            header('Content-Type: text/csv; charset=utf-8');
-            header('Content-Disposition: attachment; filename="alegra-clientes-' . date('Y-m-d') . '.csv"');
-            $out = fopen('php://output', 'w');
             fputcsv($out, ['name', 'email', 'phone', 'alegra_id', 'sync_status']);
-            foreach ($customers as $c) {
-                $ai = (string) get_user_meta($c->ID, 'alegra_contact_id', true);
-                fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
-                    $c->display_name, $c->user_email, get_user_meta($c->ID, 'billing_phone', true),
-                    // UUID strings are never > 0 — compare to '' instead.
-                    $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
-                ]));
-            }
-            fclose($out);
         }
+        foreach (self::collect_export_rows($type) as $row) {
+            fputcsv($out, $row);
+        }
+        fclose($out);
         exit;
     }
 
@@ -2081,7 +2111,7 @@ class Admin_Dashboard
         );
 
         // 4. Clear ALL cron events with alegra prefix
-        $cron_hooks = ['alegra_connector_cron_sync', 'alegra_connector_process_webhook'];
+        $cron_hooks = ['alegra_connector_cron_sync'];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }
@@ -2215,7 +2245,7 @@ class Admin_Dashboard
         $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_alegra\\_%' OR option_name LIKE '_transient_timeout_alegra\\_%' ESCAPE '\\\\'");
 
         // Clear cron
-        $cron_hooks = ['alegra_connector_cron_sync', 'alegra_connector_process_webhook'];
+        $cron_hooks = ['alegra_connector_cron_sync'];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }
@@ -2267,113 +2297,6 @@ class Admin_Dashboard
         ]);
     }
 
-    /**
-     * AJAX: Approve a pending push queue item and send it to Alegra.
-     */
-    public function ajax_approve_push(): void
-    {
-        check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error();
-
-        $queue_id = (int) ($_POST['queue_id'] ?? 0);
-        if ($queue_id <= 0) wp_send_json_error(['message' => __('ID invalido.', 'alegra-connector')]);
-
-        global $wpdb;
-        $item = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}alegra_push_queue WHERE id = %d AND status = 'pending'",
-            $queue_id
-        ));
-
-        if (!$item) {
-            wp_send_json_error(['message' => __('Item no encontrado o ya procesado.', 'alegra-connector')]);
-        }
-
-        // Execute the push
-        $result = $this->execute_queued_push($item);
-
-        if (is_wp_error($result)) {
-            \Alegra\Connector\Push_Queue::mark_applied($queue_id, $result->get_error_message());
-            \Alegra\Connector\Push_Queue::log_push(
-                $item->entity_type,
-                (int) $item->entity_id,
-                $item->action,
-                json_decode($item->payload_json ?? '{}', true) ?: [],
-                $result,
-                null,
-                get_current_user_id()
-            );
-            wp_send_json_error(['message' => sprintf(__('Error al enviar a Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
-        }
-
-        \Alegra\Connector\Push_Queue::mark_applied($queue_id);
-        \Alegra\Connector\Push_Queue::log_push(
-            $item->entity_type,
-            (int) $item->entity_id,
-            $item->action,
-            json_decode($item->payload_json ?? '{}', true) ?: [],
-            $result,
-            200,
-            get_current_user_id()
-        );
-
-        $this->log('info', 'Push queue item approved and sent to Alegra', [
-            'queue_id' => $queue_id,
-            'entity_type' => $item->entity_type,
-            'entity_id' => $item->entity_id,
-        ]);
-
-        wp_send_json_success(['message' => __('Enviado a Alegra correctamente.', 'alegra-connector')]);
-    }
-
-    /**
-     * AJAX: Reject a pending push queue item.
-     */
-    public function ajax_reject_push(): void
-    {
-        check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error();
-
-        $queue_id = (int) ($_POST['queue_id'] ?? 0);
-        if ($queue_id <= 0) wp_send_json_error(['message' => __('ID invalido.', 'alegra-connector')]);
-
-        $ok = \Alegra\Connector\Push_Queue::reject($queue_id, get_current_user_id());
-        if (!$ok) {
-            wp_send_json_error(['message' => __('No se pudo rechazar el item.', 'alegra-connector')]);
-        }
-
-        $this->log('info', 'Push queue item rejected', ['queue_id' => $queue_id]);
-        wp_send_json_success(['message' => __('Operacion rechazada. No se enviara a Alegra.', 'alegra-connector')]);
-    }
-
-    /**
-     * AJAX: Get current push queue status (counts of pending items by type).
-     */
-    public function ajax_push_queue_status(): void
-    {
-        check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error();
-
-        $pending = \Alegra\Connector\Push_Queue::get_pending(500);
-        $counts = [
-            'total' => count($pending),
-            'product' => 0,
-            'customer' => 0,
-            'order' => 0,
-            'payment' => 0,
-        ];
-        foreach ($pending as $item) {
-            $key = isset($item->entity_type) ? $item->entity_type : '';
-            if (isset($counts[$key])) {
-                $counts[$key]++;
-            }
-        }
-
-        wp_send_json_success(['counts' => $counts]);
-    }
-
-    /**
-     * AJAX: Save sync directions configuration.
-     */
     /**
      * AJAX: Wizard - advance to next step.
      */
@@ -2577,101 +2500,6 @@ class Admin_Dashboard
                 $frequency
             ),
         ]);
-    }
-
-    public function ajax_save_sync_directions(): void
-    {
-        check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) wp_send_json_error();
-
-        $allowed = ['disabled', 'manual', 'auto'];
-        $types = ['product', 'customer', 'order', 'payment'];
-
-        foreach ($types as $type) {
-            $val = sanitize_text_field($_POST['direction_' . $type] ?? 'disabled');
-            if (!in_array($val, $allowed, true)) $val = 'disabled';
-            update_option('alegra_connector_push_direction_' . $type, $val);
-        }
-
-        wp_send_json_success(['message' => __('Configuración de direcciones guardada.', 'alegra-connector')]);
-    }
-
-    /**
-     * Execute a queued push: performs the actual API call to Alegra.
-     *
-     * @param object $item Queue row.
-     * @return array|\WP_Error
-     */
-    private function execute_queued_push(object $item)
-    {
-        $payload = json_decode($item->payload_json ?? '{}', true) ?: [];
-        $entity_type = $item->entity_type;
-        $entity_id = (int) $item->entity_id;
-        $action = $item->action;
-
-        switch ($entity_type) {
-            case 'order':
-                $order = wc_get_order($entity_id);
-                if (!$order) return new \WP_Error('not_found', 'Pedido no encontrado');
-                $sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
-                if ($action === 'complete') {
-                    return $sync->create_invoice_with_payment($order);
-                } elseif ($action === 'create') {
-                    return $sync->create_invoice($order);
-                } elseif ($action === 'cancel') {
-                    return $sync->void_invoice($order);
-                }
-                return new \WP_Error('unknown_action', 'Acción desconocida: ' . $action);
-
-            case 'customer':
-                $user = get_userdata($entity_id);
-                if (!$user) return new \WP_Error('not_found', 'Cliente no encontrado');
-                $sync = new \Alegra\Connector\Sync\Customers($this->api, $this->logger);
-                return $sync->sync_to_alegra($user);
-
-            case 'product':
-                $product = wc_get_product($entity_id);
-                if (!$product) return new \WP_Error('not_found', 'Producto no encontrado');
-                $sync = new \Alegra\Connector\Sync\Products($this->api, $this->logger);
-                return $sync->sync_to_alegra($product);
-
-            case 'payment':
-                $order = wc_get_order($entity_id);
-                if (!$order) return new \WP_Error('not_found', 'Pedido no encontrado');
-                $sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
-                return $sync->create_payment_for_order($order);
-
-            default:
-                return new \WP_Error('unknown_type', 'Tipo desconocido: ' . $entity_type);
-        }
-    }
-
-    public function do_async_import(string $type): void
-    {
-        switch ($type) {
-            case 'products':
-                $sync = new Sync\Products($this->api, $this->logger);
-                if ($this->api) $sync->import_from_alegra();
-                $sync->sync_all();
-                break;
-            case 'customers':
-                $sync = new Sync\Customers($this->api, $this->logger);
-                if ($this->api) $sync->import_from_alegra();
-                $sync->sync_all();
-                break;
-            case 'categories':
-                $sync = new Sync\Categories($this->api, $this->logger);
-                if ($this->api) $sync->import_from_alegra();
-                $sync->sync_all();
-                break;
-        }
-    }
-
-    public function do_async_sync_all(): void
-    {
-        $sc = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
-        $sc->run_cron_sync();
-        set_transient('alegra_sync_progress', ['done' => true, 'message' => __('Sincronización completa.', 'alegra-connector')], 60);
     }
 
     public function ajax_check_endpoints(): void

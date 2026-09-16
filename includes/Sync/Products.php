@@ -116,6 +116,8 @@ class Products
                 }
             }
 
+            // AC-16: the mapped "default status" only applies on creation.
+            $data['status'] = $this->field_mapping('default_status', 'active');
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
@@ -167,7 +169,10 @@ class Products
                 'variations' => count($subitems),
             ]);
         } else {
-            $data['type'] = 'kit';
+            // AC-44: a variable product is always a `variantParent` in Alegra
+            // (create and update must agree; `kit` is for composed items only).
+            // AC-16: the mapped "default status" only applies on creation.
+            $data['status'] = $this->field_mapping('default_status', 'active');
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
@@ -210,6 +215,8 @@ class Products
             }
 
             $data['type'] = 'variant';
+            // AC-16: the mapped "default status" only applies on creation.
+            $data['status'] = $this->field_mapping('default_status', 'active');
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_post_meta($variation->get_id(), '_alegra_item_id', (string) $result['id']);
@@ -235,15 +242,17 @@ class Products
             'type' => 'simple',
             'price' => [
                 [
-                    'idPriceList' => 1,
+                    'idPriceList' => $this->price_list_id(),
                     'price' => (float) $product->get_regular_price(),
                 ],
             ],
             'inventory' => [
-                'unit' => 'unit',
+                'unit' => $this->field_mapping('default_unit', 'unit'),
                 'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
             ],
         ];
+
+        $this->apply_warehouse($data, $product);
 
         $sale_price = $product->get_sale_price();
         if (!empty($sale_price) && (float) $sale_price < $product->get_regular_price()) {
@@ -312,15 +321,17 @@ class Products
             'description' => wp_strip_all_tags($variation->get_description()),
             'price' => [
                 [
-                    'idPriceList' => 1,
+                    'idPriceList' => $this->price_list_id(),
                     'price' => (float) $variation->get_regular_price(),
                 ],
             ],
             'inventory' => [
-                'unit' => 'unit',
+                'unit' => $this->field_mapping('default_unit', 'unit'),
                 'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
             ],
         ];
+
+        $this->apply_warehouse($data, $variation);
 
         // Category (variations inherit from their parent)
         $cat_source = ($parent && $parent->get_category_ids()) ? $parent : $variation;
@@ -347,11 +358,72 @@ class Products
     }
 
     /**
+     * Read a saved value from the "Mapeo de Campos" settings (AC-16).
+     *
+     * These options are persisted by the mapping page; before this they were
+     * never read, so the UI promised behavior the push path did not honor.
+     */
+    private function field_mapping(string $key, string $default = ''): string
+    {
+        $map = get_option('alegra_connector_field_mapping', []);
+        if (is_array($map) && isset($map[$key]) && (string) $map[$key] !== '') {
+            return (string) $map[$key];
+        }
+        return $default;
+    }
+
+    /**
+     * Alegra price-list id for the regular price (mapping default: 1 "General").
+     */
+    private function price_list_id(): int
+    {
+        $id = (int) $this->field_mapping('regular_price_list', '1');
+        return $id > 0 ? $id : 1;
+    }
+
+    /**
+     * Configured Alegra warehouse id, or '' when warehouse management is off.
+     */
+    private function resolve_warehouse_id(): string
+    {
+        if (!get_option('alegra_connector_warehouse_enabled')) {
+            return '';
+        }
+        return (string) get_option('alegra_connector_warehouse_id', '');
+    }
+
+    /**
+     * Distribute a product's initial stock across the configured Alegra
+     * warehouse when warehouse management is enabled (AC-16). The invoice path
+     * already honored this setting; the product path did not, contradicting
+     * the settings UI.
+     */
+    private function apply_warehouse(array &$data, \WC_Product $product): void
+    {
+        $warehouse = $this->resolve_warehouse_id();
+        if ($warehouse === '' || !isset($data['inventory']) || !is_array($data['inventory'])) {
+            return;
+        }
+        $data['inventory']['warehouses'] = [[
+            'id' => $warehouse,
+            'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
+        ]];
+    }
+
+    /**
      * Sync inventory from Alegra to WooCommerce (pull)
      */
     public function sync_inventory_from_alegra(): array
     {
-        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false];
+        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false];
+
+        // AC-16: the inventory-source setting was never read. When the merchant
+        // selects WooCommerce as the source, the pull must not overwrite stock.
+        if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'woocommerce') {
+            $this->logger->info('Inventory pull skipped: WooCommerce is the configured inventory source');
+            $result['skipped'] = true;
+            return $result;
+        }
 
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
         if ($lock === false) {
@@ -674,10 +746,12 @@ class Products
             $this->update_product_from_alegra($product, $item);
         }
 
-        // Import variant children
-        if ($is_variable && !empty($item['subitems'])) {
-            foreach ($item['subitems'] as $subitem_data) {
-                $this->import_variation_from_alegra($product_id, $subitem_data);
+        // Import variant children. Alegra returns `itemVariants` for a
+        // variantParent (and `subitems` only for kits); accept both.
+        if ($is_variable) {
+            $this->register_parent_variation_attributes((int) $product_id, $item);
+            foreach ($this->get_variant_children($item) as $subitem_data) {
+                $this->import_variation_from_alegra((int) $product_id, $subitem_data);
             }
         }
 
@@ -699,11 +773,137 @@ class Products
     }
 
     /**
+     * Normalize the Alegra variant children list for a parent item.
+     *
+     * Alegra returns `itemVariants` (full item objects) for a variantParent and
+     * `subitems` (kit components, wrapped in `item`) for a kit.
+     */
+    private function get_variant_children(array $item): array
+    {
+        if (!empty($item['itemVariants']) && is_array($item['itemVariants'])) {
+            return array_values(array_filter($item['itemVariants'], 'is_array'));
+        }
+        if (!empty($item['subitems']) && is_array($item['subitems'])) {
+            return array_values(array_filter($item['subitems'], 'is_array'));
+        }
+        return [];
+    }
+
+    /**
+     * Register the parent product's variation attributes so WooCommerce can
+     * match the imported variations to them (AC-45). Uses custom (non-taxonomy)
+     * product attributes, which is what an arbitrary Alegra attribute maps to.
+     *
+     * @param array<int, array{name?:string, options?:array}> $item Alegra parent.
+     */
+    private function register_parent_variation_attributes(int $product_id, array $item): void
+    {
+        $attributes = $item['variantAttributes'] ?? [];
+        if (!is_array($attributes) || empty($attributes)) {
+            return;
+        }
+
+        $product_attributes = get_post_meta($product_id, '_product_attributes', true);
+        if (!is_array($product_attributes)) {
+            $product_attributes = [];
+        }
+
+        foreach ($attributes as $attribute) {
+            if (!is_array($attribute)) {
+                continue;
+            }
+            $name = (string) ($attribute['name'] ?? '');
+            $key  = sanitize_title($name);
+            if ($key === '') {
+                continue;
+            }
+
+            $options = [];
+            foreach ((array) ($attribute['options'] ?? []) as $option) {
+                $value = $this->variant_option_value($option);
+                if ($value !== '') {
+                    $options[] = $value;
+                }
+            }
+
+            $product_attributes[$key] = [
+                'name'         => $name,
+                'value'        => implode(' | ', array_values(array_unique($options))),
+                'position'     => count($product_attributes),
+                'is_visible'   => 1,
+                'is_variation' => 1,
+                'is_taxonomy'  => 0,
+            ];
+        }
+
+        if (!empty($product_attributes)) {
+            update_post_meta($product_id, '_product_attributes', $product_attributes);
+        }
+    }
+
+    /**
+     * Set a variation's `attribute_<key>` meta from the Alegra variant
+     * attributes so the variation is selectable in WooCommerce (AC-45).
+     *
+     * @param array<int, array{name?:string, options?:array}> $item Alegra variant.
+     */
+    private function assign_variation_attributes(int $variation_id, array $item): void
+    {
+        $attributes = $item['variantAttributes'] ?? [];
+        if (!is_array($attributes) || empty($attributes)) {
+            return;
+        }
+
+        foreach ($attributes as $attribute) {
+            if (!is_array($attribute)) {
+                continue;
+            }
+            $key = sanitize_title((string) ($attribute['name'] ?? ''));
+            if ($key === '') {
+                continue;
+            }
+            $value = '';
+            foreach ((array) ($attribute['options'] ?? []) as $option) {
+                $value = $this->variant_option_value($option);
+                if ($value !== '') {
+                    break;
+                }
+            }
+            if ($value !== '') {
+                update_post_meta($variation_id, 'attribute_' . $key, $value);
+            }
+        }
+    }
+
+    /**
+     * Extract the string value of an Alegra variant attribute option. Alegra
+     * returns objects ({id, value}); tolerate a bare string too.
+     */
+    private function variant_option_value(mixed $option): string
+    {
+        if (is_array($option)) {
+            return (string) ($option['value'] ?? '');
+        }
+        return is_scalar($option) ? (string) $option : '';
+    }
+
+    /**
+     * Persist the Alegra `reference` as the variation SKU (AC-45).
+     */
+    private function assign_variation_sku(int $variation_id, array $item): void
+    {
+        $sku = (string) ($item['reference'] ?? '');
+        if ($sku !== '') {
+            update_post_meta($variation_id, '_sku', $sku);
+        }
+    }
+
+    /**
      * Import a variation from Alegra subitem
      */
     private function import_variation_from_alegra(int $parent_id, array $subitem_data): void
     {
-        $alegra_id = (string) ($subitem_data['id'] ?? '');
+        $alegra_id = (string) ($subitem_data['id'] ?? ($subitem_data['item']['id'] ?? ''));
         if ($alegra_id === '') {
             return;
         }
@@ -718,6 +918,8 @@ class Products
             $variation = wc_get_product($variation_id);
             if ($variation) {
                 $this->update_product_from_alegra($variation, $item);
+                $this->assign_variation_attributes((int) $variation_id, $item);
+                $this->assign_variation_sku((int) $variation_id, $item);
                 if (!empty($item['category'])) {
                     $this->assign_product_category((int) $variation_id, $item);
                 }
@@ -743,6 +945,10 @@ class Products
         if ($variation) {
             $this->update_product_from_alegra($variation, $item);
         }
+
+        // AC-45: attributes + SKU make the variation selectable in WooCommerce.
+        $this->assign_variation_attributes((int) $variation_id, $item);
+        $this->assign_variation_sku((int) $variation_id, $item);
 
         if (!empty($item['category'])) {
             $this->assign_product_category((int) $variation_id, $item);
@@ -1335,7 +1541,9 @@ class Products
         static $cache = [];
         $cat_ids = $product->get_category_ids();
         if (empty($cat_ids)) {
-            return '';
+            // AC-16: honor the "Categoría por defecto" mapping when the product
+            // has no WooCommerce category (the mapping page promised this).
+            return $this->field_mapping('default_category', '');
         }
 
         // Strategy: first | deepest | specific

@@ -224,22 +224,70 @@ class Categories
         if (is_wp_error($terms) || empty($terms)) {
             return [];
         }
+
+        // AC-27: fetch the Alegra category list ONCE (paginated) and diff
+        // locally. The old implementation issued one HTTP GET per WC term
+        // (200 categories = 200 sequential API calls).
+        $valid_ids = $this->fetch_all_category_ids();
+        if ($valid_ids === null) {
+            // The first page failed; never report every term as an orphan.
+            return [];
+        }
+
         $orphans = [];
         foreach ($terms as $term) {
             $alegra_id = (string) get_term_meta($term->term_id, 'alegra_category_id', true);
-            if ($alegra_id === '') {
+            if ($alegra_id === '' || isset($valid_ids[$alegra_id])) {
                 continue;
             }
-            $result = $this->api->get_item_category($alegra_id);
-            if (is_wp_error($result)) {
-                $orphans[] = [
-                    'term_id'   => (int) $term->term_id,
-                    'name'      => (string) $term->name,
-                    'alegra_id' => $alegra_id,
-                ];
-            }
+            $orphans[] = [
+                'term_id'   => (int) $term->term_id,
+                'name'      => (string) $term->name,
+                'alegra_id' => $alegra_id,
+            ];
         }
         return $orphans;
+    }
+
+    /**
+     * Fetch every Alegra item-category id, paginated, as a lookup set.
+     *
+     * @return array<string, true>|null null when the first page could not be fetched.
+     */
+    private function fetch_all_category_ids(): ?array
+    {
+        $ids = [];
+        $per_page = 30;
+        $max_pages = 200;
+
+        for ($page = 1; $page <= $max_pages; $page++) {
+            $batch = $this->api->get_item_categories([
+                'start' => ($page - 1) * $per_page,
+                'limit' => $per_page,
+            ]);
+
+            if (is_wp_error($batch)) {
+                // A mid-pagination failure keeps what we already have; a failure
+                // on page 1 is fatal for the orphan check.
+                return $page === 1 ? null : $ids;
+            }
+
+            if (empty($batch)) {
+                break;
+            }
+
+            foreach ($batch as $category) {
+                if (is_array($category) && isset($category['id'])) {
+                    $ids[(string) $category['id']] = true;
+                }
+            }
+
+            if (count($batch) < $per_page) {
+                break;
+            }
+        }
+
+        return $ids;
     }
 
     /**

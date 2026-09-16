@@ -18,14 +18,14 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 }
 
 $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
 }
@@ -49,6 +49,11 @@ function alegra_mock_seed_item(string $id, array $data = []): void
 function alegra_mock_seed_invoice(string $id, array $data = []): void
 {
     $GLOBALS['alegra_mock_state']['invoices'][$id] = array_merge(['id' => $id], $data);
+}
+
+function alegra_mock_seed_category(string $id, array $data = []): void
+{
+    $GLOBALS['alegra_mock_state']['categories'][$id] = array_merge(['id' => $id], $data);
 }
 
 /**
@@ -223,7 +228,14 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         ]]);
     }
     if ($method === 'GET' && $path === '/item-categories') {
-        return alegra_mock_response(200, []);
+        $all = array_values($GLOBALS['alegra_mock_state']['categories']);
+        $start = (int) ($query['start'] ?? 0);
+        $limit = (int) ($query['limit'] ?? 30);
+        return alegra_mock_response(200, array_slice($all, $start, $limit));
+    }
+    if ($method === 'GET' && preg_match('#^/item-categories/([^/]+)$#', $path, $m)) {
+        $cat = $GLOBALS['alegra_mock_state']['categories'][$m[1]] ?? null;
+        return $cat ? alegra_mock_response(200, $cat) : alegra_mock_response(404, ['message' => 'Category not found']);
     }
     if ($method === 'GET' && $path === '/warehouses') {
         return alegra_mock_response(200, []);

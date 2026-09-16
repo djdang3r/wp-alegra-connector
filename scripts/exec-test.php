@@ -664,7 +664,6 @@ TestRunner::test('T8.1 AC-29 remote Alegra error text is stripped of HTML before
     // The three admin templates + shared JS must inject the message with .text().
     foreach ([
         'templates/admin-import.php',
-        'templates/admin-push-queue.php',
         'templates/admin-monitor.php',
         'admin/assets/js/admin.js',
     ] as $rel) {
@@ -966,6 +965,200 @@ TestRunner::test('T9.11 AC-52 "Run now" schedules a single event and the dead di
 
     $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
     TestRunner::assertStringNotContains("add_action('alegra_manual_run'", $main, 'the dead alegra_manual_run dispatcher must be removed');
+});
+
+// ===========================================================================
+// T10 — Batch 1c: lifecycle, data integrity and dead features
+// ===========================================================================
+echo "\nT10 — Batch 1c (lifecycle, imports, dead features)\n";
+
+TestRunner::test('T10.1 AC-27 find_orphans fetches the Alegra category list once, not per term', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 40; $i++) {
+        alegra_mock_seed_category('cat-' . $i, ['name' => 'Cat ' . $i]);
+    }
+    $t1 = wp_insert_term('Ventas', 'product_cat');
+    update_term_meta($t1['term_id'], 'alegra_category_id', 'cat-1');
+    $t2 = wp_insert_term('Hogar', 'product_cat');
+    update_term_meta($t2['term_id'], 'alegra_category_id', 'cat-2');
+    $t3 = wp_insert_term('Borrada', 'product_cat');
+    update_term_meta($t3['term_id'], 'alegra_category_id', 'cat-999');
+
+    $categories = new \Alegra\Connector\Sync\Categories(make_api(), make_logger());
+    $orphans = $categories->find_orphans();
+
+    TestRunner::assertCount(1, $orphans, 'only the term whose Alegra category is gone is an orphan');
+    TestRunner::assertSame('cat-999', $orphans[0]['alegra_id'] ?? null, 'the orphan is the deleted category');
+
+    // Count EVERY category request, list or per-item. 40 categories at 30/page
+    // = 2 paginated calls; the old code added one call per WC term (3 more).
+    $calls = 0;
+    foreach ($GLOBALS['alegra_mock_requests'] as $req) {
+        if ($req['method'] === 'GET' && strpos((string) $req['path'], '/item-categories') === 0) {
+            $calls++;
+        }
+    }
+    TestRunner::assertSame(2, $calls, 'find_orphans must paginate, not call per term (got ' . $calls . ' calls)');
+});
+
+TestRunner::test('T10.2 AC-45 an imported variation gets its attributes and SKU', function (): void {
+    alegra_test_reset();
+    $parent_alegra = 'item-parent-1';
+    $child_alegra = 'item-child-1';
+
+    alegra_mock_seed_item($parent_alegra, [
+        'name' => 'Camiseta',
+        'reference' => 'CAM',
+        'type' => 'variantParent',
+        'status' => 'active',
+        'price' => [['idPriceList' => '1', 'price' => 70000]],
+        'variantAttributes' => [
+            ['id' => '1', 'name' => 'Color', 'options' => [['id' => '1', 'value' => 'Rojo'], ['id' => '2', 'value' => 'Verde']]],
+            ['id' => '2', 'name' => 'Talla', 'options' => [['id' => '4', 'value' => 'XS'], ['id' => '5', 'value' => 'M']]],
+        ],
+        'itemVariants' => [['id' => $child_alegra]],
+    ]);
+    alegra_mock_seed_item($child_alegra, [
+        'id' => $child_alegra,
+        'name' => 'Camiseta / Rojo / XS',
+        'reference' => 'CAM-ROJO-XS',
+        'type' => 'variant',
+        'status' => 'active',
+        'price' => [['idPriceList' => '1', 'price' => 70000]],
+        'variantAttributes' => [
+            ['id' => '1', 'name' => 'Color', 'options' => [['id' => '1', 'value' => 'Rojo']]],
+            ['id' => '2', 'name' => 'Talla', 'options' => [['id' => '4', 'value' => 'XS']]],
+        ],
+    ]);
+
+    make_products()->import_from_alegra();
+
+    $variation_id = 0;
+    $parent_wc_id = 0;
+    foreach ($GLOBALS['wp_posts'] as $post) {
+        if (($post->post_type ?? '') === 'product_variation') {
+            $variation_id = (int) $post->ID;
+        }
+        if (($post->post_type ?? '') === 'product') {
+            $parent_wc_id = (int) $post->ID;
+        }
+    }
+
+    TestRunner::assertTrue($variation_id > 0, 'a product_variation post must be created');
+    TestRunner::assertSame('Rojo', get_post_meta($variation_id, 'attribute_color', true), 'the Color attribute must be set');
+    TestRunner::assertSame('XS', get_post_meta($variation_id, 'attribute_talla', true), 'the Talla attribute must be set');
+    TestRunner::assertSame('CAM-ROJO-XS', get_post_meta($variation_id, '_sku', true), 'the variation SKU must be set');
+
+    $attrs = get_post_meta($parent_wc_id, '_product_attributes', true);
+    TestRunner::assertTrue(
+        is_array($attrs) && isset($attrs['color'], $attrs['talla']),
+        'the parent must register the color/talla attributes so the variation is selectable'
+    );
+});
+
+TestRunner::test('T10.3 AC-44 a variable product is pushed as variantParent, never kit', function (): void {
+    alegra_test_reset();
+    alegra_make_product(20, ['name' => 'Var', 'sku' => 'VAR-S', 'type' => 'variation', 'regular_price' => '5']);
+    alegra_make_product(21, ['name' => 'Parent', 'sku' => 'PAR', 'type' => 'variable', 'regular_price' => '10', 'children' => [20]]);
+
+    make_products()->sync_to_alegra(wc_get_product(21));
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('variantParent', $body['type'] ?? null, 'create must use variantParent');
+    TestRunner::assertStringNotContains('"type":"kit"', json_encode($body), 'a variable product must never be created as a kit');
+});
+
+TestRunner::test('T10.4 AC-64 the CSV export paginates past 500 rows', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 600; $i++) {
+        alegra_make_product($i, ['name' => 'P' . $i, 'sku' => 'S' . $i, 'regular_price' => '10']);
+    }
+    $rows = \Alegra\Connector\Admin\Admin_Dashboard::collect_export_rows('products');
+    TestRunner::assertSame(600, count($rows), 'all 600 products must be exported (got ' . count($rows) . ')');
+
+    for ($i = 1; $i <= 600; $i++) {
+        alegra_make_user(10000 + $i, ['user_email' => 'u' . $i . '@example.test', 'display_name' => 'U' . $i]);
+    }
+    $customer_rows = \Alegra\Connector\Admin\Admin_Dashboard::collect_export_rows('customers');
+    TestRunner::assertSame(600, count($customer_rows), 'all 600 customers must be exported (got ' . count($customer_rows) . ')');
+});
+
+TestRunner::test('T10.5 AC-37 the dead push-queue subsystem is gone', function (): void {
+    TestRunner::assertFalse(
+        file_exists($GLOBALS['alegra_plugin_root'] . 'includes/Push_Queue.php'),
+        'Push_Queue.php must be removed'
+    );
+    TestRunner::assertFalse(
+        file_exists($GLOBALS['alegra_plugin_root'] . 'templates/admin-push-queue.php'),
+        'the push-queue template must be removed'
+    );
+
+    $schema = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Schema.php');
+    TestRunner::assertStringNotContains('alegra_push_queue', $schema, 'the queue table must not be created');
+    TestRunner::assertStringNotContains('create_push_queue_table', $schema, 'the queue table creator must be gone');
+
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains('alegra_push_queue', $admin, 'no admin code may query the queue table');
+    TestRunner::assertStringNotContains('render_push_queue_page', $admin, 'the push-queue page must be removed');
+});
+
+TestRunner::test('T10.6 AC-65/AC-66 dead async methods and the dead webhook hook are gone', function (): void {
+    foreach (['admin/Admin/Admin_Dashboard.php', 'alegra-connector.php', 'uninstall.php'] as $rel) {
+        $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . $rel);
+        TestRunner::assertStringNotContains('do_async_import', $src, "$rel must not reference do_async_import");
+        TestRunner::assertStringNotContains('do_async_sync_all', $src, "$rel must not reference do_async_sync_all");
+        TestRunner::assertStringNotContains('alegra_connector_process_webhook', $src, "$rel must not reference the dead webhook hook");
+    }
+});
+
+TestRunner::test('T10.7 AC-16 the previously dead settings now take effect', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertTrue(!empty($result['skipped']), 'inventory_source=woocommerce must skip the stock pull');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'no item fetch when WooCommerce owns inventory');
+
+    alegra_test_reset();
+    update_option('alegra_connector_field_mapping', [
+        'default_unit'       => 'kg',
+        'regular_price_list' => '7',
+        'default_status'     => 'inactive',
+    ]);
+    update_option('alegra_connector_warehouse_enabled', true);
+    update_option('alegra_connector_warehouse_id', 'wh-1');
+    alegra_make_product(30, ['name' => 'Mapped', 'sku' => 'M1', 'regular_price' => '10', 'stock' => 4, 'manage_stock' => true]);
+    make_products()->sync_to_alegra(wc_get_product(30));
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('kg', $body['inventory']['unit'] ?? null, 'default_unit must be used');
+    TestRunner::assertSame(7, $body['price'][0]['idPriceList'] ?? null, 'regular_price_list must be used');
+    TestRunner::assertSame('inactive', $body['status'] ?? null, 'default_status must be used');
+    TestRunner::assertSame('wh-1', $body['inventory']['warehouses'][0]['id'] ?? null, 'the configured warehouse must be sent');
+});
+
+TestRunner::test('T10.8 AC-28/AC-57 uninstall drops every table, deletes the missed options and is multisite-aware', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'uninstall.php');
+
+    foreach (['alegra_tombstones', 'alegra_pull_queue', 'alegra_runs', 'alegra_push_log', 'alegra_entity_map', 'alegra_push_queue'] as $table) {
+        TestRunner::assertStringContains($table, $src, "uninstall must drop $table");
+    }
+    foreach ([
+        'alegra_connector_schema_version',
+        'alegra_connector_consumidor_final_contact_id',
+        'alegra_kill_switch',
+        'alegra_connector_dry_run',
+        'alegra_connector_stamp_enabled',
+        'alegra_connector_push_category_strategy',
+        'alegra_connector_import_category_parent',
+        'alegra_connector_customer_resolution_mode',
+        'alegra_connector_log_suffix',
+        'alegra_connector_disconnected_reason',
+    ] as $option) {
+        TestRunner::assertStringContains("delete_option('$option')", $src, "uninstall must delete $option");
+    }
+
+    TestRunner::assertStringContains('get_sites(', $src, 'uninstall must loop every site on multisite');
+    TestRunner::assertStringContains('switch_to_blog(', $src, 'uninstall must switch per site');
 });
 
 exit(TestRunner::summary());

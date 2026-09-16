@@ -84,10 +84,10 @@ $step = max(1, min(5, $wizard_step ?: 1));
         </p>
         <p style="font-size:13px;color:var(--ac-warning-bg);background:var(--ac-warning-bg);padding:12px;border-radius:6px;margin-bottom:16px;">
             <strong><?php esc_html_e('Importante', 'alegra-connector'); ?>:</strong>
-            <?php esc_html_e('Si decides enviar ventas/facturas a Alegra, primero configura la Cola de Push para aprobar manualmente cada envio.', 'alegra-connector'); ?>
+            <?php esc_html_e('Si decides enviar ventas/facturas a Alegra, actívalo desde la pestaña Sincronización. Por defecto esta desactivado.', 'alegra-connector'); ?>
         </p>
-        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-push-queue')); ?>" class="ac-btn ac-btn-primary">
-            <?php esc_html_e('Configurar Cola de Push', 'alegra-connector'); ?>
+        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings&tab=sync')); ?>" class="ac-btn ac-btn-primary">
+            <?php esc_html_e('Configurar Sincronización', 'alegra-connector'); ?>
         </a>
     <?php elseif ($step === 5): ?>
         <h2><?php esc_html_e('Paso 5: Listo!', 'alegra-connector'); ?></h2>

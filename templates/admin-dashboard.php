@@ -9,7 +9,6 @@ $sync_method = get_option('alegra_connector_sync_method', 'cron');
 
 // Get additional info for dashboard cards
 $running_runs = \Alegra\Connector\Runs::currently_running();
-$pending_push = \Alegra\Connector\Push_Queue::get_pending(50);
 $kill_switch = \Alegra\Connector\Kill_Switch::is_active();
 
 // Billing health data.
@@ -82,7 +81,7 @@ include __DIR__ . '/header.php';
 <?php endif; ?>
 
 <!-- Quick status overview (NEW: at-a-glance answers) -->
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">
     <div class="ac-kpi-card" style="border-left:4px solid <?php echo $is_connected ? 'var(--ac-success)' : 'var(--ac-warning)'; ?>;padding:14px 16px;">
         <div style="font-size:11px;font-weight:600;color:var(--ac-text-secondary);text-transform:uppercase;"><?php esc_html_e('Conexión', 'alegra-connector'); ?></div>
         <div style="font-size:18px;font-weight:600;margin-top:4px;">
@@ -96,15 +95,6 @@ include __DIR__ . '/header.php';
         </div>
         <?php if (count($running_runs) > 0): ?>
             <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-monitor')); ?>" style="font-size:11px;"><?php esc_html_e('Ver Monitor', 'alegra-connector'); ?> &rarr;</a>
-        <?php endif; ?>
-    </div>
-    <div class="ac-kpi-card" style="border-left:4px solid var(--ac-warning);padding:14px 16px;">
-        <div style="font-size:11px;font-weight:600;color:var(--ac-text-secondary);text-transform:uppercase;"><?php esc_html_e('Pushes pendientes', 'alegra-connector'); ?></div>
-        <div style="font-size:18px;font-weight:600;margin-top:4px;">
-            <?php echo count($pending_push); ?>
-        </div>
-        <?php if (count($pending_push) > 0): ?>
-            <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-push-queue')); ?>" style="font-size:11px;"><?php esc_html_e('Revisar Cola', 'alegra-connector'); ?> &rarr;</a>
         <?php endif; ?>
     </div>
     <div class="ac-kpi-card" style="border-left:4px solid var(--ac-info);padding:14px 16px;">
@@ -196,10 +186,6 @@ include __DIR__ . '/header.php';
         <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-monitor')); ?>" class="ac-btn">
             <span class="dashicons dashicons-dashboard" style="font-size:16px;width:16px;height:16px;"></span>
             <?php esc_html_e('Monitor de Procesos', 'alegra-connector'); ?>
-        </a>
-        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-push-queue')); ?>" class="ac-btn">
-            <span class="dashicons dashicons-clipboard" style="font-size:16px;width:16px;height:16px;"></span>
-            <?php esc_html_e('Cola de Push', 'alegra-connector'); ?>
         </a>
         <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-products')); ?>" class="ac-btn">
             <span class="dashicons dashicons-products" style="font-size:16px;width:16px;height:16px;"></span>
