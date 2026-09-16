@@ -380,6 +380,21 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_push_category_id', ['sanitize_callback' => 'intval']);
         // Parent term for categories imported from Alegra (read by Categories/Products).
         register_setting('alegra_connector_settings', 'alegra_connector_import_category_parent', ['sanitize_callback' => 'intval']);
+        // AC-19/AC-18 performance knobs. These were read with hardcoded defaults
+        // but never written (dead config); register them so the Avanzado tab can
+        // actually set them. Clamped so a bad value cannot break an import.
+        register_setting('alegra_connector_settings', 'alegra_connector_import_time_budget', [
+            'sanitize_callback' => fn($v) => max(30, min(600, (int) $v)),
+            'default' => 240,
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_import_max_pages', [
+            'sanitize_callback' => fn($v) => max(0, (int) $v),
+            'default' => 0,
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_orders_poll_batch', [
+            'sanitize_callback' => fn($v) => max(1, min(100, (int) $v)),
+            'default' => 20,
+        ]);
         // Manual Consumidor Final override (read by Consumidor_Final::get_id()).
         register_setting('alegra_connector_settings', 'alegra_connector_consumidor_final_manual_override', [
             'sanitize_callback' => 'rest_sanitize_boolean',
@@ -1434,7 +1449,7 @@ class Admin_Dashboard
         update_option('alegra_connector_connection_tested', true);
 
         $diagnostics = $result['diagnostics'] ?? [];
-        update_option('alegra_connector_diagnostics', $diagnostics);
+        update_option('alegra_connector_diagnostics', $diagnostics, false);
 
         $this->log('info', 'Connection test successful', ['company' => $result['company'] ?? 'Unknown', 'diagnostics' => $diagnostics]);
 
@@ -1620,7 +1635,8 @@ class Admin_Dashboard
         $tp = (int)($state['total_pages'] ?? 0);
         $done = $is_last || ($tp > 0 && $page >= $tp) || empty($items);
 
-        // Restore original sync_images setting when sync completes, otherwise keep state
+        // Clear the batch state when the run is done; otherwise persist it so
+        // the next page can resume.
         if ($done) {
             delete_transient('alegra_batch_state');
         } else {
@@ -1713,8 +1729,10 @@ class Admin_Dashboard
         $field_mapping = isset($_POST['field_mapping']) ? (array) $_POST['field_mapping'] : [];
         $tax_mapping = isset($_POST['tax_mapping']) ? (array) $_POST['tax_mapping'] : [];
 
-        update_option('alegra_connector_field_mapping', map_deep($field_mapping, 'sanitize_text_field'));
-        update_option('alegra_connector_tax_mapping', map_deep($tax_mapping, 'sanitize_text_field'));
+        // AC-81: these arrays can grow with configuration; keep them out of the
+        // autoloaded `alloptions` payload (3rd arg = autoload 'no').
+        update_option('alegra_connector_field_mapping', map_deep($field_mapping, 'sanitize_text_field'), false);
+        update_option('alegra_connector_tax_mapping', map_deep($tax_mapping, 'sanitize_text_field'), false);
 
         $this->logger->info('Field mapping saved');
 
@@ -2050,11 +2068,7 @@ class Admin_Dashboard
     }
 
     /**
-     * Batch-sync pending WC orders to Alegra invoices
-     */
-    /**
      * Cancel a running chunked sync by deleting the batch state transient.
-     * Also restores the original sync_images setting if it was overridden.
      */
     public function ajax_cancel_sync(): void
     {
@@ -2099,7 +2113,9 @@ class Admin_Dashboard
         }
 
         if (!empty($created)) {
-            update_option('alegra_connector_webhook_subscriptions', $created);
+            // AC-81: the subscription list grows with configuration; do not
+            // autoload it on every request.
+            update_option('alegra_connector_webhook_subscriptions', $created, false);
         }
 
         $message = sprintf(__('%d webhooks registrados.', 'alegra-connector'), count($created));
@@ -2689,11 +2705,11 @@ class Admin_Dashboard
             wp_schedule_event(time() + 60, $schedule_name, $hook);
         }
 
-        // Update the option that drives schedule_cron()
+        // Update the option that drives schedule_cron(). update_option() itself
+        // fires `update_option_alegra_connector_sync_frequency`, which
+        // schedule_cron() is hooked to, so an explicit do_action() here
+        // scheduled the cron a second time (AC-78).
         update_option('alegra_connector_sync_frequency', $frequency);
-
-        // Trigger a re-schedule via the plugin's own mechanism
-        do_action('update_option_alegra_connector_sync_frequency', $frequency);
 
         $this->log('info', 'Cron frequency changed', ['hook' => $hook, 'frequency' => $frequency]);
 

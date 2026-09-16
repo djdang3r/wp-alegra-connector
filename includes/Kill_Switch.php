@@ -10,6 +10,16 @@
  * - Plugin deactivation
  * - Admin emergency stop (future)
  *
+ * Two related-but-distinct "connected" notions exist and must not be conflated:
+ * - `alegra_connector_connection_tested` (option): the UI badge — did the last
+ *   credential test reach Alegra? It is a mirror maintained by activate()/
+ *   deactivate() and by ajax_test_connection(), not an operational gate.
+ * - `Kill_Switch::is_active()`: the operational gate checked at every sync
+ *   entry point. It deliberately reads the DB directly and does NOT consult the
+ *   option above (see is_active()).
+ * Collapsing them would make a stale UI flag able to halt sync; they are kept
+ * separate on purpose.
+ *
  * @package Alegra\Connector
  */
 

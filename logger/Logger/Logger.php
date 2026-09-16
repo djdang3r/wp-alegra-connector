@@ -195,9 +195,12 @@ class Logger
         }
     }
 
-    public function clear_old_logs(int $retention_days = 30): int
+    public function clear_old_logs(?int $retention_days = null): int
     {
         $this->ensure_dir();
+        // AC-71: fall back to the retention configured at construction instead
+        // of a hardcoded 30, so the property is actually used.
+        $retention_days ??= $this->retention_days;
         $count = 0;
         $cutoff = strtotime('- ' . $retention_days . ' days');
         $files = glob($this->log_dir . '/*.log');

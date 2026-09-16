@@ -518,13 +518,24 @@ check(
     '— order meta must go through the WC CRUD API (found ' . $legacy_order_meta . ')'
 );
 
-// ---- 28: create_credit_note uses the plural invoices array ----
-echo "\n[28] create_credit_note() uses the plural 'invoices' array\n";
+// ---- 28: the credit-note paths are collapsed onto one implementation ----
+echo "\n[28] create_credit_note() delegates to create_credit_note_for_refund()\n";
 $credit_src = method_source($orders_class, 'create_credit_note');
+$refund_src = method_source($orders_class, 'create_credit_note_for_refund');
+$credit_ok = str_contains($credit_src, 'create_credit_note_for_refund')
+    && str_contains($refund_src, "'invoices'");
 check(
-    "create_credit_note() sends 'invoices' => [...]",
-    str_contains($credit_src, "'invoices'"),
-    '— the Alegra credit-note API expects an invoices array (the old singular key failed)'
+    'create_credit_note() delegates to the single refund implementation (which sends the plural invoices array)',
+    $credit_ok,
+    '— two independent credit-note implementations were the root cause of the duplicate DIAN note'
+);
+
+// ---- 28b: both refund paths share ONE idempotency key ----
+echo "\n[28b] refund idempotency uses State_Sync::REFUND_META_FMT\n";
+check(
+    'create_credit_note_for_refund() uses State_Sync::REFUND_META_FMT',
+    str_contains($refund_src, 'REFUND_META_FMT'),
+    '— Orders and State_Sync must agree on the per-refund meta key'
 );
 
 // ---- 29: create_credit_note_for_refund caps via _alegra_credited_amount ----

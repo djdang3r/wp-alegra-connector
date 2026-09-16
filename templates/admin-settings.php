@@ -276,6 +276,21 @@ $ac_group_badge = ['A'=>'danger','B'=>'warning','C'=>'neutral'];
 <input type="number" name="alegra_connector_log_retention_days" value="<?php echo esc_attr(get_option('alegra_connector_log_retention_days',30));?>" class="small-text" min="1" max="365"> <?php esc_html_e('dias','alegra-connector');?>
 <p class="description"><?php esc_html_e('Los logs anteriores a este numero de dias se eliminan automaticamente. Los logs se guardan en wp-content/uploads/alegra-logs/.','alegra-connector');?></p></td></tr>
 
+<!-- Import time budget -->
+<tr><th><?php esc_html_e('Presupuesto de importacion (segundos):','alegra-connector');?></th><td>
+<input type="number" name="alegra_connector_import_time_budget" value="<?php echo esc_attr(get_option('alegra_connector_import_time_budget',240));?>" class="small-text" min="30" max="600"> <?php esc_html_e('segundos','alegra-connector');?>
+<p class="description"><?php esc_html_e('Tiempo maximo que una importacion de productos usa por corrida. Al agotarse, la importacion se pausa y continua en la siguiente ejecucion.','alegra-connector');?></p></td></tr>
+
+<!-- Import max pages -->
+<tr><th><?php esc_html_e('Paginas maximas por importacion:','alegra-connector');?></th><td>
+<input type="number" name="alegra_connector_import_max_pages" value="<?php echo esc_attr(get_option('alegra_connector_import_max_pages',0));?>" class="small-text" min="0">
+<p class="description"><?php esc_html_e('Limite de paginas por corrida. 0 = sin limite (recomendado: la importacion reanuda desde el cursor).','alegra-connector');?></p></td></tr>
+
+<!-- Orders poll batch -->
+<tr><th><?php esc_html_e('Pedidos por revision de estado:','alegra-connector');?></th><td>
+<input type="number" name="alegra_connector_orders_poll_batch" value="<?php echo esc_attr(get_option('alegra_connector_orders_poll_batch',20));?>" class="small-text" min="1" max="100">
+<p class="description"><?php esc_html_e('Cuantos pedidos revisa cada corrida del cron al consultar el estado de sus facturas en Alegra.','alegra-connector');?></p></td></tr>
+
 <!-- Bank Account -->
 <tr><th><?php esc_html_e('Cuenta bancaria para pagos:','alegra-connector');?></th><td>
 <?php if(!empty($alegra_bank_accounts)):?>

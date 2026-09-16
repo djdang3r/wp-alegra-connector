@@ -387,9 +387,24 @@ final class Alegra_Connector
             'alegra_connector_dry_run' => false,
         ];
 
+        // AC-81: options that are only ever read in admin/cron context must not
+        // be pulled into `alloptions` on every frontend request. Options read by
+        // the frontend (push flags, dry-run, stamp, currency, API credentials,
+        // billing catalog, company country) keep the default autoload.
+        $non_autoload = [
+            'alegra_connector_version',
+            'alegra_connector_sync_frequency',
+            'alegra_connector_sync_products',
+            'alegra_connector_sync_customers',
+            'alegra_connector_sync_orders',
+            'alegra_connector_sync_categories',
+            'alegra_connector_log_retention_days',
+            'alegra_connector_sync_inactive_products',
+        ];
+
         foreach ($defaults as $key => $value) {
             if (get_option($key) === false) {
-                add_option($key, $value);
+                add_option($key, $value, '', in_array($key, $non_autoload, true) ? 'no' : 'yes');
             }
         }
 

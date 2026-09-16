@@ -27,6 +27,13 @@ class Public_
      */
     private static bool $is_syncing = false;
 
+    /**
+     * AC-84: the push-hook enablement options are read ONCE here, when the
+     * object is built on `plugins_loaded`. Toggling them in wp-admin during the
+     * same request does not retroactively register/unregister hooks; the new
+     * state applies from the next request. That is intentional — registering
+     * hooks mid-request is unpredictable — so the options are not re-evaluated.
+     */
     public function __construct(?API\Client $api, ?Logger\Logger $logger)
     {
         $this->api = $api;
@@ -223,12 +230,6 @@ class Public_
     {
         $this->logger->info('WooCommerce: Order completed', ['order_id' => $order_id]);
         $this->trigger_sync('order', $order_id, 'complete');
-    }
-
-    public function on_order_refunded(int $order_id): void
-    {
-        $this->logger->info('WooCommerce: Order refunded', ['order_id' => $order_id]);
-        $this->trigger_sync('order', $order_id, 'refund');
     }
 
     public function on_order_cancelled(int $order_id): void

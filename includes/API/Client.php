@@ -226,7 +226,10 @@ class Client
                 return new \WP_Error('json_error', 'Invalid JSON response from API');
             }
 
-            return $decoded ?? [];
+            // AC-73: a JSON scalar (number/string/bool) decodes to a non-array
+            // despite the array|\WP_Error contract; normalise so callers can
+            // always treat the result as an array.
+            return is_array($decoded) ? $decoded : [];
         }
 
         return new \WP_Error('max_retries', 'Maximum API retries exceeded (5 attempts)');
@@ -342,22 +345,6 @@ class Client
             }
         }
         return null;
-    }
-
-    /**
-     * Get the Consumidor Final contact ID (cached or resolved).
-     * Returns the ID string or false if not available. NEVER creates the contact.
-     */
-    public function get_or_create_consumidor_final(): string|false
-    {
-        if (!class_exists('\Alegra\Connector\Consumidor_Final')) {
-            return false;
-        }
-        $id = \Alegra\Connector\Consumidor_Final::get_id();
-        if ($id === false && $this->logger) {
-            $this->logger->error('Consumidor Final could not be resolved');
-        }
-        return $id;
     }
 
     /**
@@ -488,25 +475,16 @@ class Client
         return $this->get('/currencies', $params);
     }
 
-    public function get_items_count(): int
-    {
-        $result = $this->get('/items', ['metadata' => 'true', 'limit' => 1]);
-        if (is_wp_error($result)) return -1;
-        return (int) ($result['metadata']['total'] ?? 0);
-    }
-
-    public function get_contacts_count(): int
-    {
-        $result = $this->get('/contacts', ['metadata' => 'true', 'limit' => 1, 'type' => 'client']);
-        if (is_wp_error($result)) return -1;
-        return (int) ($result['metadata']['total'] ?? 0);
-    }
-
     // Number Templates
     public function get_number_templates(array $params = []): array|\WP_Error
     {
         if (!array_key_exists('documentType', $params)) {
             $params['documentType'] = 'invoice';
+        }
+        // AC-89: the default page size is 10; request the max (30) so an
+        // account with more than 10 templates does not hide the electronic one.
+        if (!array_key_exists('limit', $params)) {
+            $params['limit'] = 30;
         }
         return $this->get('/number-templates', $params);
     }
@@ -694,13 +672,6 @@ class Client
         return $this->post('/invoices/' . $id . '/open', []);
     }
 
-    public function stamp_invoice(string $id, bool $generateStamp = true): array|\WP_Error
-    {
-        return $this->post('/invoices/' . $id . '/stamp', [
-            'stamp' => ['generateStamp' => $generateStamp],
-        ]);
-    }
-
     // Retentions on invoices
     public function update_invoice_retentions(string $id, array $retentions): array|\WP_Error
     {
@@ -758,20 +729,25 @@ class Client
     // Item attachments (images)
     public function upload_item_image(string $item_id, string $file_path): array|\WP_Error
     {
-        if (get_option('alegra_connector_dry_run', false)) {
-            if ($this->logger) {
-                $this->logger->warning('[DRY RUN] Blocked POST /items/' . $item_id . '/attachment', ['file' => $file_path]);
-            }
-            return ['dry_run' => true, 'blocked' => 'POST /items/' . $item_id . '/attachment'];
-        }
-
         if (!file_exists($file_path)) {
             return new \WP_Error('file_not_found', 'Image file not found');
         }
 
+        // Read through a file handle instead of file_get_contents() (AC-80).
+        // The caller (Products::sync_product_image) already rejects files over
+        // Alegra's 2 MB limit, so this is bounded.
+        $handle = fopen($file_path, 'rb');
+        if ($handle === false) {
+            return new \WP_Error('file_not_found', 'Image file could not be opened');
+        }
+        $file_content = stream_get_contents($handle);
+        fclose($handle);
+        if ($file_content === false) {
+            return new \WP_Error('file_read_error', 'Image file could not be read');
+        }
+
         $boundary = 'alegra-' . uniqid();
         $file_name = basename($file_path);
-        $file_content = file_get_contents($file_path);
         $mime = mime_content_type($file_path) ?: 'image/jpeg';
 
         $body = "--{$boundary}\r\n";
@@ -780,33 +756,17 @@ class Client
         $body .= $file_content . "\r\n";
         $body .= "--{$boundary}--\r\n";
 
-        $url = $this->base_url . '/items/' . $item_id . '/attachment';
-
-        $response = wp_remote_post($url, [
+        // Naming-drift collapse: route the upload through the single HTTP write
+        // path (request()) so it inherits the dry-run guard, rate-limit throttle
+        // and retry/backoff instead of duplicating the dry-run check and
+        // bypassing throttling/retry.
+        return $this->request('POST', '/items/' . $item_id . '/attachment', [], [
             'headers' => [
                 'Authorization' => $this->get_auth_header(),
                 'Content-Type' => 'multipart/form-data; boundary=' . $boundary,
             ],
             'body' => $body,
-            'timeout' => 30,
         ]);
-
-        if (is_wp_error($response)) {
-            if ($this->logger) $this->logger->error('Item image upload failed', ['error' => $response->get_error_message()]);
-            return $response;
-        }
-
-        $code = wp_remote_retrieve_response_code($response);
-        $response_body = wp_remote_retrieve_body($response);
-        $decoded = json_decode($response_body, true);
-
-        if ($code >= 400) {
-            $message = is_array($decoded) ? ($decoded['message'] ?? 'Upload failed') : 'Upload failed';
-            if ($this->logger) $this->logger->error('Item image upload error', ['code' => $code, 'message' => $message]);
-            return new \WP_Error('upload_error', $message);
-        }
-
-        return $decoded ?? [];
     }
 
     // Rate limiting.

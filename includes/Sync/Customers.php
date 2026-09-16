@@ -245,14 +245,19 @@ class Customers
                     break;
                 }
 
-                set_transient('alegra_sync_progress', [
-                    'type' => 'customers',
-                    'current_page' => $p,
-                    'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
-                    'imported' => $result['imported'],
-                    'updated' => $result['updated'],
-                    'message' => sprintf(__('Procesando clientes... Página %d', 'alegra-connector'), $p),
-                ], 120);
+                // AC-83: throttle the progress write (every 5th page) and use a
+                // TTL longer than a run so the admin UI never sees it expire
+                // mid-import.
+                if ($p === 1 || $p % 5 === 0) {
+                    set_transient('alegra_sync_progress', [
+                        'type' => 'customers',
+                        'current_page' => $p,
+                        'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
+                        'imported' => $result['imported'],
+                        'updated' => $result['updated'],
+                        'message' => sprintf(__('Procesando clientes... Página %d', 'alegra-connector'), $p),
+                    ], 600);
+                }
 
                 $alegra_contacts = $this->api->get_contacts([
                     'start' => ($current_page - 1) * $per_page,
@@ -417,11 +422,14 @@ class Customers
             if (!is_wp_error($payload)) {
                 return $payload;
             }
+
+            // Minimal payload for customers without billing data. The invoice
+            // flow uses Consumidor Final; this keeps the customer-sync flow
+            // working for legacy/partial records. The shape is owned by
+            // Billing_Fields so there is a single contact-payload builder.
+            return \Alegra\Connector\Billing_Fields::build_minimal_contact_payload($customer);
         }
 
-        // Fallback: minimal payload for customers without billing data.
-        // The invoice flow uses Consumidor Final; this keeps the customer-sync
-        // flow working for legacy/partial records.
         return [
             'name'     => $customer->display_name ?: $customer->user_email,
             'email'    => $customer->user_email,

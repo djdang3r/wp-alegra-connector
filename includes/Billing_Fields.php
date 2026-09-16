@@ -34,7 +34,7 @@ class Billing_Fields
         'kindofperson' => [
             'meta_key' => 'billing_alegra_kindofperson', 'label' => 'Tipo de persona',
             'alegra_field' => 'kindOfPerson', 'type' => 'select',
-            'options' => ['PERSON_ENTITY' => 'Persona Natural', 'LEGAL_ENTITY' => 'Persona Jurídica (empresa)'],
+            'options' => ['PERSON_ENTITY' => 'Persona Natural', 'LEGAL_ENTITY' => 'Persona Jurídica (empresa)', 'OTHER_ENTITY' => 'Otro tipo de obligado'],
             'required' => true, 'group' => 'A', 'render_when' => 'always',
             'help' => 'Define si la factura sale a nombre de una persona natural o de una empresa.',
             'help_url' => 'https://developer.alegra.com/reference/colombia',
@@ -318,10 +318,10 @@ class Billing_Fields
         // ENABLED. A disabled field must never be required — enabling only
         // optional fields must not block checkout/registration.
         $kind = self::as_string($values['kindofperson']);
-        if (self::is_field_enabled('kindofperson') && !in_array($kind, ['PERSON_ENTITY', 'LEGAL_ENTITY'], true)) {
+        if (self::is_field_enabled('kindofperson') && !in_array($kind, ['PERSON_ENTITY', 'LEGAL_ENTITY', 'OTHER_ENTITY'], true)) {
             return new \WP_Error(
                 'invalid_kindofperson',
-                __('Seleccione un tipo de persona válido (Persona Natural o Persona Jurídica).', 'alegra-connector')
+                __('Seleccione un tipo de persona válido (Persona Natural, Persona Jurídica u Otro tipo de obligado).', 'alegra-connector')
             );
         }
 
@@ -402,13 +402,36 @@ class Billing_Fields
             'address' => [
                 'address' => (string) get_user_meta($user_id, 'billing_address_1', true),
                 'city' => (string) get_user_meta($user_id, 'billing_city', true),
-                'department' => (string) get_user_meta($user_id, 'billing_state', true),
-                'country' => (string) get_user_meta($user_id, 'billing_country', true),
-                'zipCode' => (string) get_user_meta($user_id, 'billing_postcode', true),
+                'state' => (string) get_user_meta($user_id, 'billing_state', true),
+                'postcode' => (string) get_user_meta($user_id, 'billing_postcode', true),
             ],
         ];
 
         return self::build_payload($values, $contact);
+    }
+
+    /**
+     * Build a minimal Alegra contact payload for a customer without the
+     * e-invoicing billing data.
+     *
+     * Naming-drift collapse: Customers::prepare_customer_data() used to build
+     * its own `['name','email','type']` payload, so the contact shape lived in
+     * two places. The generic shape is defined here now.
+     *
+     * @return array<string, string>
+     */
+    public static function build_minimal_contact_payload(\WP_User $user): array
+    {
+        $name = trim((string) $user->display_name);
+        if ($name === '') {
+            $name = (string) $user->user_email;
+        }
+
+        return [
+            'name'  => $name,
+            'email' => (string) $user->user_email,
+            'type'  => 'client',
+        ];
     }
 
     /**
@@ -436,9 +459,8 @@ class Billing_Fields
             'address' => [
                 'address' => (string) $order->get_billing_address_1(),
                 'city' => (string) $order->get_billing_city(),
-                'department' => (string) $order->get_billing_state(),
-                'country' => (string) $order->get_billing_country(),
-                'zipCode' => (string) $order->get_billing_postcode(),
+                'state' => (string) $order->get_billing_state(),
+                'postcode' => (string) $order->get_billing_postcode(),
             ],
         ];
 
@@ -1093,6 +1115,17 @@ class Billing_Fields
             }
         }
 
+        // AC-75: Alegra requires a name; a PERSON_ENTITY with no usable
+        // first/last name (or a non-CO contact with an empty display name) would
+        // otherwise be POSTed nameless and rejected with a generic 400. Signal
+        // incomplete so the caller falls back to Consumidor Final instead.
+        if (empty($payload['name']) && empty($payload['nameObject'])) {
+            return new \WP_Error(
+                'incomplete_billing_data',
+                __('El cliente no tiene un nombre válido para crear el contacto en Alegra.', 'alegra-connector')
+            );
+        }
+
         // AC-49: kindOfPerson / identificationObject / regime are Colombia
         // (e-invoicing) fields. Gate them on the account country; a non-CO
         // account gets the generic flat `identification`.
@@ -1126,9 +1159,16 @@ class Billing_Fields
             $payload['observations'] = (string) $values['observations'];
         }
 
+        // AC-87: send only the address keys Alegra documents per country
+        // (CO: address/city; other countries: + province/postalCode). The old
+        // payload always sent department/country/zipCode, which the docs do not
+        // define for contacts.
         $address = $contact['address'] ?? [];
         if (is_array($address)) {
-            $payload['address'] = $address;
+            $documented = self::documented_address($address);
+            if (!empty($documented)) {
+                $payload['address'] = $documented;
+            }
         }
 
         $payload['type'] = 'client';
@@ -1188,6 +1228,39 @@ class Billing_Fields
         }
 
         return $name_object;
+    }
+
+    /**
+     * Normalize raw billing address fields to the keys Alegra documents (AC-87).
+     *
+     * Colombia documents only `address` and `city`; the generic/Argentina
+     * variant adds `province` and `postalCode`. Anything else (department,
+     * country, zipCode) is dropped so a country variant cannot reject the
+     * payload for unknown keys.
+     *
+     * @param array<string, mixed> $raw
+     * @return array<string, string>
+     */
+    private static function documented_address(array $raw): array
+    {
+        $address = [];
+        if (trim((string) ($raw['address'] ?? '')) !== '') {
+            $address['address'] = (string) $raw['address'];
+        }
+        if (trim((string) ($raw['city'] ?? '')) !== '') {
+            $address['city'] = (string) $raw['city'];
+        }
+
+        if (!self::is_colombia_account()) {
+            if (trim((string) ($raw['state'] ?? '')) !== '') {
+                $address['province'] = (string) $raw['state'];
+            }
+            if (trim((string) ($raw['postcode'] ?? '')) !== '') {
+                $address['postalCode'] = (string) $raw['postcode'];
+            }
+        }
+
+        return $address;
     }
 
     /**

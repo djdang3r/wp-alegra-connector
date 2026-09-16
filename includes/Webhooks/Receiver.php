@@ -76,6 +76,13 @@ class Receiver
         $event = sanitize_text_field($payload['subject']);
         $data = $payload['message'] ?? [];
 
+        // AC-77: `message` must be an array. A scalar body used to raise a
+        // TypeError inside process_event(string, array) that was caught and
+        // reported as a generic 500; reject it as a bad request instead.
+        if (!is_array($data)) {
+            return new \WP_REST_Response(['error' => 'Invalid payload: message must be an object'], 400);
+        }
+
         if ($this->logger) {
             $this->logger->info('Webhook received', ['event' => $event]);
         }

@@ -3,7 +3,10 @@ $page_title=__('Documentación','alegra-connector');
 $page_subtitle=__('Guia completa del plugin Alegra Connector','alegra-connector');
 include __DIR__.'/header.php';
 
-// Simple markdown to HTML converter
+// Simple markdown to HTML converter.
+// AC-85: guard the declaration so including this template twice (or two admin
+// pages in one request) cannot trigger a "cannot redeclare function" fatal.
+if (!function_exists('ac_md_to_html')) {
 function ac_md_to_html(string $md): string {
     // Step 1: Extract and protect fenced code blocks
     $code_blocks = [];
@@ -82,6 +85,7 @@ function ac_md_to_html(string $md): string {
         else $md .= '<p>'.$b.'</p>';
     }
     return $md;
+}
 }
 
 // Split content by ## sections for navigation

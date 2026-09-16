@@ -286,6 +286,13 @@ class Orders
             return $invoice_result;
         }
 
+        // AC-72: in dry-run mode create_invoice() returns ['dry_run' => true]
+        // with no `id`; reading $invoice_result['id'] unguarded produced a
+        // warning and an empty invoice id. Bail out before touching it.
+        if (!isset($invoice_result['id']) || (string) $invoice_result['id'] === '') {
+            return $invoice_result;
+        }
+
         $existing_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment_id !== '') {
             return $invoice_result;
@@ -335,125 +342,44 @@ class Orders
         return $invoice_result;
     }
 
+    /**
+     * Create a credit note for the whole order (legacy entry point).
+     *
+     * Naming-drift collapse (root cause of AC-04): this used to be a SECOND,
+     * independent credit-note implementation with its own idempotency key
+     * (`_alegra_credit_note_id`) and its own payload shape. Together with the
+     * per-refund path it let one full refund issue two DIAN credit notes. It now
+     * delegates to the single implementation, create_credit_note_for_refund(),
+     * so every caller shares one payload builder, one cumulative cap and one
+     * idempotency key.
+     */
     public function create_credit_note(\WC_Order $order): array|\WP_Error
     {
-        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        $order_id = (int) $order->get_id();
 
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
         if ($alegra_invoice_id === '') {
             return new \WP_Error('no_invoice', __('El pedido no tiene una factura de Alegra vinculada', 'alegra-connector'));
         }
 
-        // Idempotency: never issue a second credit note for the same order.
-        // State_Sync::handle_refund() (the refund owner) records its per-refund
-        // keys AND the cumulative cap; either marker means a credit note exists.
-        $existing_credit_note = (string) $order->get_meta('_alegra_credit_note_id', true);
-        if ($existing_credit_note !== '') {
-            return ['id' => $existing_credit_note, 'already_exists' => true];
-        }
+        // Credit whatever has not been credited yet. The cumulative
+        // _alegra_credited_amount marker (maintained by the shared
+        // implementation) makes this idempotent: a second call credits 0.
         $credited_before = (float) $order->get_meta('_alegra_credited_amount', true);
-        if ($credited_before > 0) {
+        $amount = round((float) $order->get_total() - $credited_before, 2);
+        if ($amount <= 0) {
             return new \WP_Error(
                 'credit_note_already_issued',
                 __('Ya se emitió una nota de crédito para este pedido.', 'alegra-connector')
             );
         }
 
-        $invoice = $this->api->get_invoice($alegra_invoice_id);
-        if (!is_wp_error($invoice) && is_array($invoice)) {
-            $emission = (string) ($invoice['emission_status'] ?? '');
-            if ($emission === 'PENDING' || $emission === '') {
-                return new \WP_Error(
-                    'invoice_not_stamped',
-                    __('No se puede crear la nota de crédito: la factura original no está emitida ante la DIAN.', 'alegra-connector')
-                );
-            }
-        }
-
-        $refunds = $order->get_refunds();
-        if (!empty($refunds)) {
-            $items = [];
-            foreach ($refunds as $refund) {
-                $refund_items = $this->prepare_credit_note_items_from_refund($refund);
-                $items = array_merge($items, $refund_items);
-            }
-            $observation = sprintf(
-                __('Reembolso parcial de pedido #%d - WooCommerce', 'alegra-connector'),
-                $order->get_id()
-            );
-        } else {
-            $items = $this->prepare_credit_note_items($order);
-            $observation = sprintf(
-                __('Reembolso total de pedido #%d - WooCommerce', 'alegra-connector'),
-                $order->get_id()
-            );
-        }
-
-        $total = 0.0;
-        foreach ($items as $item) {
-            $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
-            if (isset($item['discount'])) {
-                $line *= (1 - ((float) $item['discount'] / 100));
-            }
-            $total += $line;
-        }
-
-        // Cumulative cap: never credit more than the original invoice total.
-        $invoice_total = (!is_wp_error($invoice) && isset($invoice['total']))
-            ? (float) $invoice['total']
-            : (float) $order->get_total();
-        if ($credited_before + $total > $invoice_total + 0.01) {
-            return new \WP_Error(
-                'credit_note_exceeds_invoice',
-                __('El monto de la nota de crédito supera el total de la factura.', 'alegra-connector')
-            );
-        }
-
-        // Resolve the client — required by POST /credit-notes.
-        $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
-        if ($client_id === '') {
-            $cf = \Alegra\Connector\Consumidor_Final::get_id();
-            $client_id = $cf !== false ? (string) $cf : '';
-        }
-        if ($client_id === '') {
-            return new \WP_Error(
-                'customer_unresolved',
-                __('No se pudo resolver el cliente para la nota de crédito.', 'alegra-connector')
-            );
-        }
-
-        $data = [
-            'client' => ['id' => $client_id],
-            'invoices' => [
-                [
-                    'id'     => $alegra_invoice_id,
-                    'amount' => round($total, 2),
-                ],
-            ],
-            'date' => date('Y-m-d'),
-            'dueDate' => date('Y-m-d'),
-            'observations' => $observation,
-            'items' => $items,
-        ];
-
-        if (get_option('alegra_connector_stamp_enabled', true)) {
-            $data['stamp'] = ['generateStamp' => true];
-        }
-
-        $result = $this->api->create_credit_note($data);
-
-        if (!is_wp_error($result)) {
-            $cn_id = $result['id'] ?? '';
-            $order->update_meta_data('_alegra_credit_note_id', (string) $cn_id);
-            // Maintain the cumulative cap so a later refund cannot over-credit.
-            $order->update_meta_data('_alegra_credited_amount', $credited_before + $total);
-            $order->save();
-            $this->logger->info('Credit note created in Alegra', [
-                'order_id' => $order->get_id(),
-                'credit_note_id' => $cn_id,
-            ]);
-        }
-
-        return $result;
+        return $this->create_credit_note_for_refund(
+            $order_id,
+            $amount,
+            sprintf(__('Reembolso de pedido #%d - WooCommerce', 'alegra-connector'), $order_id),
+            0
+        );
     }
 
     /**
@@ -488,7 +414,10 @@ class Orders
         }
 
         // Idempotency: this specific refund was already credited.
-        $refund_meta_key = '_alegra_credit_note_for_refund_' . $refund_id;
+        // Naming-drift collapse: State_Sync (the refund owner) and this class
+        // used two different per-refund keys for the same concept, so their
+        // guards never composed. Unify on State_Sync::REFUND_META_FMT.
+        $refund_meta_key = sprintf(\Alegra\Connector\State_Sync::REFUND_META_FMT, $refund_id);
         if ($refund_id > 0) {
             $stored = $order->get_meta($refund_meta_key, true);
             if (!empty($stored)) {
@@ -870,8 +799,12 @@ class Orders
                     }
                 }
 
-                // Step 3b — legacy billing_nit lookup.
-                $nit = $customer ? (string) get_user_meta($customer->ID, 'billing_nit', true) : (string) $order->get_meta('billing_nit');
+                // Step 3b — legacy billing_nit lookup (registered customers
+                // only). Customers::update_customer_from_alegra() writes
+                // billing_nit to USER meta; the guest branch used to read an
+                // order meta key (`billing_nit`, no underscore) that nothing
+                // ever writes, so it was dead (AC-76).
+                $nit = $customer ? (string) get_user_meta($customer->ID, 'billing_nit', true) : '';
                 if ($nit !== '') {
                     $contacts = $this->api->get_contacts(['identification' => $nit, 'limit' => 5]);
                     if (!is_wp_error($contacts) && !empty($contacts)) {
@@ -935,6 +868,14 @@ class Orders
     /**
      * Persist the resolved Alegra contact id on the order and, when present,
      * on the customer.
+     *
+     * Contact-id meta naming (deliberately left as-is; renaming without a
+     * migration would orphan data on live stores):
+     * - order:  `_billing_alegra_contact_id`
+     * - user:   `alegra_contact_id`
+     * - term:   `alegra_category_id`
+     * The three storages are different entity types; the prefix drift is
+     * historical and every read/write uses the same key for its entity.
      */
     private function persist_contact_id(\WC_Order $order, ?\WP_User $customer, string $contact_id): void
     {
@@ -1139,70 +1080,6 @@ class Orders
             ],
             'paymentMethod' => $this->get_payment_method_code($order),
         ];
-    }
-
-    private function prepare_credit_note_items(\WC_Order $order): array
-    {
-        $items = [];
-
-        foreach ($order->get_items() as $item_obj) {
-            $product_id = $item_obj->get_product_id();
-            $variation_id = $item_obj->get_variation_id();
-
-            $alegra_item_id = $this->resolve_item_alegra_id($product_id, $variation_id);
-
-            $subtotal = (float) $item_obj->get_subtotal();
-            $line_total = (float) $item_obj->get_total();
-
-            $item_data = [
-                'name' => $item_obj->get_name(),
-                'quantity' => (int) $item_obj->get_quantity(),
-                'price' => (float) ($subtotal / max(1, $item_obj->get_quantity())),
-            ];
-
-            // Keep credit-note lines aligned with the discounted invoice total.
-            $discount = self::line_discount_percent($subtotal, $line_total);
-            if ($discount > 0) {
-                $item_data['discount'] = $discount;
-            }
-
-            if ($alegra_item_id !== '') {
-                $item_data['id'] = $alegra_item_id;
-            }
-
-            $items[] = $item_data;
-        }
-
-        return $items;
-    }
-
-    private function prepare_credit_note_items_from_refund(\WC_Order_Refund $refund): array
-    {
-        $items = [];
-
-        foreach ($refund->get_items() as $item_obj) {
-            $product_id = $item_obj->get_product_id();
-            $variation_id = $item_obj->get_variation_id();
-            $alegra_item_id = $this->resolve_item_alegra_id($product_id, $variation_id);
-
-            $refund_qty = abs((int) $item_obj->get_quantity());
-            $refund_total = abs((float) $item_obj->get_total());
-            $refund_price = $refund_qty > 0 ? $refund_total / $refund_qty : 0;
-
-            $item_data = [
-                'name' => $item_obj->get_name(),
-                'quantity' => $refund_qty,
-                'price' => $refund_price,
-            ];
-
-            if ($alegra_item_id !== '') {
-                $item_data['id'] = $alegra_item_id;
-            }
-
-            $items[] = $item_data;
-        }
-
-        return $items;
     }
 
     private function get_preferred_number_template(): ?string

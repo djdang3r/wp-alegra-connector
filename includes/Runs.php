@@ -48,7 +48,13 @@ class Runs
         global $wpdb;
 
         if ($started_by === null) {
-            $started_by = (wp_get_current_user()->user_login ?? 'system');
+            // AC-70: wp_get_current_user() always returns a WP_User (id 0 when
+            // there is no logged-in user), so `?? 'system'` never fired and cron
+            // runs were recorded with an empty started_by. Key off the user id.
+            $user_id = get_current_user_id();
+            $started_by = $user_id > 0
+                ? (string) (wp_get_current_user()->user_login ?: 'system')
+                : 'system';
         }
 
         $wpdb->insert($wpdb->prefix . 'alegra_runs', [
@@ -152,16 +158,51 @@ class Runs
     }
 
     /**
+     * A run still marked `running` after this many seconds is treated as
+     * abandoned (crashed worker / killed request) and reconciled (AC-82).
+     */
+    private const STALE_AFTER_SECONDS = 3600;
+
+    /**
      * Get currently running runs.
+     *
+     * AC-82: bounded (LIMIT) and stale-aware. A worker that crashed without
+     * calling finish() left rows stuck in `running` forever, polluting the
+     * monitor and inflating the "currently running" count. Anything older than
+     * STALE_AFTER_SECONDS is marked `stale` before the live rows are returned.
      */
     public static function currently_running(): array
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_runs';
 
-        return $wpdb->get_results(
-            "SELECT * FROM $table WHERE status = 'running' ORDER BY started_at DESC"
-        );
+        self::mark_stale();
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM $table WHERE status = 'running' ORDER BY started_at DESC LIMIT %d",
+            50
+        ));
+    }
+
+    /**
+     * Mark abandoned `running` rows as `stale` so they stop being reported as
+     * live (AC-82). Bounded by the same LIMIT as the read.
+     */
+    private static function mark_stale(): void
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_runs';
+        $cutoff = gmdate('Y-m-d H:i:s', time() - self::STALE_AFTER_SECONDS);
+
+        $wpdb->query($wpdb->prepare(
+            "UPDATE $table
+             SET status = 'stale', finished_at = %s, error_summary = %s
+             WHERE status = 'running' AND started_at < %s
+             LIMIT 50",
+            current_time('mysql'),
+            __('Proceso abandonado (sin finalizar)', 'alegra-connector'),
+            $cutoff
+        ));
     }
 
     /**

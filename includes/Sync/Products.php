@@ -474,14 +474,19 @@ class Products
                     break;
                 }
 
-                set_transient('alegra_sync_progress', [
-                    'type' => 'inventory',
-                    'current_page' => $p,
-                    'items_processed' => $result['updated'] + $result['errors'],
-                    'updated' => $result['updated'],
-                    'errors' => $result['errors'],
-                    'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p),
-                ], 120);
+                // AC-83: throttle the progress write (every 5th page) and use a
+                // TTL longer than a run so the admin UI never sees it expire
+                // mid-import.
+                if ($p === 1 || $p % 5 === 0) {
+                    set_transient('alegra_sync_progress', [
+                        'type' => 'inventory',
+                        'current_page' => $p,
+                        'items_processed' => $result['updated'] + $result['errors'],
+                        'updated' => $result['updated'],
+                        'errors' => $result['errors'],
+                        'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p),
+                    ], 600);
+                }
 
                 // AC-51: simple mode strips `inventory` down to `unit`, so
                 // `availableQuantity` is absent and the guard below skips every
@@ -658,15 +663,18 @@ class Products
                 break;
             }
 
-            // Update progress transient
-            set_transient('alegra_sync_progress', [
-                'type' => 'products',
-                'current_page' => $current_page,
-                'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
-                'imported' => $result['imported'],
-                'updated' => $result['updated'],
-                'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $current_page),
-            ], 120);
+            // Update progress transient (AC-83: throttled to every 5th page,
+            // with a TTL longer than the run).
+            if ($pages_done === 0 || $pages_done % 5 === 0) {
+                set_transient('alegra_sync_progress', [
+                    'type' => 'products',
+                    'current_page' => $current_page,
+                    'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
+                    'imported' => $result['imported'],
+                    'updated' => $result['updated'],
+                    'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $current_page),
+                ], 600);
+            }
 
             $api_params = [
                 'start' => $start,
@@ -1271,11 +1279,12 @@ class Products
                 continue;
             }
 
-            // Skip already-processed URLs in this session
-            if (in_array($img['url'], $seen_urls, true)) {
+            // Skip already-processed URLs in this session. AC-79: use a hash
+            // set (O(1)) instead of in_array() (O(n)) to avoid O(n²) dedup.
+            if (isset($seen_urls[$img['url']])) {
                 continue;
             }
-            $seen_urls[] = $img['url'];
+            $seen_urls[$img['url']] = true;
 
             $attachment_id = $this->download_and_attach_image($product_id, $img['url']);
             if (!$attachment_id) continue;
@@ -1297,8 +1306,8 @@ class Products
             $seen_urls = [];
             foreach ($images as $img) {
                 if (empty($img['url'])) continue;
-                if (in_array($img['url'], $seen_urls, true)) continue;
-                $seen_urls[] = $img['url'];
+                if (isset($seen_urls[$img['url']])) continue;
+                $seen_urls[$img['url']] = true;
                 $attachment_id = $this->download_and_attach_image($product_id, $img['url']);
                 if (!$attachment_id) continue;
                 if (!$featured_set) {
