@@ -89,7 +89,9 @@ class Consumidor_Final
         $lock_key = self::cache_key(self::LOCK_KEY);
 
         // Acquire a lock so concurrent requests do not hammer the API.
-        if (!set_transient($lock_key, 1, self::LOCK_TTL)) {
+        // NOTE: set_transient() returns true even when the key already exists,
+        // so existence must be checked with get_transient() first.
+        if (get_transient($lock_key)) {
             usleep(500000); // 500ms
 
             $cached = get_transient(self::cache_key(self::CACHE_TRANSIENT));
@@ -104,6 +106,8 @@ class Consumidor_Final
 
             return false;
         }
+
+        set_transient($lock_key, 1, self::LOCK_TTL);
 
         try {
             if ($client === null) {

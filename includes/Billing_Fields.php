@@ -453,10 +453,17 @@ class Billing_Fields
             $type = (string) $field['type'];
             $wc_type = in_array($type, ['select', 'textarea'], true) ? $type : 'text';
 
+            // Conditionally-required fields (render_when != always) must NOT be
+            // marked required in the WC fields array: WooCommerce enforces
+            // `required` server-side regardless of the JS visibility toggle, which
+            // would block natural persons on the `company` field. They are enforced
+            // by self::validate() on woocommerce_checkout_process instead.
+            $is_conditional = (string) ($field['render_when'] ?? 'always') !== 'always';
+
             $entry = [
                 'type' => $wc_type,
                 'label' => (string) $field['label'],
-                'required' => !empty($field['required']),
+                'required' => !empty($field['required']) && !$is_conditional,
                 'class' => [
                     'form-row-wide',
                     'alegra-billing-field',
@@ -513,7 +520,10 @@ class Billing_Fields
     {
         $name = (string) $field['meta_key'];
         $id = 'alegra-' . $key;
-        $required = !empty($field['required']);
+        // Only unconditionally-rendered fields are marked required in the form.
+        // Conditional fields (e.g. company for legal entities) are enforced by
+        // self::validate() and, on checkout, by the JS visibility layer.
+        $required = !empty($field['required']) && (string) ($field['render_when'] ?? 'always') === 'always';
         $required_attr = $required ? ' required' : '';
 
         $classes = 'form-row form-row-wide alegra-billing-field alegra-group-' . strtolower((string) $field['group']);
@@ -606,6 +616,10 @@ class Billing_Fields
      */
     private static function on_register_post($username, $email, $errors): void
     {
+        if (!self::has_enabled_fields()) {
+            return;
+        }
+
         $result = self::validate(self::collect_posted_values());
         if (is_wp_error($result) && $errors instanceof \WP_Error) {
             $errors->add($result->get_error_code(), $result->get_error_message());
@@ -617,6 +631,10 @@ class Billing_Fields
      */
     private static function on_checkout_process(): void
     {
+        if (!self::has_enabled_fields()) {
+            return;
+        }
+
         $result = self::validate(self::collect_posted_values());
         if (is_wp_error($result)) {
             wc_add_notice($result->get_error_message(), 'error');
