@@ -174,6 +174,12 @@ final class Alegra_Connector
         // DB migrations on plugins_loaded (idempotent via dbDelta)
         add_action('plugins_loaded', [\Alegra\Connector\Schema::class, 'migrate'], 5);
 
+        // Billing fields + checkout integration (2.3.0)
+        \Alegra\Connector\Checkout_Integration::register();
+
+        // State sync: refunds, profile updates, payment method changes (2.3.0)
+        \Alegra\Connector\State_Sync::register_hooks();
+
         // Tombstone hook: track products deleted in WC
         add_action('before_delete_post', [\Alegra\Connector\Tombstone_Manager::class, 'on_post_delete']);
 
