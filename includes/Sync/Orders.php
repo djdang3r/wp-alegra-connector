@@ -187,8 +187,18 @@ class Orders
             );
         }
 
+        $total = 0.0;
+        foreach ($items as $item) {
+            $total += (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+        }
+
         $data = [
-            'invoice' => ['id' => $alegra_invoice_id],
+            'invoices' => [
+                [
+                    'id'     => $alegra_invoice_id,
+                    'amount' => round($total, 2),
+                ],
+            ],
             'date' => date('Y-m-d'),
             'dueDate' => date('Y-m-d'),
             'observations' => $observation,
@@ -372,11 +382,14 @@ class Orders
         );
 
         if (!is_wp_error($result)) {
+            $order->add_order_note(sprintf(
+                __('Factura Alegra #%s anulada.', 'alegra-connector'),
+                $alegra_invoice_id
+            ));
             $this->logger->info('Invoice voided in Alegra', [
                 'order_id' => $order->get_id(),
                 'invoice_id' => $alegra_invoice_id,
             ]);
-
         }
 
         return $result;
