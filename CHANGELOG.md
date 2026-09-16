@@ -2,6 +2,114 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.1] - 2026-09-16
+
+> **⚠️ This release replaces the broken public 2.3.0 — upgrade immediately.**
+> 2.3.0 was published with **two fatal errors** inside (`update_transient()` is
+> not a WordPress function, and `map_product_tax()` returned `int` from a
+> `: string` method under `strict_types`), a duplicate DIAN credit-note bug and
+> a set of correctness defects. A full audit followed — **68 findings, all fixed
+> across batches 0–3** (critical → security → correctness → performance →
+> hygiene). This is a **security and correctness release, not a feature
+> release**. The 2.3.0 feature set is unchanged; only the defects are.
+
+### 🛡️ Critical & Security
+
+- **FIX: `update_transient()` fatal killed every cron sync** — `update_transient()` is not a WordPress function. It fataled every cron run right before the completion heartbeat, so runs were marked failed and `alegra_connector_last_sync` was never updated. Replaced with `set_transient()` (and a proper heartbeat write).
+
+- **FIX: `map_product_tax()` TypeError killed every product push** — The method is declared `: string` but returned `int 0` for products without an explicit tax class. Under `strict_types` that is a `TypeError`, so **every** product push without a tax class died. It now returns `'0'` (and the callers treat tax as a string end-to-end).
+
+- **FIX: a full refund issued TWO credit notes to the DIAN** — Two hooks both created a credit note (`order_status_refunded` → `create_credit_note`, `order_refunded` → `create_credit_note_for_refund`). A full refund fires both, with different idempotency keys, so it emitted **two fiscal documents**. There is now a single owner and one per-refund idempotency key.
+
+- **FIX: sync/invoice/contact/refund locks were not atomic** — The locks used `get_transient()` then `set_transient()` (an unconditional upsert), so two PHP-FPM workers could both read empty and both win, each creating an invoice for the same order → **duplicate fiscal documents**. Replaced with an `add_option()`-based compare-and-swap (`wp_options.option_name` is UNIQUE) with stale-lock reclamation; every lock site releases in a `finally` block.
+
+- **FIX: Colombian invoices sent the wrong `paymentMethod` catalog** — Colombia requires the uppercase DIAN "Medio de pago" codes; the plugin sent the lowercase global codes. It now maps WooCommerce gateways to DIAN codes for CO and **omits** `paymentMethod` (rather than guessing) when the gateway has no unambiguous DIAN equivalent.
+
+- **FIX: API token rendered in the settings page HTML** — The Alegra API token was printed in plaintext in the settings page markup, readable by any user with `manage_woocommerce`. It is now masked, and submitting the field empty keeps the stored value instead of wiping it.
+
+- **FIX: DOM XSS from Alegra error text** — Raw Alegra error strings were concatenated into HTML in three admin templates. Nodes are now built with `.text()` and tags are stripped at the source.
+
+- **FIX: webhooks could never authenticate** — The receiver required an HMAC signature, but **Alegra sends no signature**, so every webhook returned `401` and the feature was silently dead. Verification is now optional (only enforced when a signature header is actually present) and replay protection uses a body-hash window.
+
+- **FIX: capability mismatches** — Credential overwrite, user/attachment deletion, CSV import and disconnect now require the capability the operation actually needs, instead of a weaker shared check.
+
+### 🐛 Correctness
+
+- **FIX: HPOS order read still used `get_post_meta()`** — One admin/dashboard order-meta read bypassed the WooCommerce CRUD API, so on High-Performance Order Storage stores **every order looked pending**. It now uses `$order->get_meta()`.
+
+- **FIX: Alegra UUIDs truncated by `(int)` casts** — Five remaining places cast Alegra UUIDs to `int`, corrupting ids. All Alegra ids are treated as strings end-to-end.
+
+- **FIX: disabled billing fields were still required and still sent** — Field enablement now gates collection, validation, saving and payload building alike, so a disabled field is neither demanded at checkout nor transmitted.
+
+- **FIX: coupon discounts were not mapped** — Invoices exceeded the WooCommerce order total because discounts were dropped from the payload. Coupon discounts are now applied.
+
+- **FIX: CO-only contact fields sent to every account country** — Contact address keys are now filtered per country, so a non-Colombian account is not sent Colombian-only fields (and `OTHER_ENTITY` was added to `kindOfPerson`).
+
+- **FIX: payment-method change >5 min after the baseline was dropped** — The baseline lived in a 300-second transient, so a later change was silently ignored. The baseline is now persisted so the change is detected.
+
+- **FIX: inventory pull omitted `mode=advanced`** — The stock pull requested the simple item shape, which excludes inventory detail — likely a silent no-op. It now asks for `mode=advanced`.
+
+- **FIX: a failed DIAN stamp left an untracked draft → duplicate on retry** — Alegra returns `400` with the created invoice in the body when stamping fails; the plugin discarded it and a retry created a second invoice. The id is now recovered and persisted, and the order is annotated that it was created but not stamped.
+
+- **FIX: no idempotency — a lost response duplicated the invoice/payment** — Before creating a document the plugin now pre-searches for an existing one, so a lost/retried response no longer duplicates an invoice or a payment.
+
+- **FIX: imported variations had no attributes** — Imported product variations were created without attributes and therefore were not selectable in WooCommerce. They now get their attributes.
+
+- **FIX: `Consumidor Final` cache was never invalidated** — A deleted/replaced contact id was served forever; the cache is now invalidated and `resolve()` respects it.
+
+- **FIX: a missing Alegra price overwrote the WooCommerce price with `0`** — A missing/absent price is now skipped instead of zeroing the store price.
+
+### ⚡ Performance & Robustness
+
+- **FIX: `Schema::migrate()` ran six `dbDelta()` on every request** — Including frontend page views, for every visitor. It is now version-guarded via `alegra_connector_schema_version`, so schema work runs only on install/upgrade.
+
+- **FIX: `Entity_Map` was never written on import → O(N²) scans** — Every lookup fell back to an unindexed `wp_postmeta.meta_value` scan. Imports now populate the entity map, lookups use it, and `backfill_from_postmeta()` is keyset-paginated and opt-in.
+
+- **FIX: product import was silently capped at 6,000 items and not resumable** — It now has a cursor + time budget, no page cap, and drops the `set_time_limit(300)` crutch; interrupted runs resume instead of restarting.
+
+- **FIX: rate limiting used a window that never reset, at a third of the documented limit** — It now uses a fixed window that resets, honours the `X-Rate-Limit-*` headers, and uses the documented **150 req/min** (was 50).
+
+- **FIX: log tables had no retention; dead tables lingered** — A daily retention/prune cron was added, and three writerless tables (`wp_alegra_pull_queue`, `wp_alegra_push_log`, `wp_alegra_push_queue`) are dropped.
+
+- **REMOVED: the non-functional push-queue subsystem** — `enqueue()` had zero callers, `execute_queued_push()` called a missing method and `mark_applied()` had no status guard. The class, admin page, template, AJAX handlers and settings were removed (see Upgrade Notes).
+
+- **FIX: cron overlap and admin page cost** — Added the missing global cron overlap lock; the orders poll is locked and ID-only; admin pages use `EXISTS`/SQL aggregates instead of per-row correlated subqueries; image dedup uses the indexed map and an O(1) hash set.
+
+### 🌍 i18n & Hygiene
+
+- **NEW: the plugin now ships a translation template** — There was **no `.pot` at all**, so the plugin could not be translated. Added a dependency-free extractor (`scripts/make-pot.php`), generated `languages/alegra-connector.pot`, and wired it into the release build.
+
+- **FIX: mojibake and hardcoded strings** — Restored accented characters that had been corrupted (`Estad sticas` → `Estadísticas`, etc.), wrapped the remaining hardcoded user-facing strings in the `alegra-connector` text domain, and moved hardcoded JS strings into the localized payload.
+
+- **FIX: Chart.js loaded from a third-party CDN** — Vendored locally at `admin/assets/js/vendor/chart.min.js`.
+
+- **FIX: `uninstall.php` left data behind and did nothing on multisite** — It now removes every table, option, meta and scheduled action it created, and works on a network uninstall.
+
+- **FIX: the Logger self-check silently deactivated the plugin** — A class-load failure used to deactivate a production plugin. It now only raises an admin notice.
+
+### 📝 Technical
+
+- Plugin version: **2.3.0 → 2.3.1** (PATCH — corrective release; no API or feature change).
+- Plugin header `Version:` and `ALEGRA_CONNECTOR_VERSION` bumped to `2.3.1`.
+- `Schema::SCHEMA_VERSION` reconciled from `2.4.0` to `2.3.1` so it names the release that actually ships the schema change (see Upgrade Notes).
+- `scripts/make-pot.php` `$version` bumped to `2.3.1`; the `.pot` header now reports `Alegra Connector 2.3.1`.
+- New files: `scripts/make-pot.php`, `scripts/exec-test.php`, `scripts/exec-test.sh`, `scripts/lib/` (wp-stubs, alegra-mock, test-framework), `languages/alegra-connector.pot`, `admin/assets/js/vendor/chart.min.js`.
+- Smoke-test extended; the release gate now also runs an **execution harness** that boots the plugin against a stubbed WordPress/WooCommerce and a mocked Alegra API, so a runtime fatal or a bad payload cannot be packaged.
+- `README.md` version line bumped to `2.3.1`.
+
+### ✅ Upgrade Notes
+
+- **Upgrade from 2.3.0 immediately.** All fixes are corrective; settings and data are preserved. The 2.3.0 feature set is unchanged.
+- **Three tables are dropped** by the schema migration: `wp_alegra_pull_queue`, `wp_alegra_push_log` and `wp_alegra_push_queue`. They had no writers (the push-queue subsystem was removed — see below). If you had bookmarked or scripted against them, they are gone.
+- **The push-queue UI and settings are gone.** The old "Cola de push a Alegra" admin page, its AJAX actions and the per-entity push-direction settings were removed because the subsystem never worked (`enqueue()` had zero callers; the executor called a missing method). Nothing that worked was lost, but a setting/UI you may have seen is no longer there.
+- **The schema migration re-runs once on upgrade and is idempotent.** 2.3.0 stored `alegra_connector_schema_version = '2.3.0'`; 2.3.1 ships `'2.3.1'`, so the guard differs and the migrations (drop dead tables, UUID column migration) run exactly once. The UUID column migration keeps its own separate guard.
+- **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
+- **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
+- **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
+- See `docs/RELEASE_2.3.1_VERIFICATION.md` for the three assumptions that still require a live API test.
+
+---
+
 ## [2.3.0] - 2026-09-16
 
 ### 🐛 Critical Fixes

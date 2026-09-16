@@ -12,6 +12,9 @@
 # Temporary test packages
 /temp_pkg/
 
+# Agent/audit workspace (not part of the plugin)
+/.omo/
+
 # Unit/integration tests (not yet implemented)
 /tests/
 

@@ -1,0 +1,330 @@
+# Verificación en Producción — Alegra Connector 2.3.1
+
+Esta guía es la **lista de validación** de la versión 2.3.1. La 2.3.1 **reemplaza
+a la 2.3.0**, que se publicó rota: traía dos errores fatales
+(`update_transient()` no existe en WordPress; `map_product_tax()` devolvía `int`
+desde un método `: string` bajo `strict_types`), una nota crédito duplicada ante
+la DIAN y varios defectos de correctitud. La 2.3.1 corrige los 68 hallazgos de
+la auditoría (lotes 0–3).
+
+La 2.3.0 se construyó contra la **documentación oficial** de Alegra y de
+WooCommerce, pero **nueve comportamientos concretos nunca se probaron contra la
+API real de Alegra ni contra una tienda real**. La auditoría posterior resolvió
+parte de ellos:
+
+- **4 resueltos por la documentación** (2, 3, 5 y 6): ya no hace falta probarlos.
+- **2 resultaron ser bugs** (8 y 9): no eran "verificar", eran errores reales,
+  y quedaron **corregidos** en la 2.3.1.
+- **3 siguen necesitando prueba en vivo** (1, 4 y 7).
+
+> **Sé honesto contigo mismo:** los ítems 1, 4 y 7 **no** están "probados en
+> producción". Están implementados según la documentación y con el mayor
+> cuidado, pero la única prueba válida es tu cuenta real de Alegra y tu tienda
+> real. Si algo falla, el detalle importa más que el "sí funcionó".
+
+**Guía complementaria:** este documento **no** repite cómo instalar ni cómo
+revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
+(secciones 2, 3, 4 y 6). Acá solo se valida. La guía de despliegue cubre la
+**instalación y el rollback**; esta cubre la **verificación funcional**.
+
+- Dónde ver los **logs:** `Alegra Connector → Logs`. En disco:
+  `wp-content/uploads/alegra-logs/alegra-sync-AAAA-MM-DD.log`.
+- Dónde ver el **estado de facturación:** `Alegra Connector → Dashboard` →
+  tarjeta **"Estado de facturación"**.
+- Dónde cambiar los **ajustes:** `Alegra Connector → Configuración` →
+  pestaña **"Facturación electrónica"**.
+
+**Leyenda de riesgo**
+
+| Riesgo | Significado |
+|---|---|
+| **Alto** | Si falla, la facturación electrónica no sirve. **Bloquea** el uso real de la 2.3.1 hasta resolverse. |
+| **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
+| **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
+
+---
+
+## 1. `edit-item` no dispara con cambios solo de stock
+
+- **Qué se asume:** que Alegra **no** dispara el webhook `edit-item` cuando lo
+  único que cambia en un producto es el **inventario**. Por eso la
+  sincronización de stock en tiempo real no depende del webhook: cae en el
+  **poll** (la sincronización programada, por defecto cada 15 minutos, método
+  `both`). El handler de `edit-item` existe igual
+  (`includes/Webhooks/Handlers.php:32`), por si Alegra sí lo dispara.
+- **Por qué importa:** si Alegra no dispara el webhook **y** el poll estuviera
+  desactivado o roto, el stock de WooCommerce quedaría desactualizado respecto
+  a Alegra, y podrías vender sin existencias.
+- **Cómo verificarlo:**
+  1. En Alegra, entra a un producto y **cambia solo el stock** (deja nombre y
+     precio intactos). Guarda.
+  2. Espera unos segundos y revisa `Alegra Connector → Logs`. Busca
+     `Processing webhook event` con `"event": "edit-item"`. Si aparece otro
+     evento, el log lo dirá (`Unhandled webhook event`).
+  3. Mira el mismo producto en **WooCommerce → Productos**: ¿cambió el stock?
+     Si cambió en segundos, el webhook funcionó. Si no, espera a que corra la
+     sincronización programada (hasta 15 min por defecto) y vuelve a mirar.
+  4. Para forzarla, usa **Alegra Connector → Dashboard → "Traer productos
+     desde Alegra"**.
+- **Resultado esperado:** el stock de WooCommerce termina actualizado. Puede
+  ser **por webhook** (inmediato) **o por poll** (hasta el intervalo
+  configurado). Las dos vías son correctas.
+- **Si falla:** si ni el webhook ni el poll actualizan el stock, revisa en
+  `Alegra Connector → Monitor` que la sincronización programada esté
+  registrada, y en `Alegra Connector → Configuración → Sincronización` que la
+  frecuencia no esté desactivada. Mientras tanto, el botón "Traer productos
+  desde Alegra" es el parche manual.
+- **Riesgo: Bajo.** No bloquea el release: el poll es la red de seguridad.
+
+---
+
+## 2. `idItemCategory` con múltiples valores — ✅ RESUELTO (documentación)
+
+**Estado: resuelto. Ya no hace falta probarlo en vivo.**
+
+- **Qué se asumía:** si Alegra aceptaba un **arreglo** de categorías por
+  producto. El plugin envía **una sola** (`includes/Sync/Products.php`:
+  `'category' => ['id' => ...]`).
+- **Qué dice la documentación:** en `GET /items`, `idItemCategory` es un
+  **parámetro de filtro** con `"type": "string"` — un **único** valor, no un
+  arreglo. Y el ítem expone `category` como **un objeto** `{id, name}`, también
+  singular.
+  - https://developer.alegra.com/reference/get_items
+- **Conclusión:** Alegra acepta **una sola** categoría por ítem. El push de una
+  categoría del plugin es correcto. Un producto de WooCommerce con dos
+  categorías queda clasificado en Alegra en **una** (comportamiento esperado,
+  no un bug).
+
+---
+
+## 3. El push de categoría acepta `{id}` — ✅ RESUELTO (documentación)
+
+**Estado: resuelto. Ya no hace falta probarlo en vivo.**
+
+- **Qué se asumía:** que el endpoint de productos acepta la categoría como
+  **objeto** `['id' => $alegra_cat_id]` en vez de un nombre plano.
+- **Qué dice la documentación:** el ítem documenta `category` como un objeto con
+  `id`/`name`, tanto al listar (`GET /items`) como al consultar uno
+  (`GET /items/{id}`). El plugin primero crea la categoría
+  (`create_item_category`, `includes/Sync/Products.php`) y luego la referencia
+  por `id` en el producto.
+  - https://developer.alegra.com/reference/get_items
+  - https://developer.alegra.com/reference/get_items-id
+- **Conclusión:** el formato `{ id }` es el documentado. La implementación es
+  correcta.
+
+---
+
+## 4. Ruta `customer.address.<field>` en Blocks
+
+- **Qué se asume:** que el **checkout por bloques** (Checkout Blocks) resuelve
+  bien la ruta de los campos adicionales
+  `customer.address.<namespace>/<field>` (`alegra-connector/dv`,
+  `alegra-connector/company`, etc.). Las condiciones se escribieron contra la
+  documentación y el esquema oficial de WooCommerce
+  (`includes/Checkout_Integration.php:253`), pero **no** contra un checkout
+  Blocks real con este plugin.
+- **Por qué importa:** si la ruta no resuelve, los campos condicionales **no se
+  muestran ni se ocultan** como corresponde: el Dígito de verificación podría
+  pedirse sin ser NIT, o la Razón social no aparecer para una empresa. Eso
+  produce facturas con datos incompletos.
+- **Cómo verificarlo:**
+  1. Asegúrate de que tu página de checkout use el **editor de bloques** (no
+     el shortcode clásico). La página de checkout en Blocks es la que se edita
+     con el editor de bloques de WordPress.
+  2. Llega al checkout con un producto en el carrito.
+  3. En **Tipo de documento**, elige **NIT** → debe **aparecer** el campo
+     **"Dígito de verificación"**. Elige cualquier otro tipo → debe
+     **desaparecer**.
+  4. En **Tipo de persona**, elige **Persona Jurídica (empresa)** → debe
+     **aparecer** **"Razón social"**. Elige **Persona Natural** → debe
+     **desaparecer**.
+  5. Repite en la página **"Mi cuenta"** si el cliente edita su dirección.
+- **Resultado esperado:** los campos aparecen y desaparecen según lo elegido,
+  igual que en el checkout clásico.
+- **Si falla:** es el primer sitio a revisar (lo dice la guía de despliegue).
+  Anota **qué campo**, **qué valor** y si quedó visible u oculto cuando no
+  correspondía. El problema estará en la ruta del esquema o en el namespace
+  `alegra-connector/`.
+- **Riesgo: Medio.** No impide facturar, pero puede generar facturas con datos
+  mal capturados si el cliente no ve el campo que necesita.
+
+---
+
+## 5. `stamp.generateStamp` (emisión ante la DIAN) — ✅ RESUELTO (documentación)
+
+**Estado: resuelto. Ya no hace falta probarlo en vivo.**
+
+- **Qué se asumía:** que el campo `stamp.generateStamp` emite de verdad la
+  factura ante la DIAN.
+- **Qué dice la documentación:** para Colombia, el body de `POST /invoices`
+  acepta el objeto `stamp: { "generateStamp": true }` para emitir la factura.
+  La documentación además describe el caso de fallo que el plugin ya maneja:
+  si el timbrado falla, Alegra crea el documento y devuelve `400` con el error y
+  el documento creado en la respuesta.
+  - https://developer.alegra.com/reference/post_invoices
+- **Conclusión:** la forma del payload es la documentada. (La emisión real ante
+  la DIAN depende de que tu cuenta tenga configurado el certificado y la llave
+  privada; eso sí es config de cuenta, no del plugin.)
+
+---
+
+## 6. `invoices: [{id, amount}]` en notas de crédito — ✅ RESUELTO (documentación)
+
+**Estado: resuelto. Ya no hace falta probarlo en vivo.**
+
+- **Qué se asumía:** que Alegra acepta el arreglo **plural** `invoices` con
+  `{id, amount}` para asociar la nota crédito a la factura original.
+- **Qué dice la documentación:** `POST /credit-notes` define `invoices` como un
+  **array** de objetos `{ id, amount }`; para timbrar, `amount` puede ser
+  parcial o igual al saldo y **la suma debe coincidir con el total** de la nota
+  crédito. El plugin envía exactamente esa forma (`includes/Sync/Orders.php`).
+  - https://developer.alegra.com/reference/post_credit-notes
+- **Conclusión:** el formato es el documentado. La implementación es correcta.
+
+---
+
+## 7. Consumidor Final debe pre-existir en Alegra
+
+- **Qué se asume:** que el contacto **"Consumidor Final"** ya existe en tu
+  cuenta de Alegra con estos datos exactos: identificación
+  **`222222222222`**, tipo **`CC`**, persona **`PERSON_ENTITY`**, régimen
+  **`SIMPLIFIED_REGIME`**. El plugin lo **busca pero nunca lo crea**
+  (`includes/Consumidor_Final.php:20`). Es el respaldo cuando un pedido no
+  trae datos de facturación suficientes.
+- **Por qué importa:** si el contacto no existe y el pedido no tiene datos, la
+  factura **se aborta** en vez de usar el genérico. En modo "Exigir datos al
+  cliente" ni siquiera hay respaldo.
+- **Cómo verificarlo:**
+  1. En Alegra → **Contactos**, busca por identificación `222222222222` o por
+     nombre `Consumidor Final`.
+  2. Ve a `Alegra Connector → Dashboard` → tarjeta **"Estado de facturación"**
+     → fila **"Consumidor Final"**. Debe estar en verde y decir
+     **"Disponible"**.
+- **Resultado esperado:** la fila muestra **"Disponible"** (verde).
+- **Si falla:** el widget dirá **"No encontrado en Alegra"** (ámbar) y te
+  pedirá crearlo. Créalo a mano con los datos exactos de arriba. Si prefieres
+  usar otro contacto, actívalo en
+  `Alegra Connector → Configuración → Facturación electrónica → "Consumidor
+  Final manual"`.
+- **Riesgo: Alto.** Sin Consumidor Final, los pedidos sin datos completos no se
+  facturan.
+
+---
+
+## 8. HPOS (almacenamiento de pedidos de WooCommerce) — 🐛 ERA UN BUG → CORREGIDO
+
+**Estado: era un bug real, no una suposición. Corregido en la 2.3.1.**
+
+- **Qué se asumía:** que la versión anterior funcionaba con **HPOS**
+  (High-Performance Order Storage). El plugin usaba la API oficial de
+  WooCommerce en la mayoría de los caminos, pero **no en todos**.
+- **Qué estaba mal:** una lectura de meta de pedido en el panel
+  (`Admin_Dashboard.php:1890`, AC-34) seguía usando `get_post_meta()` en vez de
+  la API CRUD de WooCommerce. Bajo HPOS, `get_post_meta()` no ve el meta del
+  pedido, así que **todos los pedidos se clasificaban como pendientes**. (No
+  duplicaba facturas, porque la creación sí era idempotente, pero el estado que
+  veías era incorrecto.)
+- **Qué se corrigió:** esa lectura ahora usa `$order->get_meta()`, que funciona
+  con almacenamiento clásico y con HPOS. Ya no hay que "verificar" esto: era un
+  defecto de código y está arreglado. Vale la pena confirmar en tu tienda que
+  un pedido ya facturado se ve como facturado.
+
+---
+
+## 9. El cap de reembolsos usaba un transient lock, no una transacción — 🐛 ERA UN BUG → CORREGIDO
+
+**Estado: era un bug real, más grave de lo descrito. Corregido en la 2.3.1.**
+
+- **Qué se asumía:** que el tope acumulado de reembolsos
+  (`_alegra_credited_amount`) no se iba a romper con reembolsos simultáneos
+  porque el caso borde era poco probable.
+- **Qué estaba mal:** la carrera era real y peor de lo descrito. Los locks no
+  eran atómicos (`get_transient` + `set_transient`, AC-03): dos workers podían
+  leer vacío, ambos escribir y ambos ganar. Y el camino de nota crédito sin
+  guardia **nunca** actualizaba `_alegra_credited_amount` (AC-09). Resultado:
+  reembolsos concurrentes podían acreditar de más ante la DIAN, por encima del
+  total de la factura.
+- **Qué se corrigió:** los locks ahora usan un **compare-and-swap** sobre
+  `add_option()` (`wp_options.option_name` es UNIQUE), con reclamación de locks
+  vencidos, y todos los sitios liberan en un bloque `finally`. Además, un solo
+  dueño crea la nota crédito por reembolso (una sola clave de idempotencia) y el
+  tope acumulado se actualiza siempre. Ya no hay que "probar dos reembolsos a la
+  vez": el mecanismo es atómico. Podés revalidarlo si querés, pero ya no es un
+  riesgo conocido.
+
+---
+
+## Orden de prueba recomendado (solo los 3 que quedan)
+
+1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
+   test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
+2. **Desplegar** e instalar la 2.3.1. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
+   se crea a mano antes de facturar.
+4. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
+   revisa el log (`[DRY RUN] Blocked POST ...`) y que no se cree nada en
+   Alegra. Ver `RELEASE_2.3.0_DEPLOY.md` §4. **Desactívalo al terminar.**
+5. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
+   prueba del paso anterior.
+6. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
+7. **Pedido real de bajo valor + emisión DIAN.** Acá empieza lo que toca dinero
+   real: confirma que la factura queda emitida (el payload es el documentado,
+   ítem 5, pero la emisión depende de tu cuenta).
+8. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
+   crédito ligada a la factura (el formato es el documentado, ítem 6; el cap es
+   atómico, ítem 9).
+
+---
+
+## Qué hacer si algo falla
+
+1. **Revisa primero los logs:** `Alegra Connector → Logs` (y en disco,
+   `wp-content/uploads/alegra-logs/`). El mensaje de Alegra suele decir
+   exactamente qué campo rechazó.
+2. **Anota el caso:** pedido, hora, qué hiciste y el mensaje textual. Sin eso,
+   no se puede diagnosticar.
+3. **Rollback a 2.2.0** (el procedimiento completo está en
+   `RELEASE_2.3.0_DEPLOY.md` §6):
+   - Desactiva **"Alegra Connector"** en **Plugins**.
+   - Reemplaza la carpeta por `releases/alegra-connector-v2.2.0.zip`.
+   - Reactiva el plugin.
+   - **Ojo:** la 2.3.0 migró las columnas `alegra_id` de `BIGINT` a
+     `VARCHAR(36)`; eso **no** se revierte. Con IDs numéricos, 2.2.0 sigue
+     funcionando.
+4. **Mientras esté en duda la emisión DIAN**, puedes desmarcar **"Emitir
+   facturas ante la DIAN"** para que las facturas queden en borrador y no se
+   envíen a la DIAN, y seguir operando con cautela.
+5. **No borres** pedidos, notas crédito ni facturas de Alegra para "limpiar":
+   primero entiende qué pasó.
+
+---
+
+## Checklist final
+
+### Antes de empezar
+- [ ] Respaldo de base de datos y de archivos hecho.
+- [ ] `sha256` del ZIP coincide con el `.sha256`.
+- [ ] Smoke test del ZIP termina en `SMOKE OK`.
+- [ ] 2.3.1 instalado y la versión figura como **2.3.1** en **Plugins**.
+
+### Las 3 verificaciones que quedan
+- [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
+      (webhook o poll).
+- [ ] **4.** En Blocks: NIT → aparece Dígito de verificación; Persona Jurídica
+      → aparece Razón social (y se ocultan al revés).
+- [ ] **7.** Consumidor Final: widget en verde **"Disponible"**.
+
+### Ya resueltos (no requieren prueba en vivo)
+- [x] **2.** `idItemCategory` es un valor único; el push de una categoría es
+      correcto (documentación).
+- [x] **3.** El push de categoría acepta `{id}` (documentación).
+- [x] **5.** `stamp.generateStamp` es la forma documentada (documentación).
+- [x] **6.** `invoices: [{id, amount}]` es la forma documentada (documentación).
+- [x] **8.** HPOS: era un `get_post_meta()` en el panel; corregido.
+- [x] **9.** Cap de reembolsos: locks no atómicos; corregidos.
+
+### Cierre
+- [ ] "Modo de prueba" **desactivado**.
+- [ ] "Emitir facturas ante la DIAN" en el estado deseado.
+- [ ] Logs revisados y sin errores `[Alegra]` repetidos.

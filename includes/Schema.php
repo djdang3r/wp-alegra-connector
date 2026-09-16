@@ -20,8 +20,16 @@ class Schema
     /**
      * Current schema version. Bump this whenever the table set changes so the
      * version guard in migrate() runs the migrations exactly once.
+     *
+     * Kept in lockstep with the plugin version: it identifies the release whose
+     * schema this is, not a future one. Batch 2 introduced it as '2.4.0', but
+     * 2.3.1 is the release that actually ships the schema change (drop the dead
+     * queue tables, UUID column migration), so it must read '2.3.1'. Existing
+     * 2.3.0 installs stored the old literal '2.3.0' in
+     * `alegra_connector_schema_version`, so the guard still differs and the
+     * (idempotent) migrations run once on upgrade.
      */
-    public const SCHEMA_VERSION = '2.4.0';
+    public const SCHEMA_VERSION = '2.3.1';
 
     /**
      * Run all migrations. Safe to call multiple times.

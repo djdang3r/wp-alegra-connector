@@ -16,6 +16,7 @@ scripts/
 temp_pkg/
 tests/
 releases/
+.omo/
 
 # Dependencies (if/when added — keep out of the ZIP)
 /vendor/
