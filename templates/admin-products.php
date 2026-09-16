@@ -168,8 +168,8 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
     </tr>
 <?php else: ?>
     <?php foreach ($products as $p):
-        $ai = (int)($p['alegra_id'] ?? 0);
-        $s  = $ai > 0;
+        $ai = (string)($p['alegra_id'] ?? '');
+        $s  = $ai !== '' && $ai !== null;
         $type = $p['type'];
         $pi  = (int)($p['parent_id'] ?? 0);
         $is_variation = ($type === 'variation' || $pi > 0);

@@ -37,7 +37,7 @@ class Categories
         ];
 
         if (!empty($alegra_id)) {
-            $result = $this->api->update_item_category((int) $alegra_id, $data);
+            $result = $this->api->update_item_category((string) $alegra_id, $data);
             $this->logger->info('Category updated in Alegra', [
                 'term_id' => $category->term_id,
                 'alegra_id' => $alegra_id,
@@ -92,7 +92,7 @@ class Categories
         $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
         $current_page = 1;
         $max_pages = 200;
-        set_time_limit(60);
+        set_time_limit(300);
 
         for ($p = 1; $p <= $max_pages; $p++) {
             $alegra_categories = $this->api->get_item_categories([
@@ -138,8 +138,27 @@ class Categories
             return 'updated';
         }
 
+        // Link an existing WC term with the same name instead of failing with
+        // WP_Error('term_exists') when it was created manually (without meta).
+        $existing = term_exists($name, 'product_cat');
+        if ($existing) {
+            $term_id = is_array($existing) ? (int) $existing['term_id'] : (int) $existing;
+            update_term_meta($term_id, 'alegra_category_id', $alegra_id);
+            wp_update_term($term_id, 'product_cat', [
+                'description' => $category['description'] ?? '',
+            ]);
+
+            $this->logger->info('Category linked to existing term from Alegra', [
+                'alegra_id' => $alegra_id,
+                'term_id' => $term_id,
+            ]);
+
+            return 'updated';
+        }
+
         $term = wp_insert_term($name, 'product_cat', [
             'description' => $category['description'] ?? '',
+            'parent' => self::get_import_parent_id(),
         ]);
 
         if (is_wp_error($term)) {
@@ -160,18 +179,64 @@ class Categories
         return true;
     }
 
-    private function get_category_by_alegra_id(int $alegra_id): ?int
+    /**
+     * Parent term ID for categories imported from Alegra (0 = top level).
+     */
+    private static function get_import_parent_id(): int
+    {
+        return (int) get_option('alegra_connector_import_category_parent', 0);
+    }
+
+    private function get_category_by_alegra_id(string $alegra_id): ?int
     {
         global $wpdb;
 
         $term_id = $wpdb->get_var(
             $wpdb->prepare(
-                "SELECT term_id FROM {$wpdb->termmeta} WHERE meta_key = 'alegra_category_id' AND meta_value = %d LIMIT 1",
+                "SELECT term_id FROM {$wpdb->termmeta} WHERE meta_key = 'alegra_category_id' AND meta_value = %s LIMIT 1",
                 $alegra_id
             )
         );
 
         return $term_id ? (int) $term_id : null;
+    }
+
+    /**
+     * Find WC product_cat terms whose alegra_category_id no longer exists in Alegra.
+     *
+     * @return array<int, array{term_id:int, name:string, alegra_id:string}>
+     */
+    public function find_orphans(): array
+    {
+        $terms = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => false]);
+        if (is_wp_error($terms) || empty($terms)) {
+            return [];
+        }
+        $orphans = [];
+        foreach ($terms as $term) {
+            $alegra_id = (string) get_term_meta($term->term_id, 'alegra_category_id', true);
+            if ($alegra_id === '') {
+                continue;
+            }
+            $result = $this->api->get_item_category($alegra_id);
+            if (is_wp_error($result)) {
+                $orphans[] = [
+                    'term_id'   => (int) $term->term_id,
+                    'name'      => (string) $term->name,
+                    'alegra_id' => $alegra_id,
+                ];
+            }
+        }
+        return $orphans;
+    }
+
+    /**
+     * Unlink the alegra_category_id meta from a term.
+     */
+    public function unlink(int $term_id): void
+    {
+        delete_term_meta($term_id, 'alegra_category_id');
+        $this->logger->info('Category unlinked from Alegra', ['term_id' => $term_id]);
     }
 
     public function delete_from_alegra(int $term_id): array|\WP_Error

@@ -1,7 +1,7 @@
 <?php
 if (!defined('ABSPATH')) exit;
-$alegra_id = (int) get_user_meta($customer->ID, 'alegra_contact_id', true);
-$synced = $alegra_id > 0;
+$alegra_id = (string) get_user_meta($customer->ID, 'alegra_contact_id', true);
+$synced = $alegra_id !== '' && $alegra_id !== null;
 $alegra_error = $alegra_error ?? null;
 $alegra_data = $alegra_data ?? null;
 $page_title = sprintf(__('Cliente: %s', 'alegra-connector'), $customer->display_name);

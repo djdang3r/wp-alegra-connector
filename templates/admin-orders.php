@@ -41,8 +41,8 @@ $order_status=isset($_GET['order_status'])?sanitize_text_field($_GET['order_stat
 <thead><tr><th style="width:36px;"><input type="checkbox" class="alegra-select-all" data-type="order"></th><th style="width:80px;"><?php esc_html_e('Pedido','alegra-connector');?></th><th><?php esc_html_e('Fecha','alegra-connector');?></th><th><?php esc_html_e('Cliente','alegra-connector');?></th><th><?php esc_html_e('Total','alegra-connector');?></th><th><?php esc_html_e('Estado WC','alegra-connector');?></th><th><?php esc_html_e('Factura Alegra','alegra-connector');?></th><th><?php esc_html_e('Pago','alegra-connector');?></th><th><?php esc_html_e('Sync','alegra-connector');?></th><th></th></tr></thead>
 <tbody><?php if(empty($orders)):?><tr><td colspan="10" style="text-align:center;padding:30px;color:var(--ac-text-muted);"><?php esc_html_e('No se encontraron pedidos.','alegra-connector');?></td></tr>
 <?php else:foreach($orders as $o):
-    $ii=(int)get_post_meta($o->get_id(),'_alegra_invoice_id',true);$in=get_post_meta($o->get_id(),'_alegra_invoice_number',true);$s=$ii>0;
-    $pi=(int)get_post_meta($o->get_id(),'_alegra_payment_id',true);$ps=$pi>0;
+    $ii=(string)get_post_meta($o->get_id(),'_alegra_invoice_id',true);$in=get_post_meta($o->get_id(),'_alegra_invoice_number',true);$s=$ii!==''&&$ii!==null;
+    $pi=(string)get_post_meta($o->get_id(),'_alegra_payment_id',true);$ps=$pi!==''&&$pi!==null;
     $ost=$o->get_status();$osl=wc_get_order_status_name($ost);
     if($filter==='synced'&&!$s)continue;if($filter==='pending'&&$s)continue;
     if($order_status&&$ost!==$order_status)continue;

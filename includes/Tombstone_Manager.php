@@ -41,8 +41,8 @@ class Tombstone_Manager
             return;
         }
 
-        $alegra_id = (int) get_post_meta($post_id, '_alegra_item_id', true);
-        if ($alegra_id <= 0) {
+        $alegra_id = (string) get_post_meta($post_id, '_alegra_item_id', true);
+        if ($alegra_id === '') {
             return;
         }
 
@@ -65,7 +65,7 @@ class Tombstone_Manager
 
         $existing = $wpdb->get_row($wpdb->prepare(
             "SELECT id, resurrected_at FROM $table
-             WHERE alegra_type = %s AND alegra_id = %d",
+             WHERE alegra_type = %s AND alegra_id = %s",
             $data['alegra_type'],
             $data['alegra_id']
         ));
@@ -101,14 +101,14 @@ class Tombstone_Manager
     /**
      * Check if a tombstone exists for the given Alegra ID.
      */
-    public static function exists(string $alegra_type, int $alegra_id): bool
+    public static function exists(string $alegra_type, string $alegra_id): bool
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_tombstones';
 
         $found = $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM $table
-             WHERE alegra_type = %s AND alegra_id = %d
+             WHERE alegra_type = %s AND alegra_id = %s
              AND resurrected_at IS NULL
              LIMIT 1",
             $alegra_type,
@@ -121,7 +121,7 @@ class Tombstone_Manager
     /**
      * Mark a tombstone as resurrected (when an item reappears via pull).
      */
-    public static function mark_resurrected(string $alegra_type, int $alegra_id): void
+    public static function mark_resurrected(string $alegra_type, string $alegra_id): void
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_tombstones';

@@ -46,7 +46,7 @@ class Products
 
         // Sync product image if enabled
         if (!is_wp_error($result) && get_option('alegra_connector_sync_images', true)) {
-            $this->sync_product_image($product, (int) ($result['id'] ?? 0));
+            $this->sync_product_image($product, (string) ($result['id'] ?? ''));
         }
 
         return $result;
@@ -55,9 +55,9 @@ class Products
     /**
      * Upload product featured image to Alegra item attachment
      */
-    private function sync_product_image(\WC_Product $product, int $alegra_id): void
+    private function sync_product_image(\WC_Product $product, string $alegra_id): void
     {
-        if ($alegra_id <= 0) return;
+        if ($alegra_id === '') return;
 
         $image_id = $product->get_image_id();
         if (!$image_id) return;
@@ -90,10 +90,10 @@ class Products
      */
     private function sync_simple_product(\WC_Product $product): array|\WP_Error
     {
-        $alegra_id = (int) get_post_meta($product->get_id(), '_alegra_item_id', true);
+        $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
         $data = $this->prepare_simple_product_data($product);
 
-        if ($alegra_id > 0) {
+        if ($alegra_id !== '') {
             $result = $this->api->update_item($alegra_id, $data);
             $this->logger->info('Product updated in Alegra', [
                 'product_id' => $product->get_id(),
@@ -105,7 +105,7 @@ class Products
             if (!empty($sku)) {
                 $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
                 if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
-                    $alegra_id = (int) $items[0]['id'];
+                    $alegra_id = (string) $items[0]['id'];
                     update_post_meta($product->get_id(), '_alegra_item_id', $alegra_id);
                     $result = $this->api->update_item($alegra_id, $data);
                     $this->logger->info('Product linked to existing Alegra item by SKU', [
@@ -118,7 +118,7 @@ class Products
 
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($product->get_id(), '_alegra_item_id', (int) $result['id']);
+                update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
                 $this->logger->info('Product created in Alegra', [
                     'product_id' => $product->get_id(),
                     'alegra_id' => $result['id'],
@@ -134,7 +134,7 @@ class Products
      */
     private function sync_variable_product(\WC_Product $product): array|\WP_Error
     {
-        $alegra_id = (int) get_post_meta($product->get_id(), '_alegra_item_id', true);
+        $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
 
         // First, sync each variation individually to get their Alegra IDs
         $variation_ids = $product->get_children();
@@ -149,7 +149,7 @@ class Products
             $var_result = $this->sync_variation($variation);
             if (!is_wp_error($var_result) && isset($var_result['id'])) {
                 $subitems[] = [
-                    'id' => (int) $var_result['id'],
+                    'id' => (string) $var_result['id'],
                     'reference' => $variation->get_sku(),
                     'price' => (float) $variation->get_regular_price(),
                     'quantity' => (int) ($variation->get_stock_quantity() ?? 0),
@@ -159,7 +159,7 @@ class Products
 
         $data = $this->prepare_variable_product_data($product, $subitems);
 
-        if ($alegra_id > 0) {
+        if ($alegra_id !== '') {
             $result = $this->api->update_item($alegra_id, $data);
             $this->logger->info('Variable product updated in Alegra', [
                 'product_id' => $product->get_id(),
@@ -170,7 +170,7 @@ class Products
             $data['type'] = 'kit';
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($product->get_id(), '_alegra_item_id', (int) $result['id']);
+                update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
                 $this->logger->info('Variable product created in Alegra', [
                     'product_id' => $product->get_id(),
                     'alegra_id' => $result['id'],
@@ -187,10 +187,10 @@ class Products
      */
     private function sync_variation(\WC_Product $variation): array|\WP_Error
     {
-        $alegra_id = (int) get_post_meta($variation->get_id(), '_alegra_item_id', true);
+        $alegra_id = (string) get_post_meta($variation->get_id(), '_alegra_item_id', true);
         $data = $this->prepare_variation_data($variation);
 
-        if ($alegra_id > 0) {
+        if ($alegra_id !== '') {
             $result = $this->api->update_item($alegra_id, $data);
         } else {
             // Search by SKU in Alegra before creating (prevent duplicates)
@@ -198,7 +198,7 @@ class Products
             if (!empty($sku)) {
                 $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
                 if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
-                    $alegra_id = (int) $items[0]['id'];
+                    $alegra_id = (string) $items[0]['id'];
                     update_post_meta($variation->get_id(), '_alegra_item_id', $alegra_id);
                     $result = $this->api->update_item($alegra_id, $data);
                     $this->logger->info('Variation linked to existing Alegra item by SKU', [
@@ -212,7 +212,7 @@ class Products
             $data['type'] = 'variant';
             $result = $this->api->create_item($data);
             if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($variation->get_id(), '_alegra_item_id', (int) $result['id']);
+                update_post_meta($variation->get_id(), '_alegra_item_id', (string) $result['id']);
                 $this->logger->info('Variation synced to Alegra', [
                     'variation_id' => $variation->get_id(),
                     'alegra_id' => $result['id'],
@@ -252,14 +252,14 @@ class Products
 
         // Tax
         $tax_id = $this->map_product_tax($product);
-        if ($tax_id > 0) {
+        if ($tax_id !== '') {
             $data['tax'] = [['id' => $tax_id]];
         }
 
         // Category
-        $cat_name = $this->get_main_category_name($product->get_category_ids());
-        if ($cat_name) {
-            $data['category'] = ['name' => $cat_name];
+        $alegra_cat_id = $this->resolve_alegra_category_id($product);
+        if ($alegra_cat_id !== '') {
+            $data['category'] = ['id' => $alegra_cat_id];
         }
 
         return $data;
@@ -270,7 +270,7 @@ class Products
      */
     private function prepare_variable_product_data(\WC_Product $product, array $subitems): array
     {
-        return [
+        $data = [
             'name' => $product->get_name(),
             'reference' => $product->get_sku(),
             'description' => wp_strip_all_tags($product->get_description()),
@@ -283,6 +283,14 @@ class Products
             ],
             'subitems' => $subitems,
         ];
+
+        // Category
+        $alegra_cat_id = $this->resolve_alegra_category_id($product);
+        if ($alegra_cat_id !== '') {
+            $data['category'] = ['id' => $alegra_cat_id];
+        }
+
+        return $data;
     }
 
     /**
@@ -298,7 +306,7 @@ class Products
         }
         $variation_name = implode(' - ', $name_parts);
 
-        return [
+        $data = [
             'name' => $variation_name,
             'reference' => $variation->get_sku(),
             'description' => wp_strip_all_tags($variation->get_description()),
@@ -313,12 +321,21 @@ class Products
                 'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
             ],
         ];
+
+        // Category (variations inherit from their parent)
+        $cat_source = ($parent && $parent->get_category_ids()) ? $parent : $variation;
+        $alegra_cat_id = $this->resolve_alegra_category_id($cat_source);
+        if ($alegra_cat_id !== '') {
+            $data['category'] = ['id' => $alegra_cat_id];
+        }
+
+        return $data;
     }
 
     /**
      * Map product tax class to Alegra tax ID
      */
-    private function map_product_tax(\WC_Product $product): int
+    private function map_product_tax(\WC_Product $product): string
     {
         $tax_class = $product->get_tax_class();
         if (empty($tax_class) || $tax_class === 'zero-rate') {
@@ -326,7 +343,7 @@ class Products
         }
 
         $tax_mapping = get_option('alegra_connector_tax_mapping', []);
-        return isset($tax_mapping[$tax_class]) ? (int) $tax_mapping[$tax_class] : 0;
+        return isset($tax_mapping[$tax_class]) ? (string) $tax_mapping[$tax_class] : '';
     }
 
     /**
@@ -381,7 +398,7 @@ class Products
                         continue;
                     }
 
-                    $product_id = $this->get_product_by_alegra_id((int) $item['id']);
+                    $product_id = $this->get_product_by_alegra_id((string) $item['id']);
                     if (!$product_id) {
                         continue;
                     }
@@ -556,7 +573,7 @@ class Products
      */
     private function import_single_item_from_alegra(array $item): bool|string
     {
-        $alegra_id = (int) ($item['id'] ?? 0);
+        $alegra_id = (string) ($item['id'] ?? '');
         $sku = $item['reference'] ?? '';
         $name = $item['name'] ?? '';
         $type = $item['type'] ?? 'simple';
@@ -596,6 +613,7 @@ class Products
                 $product = wc_get_product($existing_id);
                 if ($product) {
                     $this->update_product_from_alegra($product, $item);
+                    $this->assign_product_category((int) $existing_id, $item);
                     return 'updated';
                 }
             }
@@ -608,6 +626,7 @@ class Products
                     $product = wc_get_product($existing_by_sku);
                     if ($product) {
                         $this->update_product_from_alegra($product, $item);
+                        $this->assign_product_category((int) $existing_by_sku, $item);
                         return 'updated';
                     }
                 }
@@ -651,6 +670,9 @@ class Products
             }
         }
 
+        // Assign the Alegra item's category to the parent product
+        $this->assign_product_category((int) $product_id, $item);
+
         $this->logger->info('Product imported from Alegra', [
             'alegra_id' => $alegra_id,
             'product_id' => $product_id,
@@ -670,8 +692,8 @@ class Products
      */
     private function import_variation_from_alegra(int $parent_id, array $subitem_data): void
     {
-        $alegra_id = (int) ($subitem_data['id'] ?? 0);
-        if ($alegra_id <= 0) {
+        $alegra_id = (string) ($subitem_data['id'] ?? '');
+        if ($alegra_id === '') {
             return;
         }
 
@@ -685,6 +707,9 @@ class Products
             $variation = wc_get_product($variation_id);
             if ($variation) {
                 $this->update_product_from_alegra($variation, $item);
+                if (!empty($item['category'])) {
+                    $this->assign_product_category((int) $variation_id, $item);
+                }
                 return;
             }
         }
@@ -706,6 +731,95 @@ class Products
         $variation = wc_get_product($variation_id);
         if ($variation) {
             $this->update_product_from_alegra($variation, $item);
+        }
+
+        if (!empty($item['category'])) {
+            $this->assign_product_category((int) $variation_id, $item);
+        }
+    }
+
+    /**
+     * Assign the Alegra item's category to the WC product.
+     * Reads $item['category'] (object with id/name) and finds or creates the WC term.
+     */
+    private function assign_product_category(int $product_id, array $item): void
+    {
+        $category = $item['category'] ?? null;
+        if (empty($category)) {
+            return;
+        }
+
+        // Alegra returns {id, name} — handle both array and scalar
+        $alegra_cat_id = '';
+        $alegra_cat_name = '';
+        if (is_array($category)) {
+            $alegra_cat_id = (string) ($category['id'] ?? '');
+            $alegra_cat_name = (string) ($category['name'] ?? '');
+        } elseif (is_string($category)) {
+            $alegra_cat_name = $category;
+        }
+
+        if ($alegra_cat_id === '' && $alegra_cat_name === '') {
+            return;
+        }
+
+        // 1. Find by alegra_category_id term meta
+        $term_id = 0;
+        if ($alegra_cat_id !== '') {
+            $terms = get_terms([
+                'taxonomy'   => 'product_cat',
+                'hide_empty' => false,
+                'meta_query' => [[
+                    'key'   => 'alegra_category_id',
+                    'value' => $alegra_cat_id,
+                ]],
+                'number'     => 1,
+            ]);
+            if (!is_wp_error($terms) && !empty($terms)) {
+                $term_id = (int) $terms[0]->term_id;
+            }
+        }
+
+        // 2. Fallback: find by name
+        if ($term_id === 0 && $alegra_cat_name !== '') {
+            $existing = term_exists($alegra_cat_name, 'product_cat');
+            if ($existing) {
+                $term_id = is_array($existing) ? (int) $existing['term_id'] : (int) $existing;
+            }
+        }
+
+        // 3. Create if not found
+        if ($term_id === 0 && $alegra_cat_name !== '') {
+            $parent = (int) get_option('alegra_connector_import_category_parent', 0);
+            $created = wp_insert_term($alegra_cat_name, 'product_cat', ['parent' => $parent]);
+            if (is_wp_error($created)) {
+                $this->logger->warning('Failed to create category from Alegra item', [
+                    'product_id' => $product_id,
+                    'category'   => $alegra_cat_name,
+                    'error'      => $created->get_error_message(),
+                ]);
+                return;
+            }
+            $term_id = (int) $created['term_id'];
+        }
+
+        if ($term_id === 0) {
+            return;
+        }
+
+        // Backfill the alegra_category_id meta if we found it by name
+        if ($alegra_cat_id !== '' && !get_term_meta($term_id, 'alegra_category_id', true)) {
+            update_term_meta($term_id, 'alegra_category_id', $alegra_cat_id);
+        }
+
+        // Assign (fix B-8: check the result)
+        $result = wp_set_object_terms($product_id, [$term_id], 'product_cat', false);
+        if (is_wp_error($result)) {
+            $this->logger->warning('Failed to assign category to product', [
+                'product_id' => $product_id,
+                'term_id'    => $term_id,
+                'error'      => $result->get_error_message(),
+            ]);
         }
     }
 
@@ -1089,7 +1203,7 @@ class Products
         }
     }
 
-    public function sync_single_item_by_alegra_id(int $alegra_id): bool|string
+    public function sync_single_item_by_alegra_id(string $alegra_id): bool|string
     {
         $item = $this->api->get_item($alegra_id);
         if (is_wp_error($item) || !is_array($item)) {
@@ -1100,8 +1214,8 @@ class Products
 
     public function delete_from_alegra(int $product_id): array|\WP_Error
     {
-        $alegra_id = (int) get_post_meta($product_id, '_alegra_item_id', true);
-        if ($alegra_id <= 0) {
+        $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
+        if ($alegra_id === '') {
             return new \WP_Error('not_linked', 'Product not linked to Alegra');
         }
 
@@ -1113,7 +1227,7 @@ class Products
         return $result;
     }
 
-    private function get_product_by_alegra_id(int $alegra_id): ?int
+    private function get_product_by_alegra_id(string $alegra_id): ?int
     {
         $id = \Alegra\Connector\Entity_Map::find_wc_id('item', $alegra_id, 'product');
         return $id ?: null;
@@ -1128,12 +1242,85 @@ class Products
         return $id ? (int) $id : null;
     }
 
-    private function get_main_category_name(array $cat_ids): ?string
+    /**
+     * Resolve the Alegra category id for a WC product, creating it in Alegra if needed.
+     * Caches resolved ids in a per-request static array to avoid repeated API calls.
+     */
+    private function resolve_alegra_category_id(\WC_Product $product): string
+    {
+        static $cache = [];
+        $cat_ids = $product->get_category_ids();
+        if (empty($cat_ids)) {
+            return '';
+        }
+
+        // Strategy: first | deepest | specific
+        $strategy = (string) get_option('alegra_connector_push_category_strategy', 'deepest');
+        $cat_id = $this->pick_category_id($cat_ids, $strategy);
+        if ($cat_id <= 0) {
+            return '';
+        }
+
+        if (isset($cache[$cat_id])) {
+            return $cache[$cat_id];
+        }
+
+        $alegra_id = (string) get_term_meta($cat_id, 'alegra_category_id', true);
+        if ($alegra_id !== '') {
+            $cache[$cat_id] = $alegra_id;
+            return $alegra_id;
+        }
+
+        $term = get_term($cat_id, 'product_cat');
+        if (!$term || is_wp_error($term)) {
+            return '';
+        }
+
+        $result = $this->api->create_item_category([
+            'name'        => $term->name,
+            'description' => $term->description ?: '',
+        ]);
+        if (is_wp_error($result) || empty($result['id'])) {
+            $this->logger->warning('Failed to create Alegra category', [
+                'term_id' => $cat_id,
+                'error'   => is_wp_error($result) ? $result->get_error_message() : 'no id',
+            ]);
+            return '';
+        }
+        $alegra_id = (string) $result['id'];
+        update_term_meta($cat_id, 'alegra_category_id', $alegra_id);
+        $cache[$cat_id] = $alegra_id;
+        return $alegra_id;
+    }
+
+    /**
+     * Pick which WC category to push based on the strategy.
+     */
+    private function pick_category_id(array $cat_ids, string $strategy): int
     {
         if (empty($cat_ids)) {
-            return null;
+            return 0;
         }
-        $cat = get_term($cat_ids[0], 'product_cat');
-        return ($cat && !is_wp_error($cat)) ? $cat->name : null;
+        if ($strategy === 'first') {
+            return (int) $cat_ids[0];
+        }
+        if ($strategy === 'deepest') {
+            $best = (int) $cat_ids[0];
+            $best_depth = 0;
+            foreach ($cat_ids as $cid) {
+                $depth = count(get_ancestors((int) $cid, 'product_cat'));
+                if ($depth >= $best_depth) {
+                    $best_depth = $depth;
+                    $best = (int) $cid;
+                }
+            }
+            return $best;
+        }
+        // 'specific': use the configured category
+        $specific = (int) get_option('alegra_connector_push_category_id', 0);
+        if ($specific > 0 && in_array($specific, array_map('intval', $cat_ids), true)) {
+            return $specific;
+        }
+        return (int) $cat_ids[0];
     }
 }

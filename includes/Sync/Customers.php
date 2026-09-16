@@ -34,7 +34,7 @@ class Customers
         $data = $this->prepare_customer_data($customer);
 
         if (!empty($alegra_id)) {
-            $result = $this->api->update_contact((int) $alegra_id, $data);
+            $result = $this->api->update_contact((string) $alegra_id, $data);
             $this->logger->info('Customer updated in Alegra', [
                 'customer_id' => $customer->ID,
                 'alegra_id' => $alegra_id,
@@ -61,7 +61,7 @@ class Customers
         return $result;
     }
 
-    private function resolve_duplicate(int $alegra_id, array $data, \WP_User $customer): array|\WP_Error
+    private function resolve_duplicate(string $alegra_id, array $data, \WP_User $customer): array|\WP_Error
     {
         $conflict_resolution = get_option('alegra_connector_conflict_resolution', 'alegra_wins');
 
@@ -90,7 +90,7 @@ class Customers
         return $result;
     }
 
-    private function find_existing_contact(array $data): ?int
+    private function find_existing_contact(array $data): ?string
     {
         // Try to find by email first
         $email = $data['email'] ?? '';
@@ -99,7 +99,7 @@ class Customers
             if (!is_wp_error($contacts) && !empty($contacts)) {
                 foreach ($contacts as $contact) {
                     if (isset($contact['email']) && strcasecmp($contact['email'], $email) === 0) {
-                        return (int) $contact['id'];
+                        return (string) $contact['id'];
                     }
                 }
             }
@@ -112,7 +112,7 @@ class Customers
             if (!is_wp_error($contacts) && !empty($contacts)) {
                 foreach ($contacts as $contact) {
                     if (isset($contact['identification']) && $contact['identification'] === $identification) {
-                        return (int) $contact['id'];
+                        return (string) $contact['id'];
                     }
                 }
             }
@@ -370,7 +370,7 @@ class Customers
             return new \WP_Error('not_linked', 'Customer not linked to Alegra');
         }
 
-        $result = $this->api->delete_contact((int) $alegra_id);
+        $result = $this->api->delete_contact((string) $alegra_id);
 
         if (!is_wp_error($result)) {
             delete_user_meta($customer_id, 'alegra_contact_id');
@@ -383,7 +383,7 @@ class Customers
         return $result;
     }
 
-    public function sync_single_contact_by_alegra_id(int $alegra_id): bool|string
+    public function sync_single_contact_by_alegra_id(string $alegra_id): bool|string
     {
         $contact = $this->api->get_contact($alegra_id);
         if (is_wp_error($contact) || !is_array($contact)) {

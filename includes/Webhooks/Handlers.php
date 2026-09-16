@@ -60,8 +60,8 @@ class Handlers
     private function handle_item_event(array $data): void
     {
         $item = $data['item'] ?? $data;
-        $alegra_id = (int) ($item['id'] ?? 0);
-        if ($alegra_id <= 0) return;
+        $alegra_id = (string) ($item['id'] ?? '');
+        if ($alegra_id === '') return;
 
         $products = new Sync\Products($this->api, $this->logger);
         $result = $products->sync_single_item_by_alegra_id($alegra_id);
@@ -76,8 +76,8 @@ class Handlers
     private function handle_delete_item(array $data): void
     {
         $item = $data['item'] ?? $data;
-        $alegra_id = (int) ($item['id'] ?? 0);
-        if ($alegra_id <= 0) return;
+        $alegra_id = (string) ($item['id'] ?? '');
+        if ($alegra_id === '') return;
 
         // Write tombstone so future pulls won't recreate the product.
         // (Previously this handler deleted _alegra_item_id postmeta, but that
@@ -94,7 +94,7 @@ class Handlers
         // tombstone is the durable record. Safe to leave for a future job.)
         global $wpdb;
         $product_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_item_id' AND meta_value = %d LIMIT 1",
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_item_id' AND meta_value = %s LIMIT 1",
             $alegra_id
         ));
         if ($product_id && $this->logger) {
@@ -110,13 +110,12 @@ class Handlers
             ]);
         }
     }
-    }
 
     private function handle_client_event(array $data): void
     {
         $contact = $data['client'] ?? $data;
-        $alegra_id = (int) ($contact['id'] ?? 0);
-        if ($alegra_id <= 0) return;
+        $alegra_id = (string) ($contact['id'] ?? '');
+        if ($alegra_id === '') return;
 
         $customers = new Sync\Customers($this->api, $this->logger);
         $result = $customers->sync_single_contact_by_alegra_id($alegra_id);
@@ -131,8 +130,8 @@ class Handlers
     private function handle_delete_client(array $data): void
     {
         $contact = $data['client'] ?? $data;
-        $alegra_id = (int) ($contact['id'] ?? 0);
-        if ($alegra_id <= 0) return;
+        $alegra_id = (string) ($contact['id'] ?? '');
+        if ($alegra_id === '') return;
 
         $user_args = [
             'meta_key' => 'alegra_contact_id',
@@ -151,8 +150,8 @@ class Handlers
     private function handle_invoice_event(array $data): void
     {
         $invoice = $data['invoice'] ?? $data;
-        $alegra_invoice_id = (int) ($invoice['id'] ?? 0);
-        if ($alegra_invoice_id <= 0) return;
+        $alegra_invoice_id = (string) ($invoice['id'] ?? '');
+        if ($alegra_invoice_id === '') return;
 
         $status = $invoice['status'] ?? '';
         $balance = (float) ($invoice['balance'] ?? 0);
@@ -161,7 +160,7 @@ class Handlers
         if ($status === 'paid' && $balance <= 0 && $should_complete) {
             global $wpdb;
             $order_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_invoice_id' AND meta_value = %d LIMIT 1",
+                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_alegra_invoice_id' AND meta_value = %s LIMIT 1",
                 $alegra_invoice_id
             ));
 

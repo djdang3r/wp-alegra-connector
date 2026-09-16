@@ -1,17 +1,17 @@
 <?php
 if (!defined('ABSPATH')) exit;
 
-$payment_id = (int) get_post_meta($order->get_id(), '_alegra_payment_id', true);
-$payment_synced = $payment_id > 0;
+$payment_id = (string) get_post_meta($order->get_id(), '_alegra_payment_id', true);
+$payment_synced = $payment_id !== '' && $payment_id !== null;
 
 // Safe defaults (PHP 8+)
-$alegra_invoice_id = $alegra_invoice_id ?? 0;
+$alegra_invoice_id = $alegra_invoice_id ?? '';
 $alegra_invoice_number = $alegra_invoice_number ?? '';
 $alegra_data = $alegra_data ?? null;
 $alegra_error = $alegra_error ?? null;
 
 $page_title = sprintf(__('Pedido #%d', 'alegra-connector'), $order->get_id());
-if ($alegra_invoice_id > 0) {
+if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null) {
     $page_subtitle = __('Facturado en Alegra', 'alegra-connector');
 } elseif ($payment_synced) {
     $page_subtitle = __('Pago registrado', 'alegra-connector');
@@ -39,10 +39,10 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
 
 <div style="margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;">
     <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-orders')); ?>" class="ac-btn ac-btn-sm">&#8592; <?php esc_html_e('Volver', 'alegra-connector'); ?></a>
-    <?php if ($alegra_invoice_id > 0): ?>
+    <?php if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null): ?>
         <a href="<?php echo esc_url(admin_url('admin-ajax.php?action=alegra_get_invoice_pdf&order_id=' . $order->get_id() . '&_ajax_nonce=' . $order_pdf_nonce)); ?>" class="ac-btn ac-btn-sm" target="_blank" rel="noopener noreferrer"><span class="dashicons dashicons-pdf" style="font-size:14px;width:14px;height:14px;"></span> <?php esc_html_e('Descargar PDF', 'alegra-connector'); ?></a>
     <?php endif; ?>
-    <?php if ($alegra_invoice_id > 0 && !$payment_synced): ?>
+    <?php if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null && !$payment_synced): ?>
         <button class="ac-btn ac-btn-primary ac-btn-sm alegra-record-payment" data-order-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Registrar pago en Alegra', 'alegra-connector'); ?></button>
     <?php endif; ?>
     <?php if (!$alegra_invoice_id): ?>
@@ -79,7 +79,7 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
                 <tr><th><?php esc_html_e('Total', 'alegra-connector'); ?></th><td><strong><?php echo isset($alegra_data['total']) ? wp_kses_post(wc_price((float) $alegra_data['total'])) : '--'; ?></strong></td></tr>
                 <tr><th><?php esc_html_e('Saldo', 'alegra-connector'); ?></th><td><?php echo isset($alegra_data['balance']) ? wp_kses_post(wc_price((float) $alegra_data['balance'])) : '--'; ?></td></tr>
             </table>
-        <?php elseif ($alegra_invoice_id > 0): ?>
+        <?php elseif ($alegra_invoice_id !== '' && $alegra_invoice_id !== null): ?>
             <div class="ac-notice warning"><p><?php esc_html_e('No se pudo cargar Alegra.', 'alegra-connector'); ?></p></div>
         <?php else: ?>
             <div class="ac-empty-state">
@@ -142,7 +142,7 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
                 <td>
                     <?php if ($payment_synced): ?>
                         <span class="ac-badge success"><?php esc_html_e('Registrado', 'alegra-connector'); ?></span>
-                    <?php elseif ($alegra_invoice_id > 0): ?>
+                    <?php elseif ($alegra_invoice_id !== '' && $alegra_invoice_id !== null): ?>
                         <button class="ac-btn ac-btn-xs alegra-record-payment" data-order-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Registrar pago', 'alegra-connector'); ?></button>
                     <?php else: ?>
                         <span style="color:var(--ac-text-muted);">--</span>

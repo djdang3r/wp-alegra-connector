@@ -22,14 +22,14 @@ class Entity_Map
      * Look up a WC entity ID by Alegra ID + type.
      * Tries the new table first, falls back to postmeta for backward compat.
      */
-    public static function find_wc_id(string $alegra_type, int $alegra_id, string $wc_entity_type): ?int
+    public static function find_wc_id(string $alegra_type, string $alegra_id, string $wc_entity_type): ?int
     {
         global $wpdb;
 
         // 1. Try the indexed table
         $id = $wpdb->get_var($wpdb->prepare(
             "SELECT wc_entity_id FROM {$wpdb->prefix}alegra_entity_map
-             WHERE alegra_type = %s AND alegra_id = %d AND wc_entity_type = %s
+             WHERE alegra_type = %s AND alegra_id = %s AND wc_entity_type = %s
              LIMIT 1",
             $alegra_type, $alegra_id, $wc_entity_type
         ));
@@ -56,7 +56,7 @@ class Entity_Map
         }
 
         $id = $wpdb->get_var($wpdb->prepare(
-            "SELECT {$id_col} FROM {$table} WHERE meta_key = %s AND meta_value = %d LIMIT 1",
+            "SELECT {$id_col} FROM {$table} WHERE meta_key = %s AND meta_value = %s LIMIT 1",
             $meta_key, $alegra_id
         ));
 
@@ -72,7 +72,7 @@ class Entity_Map
     /**
      * Record a new mapping.
      */
-    public static function map(string $alegra_type, int $alegra_id, string $wc_entity_type, int $wc_entity_id): bool
+    public static function map(string $alegra_type, string $alegra_id, string $wc_entity_type, int $wc_entity_id): bool
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_entity_map';
@@ -80,7 +80,7 @@ class Entity_Map
         // INSERT ... ON DUPLICATE KEY UPDATE
         $result = $wpdb->query($wpdb->prepare(
             "INSERT INTO $table (alegra_type, alegra_id, wc_entity_type, wc_entity_id, synced_at)
-             VALUES (%s, %d, %s, %d, %s)
+             VALUES (%s, %s, %s, %d, %s)
              ON DUPLICATE KEY UPDATE wc_entity_id = VALUES(wc_entity_id), synced_at = VALUES(synced_at)",
             $alegra_type, $alegra_id, $wc_entity_type, $wc_entity_id, current_time('mysql')
         ));
@@ -105,7 +105,7 @@ class Entity_Map
         );
         foreach ($products as $row) {
             if (!$dry_run) {
-                self::map('item', (int) $row->meta_value, 'product', (int) $row->post_id);
+                self::map('item', (string) $row->meta_value, 'product', (int) $row->post_id);
             }
             $stats['products']++;
         }
@@ -113,11 +113,11 @@ class Entity_Map
         // Customers
         $customers = $wpdb->get_results(
             "SELECT user_id, meta_value FROM {$wpdb->usermeta}
-             WHERE meta_key = 'alegra_contact_id' AND meta_value > '' AND meta_value > 0"
+             WHERE meta_key = 'alegra_contact_id' AND meta_value > ''"
         );
         foreach ($customers as $row) {
             if (!$dry_run) {
-                self::map('contact', (int) $row->meta_value, 'customer', (int) $row->user_id);
+                self::map('contact', (string) $row->meta_value, 'customer', (int) $row->user_id);
             }
             $stats['customers']++;
         }
@@ -125,11 +125,11 @@ class Entity_Map
         // Orders (only those with invoice linked)
         $orders = $wpdb->get_results(
             "SELECT post_id, meta_value FROM {$wpdb->postmeta}
-             WHERE meta_key = '_alegra_invoice_id' AND meta_value > '' AND meta_value > 0"
+             WHERE meta_key = '_alegra_invoice_id' AND meta_value > ''"
         );
         foreach ($orders as $row) {
             if (!$dry_run) {
-                self::map('invoice', (int) $row->meta_value, 'order', (int) $row->post_id);
+                self::map('invoice', (string) $row->meta_value, 'order', (int) $row->post_id);
             }
             $stats['orders']++;
         }

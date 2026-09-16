@@ -698,7 +698,7 @@ class Admin_Dashboard
             'products_total' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type='product' AND post_status='publish'"),
             'orders_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_invoice_id'"),
             'orders_total' => $orders_total,
-            'customers_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_key='alegra_contact_id' AND meta_value > 0"),
+            'customers_synced' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_key='alegra_contact_id' AND meta_value != ''"),
             'customers_total' => $total_customers,
         ];
 
@@ -829,7 +829,7 @@ class Admin_Dashboard
                 'type' => $row->product_type ?: 'simple',
                 'parent_id' => (int) $row->post_parent,
                 'parent_title' => $row->parent_title ?: '',
-                'alegra_id' => (int) ($row->alegra_id ?: 0),
+                'alegra_id' => (string) ($row->alegra_id ?: ''),
                 'thumbnail_id' => $thumb_id,
                 'thumbnail_url' => $thumb_url,
                 'thumbnail_alt' => $thumb_alt,
@@ -870,11 +870,11 @@ class Admin_Dashboard
             wp_die(esc_html__('Producto no encontrado.', 'alegra-connector'));
         }
 
-        $alegra_id = (int) get_post_meta($product_id, '_alegra_item_id', true);
+        $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
         $alegra_data = null;
         $alegra_error = null;
 
-        if ($alegra_id > 0 && get_option('alegra_connector_connection_tested') && $this->api) {
+        if ($alegra_id !== '' && $alegra_id !== null && get_option('alegra_connector_connection_tested') && $this->api) {
             $result = $this->api->get_item($alegra_id);
             if (is_wp_error($result)) {
                 $alegra_error = sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message());
@@ -921,7 +921,7 @@ class Admin_Dashboard
         $total_pages = (int) ceil($total_users / $per_page);
 
         $synced_customers = (int) $wpdb->get_var(
-            "SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_key='alegra_contact_id' AND meta_value > 0"
+            "SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE meta_key='alegra_contact_id' AND meta_value != ''"
         );
 
         $header_color = 'teal';
@@ -936,11 +936,11 @@ class Admin_Dashboard
             wp_die(esc_html__('Cliente no encontrado.', 'alegra-connector'));
         }
 
-        $alegra_id = (int) get_user_meta($customer_id, 'alegra_contact_id', true);
+        $alegra_id = (string) get_user_meta($customer_id, 'alegra_contact_id', true);
         $alegra_data = null;
         $alegra_error = null;
 
-        if ($alegra_id > 0 && get_option('alegra_connector_connection_tested') && $this->api) {
+        if ($alegra_id !== '' && $alegra_id !== null && get_option('alegra_connector_connection_tested') && $this->api) {
             $result = $this->api->get_contact($alegra_id);
             if (is_wp_error($result)) {
                 $alegra_error = sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message());
@@ -986,8 +986,8 @@ class Admin_Dashboard
         }
         $total_pages = (int) ceil($total_orders / $per_page);
 
-        $synced_orders = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_invoice_id' AND meta_value > 0");
-        $payment_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_payment_id' AND meta_value > 0");
+        $synced_orders = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_invoice_id' AND meta_value != ''");
+        $payment_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_alegra_payment_id' AND meta_value != ''");
 
         $header_color = 'amber';
 
@@ -1001,16 +1001,16 @@ class Admin_Dashboard
             wp_die(esc_html__('Pedido no encontrado.', 'alegra-connector'));
         }
 
-        $alegra_invoice_id = (int) get_post_meta($order_id, '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
         $alegra_invoice_number = get_post_meta($order_id, '_alegra_invoice_number', true);
-        $alegra_payment_id = (int) get_post_meta($order_id, '_alegra_payment_id', true);
+        $alegra_payment_id = (string) get_post_meta($order_id, '_alegra_payment_id', true);
         $alegra_data = null;
         $alegra_error = null;
 
         // Make API available for templates via local variable (cleaner than $GLOBALS)
         $alegra_api = $this->api;
 
-        if ($alegra_invoice_id > 0 && get_option('alegra_connector_connection_tested') && $this->api) {
+        if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null && get_option('alegra_connector_connection_tested') && $this->api) {
             $result = $this->api->get_invoice($alegra_invoice_id);
             if (is_wp_error($result)) {
                 $alegra_error = sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message());
@@ -1405,14 +1405,14 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
         }
 
-        $alegra_invoice_id = (int) get_post_meta($order_id, '_alegra_invoice_id', true);
-        if ($alegra_invoice_id <= 0) {
+        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        if ($alegra_invoice_id === '' || $alegra_invoice_id === null) {
             wp_send_json_error(['message' => __('Primero crea la factura en Alegra.', 'alegra-connector')]);
         }
 
         // Check if payment already recorded
-        $existing_payment = (int) get_post_meta($order_id, '_alegra_payment_id', true);
-        if ($existing_payment > 0) {
+        $existing_payment = (string) get_post_meta($order_id, '_alegra_payment_id', true);
+        if ($existing_payment !== '' && $existing_payment !== null) {
             wp_send_json_error(['message' => __('El pago ya est  registrado en Alegra.', 'alegra-connector')]);
         }
 
@@ -1512,7 +1512,7 @@ class Admin_Dashboard
             $out = fopen('php://output', 'w');
             fputcsv($out, ['name', 'sku', 'price', 'stock', 'type', 'alegra_id', 'sync_status']);
             foreach ($products as $p) {
-                $ai = (int) get_post_meta($p->get_id(), '_alegra_item_id', true);
+                $ai = (string) get_post_meta($p->get_id(), '_alegra_item_id', true);
                 fputcsv($out, [
                     $p->get_name(), $p->get_sku(), $p->get_price(), $p->get_stock_quantity(),
                     $p->get_type(), $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
@@ -1526,7 +1526,7 @@ class Admin_Dashboard
             $out = fopen('php://output', 'w');
             fputcsv($out, ['name', 'email', 'phone', 'alegra_id', 'sync_status']);
             foreach ($customers as $c) {
-                $ai = (int) get_user_meta($c->ID, 'alegra_contact_id', true);
+                $ai = (string) get_user_meta($c->ID, 'alegra_contact_id', true);
                 fputcsv($out, [
                     $c->display_name, $c->user_email, get_user_meta($c->ID, 'billing_phone', true),
                     $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
@@ -1569,13 +1569,13 @@ class Admin_Dashboard
         if ($wc_id <= 0) wp_send_json_error(['message' => __('ID invalido.', 'alegra-connector')]);
 
         if ($type === 'product') {
-            $alegra_id = (int) get_post_meta($wc_id, '_alegra_item_id', true);
-            if ($alegra_id <= 0) wp_send_json_error(['message' => __('Producto no vinculado a Alegra.', 'alegra-connector')]);
+            $alegra_id = (string) get_post_meta($wc_id, '_alegra_item_id', true);
+            if ($alegra_id === '' || $alegra_id === null) wp_send_json_error(['message' => __('Producto no vinculado a Alegra.', 'alegra-connector')]);
             $sync = new Sync\Products($this->api, $this->logger);
             $result = $sync->sync_single_item_by_alegra_id($alegra_id);
         } elseif ($type === 'customer') {
-            $alegra_id = (int) get_user_meta($wc_id, 'alegra_contact_id', true);
-            if ($alegra_id <= 0) wp_send_json_error(['message' => __('Cliente no vinculado a Alegra.', 'alegra-connector')]);
+            $alegra_id = (string) get_user_meta($wc_id, 'alegra_contact_id', true);
+            if ($alegra_id === '' || $alegra_id === null) wp_send_json_error(['message' => __('Cliente no vinculado a Alegra.', 'alegra-connector')]);
             $sync = new Sync\Customers($this->api, $this->logger);
             $result = $sync->sync_single_contact_by_alegra_id($alegra_id);
         } else {
@@ -1602,13 +1602,13 @@ class Admin_Dashboard
 
         foreach ($ids as $wc_id) {
             if ($type === 'product') {
-                $alegra_id = (int) get_post_meta($wc_id, '_alegra_item_id', true);
-                if ($alegra_id <= 0) { $skipped++; continue; }
+                $alegra_id = (string) get_post_meta($wc_id, '_alegra_item_id', true);
+                if ($alegra_id === '' || $alegra_id === null) { $skipped++; continue; }
                 $sync = new Sync\Products($this->api, $this->logger);
                 $r = $sync->sync_single_item_by_alegra_id($alegra_id);
             } elseif ($type === 'customer') {
-                $alegra_id = (int) get_user_meta($wc_id, 'alegra_contact_id', true);
-                if ($alegra_id <= 0) { $skipped++; continue; }
+                $alegra_id = (string) get_user_meta($wc_id, 'alegra_contact_id', true);
+                if ($alegra_id === '' || $alegra_id === null) { $skipped++; continue; }
                 $sync = new Sync\Customers($this->api, $this->logger);
                 $r = $sync->sync_single_contact_by_alegra_id($alegra_id);
             } else {
@@ -1862,8 +1862,8 @@ class Admin_Dashboard
         $order_id = (int) ($_GET['order_id'] ?? 0);
         if ($order_id <= 0) wp_die(__('Pedido invalido.', 'alegra-connector'));
 
-        $alegra_invoice_id = (int) get_post_meta($order_id, '_alegra_invoice_id', true);
-        if ($alegra_invoice_id <= 0) wp_die(__('Este pedido no tiene factura en Alegra.', 'alegra-connector'));
+        $alegra_invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        if ($alegra_invoice_id === '' || $alegra_invoice_id === null) wp_die(__('Este pedido no tiene factura en Alegra.', 'alegra-connector'));
 
         $result = $this->api->get_invoice_pdf($alegra_invoice_id);
         if (is_wp_error($result)) wp_die(esc_html($result->get_error_message()));

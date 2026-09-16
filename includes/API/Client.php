@@ -247,7 +247,7 @@ class Client
         return $this->get('/items', $params);
     }
 
-    public function get_item(int $id): array|\WP_Error
+    public function get_item(string $id): array|\WP_Error
     {
         return $this->get('/items/' . $id, ['mode' => 'advanced']);
     }
@@ -257,12 +257,12 @@ class Client
         return $this->post('/items', $data);
     }
 
-    public function update_item(int $id, array $data): array|\WP_Error
+    public function update_item(string $id, array $data): array|\WP_Error
     {
         return $this->put('/items/' . $id, $data);
     }
 
-    public function delete_item(int $id): array|\WP_Error
+    public function delete_item(string $id): array|\WP_Error
     {
         return $this->delete('/items/' . $id);
     }
@@ -273,7 +273,7 @@ class Client
         return $this->get('/contacts', $params);
     }
 
-    public function get_contact(int $id): array|\WP_Error
+    public function get_contact(string $id): array|\WP_Error
     {
         return $this->get('/contacts/' . $id);
     }
@@ -283,14 +283,83 @@ class Client
         return $this->post('/contacts', $data);
     }
 
-    public function update_contact(int $id, array $data): array|\WP_Error
+    public function update_contact(string $id, array $data): array|\WP_Error
     {
         return $this->put('/contacts/' . $id, $data);
     }
 
-    public function delete_contact(int $id): array|\WP_Error
+    public function delete_contact(string $id): array|\WP_Error
     {
         return $this->delete('/contacts/' . $id);
+    }
+
+    /**
+     * Find a contact by identification type + number (+ optional DV).
+     * Returns the contact array or null if not found.
+     */
+    public function find_contact_by_identification(string $type, string $number, ?string $dv = null): ?array
+    {
+        $params = ['identification' => $number, 'limit' => 5];
+        $contacts = $this->get_contacts($params);
+        if (is_wp_error($contacts) || empty($contacts)) {
+            return null;
+        }
+        foreach ($contacts as $contact) {
+            $obj = $contact['identificationObject'] ?? null;
+            if (is_array($obj)) {
+                if (($obj['type'] ?? '') === $type) {
+                    if ($dv === null || ($obj['dv'] ?? '') === $dv) {
+                        return $contact;
+                    }
+                }
+            } elseif (($contact['identification'] ?? '') === $number) {
+                // Legacy flat format
+                return $contact;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Get the Consumidor Final contact ID (cached or resolved).
+     * Returns the ID string or false if not available. NEVER creates the contact.
+     */
+    public function get_or_create_consumidor_final(): string|false
+    {
+        if (!class_exists('\Alegra\Connector\Consumidor_Final')) {
+            return false;
+        }
+        $id = \Alegra\Connector\Consumidor_Final::get_id();
+        if ($id === false && $this->logger) {
+            $this->logger->error('Consumidor Final could not be resolved');
+        }
+        return $id;
+    }
+
+    /**
+     * Create a contact, retrying once if Alegra returns error code 2039
+     * (name and nameObject are mutually exclusive).
+     */
+    public function create_contact_with_2039_retry(array $data): array|\WP_Error
+    {
+        $result = $this->create_contact($data);
+        if (!is_wp_error($result)) {
+            return $result;
+        }
+        $msg = $result->get_error_message();
+        $err_data = $result->get_error_data();
+        $code = is_array($err_data) ? ($err_data['code'] ?? 0) : 0;
+        if ((int) $code !== 2039 && strpos($msg, '2039') === false) {
+            return $result;
+        }
+        // 2039: name and nameObject are mutually exclusive. Drop nameObject if name exists, else drop name.
+        $retry = $data;
+        if (isset($retry['name']) && isset($retry['nameObject'])) {
+            unset($retry['nameObject']);
+        } elseif (isset($retry['nameObject'])) {
+            unset($retry['name']);
+        }
+        return $this->create_contact($retry);
     }
 
     // Invoices
@@ -299,12 +368,12 @@ class Client
         return $this->get('/invoices', $params);
     }
 
-    public function get_invoice(int $id): array|\WP_Error
+    public function get_invoice(string $id): array|\WP_Error
     {
         return $this->get('/invoices/' . $id);
     }
 
-    public function get_invoice_pdf(int $id): array|\WP_Error
+    public function get_invoice_pdf(string $id): array|\WP_Error
     {
         return $this->get('/invoices/' . $id, ['fields' => 'pdf']);
     }
@@ -314,12 +383,12 @@ class Client
         return $this->post('/invoices', $data);
     }
 
-    public function update_invoice(int $id, array $data): array|\WP_Error
+    public function update_invoice(string $id, array $data): array|\WP_Error
     {
         return $this->put('/invoices/' . $id, $data);
     }
 
-    public function void_invoice(int $id, string $reason = ''): array|\WP_Error
+    public function void_invoice(string $id, string $reason = ''): array|\WP_Error
     {
         $data = [];
         if (!empty($reason)) {
@@ -340,7 +409,7 @@ class Client
         return $this->get('/item-categories', $params);
     }
 
-    public function get_item_category(int $id): array|\WP_Error
+    public function get_item_category(string $id): array|\WP_Error
     {
         return $this->get('/item-categories/' . $id);
     }
@@ -350,12 +419,12 @@ class Client
         return $this->post('/item-categories', $data);
     }
 
-    public function update_item_category(int $id, array $data): array|\WP_Error
+    public function update_item_category(string $id, array $data): array|\WP_Error
     {
         return $this->put('/item-categories/' . $id, $data);
     }
 
-    public function delete_item_category(int $id): array|\WP_Error
+    public function delete_item_category(string $id): array|\WP_Error
     {
         return $this->delete('/item-categories/' . $id);
     }
@@ -412,10 +481,13 @@ class Client
     // Number Templates
     public function get_number_templates(array $params = []): array|\WP_Error
     {
+        if (!array_key_exists('documentType', $params)) {
+            $params['documentType'] = 'invoice';
+        }
         return $this->get('/number-templates', $params);
     }
 
-    public function get_number_template(int $id): array|\WP_Error
+    public function get_number_template(string $id): array|\WP_Error
     {
         return $this->get('/number-templates/' . $id);
     }
@@ -426,7 +498,7 @@ class Client
         return $this->get('/terms', $params);
     }
 
-    public function get_term(int $id): array|\WP_Error
+    public function get_term(string $id): array|\WP_Error
     {
         return $this->get('/terms/' . $id);
     }
@@ -437,7 +509,7 @@ class Client
         return $this->get('/retentions', $params);
     }
 
-    public function get_retention(int $id): array|\WP_Error
+    public function get_retention(string $id): array|\WP_Error
     {
         return $this->get('/retentions/' . $id);
     }
@@ -448,7 +520,7 @@ class Client
         return $this->get('/bank-accounts', $params);
     }
 
-    public function get_bank_account(int $id): array|\WP_Error
+    public function get_bank_account(string $id): array|\WP_Error
     {
         return $this->get('/bank-accounts/' . $id);
     }
@@ -471,48 +543,48 @@ class Client
         return $this->get('/credit-notes', $params);
     }
 
-    public function get_credit_note(int $id): array|\WP_Error
+    public function get_credit_note(string $id): array|\WP_Error
     {
         return $this->get('/credit-notes/' . $id);
     }
 
-    public function update_credit_note(int $id, array $data): array|\WP_Error
+    public function update_credit_note(string $id, array $data): array|\WP_Error
     {
         return $this->put('/credit-notes/' . $id, $data);
     }
 
-    public function delete_credit_note(int $id): array|\WP_Error
+    public function delete_credit_note(string $id): array|\WP_Error
     {
         return $this->delete('/credit-notes/' . $id);
     }
 
-    public function void_credit_note(int $id): array|\WP_Error
+    public function void_credit_note(string $id): array|\WP_Error
     {
         return $this->post('/credit-notes/' . $id . '/void', []);
     }
 
     // Full CRUD for Payments
-    public function get_payment(int $id): array|\WP_Error
+    public function get_payment(string $id): array|\WP_Error
     {
         return $this->get('/payments/' . $id);
     }
 
-    public function update_payment(int $id, array $data): array|\WP_Error
+    public function update_payment(string $id, array $data): array|\WP_Error
     {
         return $this->put('/payments/' . $id, $data);
     }
 
-    public function delete_payment(int $id): array|\WP_Error
+    public function delete_payment(string $id): array|\WP_Error
     {
         return $this->delete('/payments/' . $id);
     }
 
-    public function void_payment(int $id): array|\WP_Error
+    public function void_payment(string $id): array|\WP_Error
     {
         return $this->post('/payments/' . $id . '/void', []);
     }
 
-    public function open_payment(int $id): array|\WP_Error
+    public function open_payment(string $id): array|\WP_Error
     {
         return $this->post('/payments/' . $id . '/open', []);
     }
@@ -523,17 +595,17 @@ class Client
         return $this->post('/price-lists', $data);
     }
 
-    public function update_price_list(int $id, array $data): array|\WP_Error
+    public function update_price_list(string $id, array $data): array|\WP_Error
     {
         return $this->put('/price-lists/' . $id, $data);
     }
 
-    public function get_price_list(int $id): array|\WP_Error
+    public function get_price_list(string $id): array|\WP_Error
     {
         return $this->get('/price-lists/' . $id);
     }
 
-    public function delete_price_list(int $id): array|\WP_Error
+    public function delete_price_list(string $id): array|\WP_Error
     {
         return $this->delete('/price-lists/' . $id);
     }
@@ -544,7 +616,7 @@ class Client
         return $this->get('/variant-attributes', $params);
     }
 
-    public function get_variant_attribute(int $id): array|\WP_Error
+    public function get_variant_attribute(string $id): array|\WP_Error
     {
         return $this->get('/variant-attributes/' . $id);
     }
@@ -555,7 +627,7 @@ class Client
     }
 
     // Tax CRUD
-    public function get_tax(int $id): array|\WP_Error
+    public function get_tax(string $id): array|\WP_Error
     {
         return $this->get('/taxes/' . $id);
     }
@@ -582,7 +654,7 @@ class Client
         return $this->get('/estimates', $params);
     }
 
-    public function get_estimate(int $id): array|\WP_Error
+    public function get_estimate(string $id): array|\WP_Error
     {
         return $this->get('/estimates/' . $id);
     }
@@ -593,12 +665,12 @@ class Client
     }
 
     // Invoice actions
-    public function open_invoice(int $id): array|\WP_Error
+    public function open_invoice(string $id): array|\WP_Error
     {
         return $this->post('/invoices/' . $id . '/open', []);
     }
 
-    public function stamp_invoice(int $id, bool $generateStamp = true): array|\WP_Error
+    public function stamp_invoice(string $id, bool $generateStamp = true): array|\WP_Error
     {
         return $this->post('/invoices/' . $id . '/stamp', [
             'stamp' => ['generateStamp' => $generateStamp],
@@ -606,7 +678,7 @@ class Client
     }
 
     // Retentions on invoices
-    public function update_invoice_retentions(int $id, array $retentions): array|\WP_Error
+    public function update_invoice_retentions(string $id, array $retentions): array|\WP_Error
     {
         return $this->put('/invoices/' . $id . '/retentions-applied', $retentions);
     }
@@ -617,7 +689,7 @@ class Client
         return $this->get('/cost-centers', $params);
     }
 
-    public function get_cost_center(int $id): array|\WP_Error
+    public function get_cost_center(string $id): array|\WP_Error
     {
         return $this->get('/cost-centers/' . $id);
     }
@@ -660,7 +732,7 @@ class Client
     }
 
     // Item attachments (images)
-    public function upload_item_image(int $item_id, string $file_path): array|\WP_Error
+    public function upload_item_image(string $item_id, string $file_path): array|\WP_Error
     {
         if (!file_exists($file_path)) {
             return new \WP_Error('file_not_found', 'Image file not found');

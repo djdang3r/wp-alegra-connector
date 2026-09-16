@@ -51,9 +51,9 @@ class Orders
         set_transient($lock_key, 1, 30); // 30s lock
 
         try {
-            $alegra_id = (int) get_post_meta($order_id, '_alegra_invoice_id', true);
+            $alegra_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
 
-            if ($alegra_id > 0) {
+            if ($alegra_id !== '') {
                 $this->logger->info('Order already has Alegra invoice', [
                     'order_id' => $order_id,
                     'alegra_id' => $alegra_id,
@@ -66,7 +66,7 @@ class Orders
             $result = $this->api->create_invoice($data);
 
             if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($order_id, '_alegra_invoice_id', (int) $result['id']);
+                update_post_meta($order_id, '_alegra_invoice_id', (string) $result['id']);
                 $invoice_number = $result['number'] ?? $result['id'];
                 if (isset($result['numberTemplate']['fullNumber'])) {
                     $invoice_number = $result['numberTemplate']['fullNumber'];
@@ -99,17 +99,17 @@ class Orders
             return $invoice_result;
         }
 
-        $existing_payment_id = (int) get_post_meta($order->get_id(), '_alegra_payment_id', true);
-        if ($existing_payment_id > 0) {
+        $existing_payment_id = (string) get_post_meta($order->get_id(), '_alegra_payment_id', true);
+        if ($existing_payment_id !== '') {
             return $invoice_result;
         }
 
-        $payment_data = $this->prepare_payment_data($order, (int) $invoice_result['id']);
+        $payment_data = $this->prepare_payment_data($order, (string) $invoice_result['id']);
 
         if (!empty($payment_data)) {
             $payment_result = $this->api->create_payment($payment_data);
             if (!is_wp_error($payment_result)) {
-                update_post_meta($order->get_id(), '_alegra_payment_id', (int) ($payment_result['id'] ?? 0));
+                update_post_meta($order->get_id(), '_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
                 if (!empty($payment_result['number'])) {
                     update_post_meta($order->get_id(), '_alegra_payment_number', $payment_result['number']);
                 }
@@ -129,9 +129,9 @@ class Orders
 
     public function create_credit_note(\WC_Order $order): array|\WP_Error
     {
-        $alegra_invoice_id = (int) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
 
-        if ($alegra_invoice_id <= 0) {
+        if ($alegra_invoice_id === '') {
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
         }
 
@@ -165,8 +165,8 @@ class Orders
         $result = $this->api->create_credit_note($data);
 
         if (!is_wp_error($result)) {
-            $cn_id = $result['id'] ?? 0;
-            update_post_meta($order->get_id(), '_alegra_credit_note_id', (int) $cn_id);
+            $cn_id = $result['id'] ?? '';
+            update_post_meta($order->get_id(), '_alegra_credit_note_id', (string) $cn_id);
             $this->logger->info('Credit note created in Alegra', [
                 'order_id' => $order->get_id(),
                 'credit_note_id' => $cn_id,
@@ -178,9 +178,9 @@ class Orders
 
     public function void_invoice(\WC_Order $order): array|\WP_Error
     {
-        $alegra_invoice_id = (int) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+        $alegra_invoice_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
 
-        if ($alegra_invoice_id <= 0) {
+        if ($alegra_invoice_id === '') {
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
         }
 
@@ -213,8 +213,8 @@ class Orders
         $orders = wc_get_orders($args);
 
         foreach ($orders as $order) {
-            $alegra_id = (int) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
-            if ($alegra_id > 0) {
+            $alegra_id = (string) get_post_meta($order->get_id(), '_alegra_invoice_id', true);
+            if ($alegra_id !== '') {
                 continue;
             }
 
@@ -274,27 +274,27 @@ class Orders
 
         // Payment term
         $term = $this->get_default_payment_term();
-        if ($term > 0) {
+        if ($term !== '') {
             $data['term'] = $term;
         }
 
         // Warehouse
-        $warehouse = (int) get_option('alegra_connector_warehouse_id', 0);
-        if ($warehouse > 0 && get_option('alegra_connector_warehouse_enabled')) {
+        $warehouse = (string) get_option('alegra_connector_warehouse_id', '');
+        if ($warehouse !== '' && get_option('alegra_connector_warehouse_enabled')) {
             $data['warehouse'] = $warehouse;
         }
 
         return $data;
     }
 
-    private function ensure_customer_synced(\WC_Order $order): int
+    private function ensure_customer_synced(\WC_Order $order): string
     {
         $customer = $order->get_user();
 
         // Registered user: check if already linked first
         if ($customer) {
-            $alegra_id = (int) get_user_meta($customer->ID, 'alegra_contact_id', true);
-            if ($alegra_id > 0) {
+            $alegra_id = (string) get_user_meta($customer->ID, 'alegra_contact_id', true);
+            if ($alegra_id !== '') {
                 return $alegra_id;
             }
 
@@ -303,7 +303,7 @@ class Orders
             if (!empty($email)) {
                 $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 1]);
                 if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-                    $existing_id = (int) $contacts[0]['id'];
+                    $existing_id = (string) $contacts[0]['id'];
                     update_user_meta($customer->ID, 'alegra_contact_id', $existing_id);
                     $this->logger->info('Linked existing Alegra contact by email (order sync)', [
                         'user_id' => $customer->ID,
@@ -318,7 +318,7 @@ class Orders
             if (!empty($nit)) {
                 $contacts = $this->api->get_contacts(['identification' => $nit, 'limit' => 1]);
                 if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-                    $existing_id = (int) $contacts[0]['id'];
+                    $existing_id = (string) $contacts[0]['id'];
                     update_user_meta($customer->ID, 'alegra_contact_id', $existing_id);
                     $this->logger->info('Linked existing Alegra contact by NIT (order sync)', [
                         'user_id' => $customer->ID,
@@ -332,15 +332,15 @@ class Orders
             $customers_sync = new Customers($this->api, $this->logger);
             $sync_result = $customers_sync->sync_to_alegra($customer);
             if (!is_wp_error($sync_result) && isset($sync_result['id'])) {
-                return (int) $sync_result['id'];
+                return (string) $sync_result['id'];
             }
-            return 0;
+            return '';
         }
 
         // Guest checkout: search by email first, then by NIT, then create
         $email = $order->get_billing_email();
         if (empty($email)) {
-            return 0;
+            return '';
         }
 
         // Search by email first
@@ -348,9 +348,9 @@ class Orders
         if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
             $this->logger->info('Found existing Alegra contact by email (guest order)', [
                 'order_id' => $order->get_id(),
-                'alegra_id' => (int) $contacts[0]['id'],
+                'alegra_id' => (string) $contacts[0]['id'],
             ]);
-            return (int) $contacts[0]['id'];
+            return (string) $contacts[0]['id'];
         }
 
         // Search by NIT/identification as fallback
@@ -360,9 +360,9 @@ class Orders
             if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
                 $this->logger->info('Found existing Alegra contact by NIT (guest order)', [
                     'order_id' => $order->get_id(),
-                    'alegra_id' => (int) $contacts[0]['id'],
+                    'alegra_id' => (string) $contacts[0]['id'],
                 ]);
-                return (int) $contacts[0]['id'];
+                return (string) $contacts[0]['id'];
             }
         }
 
@@ -386,17 +386,17 @@ class Orders
         if (!is_wp_error($result) && isset($result['id'])) {
             $this->logger->info('New Alegra contact created from guest order', [
                 'order_id' => $order->get_id(),
-                'alegra_id' => (int) $result['id'],
+                'alegra_id' => (string) $result['id'],
             ]);
-            return (int) $result['id'];
+            return (string) $result['id'];
         }
 
-        return 0;
+        return '';
     }
 
-    private function build_client_data(\WC_Order $order, int $customer_alegra_id): array
+    private function build_client_data(\WC_Order $order, string $customer_alegra_id): array
     {
-        if ($customer_alegra_id > 0) {
+        if ($customer_alegra_id !== '') {
             return ['id' => $customer_alegra_id];
         }
 
@@ -414,8 +414,8 @@ class Orders
     private function calculate_due_date(\WC_Order $order): string
     {
         // Try to get payment term from Alegra
-        $term_id = (int) get_option('alegra_connector_payment_term_id', 0);
-        if ($term_id > 0) {
+        $term_id = (string) get_option('alegra_connector_payment_term_id', '');
+        if ($term_id !== '') {
             $term_data = $this->api->get_term($term_id);
             if (!is_wp_error($term_data) && isset($term_data['days'])) {
                 $days = (int) $term_data['days'];
@@ -445,7 +445,7 @@ class Orders
                 'quantity' => $quantity,
             ];
 
-            if ($alegra_item_id > 0) {
+            if ($alegra_item_id !== '') {
                 $item_data['id'] = $alegra_item_id;
             }
 
@@ -463,35 +463,35 @@ class Orders
         return $items;
     }
 
-    private function resolve_item_alegra_id(int $product_id, int $variation_id): int
+    private function resolve_item_alegra_id(int $product_id, int $variation_id): string
     {
         if ($variation_id > 0) {
-            $alegra_id = (int) get_post_meta($variation_id, '_alegra_item_id', true);
-            if ($alegra_id > 0) return $alegra_id;
+            $alegra_id = (string) get_post_meta($variation_id, '_alegra_item_id', true);
+            if ($alegra_id !== '') return $alegra_id;
         }
 
         if ($product_id > 0) {
-            $alegra_id = (int) get_post_meta($product_id, '_alegra_item_id', true);
-            if ($alegra_id > 0) return $alegra_id;
+            $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
+            if ($alegra_id !== '') return $alegra_id;
 
             $sku = get_post_meta($product_id, '_sku', true);
             if (!empty($sku)) {
                 $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
                 if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
-                    $found_id = (int) $items[0]['id'];
+                    $found_id = (string) $items[0]['id'];
                     update_post_meta($product_id, '_alegra_item_id', $found_id);
                     return $found_id;
                 }
             }
         }
 
-        return 0;
+        return '';
     }
 
-    private function prepare_payment_data(\WC_Order $order, int $invoice_id): array
+    private function prepare_payment_data(\WC_Order $order, string $invoice_id): array
     {
-        $account_id = (int) get_option('alegra_connector_payment_account_id', 0);
-        if ($account_id <= 0) {
+        $account_id = (string) get_option('alegra_connector_payment_account_id', '');
+        if ($account_id === '') {
             return [];
         }
 
@@ -524,7 +524,7 @@ class Orders
                 'price' => (float) ($item_obj->get_subtotal() / max(1, $item_obj->get_quantity())),
             ];
 
-            if ($alegra_item_id > 0) {
+            if ($alegra_item_id !== '') {
                 $item_data['id'] = $alegra_item_id;
             }
 
@@ -553,7 +553,7 @@ class Orders
                 'price' => $refund_price,
             ];
 
-            if ($alegra_item_id > 0) {
+            if ($alegra_item_id !== '') {
                 $item_data['id'] = $alegra_item_id;
             }
 
@@ -563,7 +563,7 @@ class Orders
         return $items;
     }
 
-    private function get_preferred_number_template(): ?int
+    private function get_preferred_number_template(): ?string
     {
         $templates = $this->api->get_number_templates();
         if (is_wp_error($templates) || empty($templates)) {
@@ -573,17 +573,17 @@ class Orders
         foreach ($templates as $tpl) {
             // Prefer electronic invoice template for Colombia
             if (isset($tpl['type']) && $tpl['type'] === 'electronic') {
-                return (int) $tpl['id'];
+                return (string) $tpl['id'];
             }
         }
 
         // Fallback to first template
-        return isset($templates[0]['id']) ? (int) $templates[0]['id'] : null;
+        return isset($templates[0]['id']) ? (string) $templates[0]['id'] : null;
     }
 
-    private function get_default_payment_term(): int
+    private function get_default_payment_term(): string
     {
-        return (int) get_option('alegra_connector_payment_term_id', 0);
+        return (string) get_option('alegra_connector_payment_term_id', '');
     }
 
     private function map_payment_method(\WC_Order $order): ?array
@@ -734,8 +734,8 @@ class Orders
 
         foreach (array_keys($tax_data['total']) as $rate_id) {
             if (isset($tax_mapping[$rate_id])) {
-                $mapped = (int) $tax_mapping[$rate_id];
-                if ($mapped > 0) {
+                $mapped = (string) $tax_mapping[$rate_id];
+                if ($mapped !== '') {
                     $ids[$mapped] = $mapped;
                 }
             }
@@ -762,8 +762,8 @@ class Orders
 
         $order_ids = [];
         foreach ($orders as $o) {
-            $alegra_id = (int) get_post_meta($o->get_id(), '_alegra_invoice_id', true);
-            if ($alegra_id > 0) {
+            $alegra_id = (string) get_post_meta($o->get_id(), '_alegra_invoice_id', true);
+            if ($alegra_id !== '') {
                 $order_ids[] = $o->get_id();
             }
         }
@@ -772,8 +772,8 @@ class Orders
 
         foreach ($order_ids as $order_id) {
             $result['checked']++;
-            $invoice_id = (int) get_post_meta($order_id, '_alegra_invoice_id', true);
-            if ($invoice_id <= 0) continue;
+            $invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+            if ($invoice_id === '') continue;
 
             $invoice = $this->api->get_invoice($invoice_id);
             if (is_wp_error($invoice)) {

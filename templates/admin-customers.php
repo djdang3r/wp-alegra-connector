@@ -37,7 +37,7 @@ $search=isset($_GET['search'])?sanitize_text_field($_GET['search']):'';
 <thead><tr><th style="width:36px;"><input type="checkbox" class="alegra-select-all" data-type="customer"></th><th style="width:60px;">ID</th><th><?php esc_html_e('Cliente','alegra-connector');?></th><th>Email</th><th><?php esc_html_e('Telefono','alegra-connector');?></th><th><?php esc_html_e('Alegra ID','alegra-connector');?></th><th><?php esc_html_e('Estado Sync','alegra-connector');?></th><th></th></tr></thead>
 <tbody><?php if(empty($customers)):?><tr><td colspan="8" style="text-align:center;padding:30px;color:var(--ac-text-muted);"><?php esc_html_e('No se encontraron clientes.','alegra-connector');?></td></tr>
 <?php else:foreach($customers as $c):
-    $ai=(int)get_user_meta($c->ID,'alegra_contact_id',true);$s=$ai>0;
+    $ai=(string)get_user_meta($c->ID,'alegra_contact_id',true);$s=$ai!==''&&$ai!==null;
     if($filter==='synced'&&!$s)continue;if($filter==='pending'&&$s)continue;
     if($search&&stripos($c->display_name.' '.$c->user_email,$search)===false)continue;
     $ph=get_user_meta($c->ID,'billing_phone',true);

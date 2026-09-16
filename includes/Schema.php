@@ -28,6 +28,46 @@ class Schema
         self::create_push_log_table();
         self::create_entity_map_table();
         self::create_push_queue_table();
+        self::maybe_migrate_alegra_id_columns();
+    }
+
+    /**
+     * Migrate alegra_id columns from BIGINT to VARCHAR(36) for UUID support.
+     * Idempotent: skips if already VARCHAR or if the version was already applied.
+     */
+    private static function maybe_migrate_alegra_id_columns(): void
+    {
+        global $wpdb;
+
+        $applied = (string) get_option('alegra_connector_schema_version', '');
+        if (version_compare($applied, '2.3.0', '>=')) {
+            return;
+        }
+
+        $tables = [
+            $wpdb->prefix . 'alegra_tombstones' => 'alegra_id',
+            $wpdb->prefix . 'alegra_pull_queue' => 'alegra_id',
+            $wpdb->prefix . 'alegra_push_log'   => 'alegra_id',
+            $wpdb->prefix . 'alegra_entity_map' => 'alegra_id',
+        ];
+
+        foreach ($tables as $table => $column) {
+            $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+            if (!$exists) {
+                continue;
+            }
+            $col = $wpdb->get_row($wpdb->prepare("SHOW COLUMNS FROM {$table} LIKE %s", $column));
+            if (!$col || stripos((string) $col->Type, 'bigint') === false) {
+                continue;
+            }
+            $null = (stripos((string) $col->Null, 'yes') !== false) ? 'NULL' : 'NOT NULL';
+            $wpdb->query("ALTER TABLE {$table} MODIFY {$column} VARCHAR(36) {$null}");
+            if ($wpdb->last_error) {
+                error_log('[Alegra Schema] Failed to migrate ' . $table . '.' . $column . ': ' . $wpdb->last_error);
+            }
+        }
+
+        update_option('alegra_connector_schema_version', '2.3.0');
     }
 
     public static function create_tombstones_table(): void
@@ -39,7 +79,7 @@ class Schema
         $sql = "CREATE TABLE $table (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             alegra_type VARCHAR(20) NOT NULL,
-            alegra_id BIGINT UNSIGNED NOT NULL,
+            alegra_id VARCHAR(36) NOT NULL,
             wc_post_id BIGINT UNSIGNED NULL,
             wc_user_id BIGINT UNSIGNED NULL,
             deleted_at DATETIME NOT NULL,
@@ -64,7 +104,7 @@ class Schema
         $sql = "CREATE TABLE $table (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             change_type VARCHAR(30) NOT NULL,
-            alegra_id BIGINT UNSIGNED NULL,
+            alegra_id VARCHAR(36) NULL,
             wc_entity_type VARCHAR(20) NULL,
             wc_entity_id BIGINT UNSIGNED NULL,
             payload_json LONGTEXT NULL,
@@ -126,7 +166,7 @@ class Schema
             user_id BIGINT UNSIGNED NULL,
             entity_type VARCHAR(20) NOT NULL,
             entity_id BIGINT UNSIGNED NOT NULL,
-            alegra_id BIGINT UNSIGNED NULL,
+            alegra_id VARCHAR(36) NULL,
             action VARCHAR(20) NOT NULL,
             request_payload LONGTEXT NULL,
             response_payload LONGTEXT NULL,
@@ -151,7 +191,7 @@ class Schema
         $sql = "CREATE TABLE $table (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             alegra_type VARCHAR(20) NOT NULL,
-            alegra_id BIGINT UNSIGNED NOT NULL,
+            alegra_id VARCHAR(36) NOT NULL,
             wc_entity_type VARCHAR(20) NOT NULL,
             wc_entity_id BIGINT UNSIGNED NOT NULL,
             synced_at DATETIME NOT NULL,
