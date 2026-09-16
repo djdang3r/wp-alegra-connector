@@ -376,6 +376,57 @@ TestRunner::test('T4.5 Public_ must NOT register the duplicate refund status hoo
     TestRunner::assertTrue(has_action('woocommerce_order_refunded') !== false, 'State_Sync owner hook must be wired');
 });
 
+TestRunner::test('T4.6 refund with a missing contact meta falls back to Consumidor Final (never an empty client id)', function (): void {
+    alegra_test_reset();
+    $cf = seed_consumidor_final();
+
+    $invoice_id = '1nv-504';
+    alegra_mock_seed_invoice($invoice_id, [
+        'emission_status' => 'STAMPED', 'total' => 40.0, 'balance' => 40.0, 'status' => 'open',
+        'items' => [['id' => '1t3m-504', 'name' => 'Widget', 'price' => 40, 'quantity' => 1]],
+    ]);
+    $refund = alegra_make_refund(902, ['total' => 40.0]);
+    // Deliberately NO _billing_alegra_contact_id: the contact meta is missing.
+    alegra_make_order(504, [
+        'total' => 40.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id],
+        'refunds' => [$refund],
+    ]);
+
+    register_refund_owner_hook();
+    do_action('woocommerce_order_refunded', 504, 902);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/credit-notes'), 'the fallback must still create the credit note');
+    $body = alegra_mock_last_request('POST', '/credit-notes')['body'] ?? [];
+    $client_id = (string) ($body['client']['id'] ?? '');
+    TestRunner::assertTrue($client_id !== '', 'a refund credit note must NEVER be POSTed with an empty client id');
+    TestRunner::assertSame($cf, $client_id, 'a missing contact meta must resolve to Consumidor Final');
+});
+
+TestRunner::test('T4.7 refund with an unresolvable client aborts with customer_unresolved and does NOT POST', function (): void {
+    alegra_test_reset();
+    // No Consumidor Final contact seeded, so get_id() cannot resolve.
+
+    $invoice_id = '1nv-505';
+    alegra_mock_seed_invoice($invoice_id, [
+        'emission_status' => 'STAMPED', 'total' => 25.0, 'balance' => 25.0, 'status' => 'open',
+        'items' => [['id' => '1t3m-505', 'name' => 'Widget', 'price' => 25, 'quantity' => 1]],
+    ]);
+    $refund = alegra_make_refund(903, ['total' => 25.0]);
+    alegra_make_order(505, [
+        'total' => 25.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id],
+        'refunds' => [$refund],
+    ]);
+
+    register_refund_owner_hook();
+    $result = State_Sync::handle_refund(505, 903);
+
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'an unresolvable client must abort');
+    TestRunner::assertSame('customer_unresolved', $result->get_error_code(), 'error code must be customer_unresolved');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'no credit note may be POSTed without a client');
+});
+
 // ===========================================================================
 // T5 — Contact resolution
 // ===========================================================================

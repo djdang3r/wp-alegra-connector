@@ -541,9 +541,22 @@ class Orders
             ]];
         }
 
+        // Resolve the client — required by POST /credit-notes.
+        $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
+        if ($client_id === '') {
+            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            $client_id = $cf !== false ? (string) $cf : '';
+        }
+        if ($client_id === '') {
+            return new \WP_Error(
+                'customer_unresolved',
+                __('No se pudo resolver el cliente para la nota de crédito.', 'alegra-connector')
+            );
+        }
+
         $data = [
             'date'     => date('Y-m-d'),
-            'client'   => ['id' => (string) $order->get_meta('_billing_alegra_contact_id', true)],
+            'client'   => ['id' => $client_id],
             'invoices' => [[
                 'id'     => $invoice_id,
                 'amount' => round($amount, 2),
