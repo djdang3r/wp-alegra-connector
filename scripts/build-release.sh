@@ -86,6 +86,22 @@ else
     echo "warning: scripts/smoke-test.sh missing or not executable; skipping pre-release gate" >&2
 fi
 
+# Preflight: run the EXECUTION tests. The smoke test only greps declarations;
+# this one boots the plugin against a mocked Alegra API and runs the real flows,
+# so a runtime fatal or a bad payload cannot be packaged.
+if [[ -z "${SKIP_SMOKE:-}" ]]; then
+    if [[ ! -x "$SCRIPT_DIR/exec-test.sh" ]]; then
+        echo "FATAL: scripts/exec-test.sh missing or not executable — refusing to ship." >&2
+        echo "  hint: chmod +x scripts/exec-test.sh" >&2
+        exit 7
+    fi
+    echo "--- Running execution tests (pre-release gate) ---"
+    "$SCRIPT_DIR/exec-test.sh"
+    echo "--- Execution tests OK ---"
+else
+    echo "warning: SKIP_SMOKE=1 set — bypassing execution tests" >&2
+fi
+
 # Output goes to releases/ (tracked in git, alongside prior version ZIPs).
 # This matches the repo's existing convention — see commit history "Add
 # release zips for v1.0.1 through v2.1.7" — and is what the user expects.
