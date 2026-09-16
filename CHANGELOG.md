@@ -2,6 +2,40 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.3] - 2026-09-16
+
+### 🐛 Fixed
+
+- **FIX: the "upload orders automatically" toggle could be silently ineffective** —
+  it was gated by a second, overlapping option (`sync_method`) whose UI default
+  was `cron`, so turning automatic ON did nothing. There are now two clearly
+  separated controls: *automatic sync FROM Alegra* (inbound) and *upload orders
+  TO Alegra* (automatic/manual).
+- **CHANGED: the default for uploading orders is now manual** — it was
+  automatic. Existing installs that already enabled it keep their setting.
+- **VERIFIED: the manual "create invoice" action works independently** — the
+  per-order "Facturar" path was verified to work regardless of the automatic
+  setting.
+
+### ✨ Changed
+
+- **CHANGED: `sync_method` is now inbound-only** — matching its label. Installs
+  with `real-time` or `disabled` will now skip the inbound cron (previously it
+  ran regardless).
+- **CHANGED: setting labels rewritten** — each control now states plainly what
+  it does and that the two are independent.
+
+### ✅ Upgrade Notes
+
+- **If you relied on orders being uploaded automatically, you must now enable
+  it explicitly** — it is off by default. Turn on *Configuración → Sincronización
+  → Subir pedidos a Alegra* to restore the old behaviour. Manual invoicing is
+  unaffected and remains the default workflow.
+- **If `sync_method` was `real-time` or `disabled`, the inbound cron now
+  respects it** — it will no longer run the periodic Alegra → WooCommerce pull.
+  If you need the pull, set the method to *Periódica* or *Periódica + Tiempo
+  Real*.
+
 ## [2.3.2] - 2026-09-16
 
 > **⚠️ This release REMOVES functionality shipped in 2.3.0/2.3.1.** If you rely
@@ -167,7 +201,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.2_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.3_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 

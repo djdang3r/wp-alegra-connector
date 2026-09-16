@@ -57,9 +57,13 @@ Sincronizar **bidireccionalmente** los datos entre una tienda WooCommerce y el s
 
 ### Modos de Sincronizacion
 
+Estos modos son de la sincronizacion **entrante** (Alegra → WooCommerce). La
+subida **saliente** (WooCommerce → Alegra) se configura aparte — ver
+*Facturacion automatica vs manual* mas abajo.
+
 | Modo | Gatillo | Latencia |
 |------|---------|----------|
-| **Tiempo Real** | WooCommerce hooks (`woocommerce_new_product`, `woocommerce_order_completed`, etc.) | Instantaneo |
+| **Tiempo Real** | Webhooks de Alegra (`edit-item`, `new-invoice`, etc.) | Instantaneo |
 | **Periodica (Cron)** | WP-Cron configurable (5/15/30/60 min) | Segun intervalo |
 | **Manual** | Boton "Sincronizar Ahora" en Dashboard | Inmediato |
 | **Polling (Alegra→WC)** | El cron verifica si facturas vinculadas fueron pagadas en Alegra | Segun intervalo del cron |

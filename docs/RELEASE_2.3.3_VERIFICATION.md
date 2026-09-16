@@ -1,10 +1,13 @@
-# Verificación en Producción — Alegra Connector 2.3.2
+# Verificación en Producción — Alegra Connector 2.3.3
 
-Esta guía es la **lista de validación** de la versión 2.3.2. La 2.3.2 **elimina**
-la emisión electrónica DIAN que traía la 2.3.0 (era una feature no pedida y
-activada por defecto) y agrega una **nota de pedido** cuando la factura sale a
-nombre del Consumidor Final. El plugin solo crea el documento en Alegra; el
-timbrado, si lo necesitás, se hace en Alegra.
+Esta guía es la **lista de validación** de la versión 2.3.3. La 2.3.3 **corrige**
+el control de subida de pedidos: separa la sincronización entrante (Alegra →
+WooCommerce) de la subida de pedidos (WooCommerce → Alegra) y deja la subida en
+**manual por defecto** (ver la **sección 0**, la más importante de esta versión).
+La 2.3.2 **eliminó** la emisión electrónica DIAN que traía la 2.3.0 (era una
+feature no pedida y activada por defecto) y agrega una **nota de pedido** cuando
+la factura sale a nombre del Consumidor Final. El plugin solo crea el documento
+en Alegra; el timbrado, si lo necesitás, se hace en Alegra.
 
 La base sigue siendo la 2.3.1, que corrigió los 68 hallazgos de la auditoría
 (lotes 0–3) sobre la 2.3.0.
@@ -47,9 +50,54 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 | Riesgo | Significado |
 |---|---|
-| **Alto** | Si falla, la factura sale con el **destinatario equivocado** (o no se factura). **Bloquea** el uso real de la 2.3.2 hasta resolverse. |
+| **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, o se factura sin querer. **Bloquea** el uso real de la 2.3.3 hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
+
+---
+
+## 0. Subida de pedidos: automática vs manual — ⚠️ LO NUEVO Y MÁS IMPORTANTE DE LA 2.3.3
+
+La 2.3.3 separa dos controles que antes se pisaban. Cada uno hace **una sola
+cosa**, y son **independientes**:
+
+| Control | Dónde | Qué gobierna |
+|---|---|---|
+| **Método de sincronización** | Configuración → Sincronización → "Método" | **Solo la entrante** (Alegra → WooCommerce): periódica, tiempo real, ambas o desactivada. **No** sube pedidos. |
+| **Subir pedidos a Alegra** | Configuración → Sincronización → "Subir pedidos a Alegra" | **Solo la saliente** (WooCommerce → Alegra). Por defecto **Manual (desactivado)**. |
+
+Antes, el toggle automático quedaba anulado cuando el método era `cron` (el
+default de la UI), así que marcarlo no hacía nada. Ese es el bug que esta
+versión corrige.
+
+### 0.a — Verificar el camino AUTOMÁTICO DESACTIVADO (el default)
+
+1. En `Alegra Connector → Configuración → Sincronización`, confirmá que
+   **"Subir pedidos a Alegra" está DESMARCADO** (es el default de una
+   instalación nueva). El Dashboard lo refleja.
+2. Creá un **pedido de prueba** en WooCommerce y **completá el pago**.
+3. Esperá unos segundos y mirá **Alegra → Facturas**.
+4. **Resultado esperado:** **no** aparece ninguna factura nueva. El pedido queda
+   como pendiente de facturar; nada se sube solo.
+5. **Si falla** (aparece una factura): el toggle quedó en automático o hay algo
+   que sube pedidos. Revisá `Alegra Connector → Logs` y la configuración de
+   subida.
+
+### 0.b — Verificar el camino MANUAL
+
+1. En **WooCommerce → Pedidos**, abrí el pedido de prueba y entrá al detalle.
+2. Hacé clic en **"Crear factura"** (en el listado de pedidos el botón dice
+   **"Facturar"**; también existen "Facturar seleccionados" y "Facturar
+   pendientes").
+3. **Resultado esperado:** la factura aparece en **Alegra → Facturas** (en
+   borrador por defecto), vinculada al contacto correcto, **sin depender** de
+   que la subida automática esté activada.
+4. **Si falla:** revisá los logs; el mensaje de Alegra suele decir qué campo
+   rechazó. Este camino es independiente del toggle automático por diseño.
+
+- **Riesgo: Alto (regresión).** El bug original era que el toggle automático no
+  hacía nada con el método en `cron`. Si el default manual no se respeta, se
+  factura sin querer; si el manual se rompe, no se puede facturar.
 
 ---
 
@@ -278,30 +326,33 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 ---
 
-## Orden de prueba recomendado (los 4 que quedan)
+## Orden de prueba recomendado
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la 2.3.2. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **Ítem 5 — CO + facturación electrónica (el más importante).** Pedido de
+2. **Desplegar** e instalar la 2.3.3. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **Ítem 0 — automático OFF (default) y manual.** Creá un pedido y confirmá
+   que **no** se factura solo; después usá "Crear factura" y confirmá que sí
+   aparece. Es el cambio de esta versión.
+4. **Ítem 5 — CO + facturación electrónica (el más importante).** Pedido de
    prueba con un cliente que **tenga** identificación; confirmá en Alegra que la
    factura sale a nombre del **cliente** y que **no** aparece la nota de
    Consumidor Final. Si cayó al genérico, reportalo.
-4. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
+5. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
    se crea a mano antes de facturar.
-5. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
+6. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
    revisa el log (`[DRY RUN] Blocked POST ...`) y que no se cree nada en
    Alegra. Ver `RELEASE_2.3.0_DEPLOY.md` §4. **Desactívalo al terminar.**
-6. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
+7. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
    prueba del paso anterior.
-7. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
-8. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirma
+8. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
+9. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirma
    que la factura se crea en Alegra (en borrador por defecto), que queda
    vinculada al cliente correcto y que **no** aparece la nota de Consumidor
    Final.
-9. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
-   crédito ligada a la factura (el formato es el documentado, ítem 6; el cap es
-   atómico, ítem 9).
+10. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
+    crédito ligada a la factura (el formato es el documentado, ítem 6; el cap es
+    atómico, ítem 9).
 
 ---
 
@@ -334,7 +385,12 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.2 instalado y la versión figura como **2.3.2** en **Plugins**.
+- [ ] 2.3.3 instalado y la versión figura como **2.3.3** en **Plugins**.
+
+### El cambio de la 2.3.3 (automático vs manual)
+- [ ] **0.a** "Subir pedidos a Alegra" **desmarcado** (default) → un pedido de
+      prueba **no** genera factura en Alegra.
+- [ ] **0.b** "Crear factura" en el pedido → la factura **sí** aparece en Alegra.
 
 ### Las 4 verificaciones que quedan
 - [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
