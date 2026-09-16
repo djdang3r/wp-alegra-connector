@@ -51,6 +51,7 @@ class Customers
             $result = $this->api->create_contact($data);
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_user_meta($customer->ID, 'alegra_contact_id', $result['id']);
+                \Alegra\Connector\Entity_Map::map('contact', (string) $result['id'], 'customer', (int) $customer->ID);
                 $this->logger->info('Customer created in Alegra', [
                     'customer_id' => $customer->ID,
                     'alegra_id' => $result['id'],
@@ -67,6 +68,7 @@ class Customers
 
         // Always link the WC customer to the existing Alegra contact
         update_user_meta($customer->ID, 'alegra_contact_id', $alegra_id);
+        \Alegra\Connector\Entity_Map::map('contact', (string) $alegra_id, 'customer', (int) $customer->ID);
 
         if ($conflict_resolution === 'woocommerce_wins') {
             $result = $this->api->update_contact($alegra_id, $data);
@@ -316,6 +318,8 @@ class Customers
 
             if ($existing_user_id) {
                 update_user_meta($existing_user_id, 'alegra_contact_id', $alegra_id);
+                // AC-07: indexed mapping at link time.
+                \Alegra\Connector\Entity_Map::map('contact', (string) $alegra_id, 'customer', (int) $existing_user_id);
                 $this->update_customer_from_alegra($existing_user_id, $contact);
                 $this->populate_wc_lookup($existing_user_id);
                 return 'updated';
@@ -340,6 +344,7 @@ class Customers
         }
 
         update_user_meta($user_id, 'alegra_contact_id', $alegra_id);
+        \Alegra\Connector\Entity_Map::map('contact', (string) $alegra_id, 'customer', (int) $user_id);
         $this->update_customer_from_alegra($user_id, $contact);
         $this->populate_wc_lookup($user_id);
 
@@ -445,6 +450,8 @@ class Customers
 
         if (!is_wp_error($result)) {
             delete_user_meta($customer_id, 'alegra_contact_id');
+            // AC-60: drop the indexed mapping.
+            \Alegra\Connector\Entity_Map::remove('contact', (string) $alegra_id, 'customer');
             $this->logger->info('Customer deleted from Alegra', [
                 'customer_id' => $customer_id,
                 'alegra_id' => $alegra_id,

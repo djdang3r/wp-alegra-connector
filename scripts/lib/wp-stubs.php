@@ -20,7 +20,32 @@ declare(strict_types=1);
 // ---------------------------------------------------------------------------
 
 if (!defined('ABSPATH')) {
-    define('ABSPATH', dirname(__DIR__, 2) . '/');
+    // Point ABSPATH at a throwaway tree that carries the wp-admin/includes
+    // stubs the plugin require_once()s (upgrade.php for Schema, media/file/image
+    // for image imports). The plugin locates its own files via __DIR__, so this
+    // does not affect it.
+    $alegra_abspath = sys_get_temp_dir() . '/alegra-exec-abspath';
+    if (!is_dir($alegra_abspath . '/wp-admin/includes')) {
+        @mkdir($alegra_abspath . '/wp-admin/includes', 0777, true);
+    }
+    foreach (['upgrade.php', 'media.php', 'file.php', 'image.php'] as $alegra_stub_inc) {
+        $alegra_stub_path = $alegra_abspath . '/wp-admin/includes/' . $alegra_stub_inc;
+        if (!is_file($alegra_stub_path)) {
+            @file_put_contents($alegra_stub_path, "<?php\n");
+        }
+    }
+    define('ABSPATH', $alegra_abspath . '/');
+}
+
+/**
+ * dbDelta stub. Schema::migrate() is the only caller. Counting the calls is
+ * how the AC-06 test proves a second migrate() does zero schema work.
+ */
+function dbDelta($queries = '', $execute = true)
+{
+    $GLOBALS['alegra_dbdelta_calls'] = ($GLOBALS['alegra_dbdelta_calls'] ?? 0)
+        + (is_array($queries) ? count($queries) : 1);
+    return [];
 }
 foreach ([
     'HOUR_IN_SECONDS'   => 3600,
@@ -429,6 +454,17 @@ function get_term($term_id, $taxonomy = '')
 }
 function get_terms($args = [])
 {
+    // Count the unindexed alegra_category_id termmeta lookups the old
+    // assign_product_category() did once per product (AC-63).
+    if (is_array($args) && !empty($args['meta_query'])) {
+        foreach ((array) $args['meta_query'] as $mq) {
+            if (is_array($mq) && ($mq['key'] ?? '') === 'alegra_category_id') {
+                $GLOBALS['alegra_category_lookups'] = ($GLOBALS['alegra_category_lookups'] ?? 0) + 1;
+                break;
+            }
+        }
+    }
+
     $name = is_array($args) ? ($args['name'] ?? null) : null;
     $out = [];
     foreach ($GLOBALS['wp_terms'] as $term) {
@@ -816,7 +852,14 @@ class Alegra_Mock_Wpdb
     public string $postmeta = 'wp_postmeta';
     public string $usermeta = 'wp_usermeta';
     public string $posts = 'wp_posts';
+    public string $users = 'wp_users';
+    public string $termmeta = 'wp_termmeta';
     public int $insert_id = 0;
+
+    public function get_charset_collate(): string
+    {
+        return '';
+    }
 
     public function prepare($query, ...$args)
     {
@@ -836,17 +879,136 @@ class Alegra_Mock_Wpdb
 
     public function get_var($query, $x = null, $y = null)
     {
-        if (strpos((string) $query, 'option_name') !== false && preg_match("/option_name\s*=\s*'([^']+)'/", (string) $query, $m)) {
+        $query = (string) $query;
+
+        if (strpos($query, 'option_name') !== false && preg_match("/option_name\s*=\s*'([^']+)'/", $query, $m)) {
             return array_key_exists($m[1], $GLOBALS['wp_options'])
                 ? (string) $GLOBALS['wp_options'][$m[1]]
                 : null;
+        }
+
+        if (strpos($query, 'alegra_entity_map') !== false && preg_match_all("/'([^']*)'/", $query, $m)) {
+            $vals = $m[1];
+            if (count($vals) >= 3) {
+                [$type, $alegra_id, $wc_type] = $vals;
+                foreach (($GLOBALS['alegra_entity_map'] ?? []) as $row) {
+                    if ($row['alegra_type'] === $type && $row['alegra_id'] === $alegra_id && $row['wc_entity_type'] === $wc_type) {
+                        return (string) $row['wc_entity_id'];
+                    }
+                }
+            }
+            return null;
+        }
+
+        if (preg_match('/FROM\s+\S*postmeta/i', $query) && strpos($query, 'meta_value') !== false) {
+            $GLOBALS['alegra_postmeta_scans'] = ($GLOBALS['alegra_postmeta_scans'] ?? 0) + 1;
+            return $this->scan_meta('wp_postmeta', $query);
+        }
+
+        if (preg_match('/FROM\s+\S*usermeta/i', $query) && strpos($query, 'meta_value') !== false) {
+            $GLOBALS['alegra_postmeta_scans'] = ($GLOBALS['alegra_postmeta_scans'] ?? 0) + 1;
+            return $this->scan_meta('wp_usermeta', $query);
+        }
+
+        return null;
+    }
+
+    private function scan_meta(string $table, string $query): ?string
+    {
+        $store = $table === 'wp_postmeta' ? ($GLOBALS['wp_postmeta'] ?? []) : ($GLOBALS['wp_usermeta'] ?? []);
+        if (!preg_match("/meta_key\s*=\s*'([^']+)'/", $query, $mk) || !preg_match("/meta_value\s*=\s*'([^']+)'/", $query, $mv)) {
+            return null;
+        }
+        foreach ($store as $entity_id => $meta) {
+            if (isset($meta[$mk[1]]) && (string) $meta[$mk[1]] === $mv[1]) {
+                return (string) $entity_id;
+            }
         }
         return null;
     }
 
     public function get_row($query, $output = null, $y = null) { return null; }
-    public function get_results($query, $output = null) { return []; }
-    public function query($query) { return 1; }
+
+    public function get_col($query, $x = 0)
+    {
+        $rows = $this->get_results($query);
+        $out = [];
+        foreach ((array) $rows as $row) {
+            $vars = is_object($row) ? get_object_vars($row) : (array) $row;
+            $out[] = array_values($vars)[0] ?? null;
+        }
+        return $out;
+    }
+
+    public function get_results($query, $output = null)
+    {
+        $query = (string) $query;
+
+        if (strpos($query, 'alegra_category_id') !== false && strpos($query, 'termmeta') !== false) {
+            $GLOBALS['alegra_category_lookups'] = ($GLOBALS['alegra_category_lookups'] ?? 0) + 1;
+            $rows = [];
+            foreach (($GLOBALS['wp_term_meta'] ?? []) as $term_id => $meta) {
+                if (isset($meta['alegra_category_id']) && (string) $meta['alegra_category_id'] !== '') {
+                    $rows[] = (object) ['term_id' => $term_id, 'meta_value' => (string) $meta['alegra_category_id']];
+                }
+            }
+            return $rows;
+        }
+
+        return [];
+    }
+
+    public function query($query)
+    {
+        $query = (string) $query;
+
+        if (stripos($query, 'alegra_entity_map') !== false) {
+            if (stripos($query, 'insert into') !== false && preg_match('/VALUES\s*\((.*?)\)\s*ON DUPLICATE/is', $query, $m)) {
+                $parts = array_map('trim', str_getcsv($m[1], ',', "'"));
+                if (count($parts) >= 4) {
+                    $this->entity_map_put([
+                        'alegra_type' => (string) $parts[0],
+                        'alegra_id' => (string) $parts[1],
+                        'wc_entity_type' => (string) $parts[2],
+                        'wc_entity_id' => (int) $parts[3],
+                    ]);
+                    return 1;
+                }
+            }
+            if (stripos($query, 'delete from') !== false) {
+                if (preg_match("/alegra_type\s*=\s*'([^']*)'\s+AND\s+alegra_id\s*=\s*'([^']*)'\s+AND\s+wc_entity_type\s*=\s*'([^']*)'/i", $query, $m)) {
+                    $GLOBALS['alegra_entity_map'] = array_values(array_filter(
+                        $GLOBALS['alegra_entity_map'],
+                        static fn ($r) => !($r['alegra_type'] === $m[1] && $r['alegra_id'] === $m[2] && $r['wc_entity_type'] === $m[3])
+                    ));
+                    return 1;
+                }
+                if (preg_match("/wc_entity_type\s*=\s*'([^']*)'\s+AND\s+wc_entity_id\s*=\s*(\d+)/i", $query, $m)) {
+                    $GLOBALS['alegra_entity_map'] = array_values(array_filter(
+                        $GLOBALS['alegra_entity_map'],
+                        static fn ($r) => !($r['wc_entity_type'] === $m[1] && (int) $r['wc_entity_id'] === (int) $m[2])
+                    ));
+                    return 1;
+                }
+            }
+            return 1;
+        }
+
+        return 1;
+    }
+
+    private function entity_map_put(array $row): void
+    {
+        foreach (($GLOBALS['alegra_entity_map'] ?? []) as $i => $existing) {
+            if ($existing['alegra_type'] === $row['alegra_type']
+                && $existing['alegra_id'] === $row['alegra_id']
+                && $existing['wc_entity_type'] === $row['wc_entity_type']) {
+                $GLOBALS['alegra_entity_map'][$i] = $row;
+                return;
+            }
+        }
+        $GLOBALS['alegra_entity_map'][] = $row;
+    }
 
     public function insert($table, $data = [], $format = null)
     {

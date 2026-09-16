@@ -176,6 +176,9 @@ class Client
             $code = wp_remote_retrieve_response_code($response);
             $body = wp_remote_retrieve_body($response);
 
+            // AC-24: honour the documented X-Rate-Limit-* headers.
+            $this->capture_rate_headers($response);
+
             // Only increment rate limit on SUCCESSFUL requests (not on errors)
             // Otherwise we hit the limit just by having errors!
             if ($code < 400) {
@@ -806,39 +809,95 @@ class Client
         return $decoded ?? [];
     }
 
-    // Rate limiting (token bucket: 50 req/min, conservative vs Alegra's 60)
-    private const RATE_LIMIT_PER_MIN = 50;
-    private const RATE_BURST_ALLOWANCE = 10;
+    // Rate limiting.
+    //
+    // AC-24: Alegra documents 150 requests/min per user and exposes
+    // X-Rate-Limit-Limit/Remaining/Reset. The old code used 50, a FIXED-TTL
+    // transient that was refreshed on every write (so the counter accumulated
+    // forever and blocked permanently under sustained traffic), a non-atomic
+    // read-modify-write, and a 5s throttle against a 60s window.
+    //
+    // The window is now FIXED: we store [count, start] and reset only when the
+    // window elapses, so the counter can never grow monotonically.
+    private const RATE_LIMIT_PER_MIN = 150;
+    private const RATE_WINDOW_SECONDS = 60;
+    private const RATE_WINDOW_OPTION = 'alegra_connector_rate_window';
+
+    /**
+     * Current fixed window, resetting when it has elapsed.
+     *
+     * @return array{count:int, start:int}
+     */
+    private function rate_window(): array
+    {
+        $w = get_option(self::RATE_WINDOW_OPTION, []);
+        $now = time();
+
+        if (!is_array($w) || !isset($w['start'], $w['count']) || ($now - (int) $w['start']) >= self::RATE_WINDOW_SECONDS) {
+            return ['count' => 0, 'start' => $now];
+        }
+
+        return ['count' => (int) $w['count'], 'start' => (int) $w['start']];
+    }
 
     private function is_rate_limited(): bool
     {
-        $rate_limit = (int) get_transient('alegra_connector_rate_limit');
-        return $rate_limit >= (self::RATE_LIMIT_PER_MIN + self::RATE_BURST_ALLOWANCE);
+        return $this->rate_window()['count'] >= self::RATE_LIMIT_PER_MIN;
     }
 
     private function increment_rate_limit(): void
     {
-        $rate_limit = (int) get_transient('alegra_connector_rate_limit');
-        set_transient('alegra_connector_rate_limit', $rate_limit + 1, 60, 'no');
+        $w = $this->rate_window();
+        $w['count']++;
+        update_option(self::RATE_WINDOW_OPTION, $w, false);
     }
 
     /**
-     * Wait briefly if we're at the rate limit. Returns true if request should proceed.
-     * If limit is hard-reached, throws WP_Error so the caller knows to retry later.
+     * Honour Alegra's rate-limit headers when present (AC-24).
+     */
+    private function capture_rate_headers($response): void
+    {
+        $remaining = wp_remote_retrieve_header($response, 'x-rate-limit-remaining');
+        if ($remaining !== '' && is_numeric($remaining)) {
+            set_transient('alegra_connector_rate_remaining', (int) $remaining, 120);
+            // The server is the source of truth: if it says we are out, mark the
+            // window full so throttle() waits instead of hammering.
+            if ((int) $remaining <= 1) {
+                $w = $this->rate_window();
+                $w['count'] = self::RATE_LIMIT_PER_MIN;
+                update_option(self::RATE_WINDOW_OPTION, $w, false);
+            }
+        }
+
+        $reset = wp_remote_retrieve_header($response, 'x-rate-limit-reset');
+        if ($reset !== '' && is_numeric($reset)) {
+            set_transient('alegra_connector_rate_reset', (int) $reset, 120);
+        }
+    }
+
+    /**
+     * Wait for the actual remaining window time when the limit is reached.
+     * Returns true if the request should proceed.
      */
     private function throttle(): bool
     {
-        if ($this->is_rate_limited()) {
-            // Wait up to 5s for the rate limit window to refresh
-            $sleep = min(60 - (time() % 60), 5);
-            if ($sleep > 0) {
-                sleep($sleep);
-            }
-            // Re-check after sleep
-            if ($this->is_rate_limited()) {
-                return false;
-            }
+        if (!$this->is_rate_limited()) {
+            return true;
         }
-        return true;
+
+        // Prefer the server-provided reset; otherwise compute the window tail.
+        $reset = (int) get_transient('alegra_connector_rate_reset');
+        if ($reset <= 0) {
+            $w = $this->rate_window();
+            $reset = max(1, self::RATE_WINDOW_SECONDS - (time() - $w['start']));
+        }
+
+        // Bound the wait so a bogus header cannot hang the request.
+        $sleep = min($reset, 30);
+        if ($sleep > 0) {
+            sleep($sleep);
+        }
+
+        return !$this->is_rate_limited();
     }
 }

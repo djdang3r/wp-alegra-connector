@@ -811,58 +811,78 @@ class Admin_Dashboard
         $orders_table = HPOS::get_orders_table();
         $meta_table = HPOS::get_order_meta_table();
 
+        // AC-58: aggregate revenue/counts in SQL. The old code materialised up
+        // to 5,000 order rows into PHP just to sum them, and silently
+        // under-reported on a larger store.
+        $range = [$start, $end . ' 23:59:59'];
         if (HPOS::is_enabled()) {
-            $order_rows = $wpdb->get_results($wpdb->prepare(
-                "SELECT o.id, o.status, om.meta_value as total
-                 FROM {$orders_table} o
-                 LEFT JOIN {$meta_table} om ON o.id=om.order_id AND om.meta_key='_order_total'
-                 WHERE o.type='shop_order'
+            $status_expr = "REPLACE(o.status,'wc-','')";
+            $date_expr = 'o.date_created_gmt';
+            $from = "{$orders_table} o LEFT JOIN {$meta_table} om ON o.id=om.order_id AND om.meta_key='_order_total'";
+            $where = "o.type='shop_order' AND o.date_created_gmt >= %s AND o.date_created_gmt <= %s";
+
+            $status_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT {$status_expr} AS status, COUNT(*) AS cnt, COALESCE(SUM(om.meta_value),0) AS total
+                 FROM {$from} WHERE {$where} GROUP BY status",
+                ...$range
+            ));
+            $daily_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT DATE({$date_expr}) AS d, COUNT(*) AS cnt, COALESCE(SUM(om.meta_value),0) AS total
+                 FROM {$from} WHERE {$where} GROUP BY d",
+                ...$range
+            ));
+            $recent_ids = $wpdb->get_col($wpdb->prepare(
+                "SELECT o.id FROM {$orders_table} o WHERE o.type='shop_order'
                  AND o.date_created_gmt >= %s AND o.date_created_gmt <= %s
-                 ORDER BY o.date_created_gmt DESC
-                 LIMIT 5000",
-                $start, $end . ' 23:59:59'
+                 ORDER BY o.date_created_gmt DESC LIMIT 5",
+                ...$range
             ));
         } else {
-            $order_rows = $wpdb->get_results($wpdb->prepare(
-                "SELECT p.ID, p.post_status, pm_total.meta_value as total
-                 FROM {$wpdb->posts} p
-                 LEFT JOIN {$wpdb->postmeta} pm_total ON p.ID=pm_total.post_id AND pm_total.meta_key='_order_total'
-                 WHERE p.post_type='shop_order'
+            $status_expr = "REPLACE(p.post_status,'wc-','')";
+            $from = "{$wpdb->posts} p LEFT JOIN {$wpdb->postmeta} om ON p.ID=om.post_id AND om.meta_key='_order_total'";
+            $where = "p.post_type='shop_order' AND p.post_date >= %s AND p.post_date <= %s";
+
+            $status_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT {$status_expr} AS status, COUNT(*) AS cnt, COALESCE(SUM(om.meta_value),0) AS total
+                 FROM {$from} WHERE {$where} GROUP BY status",
+                ...$range
+            ));
+            $daily_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT DATE(p.post_date) AS d, COUNT(*) AS cnt, COALESCE(SUM(om.meta_value),0) AS total
+                 FROM {$from} WHERE {$where} GROUP BY d",
+                ...$range
+            ));
+            $recent_ids = $wpdb->get_col($wpdb->prepare(
+                "SELECT p.ID FROM {$wpdb->posts} p WHERE p.post_type='shop_order'
                  AND p.post_date >= %s AND p.post_date <= %s
-                 ORDER BY p.post_date DESC
-                 LIMIT 5000",
-                $start, $end . ' 23:59:59'
+                 ORDER BY p.post_date DESC LIMIT 5",
+                ...$range
             ));
         }
 
-        if (!is_array($order_rows)) $order_rows = [];
-
-        $order_ids = [];
-        foreach ($order_rows as $row) {
-            $order_ids[] = (int) $row->id ?? (int) $row->ID;
-            $status = str_replace('wc-', '', $row->status ?? $row->post_status);
+        foreach ((array) $status_rows as $row) {
+            $status = (string) ($row->status ?? '');
             $total = (float) ($row->total ?? 0);
+            $count = (int) ($row->cnt ?? 0);
 
             $revenue['total'] += $total;
-            $order_counts['total']++;
+            $order_counts['total'] += $count;
 
             if (array_key_exists($status, $revenue)) {
                 $revenue[$status] += $total;
-                $order_counts[$status]++;
+                $order_counts[$status] += $count;
             }
+        }
 
-            $date_field = $row->date_created_gmt ?? $row->post_date ?? '';
-            $date = substr($date_field, 0, 10);
-            if ($date) {
-                if (!isset($daily_sales[$date])) $daily_sales[$date] = ['count' => 0, 'total' => 0];
-                $daily_sales[$date]['count']++;
-                $daily_sales[$date]['total'] += $total;
+        foreach ((array) $daily_rows as $row) {
+            $date = substr((string) ($row->d ?? ''), 0, 10);
+            if ($date !== '') {
+                $daily_sales[$date] = ['count' => (int) $row->cnt, 'total' => (float) $row->total];
             }
         }
 
         // Load recent 5 orders fully for display
-        $recent_ids = array_slice($order_ids, 0, 5);
-        foreach ($recent_ids as $oid) {
+        foreach ((array) $recent_ids as $oid) {
             $order = wc_get_order($oid);
             if (!$order) continue;
             $recent_orders[] = [
@@ -1038,19 +1058,20 @@ class Admin_Dashboard
         $post_type_clause = '';
         $show_variations = false;
 
+        // AC-58: EXISTS instead of a scalar correlated subquery. The old
+        // COUNT ran a 3-join subquery once per product row just to paginate.
         if ($post_type_filter === 'variable') {
-            $post_type_clause = "AND (SELECT t.slug FROM {$wpdb->term_relationships} tr
+            $post_type_clause = "AND p.post_type='product' AND EXISTS (
+                SELECT 1 FROM {$wpdb->term_relationships} tr
                 INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id=tt.term_taxonomy_id
                 INNER JOIN {$wpdb->terms} t ON tt.term_id=t.term_id
-                WHERE tr.object_id=p.ID AND tt.taxonomy='product_type' LIMIT 1) = 'variable'";
+                WHERE tr.object_id=p.ID AND tt.taxonomy='product_type' AND t.slug='variable')";
         } elseif ($post_type_filter === 'simple') {
-            $post_type_clause = "AND (p.post_type='product') AND (SELECT t.slug FROM {$wpdb->term_relationships} tr
+            $post_type_clause = "AND p.post_type='product' AND NOT EXISTS (
+                SELECT 1 FROM {$wpdb->term_relationships} tr
                 INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id=tt.term_taxonomy_id
                 INNER JOIN {$wpdb->terms} t ON tt.term_id=t.term_id
-                WHERE tr.object_id=p.ID AND tt.taxonomy='product_type' LIMIT 1) IS NULL OR (SELECT t.slug FROM {$wpdb->term_relationships} tr
-                INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id=tt.term_taxonomy_id
-                INNER JOIN {$wpdb->terms} t ON tt.term_id=t.term_id
-                WHERE tr.object_id=p.ID AND tt.taxonomy='product_type' LIMIT 1) = 'simple')";
+                WHERE tr.object_id=p.ID AND tt.taxonomy='product_type' AND t.slug='variable')";
         } elseif ($post_type_filter === 'variations') {
             $post_type_clause = "AND p.post_type='product_variation'";
             $show_variations = true;
@@ -2518,9 +2539,10 @@ class Admin_Dashboard
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
-        @set_time_limit(0);
-        wp_raise_memory_limit();
-
+        // AC-61: no unbounded execution-time override here. The hook is
+        // scheduled as a one-off event, so this request only enqueues it — it
+        // does not run the sync inline. The sync itself is bounded by the
+        // import time budget and resumes from a cursor.
         $hook = sanitize_text_field($_POST['hook'] ?? '');
         if (empty($hook) || !preg_match('/^[a-zA-Z0-9_]+$/', $hook)) {
             wp_send_json_error(['message' => __('Hook invalido.', 'alegra-connector')]);

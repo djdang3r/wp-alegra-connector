@@ -29,13 +29,13 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
  */
 function alegra_connector_uninstall_tables(): array
 {
+    // AC-22: alegra_pull_queue / alegra_push_log / alegra_push_queue have no
+    // writers and are dropped by Schema::migrate(); they are no longer part of
+    // the plugin's table set.
     return [
         'alegra_tombstones',
-        'alegra_pull_queue',
         'alegra_runs',
-        'alegra_push_log',
         'alegra_entity_map',
-        'alegra_push_queue',
     ];
 }
 
@@ -87,6 +87,12 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_webhook_secret');
     delete_option('alegra_connector_webhook_subscriptions');
     delete_option('alegra_connector_schema_version');
+    delete_option('alegra_connector_uuid_columns_migrated');
+    delete_option('alegra_connector_products_import_cursor');
+    delete_option('alegra_connector_import_time_budget');
+    delete_option('alegra_connector_import_max_pages');
+    delete_option('alegra_connector_orders_poll_batch');
+    delete_option('alegra_connector_rate_window');
     delete_option('alegra_connector_billing_field_catalog_enabled');
     delete_option('alegra_connector_customer_resolution_mode');
     delete_option('alegra_connector_stamp_enabled');
@@ -196,7 +202,7 @@ function alegra_connector_uninstall_site(): void
     delete_metadata('term', 0, 'alegra_category_id', '', true);
 
     // 8. Clear scheduled actions (WP-Cron + Action Scheduler).
-    foreach (['alegra_connector_cron_sync'] as $hook) {
+    foreach (['alegra_connector_cron_sync', 'alegra_connector_daily_maintenance'] as $hook) {
         wp_clear_scheduled_hook($hook);
     }
     if (function_exists('as_unschedule_all_actions')) {

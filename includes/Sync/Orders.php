@@ -186,6 +186,10 @@ class Orders
         }
         $order->update_meta_data('_alegra_invoice_number', $invoice_number);
         $order->save();
+
+        // AC-07: write the indexed mapping so a later lookup never scans
+        // wp_postmeta.meta_value (O(N²) on a large catalog).
+        \Alegra\Connector\Entity_Map::map('invoice', $invoice_id, 'order', (int) $order->get_id());
     }
 
     /**
@@ -1459,54 +1463,95 @@ class Orders
             return $result;
         }
 
-        $orders = wc_get_orders([
-            'limit' => 50,
-            'status' => ['processing', 'pending', 'on-hold'],
-            'orderby' => 'date',
-            'order' => 'DESC',
-        ]);
-
-        $order_ids = [];
-        foreach ($orders as $o) {
-            $alegra_id = (string) $o->get_meta('_alegra_invoice_id', true);
-            if ($alegra_id !== '') {
-                $order_ids[$o->get_id()] = $alegra_id;
-            }
+        // AC-18: the poll issues one HTTP call per order. Without a lock two
+        // overlapping cron ticks duplicate every call. Wrap it in the same
+        // per-type mutex the other sync steps use.
+        $lock = self::acquire_poll_lock();
+        if ($lock === false) {
+            $this->logger->info('Invoice status poll skipped: another poll is running');
+            return $result;
         }
 
-        $should_complete = get_option('alegra_connector_auto_complete_order', true);
-
-        foreach ($order_ids as $order_id => $invoice_id) {
-            // Re-check the kill switch so an in-flight poll stops.
-            if (\Alegra\Connector\Kill_Switch::is_active()) {
-                $this->logger->info('Invoice status poll stopped: kill switch active');
-                break;
+        try {
+            // AC-18: a sane, configurable batch. The API cost is high (one
+            // request per order) so the default is deliberately lower than the
+            // old 50. At a 5-min cron this is 288 * 20 = 5.7k calls/day vs the
+            // old ~14k.
+            $limit = (int) get_option('alegra_connector_orders_poll_batch', 20);
+            if ($limit < 1) {
+                $limit = 20;
             }
 
-            $result['checked']++;
+            // AC-18: fetch IDs + filter in SQL. `return => ids` avoids
+            // hydrating full WC_Order objects just to read one meta.
+            $query = [
+                'limit'   => $limit,
+                'status'  => ['processing', 'pending', 'on-hold'],
+                'orderby' => 'date',
+                'order'   => 'DESC',
+                'return'  => 'ids',
+                'meta_query' => [[
+                    'key'     => '_alegra_invoice_id',
+                    'value'   => '',
+                    'compare' => '!=',
+                ]],
+            ];
 
-            $invoice = $this->api->get_invoice($invoice_id);
-            if (is_wp_error($invoice)) {
-                $result['errors']++;
-                continue;
-            }
+            $order_ids = wc_get_orders($query);
+            $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
-            $status = $invoice['status'] ?? '';
-            $balance = (float) ($invoice['balance'] ?? 0);
+            foreach ((array) $order_ids as $order_id) {
+                // Re-check the kill switch so an in-flight poll stops.
+                if (\Alegra\Connector\Kill_Switch::is_active()) {
+                    $this->logger->info('Invoice status poll stopped: kill switch active');
+                    break;
+                }
 
-            if ($status === 'paid' && $balance <= 0 && $should_complete) {
                 $order = wc_get_order($order_id);
-                if ($order && $order->get_status() !== 'completed') {
-                    $order->add_order_note(sprintf(
-                        __('[Alegra] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),
-                        $invoice['numberTemplate']['fullNumber'] ?? $invoice_id
-                    ));
-                    $order->update_status('completed');
-                    $result['completed']++;
+                if (!$order) {
+                    continue;
+                }
+                $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+                if ($invoice_id === '') {
+                    continue;
+                }
+
+                $result['checked']++;
+
+                $invoice = $this->api->get_invoice($invoice_id);
+                if (is_wp_error($invoice)) {
+                    $result['errors']++;
+                    continue;
+                }
+
+                $status = $invoice['status'] ?? '';
+                $balance = (float) ($invoice['balance'] ?? 0);
+
+                if ($status === 'paid' && $balance <= 0 && $should_complete) {
+                    if ($order->get_status() !== 'completed') {
+                        $order->add_order_note(sprintf(
+                            __('[Alegra] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),
+                            $invoice['numberTemplate']['fullNumber'] ?? $invoice_id
+                        ));
+                        $order->update_status('completed');
+                        $result['completed']++;
+                    }
                 }
             }
+        } finally {
+            self::release_poll_lock($lock);
         }
 
         return $result;
+    }
+
+    private static function acquire_poll_lock(): string|false
+    {
+        return Controller::acquire_lock('alegra_sync_running_orders', 300);
+    }
+
+    private static function release_poll_lock(string $token): void
+    {
+        Controller::release_lock('alegra_sync_running_orders', $token);
     }
 }

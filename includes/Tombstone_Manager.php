@@ -53,6 +53,9 @@ class Tombstone_Manager
             'deleted_by' => get_current_user_id(),
             'reason' => 'manual_wc',
         ]);
+
+        // AC-60: drop the indexed mapping so it cannot point at a ghost id.
+        Entity_Map::remove('item', $alegra_id, 'product');
     }
 
     /**

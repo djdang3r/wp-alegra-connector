@@ -242,6 +242,10 @@ final class Alegra_Connector
         // priority-999 self-check below would wrongly deactivate the plugin).
         $this->init_logger();
 
+        // Daily retention pruning + entity-map reconciliation (AC-22/AC-60).
+        // No WooCommerce dependency; always registered.
+        Maintenance::register_hooks();
+
         // AC-17: hard guard. This plugin loads before WooCommerce (alphabetical),
         // so if WC is missing every `wc_*`/`WC_*` call in templates and AJAX
         // handlers would fatal (white screen / HTTP 500). Bail out early with a
@@ -389,8 +393,15 @@ final class Alegra_Connector
             }
         }
 
+        // Create/upgrade the schema immediately on activation (AC-06). The
+        // plugins_loaded migration hook has already fired by the time an
+        // activation hook runs, so without this the tables would only be
+        // created on the next request.
+        Schema::migrate();
+
         // Schedule cron on activation
         $this->schedule_cron();
+        Maintenance::schedule();
 
         // Log activation
         if ($this->logger) {
@@ -428,7 +439,7 @@ final class Alegra_Connector
         );
 
         // 3. Clear ALL cron events with alegra prefix
-        $cron_hooks = ['alegra_connector_cron_sync'];
+        $cron_hooks = ['alegra_connector_cron_sync', Maintenance::CRON_HOOK];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }
@@ -468,6 +479,9 @@ final class Alegra_Connector
         if (!wp_next_scheduled($hook)) {
             wp_schedule_event(time() + 60, $schedule, $hook);
         }
+
+        // Keep the daily maintenance event present (AC-22).
+        Maintenance::schedule();
     }
 
     /**

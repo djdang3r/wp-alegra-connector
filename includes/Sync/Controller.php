@@ -59,12 +59,25 @@ class Controller
             return;
         }
 
+        // AC-20: one global mutex around the WHOLE run. Per-entity locks alone
+        // let two ticks interleave (each holding a different entity lock),
+        // producing duplicate runs, double API traffic and double writes.
+        $global_lock = self::acquire_lock('alegra_cron_global', 600);
+        if ($global_lock === false) {
+            $this->logger->info('Cron sync skipped: another run is already in progress');
+            return;
+        }
+
         $this->logger->info('Starting cron synchronization (Alegra → WC only)');
 
-        // Wrap entire run in Runs::track for the Monitor
-        Runs::track('cron_sync_all', function ($run_id) {
-            $this->run_cron_sync_inner($run_id);
-        }, 'cron');
+        try {
+            // Wrap entire run in Runs::track for the Monitor
+            Runs::track('cron_sync_all', function ($run_id) {
+                $this->run_cron_sync_inner($run_id);
+            }, 'cron');
+        } finally {
+            self::release_lock('alegra_cron_global', $global_lock);
+        }
     }
 
     private function run_cron_sync_inner(int $run_id): void
@@ -168,6 +181,9 @@ class Controller
         }
 
         set_transient('alegra_connector_last_sync', time(), DAY_IN_SECONDS);
+
+        // AC-22: bounded retention pruning at the tail of every cron run.
+        \Alegra\Connector\Maintenance::prune();
 
         Heartbeat::set($run_id, ['step' => 'done', 'message' => sprintf(
             __('Completado: %d productos, %d clientes, %d ordenes, %d categorias', 'alegra-connector'),

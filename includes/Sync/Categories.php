@@ -46,6 +46,7 @@ class Categories
             $result = $this->api->create_item_category($data);
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_term_meta($category->term_id, 'alegra_category_id', $result['id']);
+                \Alegra\Connector\Entity_Map::map('category', (string) $result['id'], 'category', (int) $category->term_id);
                 $this->logger->info('Category created in Alegra', [
                     'term_id' => $category->term_id,
                     'alegra_id' => $result['id'],
@@ -296,6 +297,8 @@ class Categories
     public function unlink(int $term_id): void
     {
         delete_term_meta($term_id, 'alegra_category_id');
+        // AC-60: drop the indexed mapping too.
+        \Alegra\Connector\Entity_Map::remove_by_wc('category', (int) $term_id);
         $this->logger->info('Category unlinked from Alegra', ['term_id' => $term_id]);
     }
 
@@ -313,6 +316,7 @@ class Categories
         ]);
 
         delete_term_meta($term_id, 'alegra_category_id');
+        \Alegra\Connector\Entity_Map::remove_by_wc('category', (int) $term_id);
 
         return ['success' => true];
     }

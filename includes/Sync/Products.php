@@ -23,10 +23,41 @@ class Products
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
+    /**
+     * AC-63: per-instance Alegra-category-id / name → WC term id caches. Loaded
+     * once (single indexed query) and reused for every imported product.
+     *
+     * @var array<string,int>
+     */
+    private array $category_id_map = [];
+    /** @var array<string,int> */
+    private array $category_name_map = [];
+    private bool $category_map_loaded = false;
+
     public function __construct(?API\Client $api, ?Logger\Logger $logger)
     {
         $this->api = $api;
         $this->logger = $logger;
+    }
+
+    /**
+     * Load the Alegra category → WC term map once per instance (AC-63).
+     */
+    private function load_category_map(): void
+    {
+        if ($this->category_map_loaded) {
+            return;
+        }
+        $this->category_map_loaded = true;
+
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT term_id, meta_value FROM {$wpdb->termmeta}
+             WHERE meta_key = 'alegra_category_id' AND meta_value > ''"
+        );
+        foreach ((array) $rows as $row) {
+            $this->category_id_map[(string) $row->meta_value] = (int) $row->term_id;
+        }
     }
 
     /**
@@ -574,14 +605,33 @@ class Products
             return new \WP_Error('kill_switch_active', 'Plugin is disconnected or deactivated');
         }
 
-        $result = ['imported' => 0, 'updated' => 0, 'errors' => 0, 'total_pages' => 0, 'current_page' => 0];
-        $current_page = $page;
-        $max_pages = 200; // ~6000 items max
+        $result = ['imported' => 0, 'updated' => 0, 'errors' => 0, 'total_pages' => 0, 'current_page' => 0, 'paused' => false];
+        $cursor_key = 'alegra_connector_products_import_cursor';
 
-        // Prevent PHP timeout on large syncs
-        set_time_limit(300);
+        // AC-19: resume from the persisted cursor. The old code always started
+        // at page 1, so every interrupted run re-imported the whole catalog.
+        if ($page > 1) {
+            $start = ($page - 1) * $per_page;
+        } else {
+            $start = max(0, (int) get_option($cursor_key, 0));
+        }
+        $current_page = (int) floor($start / $per_page) + 1;
 
-        for ($p = 1; $p <= $max_pages; $p++) {
+        // AC-19/AC-61: a wall-clock budget replaces set_time_limit(300). Stop
+        // cleanly before max_execution_time and let the next run resume.
+        $budget = (int) get_option('alegra_connector_import_time_budget', 240);
+        if ($budget < 30) {
+            $budget = 30;
+        }
+        $deadline = microtime(true) + $budget;
+
+        // AC-19: 0 = unlimited. The resume cursor makes a hard page cap
+        // unnecessary — a 50k-item catalog imports across several runs.
+        $max_pages = (int) get_option('alegra_connector_import_max_pages', 0);
+        $pages_done = 0;
+        $completed = false;
+
+        while (true) {
             // Check for cancellation
             if (get_transient('alegra_sync_cancelled')) {
                 delete_transient('alegra_sync_cancelled');
@@ -595,18 +645,31 @@ class Products
                 break;
             }
 
+            // AC-19: pause at the time budget; the next run continues here.
+            if (microtime(true) >= $deadline) {
+                $result['paused'] = true;
+                $this->logger->info('Products import paused at the time budget; resuming next run', [
+                    'cursor' => $start,
+                ]);
+                break;
+            }
+
+            if ($max_pages > 0 && $pages_done >= $max_pages) {
+                break;
+            }
+
             // Update progress transient
             set_transient('alegra_sync_progress', [
                 'type' => 'products',
-                'current_page' => $p,
+                'current_page' => $current_page,
                 'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
                 'imported' => $result['imported'],
                 'updated' => $result['updated'],
-                'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $p),
+                'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $current_page),
             ], 120);
 
             $api_params = [
-                'start' => ($current_page - 1) * $per_page,
+                'start' => $start,
                 'limit' => $per_page,
                 'mode' => 'advanced',
             ];
@@ -617,11 +680,14 @@ class Products
 
             if (is_wp_error($alegra_items)) {
                 delete_transient('alegra_sync_progress');
-                if ($current_page === 1) return $alegra_items;
+                if ($start === 0) return $alegra_items;
                 break;
             }
 
-            if (empty($alegra_items)) break;
+            if (empty($alegra_items)) {
+                $completed = true;
+                break;
+            }
 
             foreach ($alegra_items as $item) {
                 $r = $this->import_single_item_from_alegra($item);
@@ -630,8 +696,25 @@ class Products
                 else $result['errors']++;
             }
 
-            if (count($alegra_items) < $per_page) break;
+            $start += $per_page;
             $current_page++;
+            $pages_done++;
+
+            if (count($alegra_items) < $per_page) {
+                $completed = true;
+                break;
+            }
+
+            // Persist the resume cursor after every completed page.
+            update_option($cursor_key, $start, false);
+        }
+
+        // Clear the cursor only when the catalog was fully walked; otherwise the
+        // next run resumes where this one stopped (AC-19).
+        if ($completed) {
+            delete_option($cursor_key);
+        } elseif ($start > 0) {
+            update_option($cursor_key, $start, false);
         }
 
         // Final progress
@@ -695,6 +778,9 @@ class Products
             if ($existing_id) {
                 $product = wc_get_product($existing_id);
                 if ($product) {
+                    // AC-07: make sure the indexed map is populated even for a
+                    // product found through the (legacy) postmeta fallback.
+                    \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $existing_id);
                     $this->update_product_from_alegra($product, $item);
                     $this->assign_product_category((int) $existing_id, $item);
                     return 'updated';
@@ -706,6 +792,7 @@ class Products
                 $existing_by_sku = $this->get_product_by_sku($sku);
                 if ($existing_by_sku) {
                     update_post_meta($existing_by_sku, '_alegra_item_id', $alegra_id);
+                    \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $existing_by_sku);
                     $product = wc_get_product($existing_by_sku);
                     if ($product) {
                         $this->update_product_from_alegra($product, $item);
@@ -735,6 +822,9 @@ class Products
 
         update_post_meta($product_id, '_alegra_item_id', $alegra_id);
         update_post_meta($product_id, '_sku', $sku);
+        // AC-07: write the indexed mapping at create time. Without this every
+        // lookup fell back to an unindexed wp_postmeta.meta_value scan.
+        \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $product_id);
 
         $product = wc_get_product($product_id);
         if ($product) {
@@ -940,6 +1030,7 @@ class Products
         }
 
         update_post_meta($variation_id, '_alegra_item_id', $alegra_id);
+        \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $variation_id);
 
         $variation = wc_get_product($variation_id);
         if ($variation) {
@@ -980,24 +1071,21 @@ class Products
             return;
         }
 
-        // 1. Find by alegra_category_id term meta
+        // AC-63: resolve the Alegra→WC category mapping ONCE per Products
+        // instance (one indexed query) instead of a per-item get_terms() with an
+        // unindexed wp_termmeta meta_query (N queries for N products).
+        $this->load_category_map();
+
+        // 1. Find by alegra_category_id (per-request map)
         $term_id = 0;
-        if ($alegra_cat_id !== '') {
-            $terms = get_terms([
-                'taxonomy'   => 'product_cat',
-                'hide_empty' => false,
-                'meta_query' => [[
-                    'key'   => 'alegra_category_id',
-                    'value' => $alegra_cat_id,
-                ]],
-                'number'     => 1,
-            ]);
-            if (!is_wp_error($terms) && !empty($terms)) {
-                $term_id = (int) $terms[0]->term_id;
-            }
+        if ($alegra_cat_id !== '' && isset($this->category_id_map[$alegra_cat_id])) {
+            $term_id = $this->category_id_map[$alegra_cat_id];
         }
 
-        // 2. Fallback: find by name
+        // 2. Fallback: find by name (per-request map, then term_exists)
+        if ($term_id === 0 && $alegra_cat_name !== '' && isset($this->category_name_map[$alegra_cat_name])) {
+            $term_id = $this->category_name_map[$alegra_cat_name];
+        }
         if ($term_id === 0 && $alegra_cat_name !== '') {
             $existing = term_exists($alegra_cat_name, 'product_cat');
             if ($existing) {
@@ -1024,9 +1112,21 @@ class Products
             return;
         }
 
+        // Remember the resolution for the rest of this run.
+        if ($alegra_cat_id !== '') {
+            $this->category_id_map[$alegra_cat_id] = $term_id;
+        }
+        if ($alegra_cat_name !== '') {
+            $this->category_name_map[$alegra_cat_name] = $term_id;
+        }
+
         // Backfill the alegra_category_id meta if we found it by name
         if ($alegra_cat_id !== '' && !get_term_meta($term_id, 'alegra_category_id', true)) {
             update_term_meta($term_id, 'alegra_category_id', $alegra_cat_id);
+        }
+        if ($alegra_cat_id !== '') {
+            // AC-07/AC-60: keep the indexed category mapping in sync.
+            \Alegra\Connector\Entity_Map::map('category', $alegra_cat_id, 'category', $term_id);
         }
 
         // Assign. Append=true so re-imports ADD the Alegra category instead of
@@ -1320,6 +1420,8 @@ class Products
             $existing_id = $this->get_attachment_by_url($product_id, $normalized_url);
             if ($existing_id > 0) {
                 update_post_meta($existing_id, '_alegra_image_url_hash', $url_hash);
+                // AC-23: index it so the next lookup is O(1).
+                \Alegra\Connector\Entity_Map::map('image', $url_hash, 'attachment', (int) $existing_id);
                 return $existing_id;
             }
 
@@ -1356,6 +1458,8 @@ class Products
             // Store BOTH normalized URL AND hash for future dedup (faster lookup)
             update_post_meta((int) $attachment_id, '_alegra_image_url', $normalized_url);
             update_post_meta((int) $attachment_id, '_alegra_image_url_hash', $url_hash);
+            // AC-23: index the new attachment for O(1) dedup on later imports.
+            \Alegra\Connector\Entity_Map::map('image', $url_hash, 'attachment', (int) $attachment_id);
 
             $this->logger->debug('Image imported', [
                 'product_id' => $product_id,
@@ -1376,8 +1480,14 @@ class Products
      */
     private function get_attachment_by_hash(string $url_hash, int $product_id): int
     {
-        global $wpdb;
+        // AC-23: O(1) indexed lookup via the entity map. The old postmeta scan
+        // on the unindexed meta_value was a full table scan per image.
+        $mapped = \Alegra\Connector\Entity_Map::find_attachment_id($url_hash);
+        if ($mapped) {
+            return $mapped;
+        }
 
+        global $wpdb;
         $id = $wpdb->get_var($wpdb->prepare(
             "SELECT pm.post_id FROM {$wpdb->postmeta} pm
              INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_type = 'attachment'
@@ -1388,7 +1498,13 @@ class Products
             $product_id
         ));
 
-        return $id ? (int) $id : 0;
+        if ($id) {
+            // Backfill the indexed map so subsequent lookups are O(1).
+            \Alegra\Connector\Entity_Map::map('image', $url_hash, 'attachment', (int) $id);
+            return (int) $id;
+        }
+
+        return 0;
     }
 
     /**
@@ -1443,11 +1559,16 @@ class Products
 
         $attachment_id = $id ? (int) $id : 0;
         if ($attachment_id > 0) {
-            // Ensure attachment is parented to this product
-            wp_update_post([
-                'ID' => $attachment_id,
-                'post_parent' => $product_id,
-            ]);
+            // AC-23: only reparent when the parent actually differs. The old
+            // code called wp_update_post() on EVERY hit (extra write + hook
+            // storm) even when nothing changed.
+            $current = get_post($attachment_id);
+            if (!$current || (int) $current->post_parent !== $product_id) {
+                wp_update_post([
+                    'ID' => $attachment_id,
+                    'post_parent' => $product_id,
+                ]);
+            }
         }
 
         return $attachment_id;
@@ -1512,6 +1633,8 @@ class Products
         $result = $this->api->delete_item($alegra_id);
         if (!is_wp_error($result)) {
             delete_post_meta($product_id, '_alegra_item_id');
+            // AC-60: drop the indexed mapping so it cannot point at a ghost id.
+            \Alegra\Connector\Entity_Map::remove('item', $alegra_id, 'product');
         }
 
         return $result;

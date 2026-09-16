@@ -1094,7 +1094,18 @@ TestRunner::test('T10.5 AC-37 the dead push-queue subsystem is gone', function (
     );
 
     $schema = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Schema.php');
-    TestRunner::assertStringNotContains('alegra_push_queue', $schema, 'the queue table must not be created');
+    TestRunner::assertFalse(
+        (bool) preg_match('/CREATE TABLE[^;]*alegra_push_queue/i', $schema),
+        'the queue table must not be created'
+    );
+    TestRunner::assertFalse(
+        (bool) preg_match('/CREATE TABLE[^;]*alegra_pull_queue/i', $schema),
+        'the dead pull-queue table must not be created'
+    );
+    TestRunner::assertFalse(
+        (bool) preg_match('/CREATE TABLE[^;]*alegra_push_log/i', $schema),
+        'the dead push-log table must not be created'
+    );
     TestRunner::assertStringNotContains('create_push_queue_table', $schema, 'the queue table creator must be gone');
 
     $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
@@ -1139,7 +1150,7 @@ TestRunner::test('T10.7 AC-16 the previously dead settings now take effect', fun
 TestRunner::test('T10.8 AC-28/AC-57 uninstall drops every table, deletes the missed options and is multisite-aware', function (): void {
     $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'uninstall.php');
 
-    foreach (['alegra_tombstones', 'alegra_pull_queue', 'alegra_runs', 'alegra_push_log', 'alegra_entity_map', 'alegra_push_queue'] as $table) {
+    foreach (['alegra_tombstones', 'alegra_runs', 'alegra_entity_map'] as $table) {
         TestRunner::assertStringContains($table, $src, "uninstall must drop $table");
     }
     foreach ([
@@ -1159,6 +1170,99 @@ TestRunner::test('T10.8 AC-28/AC-57 uninstall drops every table, deletes the mis
 
     TestRunner::assertStringContains('get_sites(', $src, 'uninstall must loop every site on multisite');
     TestRunner::assertStringContains('switch_to_blog(', $src, 'uninstall must switch per site');
+});
+
+// ===========================================================================
+// T11 — Performance and scale (batch 2)
+// ===========================================================================
+echo "\nT11 — Performance and scale (batch 2)\n";
+
+TestRunner::test('T11.1 AC-06 a second Schema::migrate() issues zero dbDelta', function (): void {
+    alegra_test_reset();
+
+    \Alegra\Connector\Schema::migrate();
+    $first = (int) ($GLOBALS['alegra_dbdelta_calls'] ?? 0);
+    TestRunner::assertTrue($first > 0, 'the first migrate must create the tables');
+
+    \Alegra\Connector\Schema::migrate();
+    TestRunner::assertSame($first, (int) ($GLOBALS['alegra_dbdelta_calls'] ?? 0), 'a second migrate must issue zero dbDelta');
+});
+
+TestRunner::test('T11.2 AC-07 importing items writes the entity map; later lookups skip postmeta', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 3; $i++) {
+        alegra_mock_seed_item('item-' . $i, ['name' => 'P' . $i, 'reference' => 'SKU-' . $i, 'type' => 'simple', 'price' => 100]);
+    }
+
+    $result = make_products()->import_from_alegra();
+    TestRunner::assertTrue(!is_wp_error($result), 'import must not error');
+
+    $map_rows = array_values(array_filter(
+        $GLOBALS['alegra_entity_map'],
+        static fn ($r) => $r['wc_entity_type'] === 'product'
+    ));
+    TestRunner::assertSame(3, count($map_rows), 'three product mappings must be written');
+
+    $GLOBALS['alegra_postmeta_scans'] = 0;
+    $found = \Alegra\Connector\Entity_Map::find_wc_id('item', 'item-2', 'product');
+    TestRunner::assertTrue($found !== null, 'the mapped product must resolve');
+    TestRunner::assertSame(0, (int) $GLOBALS['alegra_postmeta_scans'], 'a mapped lookup must not scan postmeta');
+});
+
+TestRunner::test('T11.3 AC-19 the product import resumes from the persisted cursor', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 90, false);
+    alegra_mock_seed_item('item-1', ['name' => 'P1', 'reference' => 'SKU-1', 'type' => 'simple']);
+
+    make_products()->import_from_alegra();
+
+    $req = alegra_mock_last_request('GET', '/items');
+    TestRunner::assertTrue($req !== null, 'the import must fetch items');
+    TestRunner::assertSame('90', (string) ($req['query']['start'] ?? ''), 'the import must resume from the cursor, not page 1');
+});
+
+TestRunner::test('T11.4 AC-19 a bounded run persists the cursor for the next run', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 30; $i++) {
+        alegra_mock_seed_item('bulk-' . $i, ['name' => 'B' . $i, 'reference' => 'B-' . $i, 'type' => 'simple']);
+    }
+    update_option('alegra_connector_import_max_pages', 1, false);
+
+    $result = make_products()->import_from_alegra();
+    TestRunner::assertTrue(!is_wp_error($result), 'import must not error');
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'the cursor must point at the next page');
+});
+
+TestRunner::test('T11.5 AC-24 the rate-limit window is 150 and resets after the window', function (): void {
+    alegra_test_reset();
+    $client = make_api();
+
+    $ref = new ReflectionClass(Client::class);
+    TestRunner::assertSame(150, $ref->getConstant('RATE_LIMIT_PER_MIN'), 'the documented limit is 150/min');
+
+    for ($i = 0; $i < 150; $i++) {
+        alegra_call_private($client, 'increment_rate_limit');
+    }
+    TestRunner::assertTrue(alegra_call_private($client, 'is_rate_limited'), '150 requests fill the window');
+
+    $w = (array) get_option('alegra_connector_rate_window', []);
+    $w['start'] = time() - 61;
+    update_option('alegra_connector_rate_window', $w, false);
+
+    TestRunner::assertFalse(alegra_call_private($client, 'is_rate_limited'), 'the window must reset once 60s elapse');
+});
+
+TestRunner::test('T11.6 AC-63 N products sharing a category issue ONE lookup', function (): void {
+    alegra_test_reset();
+    $cat = ['id' => 'cat-1', 'name' => 'Ropa'];
+    for ($i = 1; $i <= 4; $i++) {
+        alegra_mock_seed_item('c-' . $i, ['name' => 'P' . $i, 'reference' => 'C-' . $i, 'type' => 'simple', 'category' => $cat]);
+    }
+    $GLOBALS['alegra_category_lookups'] = 0;
+
+    make_products()->import_from_alegra();
+
+    TestRunner::assertSame(1, (int) $GLOBALS['alegra_category_lookups'], 'four products sharing a category must resolve it with one lookup');
 });
 
 exit(TestRunner::summary());

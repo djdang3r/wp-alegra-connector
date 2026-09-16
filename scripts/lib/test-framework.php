@@ -160,6 +160,10 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_race']   = null;
     $GLOBALS['alegra_next_post_id'] = 1000;
     $GLOBALS['alegra_next_term_id'] = 500;
+    $GLOBALS['alegra_entity_map'] = [];
+    $GLOBALS['alegra_postmeta_scans'] = 0;
+    $GLOBALS['alegra_category_lookups'] = 0;
+    $GLOBALS['alegra_dbdelta_calls'] = 0;
 
     alegra_mock_reset();
 

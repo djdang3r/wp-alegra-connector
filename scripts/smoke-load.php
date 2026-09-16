@@ -292,17 +292,15 @@ check(
     '— log directory must be cleaned on plugin uninstall (privacy + disk space)'
 );
 
-// ---- Assertion 12: rate-limit transient autoload (2.2.0) ----
-echo "\n[12] Regression check: rate-limit transient must use autoload='no'\n";
+// ---- Assertion 12: rate limit uses a fixed window at the documented limit ----
+echo "\n[12] Regression check: rate limit is a FIXED window at 150/min\n";
 $api_src_2 = file_source($plugin_root . 'includes/API/Client.php');
-$has_autoload_no = (bool) preg_match(
-    "/set_transient\s*\(\s*'alegra_connector_rate_limit'\s*,\s*\\\$rate_limit\s*\+\s*1\s*,\s*60\s*,\s*'no'\s*\)/",
-    $api_src_2
-);
+$has_fixed_window = (bool) preg_match('/RATE_LIMIT_PER_MIN\s*=\s*150/', $api_src_2)
+    && str_contains($api_src_2, 'alegra_connector_rate_window');
 check(
-    'rate-limit transient uses autoload=no (4th arg)',
-    $has_autoload_no,
-    '— operational transients must not bloat wp_options autoload cache'
+    'rate limit uses a fixed window at the documented 150/min',
+    $has_fixed_window,
+    '— the old sliding transient never reset under sustained traffic'
 );
 
 // =====================================================================
@@ -461,9 +459,9 @@ echo "\n[23] alegra_id columns declared VARCHAR(36) in the DDL\n";
 $schema_src = file_source($plugin_root . 'includes/Schema.php');
 $varchar_count = preg_match_all('/alegra_id\s+VARCHAR\(36\)/', $schema_src);
 check(
-    'at least 4 alegra_id columns are VARCHAR(36)',
-    $varchar_count >= 4,
-    '— tombstones/pull_queue/push_log/entity_map must hold UUIDs (found ' . $varchar_count . ')'
+    'at least 2 alegra_id columns are VARCHAR(36)',
+    $varchar_count >= 2,
+    '— tombstones/entity_map must hold UUIDs (found ' . $varchar_count . ')'
 );
 
 // ---- 24: get_preferred_number_template returns ?string ----

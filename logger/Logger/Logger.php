@@ -15,9 +15,10 @@ if (!defined('ABSPATH')) {
 
 class Logger
 {
-    private string $log_dir;
-    private string $log_file;
+    private string $log_dir = '';
+    private string $log_file = '';
     private int $retention_days = 30;
+    private bool $dir_ready = false;
 
     /**
      * Logs live under wp-content/uploads/alegra-logs/ and contain customer PII.
@@ -30,9 +31,26 @@ class Logger
      *
      * As defence in depth the log filename also carries a random per-install
      * suffix so the path is not guessable.
+     *
+     * AC-62: the constructor used to call wp_upload_dir() + is_dir() +
+     * wp_mkdir_p() + file_exists() on EVERY request, frontend included. That
+     * work is now deferred to ensure_dir(), which runs on the first actual
+     * write/read. A normal page view pays nothing.
      */
     public function __construct()
     {
+        $this->retention_days = (int) get_option('alegra_connector_log_retention_days', 30);
+    }
+
+    /**
+     * Resolve the uploads directory and (re)assert the deny files on first use.
+     */
+    private function ensure_dir(): void
+    {
+        if ($this->dir_ready) {
+            return;
+        }
+
         $upload_dir = wp_upload_dir();
         $this->log_dir = $upload_dir['basedir'] . '/alegra-logs';
 
@@ -46,7 +64,7 @@ class Logger
         $this->protect_log_dir();
 
         $this->log_file = $this->log_dir . '/alegra-sync-' . $this->get_log_suffix() . '-' . date('Y-m-d') . '.log';
-        $this->retention_days = (int) get_option('alegra_connector_log_retention_days', 30);
+        $this->dir_ready = true;
     }
 
     /**
@@ -93,6 +111,8 @@ class Logger
 
     private function write(string $level, string $message, array $context = []): void
     {
+        $this->ensure_dir();
+
         $timestamp = current_time('Y-m-d H:i:s');
         $context_str = !empty($context) ? ' ' . wp_json_encode($context) : '';
         $log_entry = sprintf(
@@ -177,6 +197,7 @@ class Logger
 
     public function clear_old_logs(int $retention_days = 30): int
     {
+        $this->ensure_dir();
         $count = 0;
         $cutoff = strtotime('- ' . $retention_days . ' days');
         $files = glob($this->log_dir . '/*.log');
@@ -199,6 +220,7 @@ class Logger
 
     public function get_logs(int $limit = 100, string $level = '', string $type = ''): array
     {
+        $this->ensure_dir();
         $logs = [];
         $files = glob($this->log_dir . '/*.log');
 
@@ -263,6 +285,7 @@ class Logger
 
     public function download_log(string $filename = ''): void
     {
+        $this->ensure_dir();
         if (empty($filename)) {
             // $this->log_file carries the randomized per-install suffix.
             $filename = $this->log_file;
@@ -284,6 +307,7 @@ class Logger
 
     public function get_log_files(): array
     {
+        $this->ensure_dir();
         $files = glob($this->log_dir . '/*.log');
         $result = [];
 
