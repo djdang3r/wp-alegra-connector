@@ -386,7 +386,11 @@ class Orders
 
         $total = 0.0;
         foreach ($items as $item) {
-            $total += (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+            $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+            if (isset($item['discount'])) {
+                $line *= (1 - ((float) $item['discount'] / 100));
+            }
+            $total += $line;
         }
 
         // Cumulative cap: never credit more than the original invoice total.
@@ -804,16 +808,34 @@ class Orders
         }
 
         // Step 2 — lookup by email.
+        // AC-50: `email` is NOT a documented listContacts filter (the documented
+        // ones are `query` and `identification`). Use `query` and verify EVERY
+        // returned candidate; an undocumented param can be ignored by the API,
+        // which would otherwise return the first N contacts and false-match.
         $email = $customer ? $customer->user_email : $order->get_billing_email();
         if ($email !== '') {
-            $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 5]);
+            $contacts = $this->api->get_contacts(['query' => $email, 'limit' => 30]);
             if (!is_wp_error($contacts) && !empty($contacts)) {
+                $matches = [];
                 foreach ($contacts as $c) {
                     if (isset($c['id']) && isset($c['email']) && strcasecmp((string) $c['email'], $email) === 0) {
-                        $found = (string) $c['id'];
-                        $this->persist_contact_id($order, $customer, $found);
-                        return $found;
+                        $matches[] = (string) $c['id'];
                     }
+                }
+
+                if (count($matches) === 1) {
+                    $this->persist_contact_id($order, $customer, $matches[0]);
+                    return $matches[0];
+                }
+
+                if (count($matches) > 1 && $this->logger) {
+                    // Ambiguous: several contacts share this email. Do not pick
+                    // arbitrarily — fall through to the identification lookup.
+                    $this->logger->warning('Multiple Alegra contacts share this email; deferring to identification', [
+                        'order_id' => $order_id,
+                        'email'    => $email,
+                        'matches'  => count($matches),
+                    ]);
                 }
             }
         }
@@ -859,9 +881,13 @@ class Orders
                     }
                 }
 
-                // Steps 4-5 — build the payload and create the contact (only with critical data).
+                // Steps 4-5 — build the payload and create the contact.
+                // AC-26: validate() (not has_critical_data()) so a LEGAL_ENTITY
+                // with an enabled-but-empty `company` is rejected here instead of
+                // producing a nameless contact that Alegra answers with a 400.
                 $values = $this->collect_billing_values($order, $customer);
-                if (\Alegra\Connector\Billing_Fields::has_critical_data($values)) {
+                $validation = \Alegra\Connector\Billing_Fields::validate($values);
+                if (!is_wp_error($validation)) {
                     $payload = $customer
                         ? \Alegra\Connector\Billing_Fields::build_contact_payload($customer)
                         : \Alegra\Connector\Billing_Fields::build_guest_contact_payload($order);
@@ -927,6 +953,11 @@ class Orders
     {
         $values = [];
         foreach (\Alegra\Connector\Billing_Fields::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never collected.
+            if (!\Alegra\Connector\Billing_Fields::is_field_enabled($key)) {
+                $values[$key] = '';
+                continue;
+            }
             $meta_key = (string) $field['meta_key'];
             $values[$key] = $customer
                 ? (string) get_user_meta($customer->ID, $meta_key, true)
@@ -956,6 +987,26 @@ class Orders
         return date('Y-m-d', strtotime('+15 days'));
     }
 
+    /**
+     * Coupon/discount for a line, as a percentage of its pre-discount subtotal.
+     *
+     * Alegra's `items[].discount` is a percentage (post_invoices.md), and the
+     * line `price` must NOT include the discount. Returns 0 when there is none.
+     */
+    private static function line_discount_percent(float $subtotal, float $line_total): float
+    {
+        if ($subtotal <= 0) {
+            return 0.0;
+        }
+
+        $discount = (($subtotal - $line_total) / $subtotal) * 100;
+        if ($discount <= 0) {
+            return 0.0;
+        }
+
+        return round($discount, 4);
+    }
+
     private function prepare_invoice_items(\WC_Order $order): array|\WP_Error
     {
         $items = [];
@@ -980,8 +1031,10 @@ class Orders
                 );
             }
 
-            $price = (float) ($item_obj->get_subtotal() / max(1, $item_obj->get_quantity()));
+            $subtotal = (float) $item_obj->get_subtotal();
+            $line_total = (float) $item_obj->get_total();
             $quantity = (int) $item_obj->get_quantity();
+            $price = (float) ($subtotal / max(1, $quantity));
 
             $item_data = [
                 'id' => $alegra_item_id,
@@ -989,6 +1042,15 @@ class Orders
                 'price' => $price,
                 'quantity' => $quantity,
             ];
+
+            // AC-48: map the per-line coupon/discount to Alegra's `discount`
+            // (a percentage, per post_invoices.md). Without it the invoice total
+            // is HIGHER than the WooCommerce order total. `price` stays
+            // pre-discount; Alegra applies the percentage.
+            $discount = self::line_discount_percent($subtotal, $line_total);
+            if ($discount > 0) {
+                $item_data['discount'] = $discount;
+            }
 
             $tax_ids = $this->map_item_taxes($item_obj);
             if (!empty($tax_ids)) {
@@ -1085,11 +1147,20 @@ class Orders
 
             $alegra_item_id = $this->resolve_item_alegra_id($product_id, $variation_id);
 
+            $subtotal = (float) $item_obj->get_subtotal();
+            $line_total = (float) $item_obj->get_total();
+
             $item_data = [
                 'name' => $item_obj->get_name(),
                 'quantity' => (int) $item_obj->get_quantity(),
-                'price' => (float) ($item_obj->get_subtotal() / max(1, $item_obj->get_quantity())),
+                'price' => (float) ($subtotal / max(1, $item_obj->get_quantity())),
             ];
+
+            // Keep credit-note lines aligned with the discounted invoice total.
+            $discount = self::line_discount_percent($subtotal, $line_total);
+            if ($discount > 0) {
+                $item_data['discount'] = $discount;
+            }
 
             if ($alegra_item_id !== '') {
                 $item_data['id'] = $alegra_item_id;

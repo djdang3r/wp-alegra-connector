@@ -276,6 +276,16 @@ class Public_
      */
     private function trigger_sync(string $type, int $id, string $action): void
     {
+        // AC-43: honour the cross-process import flag, not just the per-request
+        // static. During a long import in worker A, a concurrent WC save in
+        // worker B must not push the product being imported.
+        if (get_transient('alegra_import_in_progress')) {
+            if ($this->logger) {
+                $this->logger->debug('Skipping sync: an import is in progress', ['type' => $type, 'id' => $id]);
+            }
+            return;
+        }
+
         $lock_key = 'alegra_sync_guard_' . $type . '_' . $id;
 
         // Prevent re-entrant sync across workers/processes
@@ -310,6 +320,14 @@ class Public_
     public static function set_syncing(bool $syncing): void
     {
         self::$is_syncing = $syncing;
+
+        // AC-43: the docblock promised cross-process safety; make it real.
+        // Importers call this so other PHP-FPM workers skip their WC hooks.
+        if ($syncing) {
+            set_transient('alegra_import_in_progress', 1, 300);
+        } else {
+            delete_transient('alegra_import_in_progress');
+        }
     }
 
     /**

@@ -368,7 +368,12 @@ function alegra_mock_body_total(mixed $body): float
     $total = 0.0;
     foreach (($body['items'] ?? []) as $item) {
         if (is_array($item)) {
-            $total += (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+            $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+            // `discount` is a percentage (post_invoices.md).
+            if (isset($item['discount'])) {
+                $line *= (1 - ((float) $item['discount'] / 100));
+            }
+            $total += $line;
         }
     }
     return round($total, 2);

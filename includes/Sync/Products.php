@@ -380,9 +380,14 @@ class Products
                     'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p),
                 ], 120);
 
+                // AC-51: simple mode strips `inventory` down to `unit`, so
+                // `availableQuantity` is absent and the guard below skips every
+                // item. Request advanced mode (as import_from_alegra already
+                // does) so the pull actually updates stock.
                 $items = $this->api->get_items([
                     'start' => ($p - 1) * 30,
                     'limit' => 30,
+                    'mode'  => 'advanced',
                 ]);
 
                 if (is_wp_error($items)) {
@@ -856,7 +861,16 @@ class Products
                 $price = (float) $item['price'];
             }
 
-            $product->set_regular_price($price);
+            // AC-46: never overwrite a WooCommerce price with 0. A missing/zero
+            // Alegra price list used to wipe the merchant's price.
+            if ($price > 0) {
+                $product->set_regular_price($price);
+            } else {
+                $this->logger->warning('Skipping price update: no usable Alegra price', [
+                    'product_id' => $product_id,
+                    'alegra_id'  => (string) ($item['id'] ?? ''),
+                ]);
+            }
 
             if (!empty($item['name'])) {
                 $product->set_name($item['name']);

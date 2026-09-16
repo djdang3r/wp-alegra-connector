@@ -55,6 +55,11 @@ class State_Sync
         add_action('woocommerce_process_shop_order_meta', static function ($order_id): void {
             self::handle_payment_method_change((int) $order_id);
         }, 20, 1);
+
+        // AC-39: render (and clear) the queued sync notices. They were written
+        // by queue_admin_notice() but nothing ever displayed them, so real
+        // failures (e.g. a dropped payment-method change) were silent.
+        add_action('admin_notices', [self::class, 'render_admin_notices']);
     }
 
     /**
@@ -233,21 +238,27 @@ class State_Sync
             return;
         }
 
-        $snapshot_key = 'alegra_order_pm_' . $order_id;
+        // AC-41: the baseline is stored durably in order meta, NOT in a 300s
+        // transient. With the transient, a payment-method change made more than
+        // 5 minutes after the baseline save found it expired, re-baselined, and
+        // silently dropped the change.
+        $baseline_key = '_alegra_last_payment_method';
         $current = (string) $order->get_payment_method();
-        $snapshot = get_transient($snapshot_key);
+        $baseline = (string) $order->get_meta($baseline_key, true);
 
-        // First save: record the baseline and bail out.
-        if ($snapshot === false) {
-            set_transient($snapshot_key, $current, self::DEBOUNCE_SECONDS);
+        // First observation: record the baseline and bail out.
+        if ($baseline === '') {
+            $order->update_meta_data($baseline_key, $current);
+            $order->save();
             return;
         }
 
-        if ((string) $snapshot === $current) {
+        if ($baseline === $current) {
             return;
         }
 
-        set_transient($snapshot_key, $current, self::DEBOUNCE_SECONDS);
+        $order->update_meta_data($baseline_key, $current);
+        $order->save();
 
         if (self::is_multi_payment($order)) {
             self::queue_admin_notice(sprintf(
@@ -416,5 +427,26 @@ class State_Sync
         }
         $notices[] = $message;
         set_transient($key, $notices, 60);
+    }
+
+    /**
+     * Render and clear the queued sync notices (AC-39).
+     */
+    public static function render_admin_notices(): void
+    {
+        $user_id = get_current_user_id();
+        $key = 'alegra_sync_admin_notices' . ($user_id > 0 ? '_' . $user_id : '');
+        $notices = get_transient($key);
+        if (!is_array($notices) || empty($notices)) {
+            return;
+        }
+
+        delete_transient($key);
+
+        foreach ($notices as $notice) {
+            echo '<div class="notice notice-warning is-dismissible"><p>'
+                . esc_html((string) $notice)
+                . '</p></div>';
+        }
     }
 }

@@ -91,10 +91,11 @@ class Admin_Dashboard
         }
     }
 
-    private function get_product_by_alegra_id(int $alegra_id): ?int
+    private function get_product_by_alegra_id(string $alegra_id): ?int
     {
         global $wpdb;
-        $pid = $wpdb->get_var($wpdb->prepare("SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_alegra_item_id' AND meta_value=%d LIMIT 1", $alegra_id));
+        // Alegra ids are UUID strings (VARCHAR(36)); %d truncated them to 0.
+        $pid = $wpdb->get_var($wpdb->prepare("SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_alegra_item_id' AND meta_value=%s LIMIT 1", $alegra_id));
         return $pid ? (int)$pid : null;
     }
 
@@ -1359,7 +1360,8 @@ class Admin_Dashboard
 
             $products_sync = new Sync\Products($this->api, $this->logger);
             foreach ($items as $item) {
-                $alegra_id = (int) ($item['id'] ?? 0);
+                // UUID string — never cast an Alegra id to int.
+                $alegra_id = (string) ($item['id'] ?? '');
                 $item_type = $item['type'] ?? 'simple';
 
                 // Skip variants - imported with their parent
@@ -1381,7 +1383,8 @@ class Admin_Dashboard
 
             $customers_sync = new Sync\Customers($this->api, $this->logger);
             foreach ($items as $item) {
-                $alegra_id = (int)($item['id'] ?? 0);
+                // UUID string — never cast an Alegra id to int.
+                $alegra_id = (string) ($item['id'] ?? '');
                 $contact_name = $item['name'] ?? '';
                 $email = $item['email'] ?? '';
 
@@ -1416,7 +1419,8 @@ class Admin_Dashboard
             foreach ($items as $item) {
                 $t = wp_insert_term($item['name'] ?? '', 'product_cat', ['description' => $item['description'] ?? '']);
                 if (!is_wp_error($t)) {
-                    update_term_meta($t['term_id'], 'alegra_category_id', (int)($item['id'] ?? 0));
+                    // UUID string — an (int) cast stored 0 for every category.
+                    update_term_meta($t['term_id'], 'alegra_category_id', (string) ($item['id'] ?? ''));
                     $state['imported']++;
                 } else { $state['errors']++; }
             }
@@ -1592,7 +1596,8 @@ class Admin_Dashboard
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
         }
 
-        $payment_id = (int) ($result['id'] ?? 0);
+        // Alegra payment ids are UUID strings.
+        $payment_id = (string) ($result['id'] ?? '');
         $order->update_meta_data('_alegra_payment_id', $payment_id);
         if (!empty($result['number'])) {
             $order->update_meta_data('_alegra_payment_number', $result['number']);
@@ -1664,7 +1669,8 @@ class Admin_Dashboard
                 $ai = (string) get_post_meta($p->get_id(), '_alegra_item_id', true);
                 fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
                     $p->get_name(), $p->get_sku(), $p->get_price(), $p->get_stock_quantity(),
-                    $p->get_type(), $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
+                    // UUID strings are never > 0 — compare to '' instead.
+                    $p->get_type(), $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
                 ]));
             }
             fclose($out);
@@ -1678,7 +1684,8 @@ class Admin_Dashboard
                 $ai = (string) get_user_meta($c->ID, 'alegra_contact_id', true);
                 fputcsv($out, array_map([self::class, 'csv_safe_cell'], [
                     $c->display_name, $c->user_email, get_user_meta($c->ID, 'billing_phone', true),
-                    $ai > 0 ? $ai : '', $ai > 0 ? 'Sincronizado' : 'Pendiente',
+                    // UUID strings are never > 0 — compare to '' instead.
+                    $ai !== '' ? $ai : '', $ai !== '' ? 'Sincronizado' : 'Pendiente',
                 ]));
             }
             fclose($out);
@@ -1943,7 +1950,13 @@ class Admin_Dashboard
 
         $pending = [];
         foreach ($orders as $oid) {
-            if (!get_post_meta($oid, '_alegra_invoice_id', true)) {
+            // AC-34: read order meta through the CRUD API. get_post_meta() is
+            // empty under HPOS, so every order was classified "pending".
+            $order = wc_get_order($oid);
+            if (!$order instanceof \WC_Order) {
+                continue;
+            }
+            if ((string) $order->get_meta('_alegra_invoice_id', true) === '') {
                 $pending[] = (int) $oid;
             }
         }
@@ -2408,15 +2421,18 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Hook invalido.', 'alegra-connector')]);
         }
 
-        // Only allow hooks that belong to this plugin
-        if (strpos($hook, 'alegra') !== 0) {
+        // AC-52: an explicit allowlist of this plugin's own cron hooks. A
+        // `strpos($hook, 'alegra') === 0` prefix check is too loose ("alegrax"
+        // matches), and the old manual-run recurrence was never registered.
+        $allowed_hooks = ['alegra_connector_cron_sync'];
+        if (!in_array($hook, $allowed_hooks, true)) {
             wp_send_json_error(['message' => __('Solo se permiten hooks de Alegra.', 'alegra-connector')]);
         }
 
-        // Schedule the hook to run on the next cron tick (immediately).
-        // Remove any pending duplicate first to avoid queueing multiple executions.
+        // Schedule a ONE-OFF event at the current timestamp, then trigger WP's
+        // cron spawn so the next request executes it.
         wp_clear_scheduled_hook($hook);
-        wp_schedule_event(time() - 1, 'alegra_manual_run', $hook);
+        wp_schedule_single_event(time(), $hook);
         spawn_cron();
 
         $this->log('info', 'Cron hook triggered manually', ['hook' => $hook]);

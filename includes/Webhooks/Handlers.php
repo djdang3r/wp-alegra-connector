@@ -117,6 +117,12 @@ class Handlers
         $alegra_id = (string) ($contact['id'] ?? '');
         if ($alegra_id === '') return;
 
+        // AC-25: an edited contact may be the Consumidor Final; drop the cached
+        // id/metadata so the next resolution re-reads it from Alegra.
+        if (\Alegra\Connector\Consumidor_Final::is_consumidor_final($alegra_id)) {
+            \Alegra\Connector\Consumidor_Final::invalidate_cache();
+        }
+
         $customers = new Sync\Customers($this->api, $this->logger);
         $result = $customers->sync_single_contact_by_alegra_id($alegra_id);
 
@@ -132,6 +138,12 @@ class Handlers
         $contact = $data['client'] ?? $data;
         $alegra_id = (string) ($contact['id'] ?? '');
         if ($alegra_id === '') return;
+
+        // AC-25: if the deleted contact is the cached Consumidor Final, drop the
+        // option/transient cache so a dead id is not served forever.
+        if (\Alegra\Connector\Consumidor_Final::is_consumidor_final($alegra_id)) {
+            \Alegra\Connector\Consumidor_Final::invalidate_cache();
+        }
 
         $user_args = [
             'meta_key' => 'alegra_contact_id',

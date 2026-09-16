@@ -86,6 +86,19 @@ class Consumidor_Final
      */
     public static function resolve(?Client $client = null): string|false
     {
+        // AC-42: serve the existing cache before touching the API. get_metadata()
+        // calls resolve() whenever its own transient is missing, so without this
+        // short-circuit every metadata read triggered a live lookup.
+        $cached = get_transient(self::cache_key(self::CACHE_TRANSIENT));
+        if (is_string($cached) && $cached !== '') {
+            return $cached;
+        }
+        $option = get_option(self::cache_key(self::OPTION_KEY), '');
+        if (is_string($option) && $option !== '') {
+            set_transient(self::cache_key(self::CACHE_TRANSIENT), $option, self::CACHE_TTL);
+            return $option;
+        }
+
         $lock_key = self::cache_key(self::LOCK_KEY);
 
         // Acquire an atomic lock so concurrent requests do not hammer the API.
@@ -155,6 +168,10 @@ class Consumidor_Final
                 return (string) $contact['id'];
             }
 
+            // AC-25: the contact is gone/replaced in Alegra. Drop every cached
+            // representation so a dead id is not served forever.
+            self::invalidate_cache();
+
             return false;
         } finally {
             \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
@@ -201,6 +218,52 @@ class Consumidor_Final
         delete_transient(self::cache_key(self::CACHE_TRANSIENT));
         delete_option(self::cache_key(self::OPTION_KEY));
         delete_transient(self::cache_key(self::METADATA_TRANSIENT));
+    }
+
+    /**
+     * Whether an Alegra contact id is the cached/manual Consumidor Final.
+     *
+     * Reads the caches directly (never resolves) so webhook handlers can detect
+     * a deleted/replaced CF contact without an extra API round-trip.
+     */
+    public static function is_consumidor_final(string $id): bool
+    {
+        if ($id === '') {
+            return false;
+        }
+
+        if (get_option('alegra_connector_consumidor_final_manual_override', false)) {
+            $manual = (string) get_option('alegra_connector_consumidor_final_manual_id', '');
+            if ($manual !== '' && $manual === $id) {
+                return true;
+            }
+        }
+
+        $option = get_option(self::cache_key(self::OPTION_KEY), '');
+        if (is_string($option) && $option !== '' && $option === $id) {
+            return true;
+        }
+
+        $cached = get_transient(self::cache_key(self::CACHE_TRANSIENT));
+        return is_string($cached) && $cached !== '' && $cached === $id;
+    }
+
+    /**
+     * Wire the settings-save invalidation hooks (AC-25).
+     *
+     * Changing the manual override must not keep serving the previously cached
+     * contact id. Idempotent.
+     */
+    public static function register_invalidation_hooks(): void
+    {
+        static $registered = false;
+        if ($registered) {
+            return;
+        }
+        $registered = true;
+
+        add_action('update_option_alegra_connector_consumidor_final_manual_override', [self::class, 'invalidate_cache']);
+        add_action('update_option_alegra_connector_consumidor_final_manual_id', [self::class, 'invalidate_cache']);
     }
 
     /**

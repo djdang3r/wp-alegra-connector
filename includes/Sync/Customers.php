@@ -92,15 +92,23 @@ class Customers
 
     private function find_existing_contact(array $data): ?string
     {
-        // Try to find by email first
+        // Try to find by email first. AC-50: `email` is not a documented
+        // listContacts filter, so use `query` and verify EVERY candidate
+        // (never trust the first row when the filter may be ignored).
         $email = $data['email'] ?? '';
         if (!empty($email)) {
-            $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 30]);
+            $contacts = $this->api->get_contacts(['query' => $email, 'limit' => 30]);
             if (!is_wp_error($contacts) && !empty($contacts)) {
+                $matches = [];
                 foreach ($contacts as $contact) {
-                    if (isset($contact['email']) && strcasecmp($contact['email'], $email) === 0) {
-                        return (string) $contact['id'];
+                    if (isset($contact['id'], $contact['email']) && strcasecmp((string) $contact['email'], $email) === 0) {
+                        $matches[] = (string) $contact['id'];
                     }
+                }
+                // Only link when the match is unambiguous; otherwise fall
+                // through to the identification lookup below.
+                if (count($matches) === 1) {
+                    return $matches[0];
                 }
             }
         }

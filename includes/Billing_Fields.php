@@ -284,11 +284,20 @@ class Billing_Fields
         $idtype = self::as_string($values['idtype'] ?? '');
         $identification = self::as_string($values['identification'] ?? '');
 
-        if ($kind === '' || $idtype === '' || $identification === '') {
+        // AC-26/AC-38: a DISABLED field is never required. Group A is
+        // force-enabled by the settings sanitizer, so in practice these are
+        // always required; the gate exists so a disabled field can never block
+        // checkout/registration.
+        if (self::is_field_enabled('kindofperson') && $kind === '') {
             return false;
         }
-
-        if ($idtype === 'NIT' && self::as_string($values['dv'] ?? '') === '') {
+        if (self::is_field_enabled('idtype') && $idtype === '') {
+            return false;
+        }
+        if (self::is_field_enabled('identification') && $identification === '') {
+            return false;
+        }
+        if (self::is_field_enabled('dv') && $idtype === 'NIT' && self::as_string($values['dv'] ?? '') === '') {
             return false;
         }
 
@@ -305,8 +314,11 @@ class Billing_Fields
     {
         $values = self::normalize_input($input);
 
+        // AC-26/AC-38: every requirement below is gated on the field being
+        // ENABLED. A disabled field must never be required — enabling only
+        // optional fields must not block checkout/registration.
         $kind = self::as_string($values['kindofperson']);
-        if (!in_array($kind, ['PERSON_ENTITY', 'LEGAL_ENTITY'], true)) {
+        if (self::is_field_enabled('kindofperson') && !in_array($kind, ['PERSON_ENTITY', 'LEGAL_ENTITY'], true)) {
             return new \WP_Error(
                 'invalid_kindofperson',
                 'Seleccione un tipo de persona válido (Persona Natural o Persona Jurídica).'
@@ -315,7 +327,7 @@ class Billing_Fields
 
         $idtype = self::as_string($values['idtype']);
         $valid_id_types = self::id_types($kind);
-        if ($idtype === '' || !isset($valid_id_types[$idtype])) {
+        if (self::is_field_enabled('idtype') && ($idtype === '' || !isset($valid_id_types[$idtype]))) {
             return new \WP_Error(
                 'invalid_idtype',
                 'Seleccione un tipo de documento válido para el tipo de persona.'
@@ -323,17 +335,19 @@ class Billing_Fields
         }
 
         $identification = trim(self::as_string($values['identification']));
-        if ($identification === '') {
+        if (self::is_field_enabled('identification') && $identification === '') {
             return new \WP_Error('missing_identification', 'El número de documento es obligatorio.');
         }
 
-        $identification_error = self::check_identification($idtype, $identification);
-        if ($identification_error !== null) {
-            return $identification_error;
+        if ($identification !== '' && $idtype !== '') {
+            $identification_error = self::check_identification($idtype, $identification);
+            if ($identification_error !== null) {
+                return $identification_error;
+            }
         }
 
         $dv = trim(self::as_string($values['dv']));
-        if ($idtype === 'NIT') {
+        if (self::is_field_enabled('dv') && $idtype === 'NIT') {
             if (!preg_match('/^\d$/', $dv)) {
                 return new \WP_Error(
                     'invalid_dv',
@@ -349,11 +363,11 @@ class Billing_Fields
 
         $regime = self::as_string($values['regime']);
         $valid_regimes = self::regimes($kind);
-        if ($regime === '' || !isset($valid_regimes[$regime])) {
+        if (self::is_field_enabled('regime') && ($regime === '' || !isset($valid_regimes[$regime]))) {
             return new \WP_Error('invalid_regime', 'Seleccione un régimen tributario válido.');
         }
 
-        if ($kind === 'LEGAL_ENTITY' && trim(self::as_string($values['company'])) === '') {
+        if (self::is_field_enabled('company') && $kind === 'LEGAL_ENTITY' && trim(self::as_string($values['company'])) === '') {
             return new \WP_Error(
                 'missing_company',
                 'La razón social es obligatoria para persona jurídica'
@@ -372,9 +386,11 @@ class Billing_Fields
     {
         $user_id = (int) $user->ID;
 
+        // AC-38: only ENABLED fields are collected; a disabled field is never
+        // sent to Alegra.
         $values = [];
         foreach (self::CATALOG as $key => $field) {
-            $values[$key] = self::get_field_value($user_id, $key);
+            $values[$key] = self::is_field_enabled($key) ? self::get_field_value($user_id, $key) : '';
         }
 
         $contact = [
@@ -402,9 +418,13 @@ class Billing_Fields
      */
     public static function build_guest_contact_payload(\WC_Order $order): array|\WP_Error
     {
+        // AC-38: only ENABLED fields are collected; a disabled field is never
+        // sent to Alegra.
         $values = [];
         foreach (self::CATALOG as $key => $field) {
-            $values[$key] = (string) $order->get_meta('_' . $field['meta_key'], true);
+            $values[$key] = self::is_field_enabled($key)
+                ? (string) $order->get_meta('_' . $field['meta_key'], true)
+                : '';
         }
 
         $contact = [
@@ -439,6 +459,24 @@ class Billing_Fields
     private static function regimes(string $kind_of_person): array
     {
         return $kind_of_person === 'LEGAL_ENTITY' ? self::REGIMES_LEGAL : self::REGIMES_PERSON;
+    }
+
+    /**
+     * Whether the connected Alegra company is Colombian (AC-49).
+     *
+     * Colombia uses `kindOfPerson` / `identificationObject` / `regime`; other
+     * countries use the generic flat `identification`. When the country is not
+     * known the plugin keeps its CO-first default, keyed off the e-invoicing
+     * (stamp) setting.
+     */
+    private static function is_colombia_account(): bool
+    {
+        $country = strtoupper(trim((string) get_option('alegra_connector_company_country', '')));
+        if ($country !== '') {
+            return in_array($country, ['CO', 'COLOMBIA'], true);
+        }
+
+        return (bool) get_option('alegra_connector_stamp_enabled', true);
     }
 
     /**
@@ -693,7 +731,11 @@ class Billing_Fields
      */
     private static function save_registration(int $customer_id): void
     {
-        foreach (self::CATALOG as $field) {
+        foreach (self::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never saved.
+            if (!self::is_field_enabled($key)) {
+                continue;
+            }
             $meta_key = (string) $field['meta_key'];
             if (!array_key_exists($meta_key, $_POST)) {
                 continue;
@@ -710,7 +752,11 @@ class Billing_Fields
         $order = function_exists('wc_get_order') ? wc_get_order($order_id) : null;
         $user_id = get_current_user_id();
 
-        foreach (self::CATALOG as $field) {
+        foreach (self::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never saved.
+            if (!self::is_field_enabled($key)) {
+                continue;
+            }
             $meta_key = (string) $field['meta_key'];
             if (!array_key_exists($meta_key, $_POST)) {
                 continue;
@@ -762,6 +808,11 @@ class Billing_Fields
             return;
         }
 
+        // AC-38: a disabled field is never saved.
+        if (!self::is_field_enabled($catalog_key)) {
+            return;
+        }
+
         $field = self::CATALOG[$catalog_key];
         $meta_key = (string) $field['meta_key'];
         $sanitized = self::sanitize_value($field, $value);
@@ -796,6 +847,10 @@ class Billing_Fields
         $user_id = (int) $order->get_customer_id();
 
         foreach (self::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never saved.
+            if (!self::is_field_enabled($key)) {
+                continue;
+            }
             $raw = self::block_field_value('alegra-connector/' . $key, $billing, $order);
             if ($raw === null) {
                 continue;
@@ -849,7 +904,11 @@ class Billing_Fields
      */
     private static function save_account(int $user_id): void
     {
-        foreach (self::CATALOG as $field) {
+        foreach (self::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never saved.
+            if (!self::is_field_enabled($key)) {
+                continue;
+            }
             $meta_key = (string) $field['meta_key'];
             if (!array_key_exists($meta_key, $_POST)) {
                 continue;
@@ -867,6 +926,11 @@ class Billing_Fields
     {
         $values = [];
         foreach (self::CATALOG as $key => $field) {
+            // AC-38: a disabled field is never collected.
+            if (!self::is_field_enabled($key)) {
+                $values[$key] = '';
+                continue;
+            }
             $meta_key = (string) $field['meta_key'];
             $values[$key] = array_key_exists($meta_key, $_POST)
                 ? self::as_string(wp_unslash($_POST[$meta_key]))
@@ -996,28 +1060,59 @@ class Billing_Fields
         $kind = (string) $values['kindofperson'];
         $idtype = (string) $values['idtype'];
 
-        $payload = ['kindOfPerson' => $kind];
+        // A disabled core field is not required, but without it no valid Alegra
+        // contact can be built — signal incomplete so the caller falls back to
+        // Consumidor Final instead of POSTing a nameless contact.
+        if ($kind === '' || $idtype === '' || (string) $values['identification'] === '') {
+            return new \WP_Error(
+                'incomplete_billing_data',
+                'El cliente no tiene los datos de facturación electrónica completos (tipo de persona, tipo y número de documento).'
+            );
+        }
+
+        $is_co = self::is_colombia_account();
+
+        $payload = [];
 
         // NEVER send both `name` and `nameObject` (Alegra error 2039).
-        if ($kind === 'LEGAL_ENTITY') {
+        if ($kind === 'LEGAL_ENTITY' && trim((string) $values['company']) !== '') {
             $payload['name'] = (string) $values['company'];
-        } else {
+        } elseif ($is_co) {
             $name_object = self::build_name_object($values, $contact);
             if (!empty($name_object)) {
                 $payload['nameObject'] = $name_object;
             }
+        } else {
+            // Non-CO generic variant: a flat `name` (no nameObject).
+            $display = trim((string) ($contact['display_name'] ?? ''));
+            if ($display === '') {
+                $display = trim((string) ($contact['first_name'] ?? '') . ' ' . (string) ($contact['last_name'] ?? ''));
+            }
+            if ($display !== '') {
+                $payload['name'] = $display;
+            }
         }
 
-        $identification = [
-            'type' => $idtype,
-            'number' => (string) $values['identification'],
-        ];
-        if ($idtype === 'NIT' && (string) $values['dv'] !== '') {
-            $identification['dv'] = (string) $values['dv'];
-        }
-        $payload['identificationObject'] = $identification;
+        // AC-49: kindOfPerson / identificationObject / regime are Colombia
+        // (e-invoicing) fields. Gate them on the account country; a non-CO
+        // account gets the generic flat `identification`.
+        if ($is_co) {
+            $payload['kindOfPerson'] = $kind;
 
-        $payload['regime'] = (string) $values['regime'];
+            $identification = [
+                'type' => $idtype,
+                'number' => (string) $values['identification'],
+            ];
+            if ($idtype === 'NIT' && (string) $values['dv'] !== '') {
+                $identification['dv'] = (string) $values['dv'];
+            }
+            $payload['identificationObject'] = $identification;
+
+            $payload['regime'] = (string) $values['regime'];
+        } else {
+            $payload['identification'] = (string) $values['identification'];
+        }
+
         $payload['email'] = (string) ($contact['email'] ?? '');
         $payload['phonePrimary'] = (string) ($contact['phone'] ?? '');
 

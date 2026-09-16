@@ -175,6 +175,15 @@ function alegra_test_reset(): void
     $GLOBALS['wp_options']['alegra_connector_dry_run'] = false;
     $GLOBALS['wp_options']['alegra_connector_auto_complete_order'] = true;
     $GLOBALS['wp_options']['alegra_connector_sync_images'] = false;
+
+    // Configured store: every billing field enabled. Mirrors enable_all() and
+    // the Group A seeding the settings sanitizer performs on an install. A test
+    // that needs a DISABLED field overrides this option explicitly.
+    $billing_enabled = [];
+    foreach (\Alegra\Connector\Billing_Fields::CATALOG as $bf_key => $bf_field) {
+        $billing_enabled[$bf_key] = 1;
+    }
+    $GLOBALS['wp_options']['alegra_connector_billing_field_catalog_enabled'] = $billing_enabled;
 }
 
 // ---------------------------------------------------------------------------

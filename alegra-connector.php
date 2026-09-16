@@ -162,15 +162,6 @@ final class Alegra_Connector
         register_activation_hook(__FILE__, [$this, 'activate']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
 
-        // Bridge hook: runs the actual sync hook when "Run now" is triggered.
-        // We pass the target hook name via a transient so this single dispatcher
-        // can invoke any alegra_* hook.
-        add_action('alegra_manual_run', function ($target_hook) {
-            if (is_string($target_hook) && strpos($target_hook, 'alegra') === 0) {
-                do_action($target_hook);
-            }
-        });
-
         // DB migrations on plugins_loaded (idempotent via dbDelta)
         add_action('plugins_loaded', [\Alegra\Connector\Schema::class, 'migrate'], 5);
 
@@ -264,6 +255,9 @@ final class Alegra_Connector
 
         // State sync: refunds, profile updates, payment method changes (2.3.0)
         \Alegra\Connector\State_Sync::register_hooks();
+
+        // Consumidor Final cache invalidation on settings change (AC-25)
+        \Alegra\Connector\Consumidor_Final::register_invalidation_hooks();
 
         // Public facing (for REST API + WooCommerce hooks) - needed for all requests
         $this->init_public();

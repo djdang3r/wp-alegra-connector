@@ -173,7 +173,11 @@ function get_option($name, $default = false)
 
 function update_option($name, $value, $autoload = null)
 {
+    $old = $GLOBALS['wp_options'][$name] ?? false;
     $GLOBALS['wp_options'][$name] = $value;
+    // WordPress fires update_option_{$option} after the write; the Consumidor
+    // Final invalidation hooks (AC-25) depend on it.
+    do_action("update_option_{$name}", $old, $value, $name);
     return true;
 }
 
@@ -377,6 +381,8 @@ function add_settings_field(...$args) { return; }
 function wp_cache_delete($key, $group = '') { return true; }
 function wp_clear_scheduled_hook($hook) { return true; }
 function wp_schedule_event($timestamp, $recurrence, $hook) { return true; }
+function wp_schedule_single_event($timestamp, $hook, $args = []) { return true; }
+function spawn_cron($gmt_time = 0) { return true; }
 function wp_next_scheduled($hook) { return false; }
 function _get_cron_array() { return []; }
 function wc_add_notice($message, $type = 'success') { return; }
@@ -441,6 +447,10 @@ function get_userdata($user_id)
 {
     $user_id = (int) $user_id;
     return $GLOBALS['wp_users'][$user_id] ?? false;
+}
+function get_users($args = [])
+{
+    return array_values($GLOBALS['wp_users']);
 }
 function get_user_by($field, $value)
 {

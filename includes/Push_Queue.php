@@ -156,7 +156,8 @@ class Push_Queue
             'user_id' => $user_id,
             'entity_type' => $entity_type,
             'entity_id' => $entity_id,
-            'alegra_id' => is_array($response) && isset($response['id']) ? (int) $response['id'] : null,
+            // Alegra ids are UUID strings; an (int) cast logged 0 for every row.
+            'alegra_id' => is_array($response) && isset($response['id']) ? (string) $response['id'] : null,
             'action' => $action,
             'request_payload' => wp_json_encode($request_payload),
             'response_payload' => $response_json,

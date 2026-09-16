@@ -93,15 +93,15 @@ class Controller
                 $this->logger->info('Cron sync skipped products: another sync is running');
             } else {
                 try {
-                    $import_result = $this->products->import_from_alegra();
+                    $products_result = $this->products->import_from_alegra();
                 } finally {
                     $this->release_sync_lock('products', $lock);
                 }
             }
-            if (isset($import_result) && !is_wp_error($import_result)) {
-                $result['products'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
-            } elseif (isset($import_result) && is_wp_error($import_result)) {
-                $result['errors']['products'] = $import_result->get_error_message();
+            if (isset($products_result) && !is_wp_error($products_result)) {
+                $result['products'] = ($products_result['imported'] ?? 0) + ($products_result['updated'] ?? 0);
+            } elseif (isset($products_result) && is_wp_error($products_result)) {
+                $result['errors']['products'] = $products_result->get_error_message();
             }
         }
 
@@ -118,15 +118,18 @@ class Controller
                 $this->logger->info('Cron sync skipped customers: another sync is running');
             } else {
                 try {
-                    $import_result = $this->customers->import_from_alegra();
+                    $customers_result = $this->customers->import_from_alegra();
                 } finally {
                     $this->release_sync_lock('customers', $lock);
                 }
             }
-            if (isset($import_result) && !is_wp_error($import_result)) {
-                $result['customers'] = ($import_result['imported'] ?? 0) + ($import_result['updated'] ?? 0);
-            } elseif (isset($import_result) && is_wp_error($import_result)) {
-                $result['errors']['customers'] = $import_result->get_error_message();
+            // AC-40: a distinct variable per entity. Reusing $products_result
+            // here made the customers count report the PRODUCTS numbers when the
+            // customers lock was held (the block never reassigned it).
+            if (isset($customers_result) && !is_wp_error($customers_result)) {
+                $result['customers'] = ($customers_result['imported'] ?? 0) + ($customers_result['updated'] ?? 0);
+            } elseif (isset($customers_result) && is_wp_error($customers_result)) {
+                $result['errors']['customers'] = $customers_result->get_error_message();
             }
         }
 

@@ -733,4 +733,239 @@ TestRunner::test('T8.4 AC-67 CSV cells starting with a formula trigger are neutr
     TestRunner::assertStringContains("array_map([self::class, 'csv_safe_cell']", $src, 'exports must apply csv_safe_cell');
 });
 
+// ===========================================================================
+// T9 — Correctness batch 1b (AC-25/26/38/40/41/42/46/48/49/51/52)
+// ===========================================================================
+echo "\nT9 — Correctness batch 1b\n";
+
+TestRunner::test('T9.1 AC-26/AC-38 a disabled field is neither required nor sent', function (): void {
+    alegra_test_reset();
+
+    // Group A only: `company` (Group B) is disabled.
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
+        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1,
+    ]);
+
+    $legal_values = [
+        'kindofperson'   => 'LEGAL_ENTITY',
+        'idtype'         => 'NIT',
+        'identification' => '900123456',
+        'dv'             => '1',
+        'regime'         => 'COMMON_REGIME',
+        'company'        => '',
+    ];
+    $validated = \Alegra\Connector\Billing_Fields::validate($legal_values);
+    TestRunner::assertFalse(is_wp_error($validated), 'a disabled company must not be required for a legal entity');
+
+    // With company ENABLED the same input must be rejected.
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
+        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1, 'company' => 1,
+    ]);
+    $rejected = \Alegra\Connector\Billing_Fields::validate($legal_values);
+    TestRunner::assertInstanceOf(\WP_Error::class, $rejected, 'an enabled-but-empty company must be required');
+    TestRunner::assertSame('missing_company', $rejected->get_error_code(), 'error code');
+
+    // Disabled optional fields must never reach the payload.
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
+        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1,
+    ]);
+    $order = alegra_make_order(900, [
+        'total' => 10.0, 'currency' => 'COP',
+        'billing' => ['country' => 'CO', 'email' => 'x@example.test', 'first_name' => 'Jane', 'last_name' => 'Doe'],
+        'meta' => [
+            '_billing_alegra_kindofperson'   => 'PERSON_ENTITY',
+            '_billing_alegra_idtype'         => 'CC',
+            '_billing_alegra_identification' => '1234567890',
+            '_billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
+            '_billing_alegra_observations'   => 'must not be sent',
+            '_billing_alegra_mobile'         => '3000000000',
+        ],
+    ]);
+    $payload = \Alegra\Connector\Billing_Fields::build_guest_contact_payload($order);
+    TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
+    TestRunner::assertArrayNotHasKey('observations', $payload, 'a disabled observations field must not be sent');
+    TestRunner::assertArrayNotHasKey('mobile', $payload, 'a disabled mobile field must not be sent');
+});
+
+TestRunner::test('T9.2 AC-38 a disabled field is never saved', function (): void {
+    alegra_test_reset();
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
+        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1,
+    ]);
+
+    $_POST = ['billing_alegra_observations' => 'secret note'];
+    $ref = new ReflectionMethod(\Alegra\Connector\Billing_Fields::class, 'save_registration');
+    $ref->setAccessible(true);
+    $ref->invoke(null, 55);
+    $_POST = [];
+
+    TestRunner::assertSame('', (string) get_user_meta(55, 'billing_alegra_observations', true), 'a disabled field must not be persisted');
+});
+
+TestRunner::test('T9.3 AC-40 the customers count is not the products count when the customers lock is held', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    update_option('alegra_connector_sync_customers', true);
+    alegra_mock_seed_item('item-a', ['name' => 'A', 'reference' => 'A', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 10]]]);
+    alegra_mock_seed_item('item-b', ['name' => 'B', 'reference' => 'B', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 20]]]);
+
+    // Hold the customers lock so its block never assigns $customers_result.
+    Controller::acquire_lock('alegra_sync_running_customers', 300);
+
+    make_controller()->run_cron_sync();
+
+    $message = '';
+    foreach ($GLOBALS['wp_transients'] as $key => $value) {
+        if (strpos((string) $key, 'alegra_run_') === 0 && is_array($value) && ($value['step'] ?? '') === 'done') {
+            $message = (string) ($value['message'] ?? '');
+        }
+    }
+
+    TestRunner::assertTrue(preg_match('/Completado: (\d+) productos, (\d+) clientes/', $message, $m) === 1, 'the done heartbeat must carry the counts: ' . $message);
+    TestRunner::assertTrue((int) ($m[1] ?? 0) > 0, 'products must have been imported');
+    TestRunner::assertSame(0, (int) ($m[2] ?? -1), 'the customers count must be 0 when the lock is held (not the products count)');
+});
+
+TestRunner::test('T9.4 AC-41 a payment-method change after the baseline still syncs', function (): void {
+    alegra_test_reset();
+    alegra_make_user(7, ['user_email' => 'pm@example.test'], [
+        'billing_alegra_kindofperson'   => 'PERSON_ENTITY',
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
+    ]);
+    $order = alegra_make_order(910, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'customer_id' => 7,
+        'meta' => ['_alegra_invoice_id' => '1nv-910'],
+    ]);
+
+    State_Sync::handle_payment_method_change(910);
+    TestRunner::assertSame('bacs', (string) $order->get_meta('_alegra_last_payment_method', true), 'the baseline must be durable order meta');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/1nv-910'), 'the first save must not sync');
+
+    // Simulate the old 300s transient expiring, then a later change.
+    $GLOBALS['wp_transients'] = [];
+    $baseline = (string) $order->get_meta('_alegra_last_payment_method', true);
+    alegra_make_order(910, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'cod', 'customer_id' => 7,
+        'meta' => ['_alegra_invoice_id' => '1nv-910', '_alegra_last_payment_method' => $baseline],
+    ]);
+
+    State_Sync::handle_payment_method_change(910);
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/1nv-910'), 'a change made after the baseline must still sync');
+});
+
+TestRunner::test('T9.5 AC-42 a cached Consumidor Final id does not hit the API', function (): void {
+    alegra_test_reset();
+    $cf = seed_consumidor_final();
+
+    TestRunner::assertSame($cf, \Alegra\Connector\Consumidor_Final::get_id(), 'CF resolves');
+    $calls = alegra_mock_count('GET', '/contacts');
+
+    $again = \Alegra\Connector\Consumidor_Final::resolve();
+    TestRunner::assertSame($cf, $again, 'resolve must return the cached id');
+    TestRunner::assertSame($calls, alegra_mock_count('GET', '/contacts'), 'resolve must not call the API when cached');
+});
+
+TestRunner::test('T9.6 AC-46 a missing/zero Alegra price does not wipe the WC price', function (): void {
+    alegra_test_reset();
+    $product = alegra_make_product(30, ['name' => 'Keep', 'sku' => 'K', 'regular_price' => '50', 'tax_class' => '']);
+
+    alegra_call_private(make_products(), 'update_product_from_alegra', $product, [
+        'id' => 'item-30', 'name' => 'Keep', 'status' => 'active', 'price' => [],
+    ]);
+    TestRunner::assertSame('50', (string) $product->get_regular_price(), 'a zero/missing price must not overwrite the WC price');
+
+    alegra_call_private(make_products(), 'update_product_from_alegra', $product, [
+        'id' => 'item-30', 'name' => 'Keep', 'status' => 'active',
+        'price' => [['idPriceList' => 1, 'price' => 75]],
+    ]);
+    TestRunner::assertSame('75', (string) $product->get_regular_price(), 'a usable price must still update');
+});
+
+TestRunner::test('T9.7 AC-48 a coupon discount is mapped so the invoice total matches the order total', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-disc');
+
+    $order = alegra_make_order(920, [
+        'total' => 90.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'd@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-disc'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 90])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice creation must succeed');
+
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'price stays pre-discount');
+    TestRunner::assertEquals(10.0, $body['items'][0]['discount'] ?? null, 'a 10% coupon must map to items[].discount');
+
+    TestRunner::assertEquals(90.0, (float) ($result['total'] ?? 0), 'the invoice total must equal the WC order total');
+    TestRunner::assertEquals(90.0, (float) $order->get_total(), 'order total');
+});
+
+TestRunner::test('T9.8 AC-51 the inventory pull requests mode=advanced', function (): void {
+    alegra_test_reset();
+    make_products()->sync_inventory_from_alegra();
+
+    $req = alegra_mock_last_request('GET', '/items');
+    TestRunner::assertTrue($req !== null, 'an items request must be sent');
+    TestRunner::assertSame('advanced', $req['query']['mode'] ?? null, 'the inventory pull must request advanced mode');
+});
+
+TestRunner::test('T9.9 AC-25 the Consumidor Final cache is invalidated on settings change and delete', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Consumidor_Final::register_invalidation_hooks();
+    $cf = seed_consumidor_final();
+
+    TestRunner::assertSame($cf, \Alegra\Connector\Consumidor_Final::get_id(), 'CF resolves and caches');
+    TestRunner::assertTrue(\Alegra\Connector\Consumidor_Final::is_consumidor_final($cf), 'the id is cached');
+
+    // (b) a settings change drops the cache.
+    update_option('alegra_connector_consumidor_final_manual_override', true);
+    TestRunner::assertFalse(\Alegra\Connector\Consumidor_Final::is_consumidor_final($cf), 'a settings change must drop the CF cache');
+
+    // Re-resolve, then (a) a delete-client webhook drops it again.
+    TestRunner::assertSame($cf, \Alegra\Connector\Consumidor_Final::get_id(), 'CF resolves again');
+    $logger = make_logger();
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+    $handlers->process_event('delete-client', ['client' => ['id' => $cf]]);
+    TestRunner::assertFalse(\Alegra\Connector\Consumidor_Final::is_consumidor_final($cf), 'a delete-client webhook must drop the CF cache');
+});
+
+TestRunner::test('T9.10 AC-49 Colombia-only fields are gated on the account country', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_company_country', 'MX');
+    $user = alegra_make_user(8, ['user_email' => 'mx@example.test', 'display_name' => 'MX Person'], [
+        'billing_alegra_kindofperson'   => 'PERSON_ENTITY',
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
+    ]);
+
+    $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
+    TestRunner::assertArrayNotHasKey('kindOfPerson', $payload, 'non-CO must not send kindOfPerson');
+    TestRunner::assertArrayNotHasKey('identificationObject', $payload, 'non-CO must not send identificationObject');
+    TestRunner::assertArrayNotHasKey('regime', $payload, 'non-CO must not send regime');
+    TestRunner::assertSame('1234567890', $payload['identification'] ?? null, 'non-CO uses the flat identification');
+
+    update_option('alegra_connector_company_country', 'CO');
+    $co_payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertSame('PERSON_ENTITY', $co_payload['kindOfPerson'] ?? null, 'CO sends kindOfPerson');
+    TestRunner::assertArrayHasKey('identificationObject', $co_payload, 'CO sends identificationObject');
+    TestRunner::assertArrayHasKey('regime', $co_payload, 'CO sends regime');
+});
+
+TestRunner::test('T9.11 AC-52 "Run now" schedules a single event and the dead dispatcher is gone', function (): void {
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains('wp_schedule_single_event(time(), $hook)', $admin, 'Run now must schedule a single event');
+    TestRunner::assertStringNotContains("'alegra_manual_run'", $admin, 'the unregistered recurrence must be gone');
+
+    $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
+    TestRunner::assertStringNotContains("add_action('alegra_manual_run'", $main, 'the dead alegra_manual_run dispatcher must be removed');
+});
+
 exit(TestRunner::summary());
