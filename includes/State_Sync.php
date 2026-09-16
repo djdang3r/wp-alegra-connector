@@ -176,7 +176,7 @@ class State_Sync
      */
     public static function handle_user_profile_update(int $user_id): void
     {
-        if ((string) get_user_meta($user_id, 'billing_alegra_kindofperson', true) !== '') {
+        if ((string) get_user_meta($user_id, 'billing_alegra_identification', true) !== '') {
             return;
         }
 
@@ -355,7 +355,7 @@ class State_Sync
         }
 
         foreach ($orders as $order) {
-            if ($order instanceof \WC_Order && (string) $order->get_meta('_billing_alegra_kindofperson') !== '') {
+            if ($order instanceof \WC_Order && (string) $order->get_meta('_billing_alegra_identification') !== '') {
                 return $order;
             }
         }

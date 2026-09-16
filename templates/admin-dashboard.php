@@ -12,7 +12,6 @@ $running_runs = \Alegra\Connector\Runs::currently_running();
 $kill_switch = \Alegra\Connector\Kill_Switch::is_active();
 
 // Billing health data.
-$stamp_enabled = (bool) get_option('alegra_connector_stamp_enabled', true);
 $dry_run = (bool) get_option('alegra_connector_dry_run', false);
 $consumidor_final_checked = $is_connected && class_exists('\Alegra\Connector\Consumidor_Final');
 $consumidor_final_available = $consumidor_final_checked
@@ -141,20 +140,6 @@ include __DIR__ . '/header.php';
             <span class="alegra-health-action">
                 <?php if ($consumidor_final_checked && !$consumidor_final_available): ?>
                     <?php esc_html_e('Créalo en Alegra con identificación CC 222222222222.', 'alegra-connector'); ?>
-                <?php endif; ?>
-            </span>
-        </div>
-        <div class="alegra-health-row">
-            <span class="alegra-health-dot <?php echo $stamp_enabled ? 'is-green' : 'is-amber'; ?>"></span>
-            <span class="alegra-health-label"><?php esc_html_e('Emisión DIAN', 'alegra-connector'); ?></span>
-            <span class="alegra-health-status">
-                <?php echo $stamp_enabled
-                    ? esc_html__('Activada', 'alegra-connector')
-                    : '<strong>' . esc_html__('Desactivada (las facturas no se envían a la DIAN)', 'alegra-connector') . '</strong>'; ?>
-            </span>
-            <span class="alegra-health-action">
-                <?php if (!$stamp_enabled): ?>
-                    <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>"><?php esc_html_e('Reactivar', 'alegra-connector'); ?> &rarr;</a>
                 <?php endif; ?>
             </span>
         </div>

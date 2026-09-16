@@ -1,11 +1,9 @@
 /**
  * Alegra Connector — legacy checkout conditional fields.
  *
- * Reproduces on the shortcode checkout what the Checkout Blocks API provides
- * natively: dynamic id-type/regime options per person type, conditional
- * visibility for dv/company/second-name fields, and a collapsible group C.
- *
- * Vanilla JS — jQuery is only used, when present, to hook WooCommerce's own
+ * The only conditional field is the NIT verification digit (DV): it is shown
+ * and required only when the customer selected the NIT document type. Vanilla
+ * JS — jQuery is only used, when present, to hook WooCommerce's own
  * `updated_checkout` event (WooCommerce triggers it through jQuery).
  */
 (function () {
@@ -13,7 +11,6 @@
 
     var cfg = window.alegraCheckout || {};
     var PREFIX = cfg.prefix || 'billing_alegra_';
-    var CONDITIONALLY_REQUIRED = { dv: true, company: true };
     var bound = false;
 
     function byName(key) {
@@ -27,118 +24,34 @@
         return el.closest('.form-row') || el.closest('p') || el.parentNode;
     }
 
-    function toggleField(key, visible) {
-        var el = byName(key);
-        if (!el) {
-            return;
-        }
-
-        var box = wrapper(el);
-        if (box) {
-            box.style.display = visible ? '' : 'none';
-        }
-
-        if (visible && CONDITIONALLY_REQUIRED[key]) {
-            el.setAttribute('required', 'required');
-        } else if (!visible) {
-            el.removeAttribute('required');
-            el.classList.remove('woocommerce-invalid', 'woocommerce-invalid-required-field');
-        }
-    }
-
-    function populateSelect(key, options) {
-        var select = byName(key);
-        if (!select || !options) {
-            return;
-        }
-
-        var previous = select.value;
-        var placeholder = document.createElement('option');
-        placeholder.value = '';
-        placeholder.textContent = (cfg.strings && cfg.strings.selectPlaceholder) || 'Seleccione…';
-
-        while (select.firstChild) {
-            select.removeChild(select.firstChild);
-        }
-        select.appendChild(placeholder);
-
-        Object.keys(options).forEach(function (value) {
-            var option = document.createElement('option');
-            option.value = value;
-            option.textContent = options[value];
-            select.appendChild(option);
-        });
-
-        select.value = Object.prototype.hasOwnProperty.call(options, previous) ? previous : '';
-    }
-
     function applyIdtype() {
         var idtype = byName('idtype');
-        toggleField('dv', !!idtype && idtype.value === 'NIT');
-    }
-
-    function applyKind() {
-        var kind = byName('kindofperson');
-        var value = kind ? kind.value : '';
-        var isLegal = value === 'LEGAL_ENTITY';
-
-        toggleField('company', isLegal);
-        toggleField('secondname', value === 'PERSON_ENTITY');
-        toggleField('secondlastname', value === 'PERSON_ENTITY');
-        applyIdtype();
-    }
-
-    function onKindChange(select) {
-        var isLegal = select.value === 'LEGAL_ENTITY';
-        populateSelect('idtype', isLegal ? cfg.idTypesLegal : cfg.idTypesPerson);
-        populateSelect('regime', isLegal ? cfg.regimesLegal : cfg.regimesPerson);
-        applyKind();
-    }
-
-    function wrapGroupC() {
-        var fields = document.querySelectorAll('.alegra-group-c');
-        if (!fields.length) {
+        var dv = byName('dv');
+        if (!dv) {
             return;
         }
 
-        var first = wrapper(fields[0]);
-        if (!first || !first.parentNode) {
-            return;
-        }
-        if (first.closest('details.alegra-group-c-details')) {
-            return;
+        var isNit = !!idtype && idtype.value === 'NIT';
+        var box = wrapper(dv);
+        if (box) {
+            box.style.display = isNit ? '' : 'none';
         }
 
-        var details = document.createElement('details');
-        details.className = 'alegra-group-c-details';
-
-        var summary = document.createElement('summary');
-        summary.textContent = (cfg.strings && cfg.strings.moreData) || 'Más datos (opcional)';
-        details.appendChild(summary);
-
-        first.parentNode.insertBefore(details, first);
-
-        for (var i = 0; i < fields.length; i++) {
-            var box = wrapper(fields[i]);
-            if (box) {
-                details.appendChild(box);
-            }
+        if (isNit) {
+            dv.setAttribute('required', 'required');
+        } else {
+            dv.removeAttribute('required');
+            dv.classList.remove('woocommerce-invalid', 'woocommerce-invalid-required-field');
         }
     }
 
     function init() {
-        applyKind();
-        wrapGroupC();
+        applyIdtype();
     }
 
     function onChange(event) {
         var target = event.target;
-        if (!target || !target.name) {
-            return;
-        }
-        if (target.name === PREFIX + 'kindofperson') {
-            onKindChange(target);
-        } else if (target.name === PREFIX + 'idtype') {
+        if (target && target.name === PREFIX + 'idtype') {
             applyIdtype();
         }
     }

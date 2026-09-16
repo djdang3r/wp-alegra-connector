@@ -308,19 +308,19 @@ check(
 // =====================================================================
 
 // ---- 13: Billing_Fields class + catalog ----
-echo "\n[13] Billing_Fields class + 11-field catalog\n";
+echo "\n[13] Billing_Fields class + identification catalog\n";
 $billing_class = 'Alegra\\Connector\\Billing_Fields';
 $billing_ok = class_exists($billing_class);
 check('Billing_Fields class loads', $billing_ok, '— the billing catalog holder must be autoloadable');
 $catalog = $billing_ok ? $billing_class::CATALOG : [];
 check(
-    'catalog has exactly 11 fields',
-    count($catalog) === 11,
-    '— expected 11 (got ' . count($catalog) . ')'
+    'catalog has exactly 3 fields (idtype, identification, dv)',
+    count($catalog) === 3,
+    '— expected 3 (got ' . count($catalog) . ')'
 );
 
-// ---- 14: groups partition the catalog ----
-echo "\n[14] Groups A/B/C partition the catalog\n";
+// ---- 14: the catalog is the identification only ----
+echo "\n[14] The catalog is the identification only\n";
 $group_counts = ['A' => 0, 'B' => 0, 'C' => 0];
 $unknown_group = [];
 foreach ($catalog as $key => $field) {
@@ -332,8 +332,8 @@ foreach ($catalog as $key => $field) {
     $group_counts[$g]++;
 }
 check(
-    'every field belongs to a known group and counts sum to 11 (A=5, B=3, C=3)',
-    $unknown_group === [] && $group_counts['A'] === 5 && $group_counts['B'] === 3 && $group_counts['C'] === 3,
+    'every field is mandatory identification data (A=3, B=0, C=0)',
+    $unknown_group === [] && $group_counts['A'] === 3 && $group_counts['B'] === 0 && $group_counts['C'] === 0,
     '— unknown: ' . implode(', ', $unknown_group) . '; counts: ' . json_encode($group_counts)
 );
 
@@ -341,7 +341,7 @@ check(
 echo "\n[15] Billing_Fields::is_field_enabled() reads alegra_connector_billing_field_catalog_enabled\n";
 update_option('alegra_connector_billing_field_catalog_enabled', ['idtype' => 1]);
 $enabled_read = class_exists($billing_class) && $billing_class::is_field_enabled('idtype') === true;
-$disabled_read = class_exists($billing_class) && $billing_class::is_field_enabled('mobile') === false;
+$disabled_read = class_exists($billing_class) && $billing_class::is_field_enabled('dv') === false;
 update_option('alegra_connector_billing_field_catalog_enabled', []);
 check(
     'enabled field returns true and unset field returns false',
@@ -486,7 +486,7 @@ check(
 // ---- 25: the 3 new options are registered ----
 echo "\n[25] The 3 new options are registered\n";
 $admin_src = file_source($plugin_root . 'admin/Admin/Admin_Dashboard.php');
-$opts = ['alegra_connector_customer_resolution_mode', 'alegra_connector_stamp_enabled', 'alegra_connector_dry_run'];
+$opts = ['alegra_connector_customer_resolution_mode', 'alegra_connector_invoice_status', 'alegra_connector_dry_run'];
 $missing_opts = [];
 foreach ($opts as $opt) {
     if (!str_contains($admin_src, "register_setting('alegra_connector_settings', '$opt'")) {
@@ -494,7 +494,7 @@ foreach ($opts as $opt) {
     }
 }
 check(
-    'customer_resolution_mode, stamp_enabled and dry_run are registered',
+    'customer_resolution_mode, invoice_status and dry_run are registered',
     $missing_opts === [],
     '— missing: ' . implode(', ', $missing_opts)
 );
@@ -527,7 +527,7 @@ $credit_ok = str_contains($credit_src, 'create_credit_note_for_refund')
 check(
     'create_credit_note() delegates to the single refund implementation (which sends the plural invoices array)',
     $credit_ok,
-    '— two independent credit-note implementations were the root cause of the duplicate DIAN note'
+    '— two independent credit-note implementations were the root cause of the duplicate credit note'
 );
 
 // ---- 28b: both refund paths share ONE idempotency key ----
@@ -560,13 +560,13 @@ check(
     '— append=true preserves the merchant manual categorization'
 );
 
-// ---- 31: update_customer_from_alegra mirrors kindofperson ----
-echo "\n[31] update_customer_from_alegra() mirrors billing_alegra_kindofperson\n";
+// ---- 31: update_customer_from_alegra mirrors the identification ----
+echo "\n[31] update_customer_from_alegra() mirrors billing_alegra_identification\n";
 $customers_src_2 = file_source($plugin_root . 'includes/Sync/Customers.php');
 check(
-    "Customers::update_customer_from_alegra() writes billing_alegra_kindofperson",
-    str_contains($customers_src_2, 'billing_alegra_kindofperson'),
-    '— the 2.3.0 billing fields must be mirrored on customer pull'
+    "Customers::update_customer_from_alegra() writes billing_alegra_identification",
+    str_contains($customers_src_2, 'billing_alegra_identification'),
+    '— the identification must be mirrored on customer pull'
 );
 
 // ---- 32: new admin settings section ----
@@ -574,7 +574,7 @@ echo "\n[32] New admin settings section renders\n";
 check(
     "add_settings_section('alegra_connector_billing_section', ...) is registered",
     str_contains($admin_src, "add_settings_section('alegra_connector_billing_section'"),
-    '— the Facturación electrónica section must exist in settings'
+    '— the Datos de facturación section must exist in settings'
 );
 
 // ---- 33: wp_set_object_terms append flag is true ----

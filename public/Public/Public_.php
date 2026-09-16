@@ -51,7 +51,7 @@ class Public_
             add_action('woocommerce_order_status_on-hold', [$this, 'on_order_on_hold'], 10, 1);
             // Refunds are owned exclusively by State_Sync::handle_refund()
             // (woocommerce_order_refunded). Hooking status_refunded here too
-            // issued a SECOND DIAN credit note for a full refund.
+            // issued a SECOND credit note for a full refund.
             add_action('woocommerce_order_status_cancelled', [$this, 'on_order_cancelled'], 10, 1);
             add_action('woocommerce_order_status_failed', [$this, 'on_order_failed'], 10, 1);
         }

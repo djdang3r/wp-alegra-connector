@@ -2,6 +2,42 @@
 
 All notable changes to Alegra Connector.
 
+## [Unreleased]
+
+### 🗑️ Removed — DIAN e-invoicing was never a requirement
+
+The plugin's job is to push orders/invoices to Alegra — automatically and
+manually. DIAN electronic invoicing was added in 2.3.0 as an **unrequested
+feature that defaulted ON**, so a Colombian store that installed the plugin and
+did nothing silently issued **legal e-invoices to the tax authority for every
+order and every refund** — irreversible, numbering-consuming, with tax/legal
+consequences. It is removed.
+
+- **REMOVED: DIAN stamping** — Invoices and credit notes no longer send
+  `stamp.generateStamp`. There is no draft-with-400 stamp-recovery path anymore.
+- **REMOVED: the DIAN payment-method catalog and `paymentForm`** — Colombian
+  invoices no longer send the uppercase DIAN "Medio de pago" codes or the
+  CASH/CREDIT `paymentForm`.
+- **REMOVED: the `emission_status` gate** — credit notes are no longer blocked
+  on the original invoice's DIAN emission state.
+- **REMOVED: the `alegra_connector_stamp_enabled` option**, its settings UI, its
+  dashboard health indicator and its uninstall cleanup.
+- **CHANGED: invoices are now created as DRAFTS** — the plugin sent
+  `status: open` unconditionally, contradicting its own documentation ("en
+  borrador"). Alegra's documented behaviour is that omitting `status` (with no
+  payments) creates a draft. A new setting, **"Estado de las facturas"**
+  (Borrador / Abierta), defaults to **Borrador**; an invoice that records a
+  payment is created open because Alegra only accepts payments on open invoices.
+- **CHANGED: the billing catalog is reduced from 11 fields to the
+  identification** — the document type, the number and the DV for a NIT are the
+  only things WooCommerce does not already collect. `kindOfPerson` and `regime`
+  are only required by Alegra's *e-invoicing* contact schema; they are not
+  required to create a plain contact, so they are gone. The admin section is
+  renamed from "Facturación electrónica" to **"Datos de facturación"**.
+- **KEPT:** customer resolution, the Consumidor Final fallback, the atomic
+  locks and the HPOS fixes — those fix the original bug and are unrelated to
+  DIAN.
+
 ## [2.3.1] - 2026-09-16
 
 > **⚠️ This release replaces the broken public 2.3.0 — upgrade immediately.**

@@ -95,7 +95,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_rate_window');
     delete_option('alegra_connector_billing_field_catalog_enabled');
     delete_option('alegra_connector_customer_resolution_mode');
-    delete_option('alegra_connector_stamp_enabled');
+    delete_option('alegra_connector_invoice_status');
     delete_option('alegra_connector_dry_run');
     delete_option('alegra_connector_push_category_strategy');
     delete_option('alegra_connector_push_category_id');

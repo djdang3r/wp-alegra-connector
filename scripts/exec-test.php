@@ -94,7 +94,6 @@ function build_refund_world(float $order_total, float $refund_amount, int $order
     $item_id = '1t3m-' . $order_id;
 
     alegra_mock_seed_invoice($invoice_id, [
-        'emission_status' => 'STAMPED',
         'total' => $order_total,
         'balance' => $order_total,
         'status' => 'open',
@@ -215,7 +214,7 @@ TestRunner::test('T2.1 cron sync completes, reaches the done heartbeat and sets 
 // ===========================================================================
 echo "\nT3 — Invoice creation (Orders::create_invoice)\n";
 
-TestRunner::test('T3.1 CO invoice payload is complete and uses an UPPERCASE DIAN payment method', function (): void {
+TestRunner::test('T3.1 CO invoice payload is complete and is created as a DRAFT', function (): void {
     alegra_test_reset();
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '119']);
     update_post_meta(10, '_alegra_item_id', '1t3m-co');
@@ -239,7 +238,9 @@ TestRunner::test('T3.1 CO invoice payload is complete and uses an UPPERCASE DIAN
     TestRunner::assertArrayHasKey('date', $body, 'date');
     TestRunner::assertArrayHasKey('dueDate', $body, 'dueDate');
     TestRunner::assertArrayHasKey('numberTemplate', $body, 'numberTemplate');
-    TestRunner::assertSame(true, $body['stamp']['generateStamp'] ?? null, 'stamp.generateStamp must be true for CO');
+    TestRunner::assertArrayNotHasKey('stamp', $body, 'invoices must NEVER request a stamp');
+    TestRunner::assertArrayNotHasKey('paymentForm', $body, 'invoices must not send the CO paymentForm');
+    TestRunner::assertSame('draft', $body['status'] ?? null, 'invoices default to draft');
     TestRunner::assertSame('c0n-co', $body['client']['id'] ?? null, 'client must reference the resolved contact');
 
     TestRunner::assertTrue(!empty($body['items']), 'items must not be empty');
@@ -247,17 +248,13 @@ TestRunner::test('T3.1 CO invoice payload is complete and uses an UPPERCASE DIAN
         TestRunner::assertArrayHasKey('id', $item, "items[$i] must carry an Alegra id (obligatory)");
     }
 
-    $pm = $body['paymentMethod'] ?? null;
-    if ($pm !== null) {
-        TestRunner::assertSame(strtoupper((string) $pm), (string) $pm, 'CO paymentMethod must be an UPPERCASE DIAN code');
-    }
-
     TestRunner::assertSame('1t3m-co', $order->get_meta('_alegra_invoice_id', true) === '' ? null : $body['items'][0]['id'], 'invoice line links the item');
     TestRunner::assertTrue((string) $order->get_meta('_alegra_invoice_id', true) !== '', '_alegra_invoice_id must be persisted');
 });
 
-TestRunner::test('T3.2 non-CO invoice never sends a lowercase global code as a DIAN code', function (): void {
+TestRunner::test('T3.2 an OPEN invoice status setting is honoured and no stamp is ever sent', function (): void {
     alegra_test_reset();
+    update_option('alegra_connector_invoice_status', 'open');
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '20']);
     update_post_meta(10, '_alegra_item_id', '1t3m-mx');
 
@@ -272,8 +269,39 @@ TestRunner::test('T3.2 non-CO invoice never sends a lowercase global code as a D
 
     make_orders()->create_invoice(wc_get_order(501));
     $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
-    TestRunner::assertArrayNotHasKey('stamp', $body, 'non-CO must not request a DIAN stamp');
-    TestRunner::assertSame('credit-card', $body['paymentMethod'] ?? null, 'non-CO keeps the lowercase global code');
+    TestRunner::assertArrayNotHasKey('stamp', $body, 'no invoice must request a stamp');
+    TestRunner::assertArrayNotHasKey('paymentForm', $body, 'no invoice must send the CO paymentForm');
+    TestRunner::assertSame('open', $body['status'] ?? null, 'the open setting must be honoured');
+});
+
+TestRunner::test('T3.3 a payment on an existing DRAFT invoice opens it before paying', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'ba-1');
+
+    // The invoice was created earlier (e.g. by woocommerce_new_order) as a draft.
+    alegra_mock_seed_invoice('1nv-draft', [
+        'status' => 'draft',
+        'total' => 10.0,
+        'balance' => 10.0,
+        'items' => [['id' => '1t3m-d', 'name' => 'Widget', 'price' => 10, 'quantity' => 1]],
+    ]);
+
+    $order = alegra_make_order(502, [
+        'total' => 10.0,
+        'currency' => 'COP',
+        'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'draft@example.test'],
+        'meta' => [
+            '_alegra_invoice_id'          => '1nv-draft',
+            '_billing_alegra_contact_id'  => 'c0n-draft',
+        ],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'the existing invoice must not be re-created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/1nv-draft/open'), 'a draft invoice must be opened before the payment');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be recorded');
 });
 
 // ===========================================================================
@@ -287,7 +315,7 @@ TestRunner::test('T4.1 full refund creates EXACTLY ONE credit note even with the
 
     register_refund_owner_hook();
     // Public_ registers the WC -> Alegra hooks (and, in the fixed code, must NOT
-    // register the refund status hook that caused the duplicate DIAN note).
+    // register the refund status hook that caused the duplicate credit note).
     $logger = make_logger();
     $public = new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
 
@@ -329,7 +357,7 @@ TestRunner::test('T4.3 a second refund exceeding the invoice total is rejected (
     alegra_test_reset();
     $invoice_id = '1nv-502';
     alegra_mock_seed_invoice($invoice_id, [
-        'emission_status' => 'STAMPED', 'total' => 100.0, 'balance' => 100.0, 'status' => 'open',
+        'total' => 100.0, 'balance' => 100.0, 'status' => 'open',
         'items' => [['id' => '1t3m-502', 'name' => 'Widget', 'price' => 100, 'quantity' => 1]],
     ]);
     $refund1 = alegra_make_refund(801, ['total' => 60.0]);
@@ -383,7 +411,7 @@ TestRunner::test('T4.6 refund with a missing contact meta falls back to Consumid
 
     $invoice_id = '1nv-504';
     alegra_mock_seed_invoice($invoice_id, [
-        'emission_status' => 'STAMPED', 'total' => 40.0, 'balance' => 40.0, 'status' => 'open',
+        'total' => 40.0, 'balance' => 40.0, 'status' => 'open',
         'items' => [['id' => '1t3m-504', 'name' => 'Widget', 'price' => 40, 'quantity' => 1]],
     ]);
     $refund = alegra_make_refund(902, ['total' => 40.0]);
@@ -410,7 +438,7 @@ TestRunner::test('T4.7 refund with an unresolvable client aborts with customer_u
 
     $invoice_id = '1nv-505';
     alegra_mock_seed_invoice($invoice_id, [
-        'emission_status' => 'STAMPED', 'total' => 25.0, 'balance' => 25.0, 'status' => 'open',
+        'total' => 25.0, 'balance' => 25.0, 'status' => 'open',
         'items' => [['id' => '1t3m-505', 'name' => 'Widget', 'price' => 25, 'quantity' => 1]],
     ]);
     $refund = alegra_make_refund(903, ['total' => 25.0]);
@@ -458,15 +486,14 @@ function make_invoice_order(int $order_id, int $user_id, string $email): WC_Orde
     ]);
 }
 
-TestRunner::test('T5.1 full billing data (legal entity) creates a contact with name (never nameObject)', function (): void {
+TestRunner::test('T5.1 a NIT contact sends identificationObject (with dv) and nameObject, never extra fiscal fields', function (): void {
     alegra_test_reset();
     alegra_make_user(1, ['user_email' => 'acme@example.test', 'display_name' => 'Acme SA'], [
-        'billing_alegra_kindofperson' => 'LEGAL_ENTITY',
-        'billing_alegra_idtype' => 'NIT',
+        'billing_alegra_idtype'         => 'NIT',
         'billing_alegra_identification' => '900123456',
-        'billing_alegra_dv' => '1',
-        'billing_alegra_regime' => 'COMMON_REGIME',
-        'billing_alegra_company' => 'Acme SA',
+        'billing_alegra_dv'             => '1',
+        'billing_first_name'            => 'Acme',
+        'billing_last_name'             => 'SA',
     ]);
     $order = make_invoice_order(600, 1, 'acme@example.test');
 
@@ -476,32 +503,33 @@ TestRunner::test('T5.1 full billing data (legal entity) creates a contact with n
     TestRunner::assertTrue($contact !== null, 'a contact must be created');
     $body = $contact['body'] ?? [];
     TestRunner::assertArrayHasKey('identificationObject', $body, 'identificationObject');
-    TestRunner::assertArrayHasKey('regime', $body, 'regime');
-    TestRunner::assertSame('LEGAL_ENTITY', $body['kindOfPerson'] ?? null, 'kindOfPerson');
-    TestRunner::assertArrayHasKey('name', $body, 'legal entity uses name');
-    TestRunner::assertArrayNotHasKey('nameObject', $body, 'legal entity must NOT also send nameObject');
+    TestRunner::assertSame('NIT', $body['identificationObject']['type'] ?? null, 'identificationObject.type');
+    TestRunner::assertSame('900123456', $body['identificationObject']['number'] ?? null, 'identificationObject.number');
+    TestRunner::assertSame('1', $body['identificationObject']['dv'] ?? null, 'identificationObject.dv');
+    TestRunner::assertArrayNotHasKey('kindOfPerson', $body, 'kindOfPerson must not be sent');
+    TestRunner::assertArrayNotHasKey('regime', $body, 'regime must not be sent');
+    TestRunner::assertArrayHasKey('nameObject', $body, 'CO contacts use nameObject');
+    TestRunner::assertArrayNotHasKey('name', $body, 'a contact must NOT also send name');
 
     $invoice = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
     TestRunner::assertTrue((string) ($invoice['client']['id'] ?? '') !== '', 'invoice must reference the created contact');
 });
 
-TestRunner::test('T5.2 full billing data (natural person) uses nameObject (never name)', function (): void {
+TestRunner::test('T5.2 a CC contact uses nameObject (never name)', function (): void {
     alegra_test_reset();
     alegra_make_user(3, ['user_email' => 'jane@example.test', 'display_name' => 'Jane Doe', 'first_name' => 'Jane', 'last_name' => 'Doe'], [
-        'billing_alegra_kindofperson' => 'PERSON_ENTITY',
-        'billing_alegra_idtype' => 'CC',
+        'billing_alegra_idtype'         => 'CC',
         'billing_alegra_identification' => '1234567890',
-        'billing_alegra_regime' => 'SIMPLIFIED_REGIME',
-        'billing_first_name' => 'Jane',
-        'billing_last_name' => 'Doe',
+        'billing_first_name'            => 'Jane',
+        'billing_last_name'             => 'Doe',
     ]);
     $order = make_invoice_order(601, 3, 'jane@example.test');
 
     make_orders()->create_invoice($order);
 
     $body = alegra_mock_last_request('POST', '/contacts')['body'] ?? [];
-    TestRunner::assertArrayHasKey('nameObject', $body, 'natural person uses nameObject');
-    TestRunner::assertArrayNotHasKey('name', $body, 'natural person must NOT also send name');
+    TestRunner::assertArrayHasKey('nameObject', $body, 'a contact uses nameObject');
+    TestRunner::assertArrayNotHasKey('name', $body, 'a contact must NOT also send name');
     TestRunner::assertSame('Jane', $body['nameObject']['firstName'] ?? null, 'nameObject.firstName');
     TestRunner::assertSame('Doe', $body['nameObject']['lastName'] ?? null, 'nameObject.lastName');
 });
@@ -539,12 +567,9 @@ TestRunner::test('T5.5 always_generic mode always uses Consumidor Final', functi
     update_option('alegra_connector_customer_resolution_mode', 'always_generic');
     $cf = seed_consumidor_final();
     alegra_make_user(1, ['user_email' => 'acme@example.test'], [
-        'billing_alegra_kindofperson' => 'LEGAL_ENTITY',
         'billing_alegra_idtype' => 'NIT',
         'billing_alegra_identification' => '900123456',
         'billing_alegra_dv' => '1',
-        'billing_alegra_regime' => 'COMMON_REGIME',
-        'billing_alegra_company' => 'Acme SA',
     ]);
     $order = make_invoice_order(604, 1, 'acme@example.test');
 
@@ -605,11 +630,11 @@ TestRunner::test('T6.3 two INTERLEAVED acquire_lock calls: exactly one wins', fu
 });
 
 // ===========================================================================
-// T7 — Stamp failure recovery
+// T7 — Invoice failure handling + reduced billing catalog
 // ===========================================================================
-echo "\nT7 — Stamp failure (create_invoice with a 400 carrying a draft)\n";
+echo "\nT7 — Plain invoice error handling + reduced billing catalog\n";
 
-TestRunner::test('T7.1 the draft invoice id from the error body is persisted and the note explains it', function (): void {
+TestRunner::test('T7.1 a 400 from /invoices surfaces as an error and persists no invoice id', function (): void {
     alegra_test_reset();
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '119']);
     update_post_meta(10, '_alegra_item_id', '1t3m-t7');
@@ -624,23 +649,36 @@ TestRunner::test('T7.1 the draft invoice id from the error body is persisted and
     ]);
 
     alegra_mock_fail('POST', '/invoices', 400, [
-        'message' => 'La factura se creó pero no se pudo emitir',
-        'error' => ['message' => 'DIAN rechazó la emisión'],
-        'invoice' => [
-            'id' => 'draft-t7-uuid',
-            'number' => 'D-1',
-            'numberTemplate' => ['fullNumber' => 'D-1'],
-        ],
+        'message' => 'La factura no se pudo crear',
     ]);
 
     $result = make_orders()->create_invoice($order);
 
     TestRunner::assertInstanceOf(\WP_Error::class, $result, 'the API call must surface an error');
-    TestRunner::assertSame('draft-t7-uuid', $order->get_meta('_alegra_invoice_id', true), 'the created draft id must be persisted');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_id', true), 'a failed POST must not persist an invoice id');
     TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'the 400 must not be retried into a duplicate');
+});
 
-    $notes = implode("\n", $order->get_notes());
-    TestRunner::assertStringContains('NO se emitió', $notes, 'the order note must say the invoice was created but not stamped');
+TestRunner::test('T7.2 the billing catalog is reduced to the identification and the payload carries no extra fiscal fields', function (): void {
+    $keys = array_keys(\Alegra\Connector\Billing_Fields::CATALOG);
+    sort($keys);
+    TestRunner::assertSame(['dv', 'identification', 'idtype'], $keys, 'the catalog must only hold the identification fields');
+
+    alegra_test_reset();
+    $user = alegra_make_user(9, ['user_email' => 'co@example.test', 'display_name' => 'Ana Perez'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_first_name'            => 'Ana',
+        'billing_last_name'             => 'Perez',
+    ]);
+
+    $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
+    TestRunner::assertArrayNotHasKey('kindOfPerson', $payload, 'kindOfPerson must never be sent');
+    TestRunner::assertArrayNotHasKey('regime', $payload, 'regime must never be sent');
+    TestRunner::assertArrayNotHasKey('stamp', $payload, 'a contact payload must never carry stamp');
+    TestRunner::assertSame('CC', $payload['identificationObject']['type'] ?? null, 'CO sends identificationObject.type');
+    TestRunner::assertSame('1234567890', $payload['identificationObject']['number'] ?? null, 'CO sends identificationObject.number');
 });
 
 // ===========================================================================
@@ -740,65 +778,57 @@ echo "\nT9 — Correctness batch 1b\n";
 TestRunner::test('T9.1 AC-26/AC-38 a disabled field is neither required nor sent', function (): void {
     alegra_test_reset();
 
-    // Group A only: `company` (Group B) is disabled.
+    // dv disabled: a NIT without a verification digit must validate.
     update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
-        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1,
+        'idtype' => 1, 'identification' => 1,
     ]);
-
-    $legal_values = [
-        'kindofperson'   => 'LEGAL_ENTITY',
+    $values = [
         'idtype'         => 'NIT',
         'identification' => '900123456',
-        'dv'             => '1',
-        'regime'         => 'COMMON_REGIME',
-        'company'        => '',
+        'dv'             => '',
     ];
-    $validated = \Alegra\Connector\Billing_Fields::validate($legal_values);
-    TestRunner::assertFalse(is_wp_error($validated), 'a disabled company must not be required for a legal entity');
+    $validated = \Alegra\Connector\Billing_Fields::validate($values);
+    TestRunner::assertFalse(is_wp_error($validated), 'a disabled dv must not be required');
 
-    // With company ENABLED the same input must be rejected.
+    // With dv ENABLED the same input must be rejected.
     update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
-        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1, 'company' => 1,
+        'idtype' => 1, 'identification' => 1, 'dv' => 1,
     ]);
-    $rejected = \Alegra\Connector\Billing_Fields::validate($legal_values);
-    TestRunner::assertInstanceOf(\WP_Error::class, $rejected, 'an enabled-but-empty company must be required');
-    TestRunner::assertSame('missing_company', $rejected->get_error_code(), 'error code');
+    $rejected = \Alegra\Connector\Billing_Fields::validate($values);
+    TestRunner::assertInstanceOf(\WP_Error::class, $rejected, 'an enabled dv must be required for a NIT');
+    TestRunner::assertSame('invalid_dv', $rejected->get_error_code(), 'error code');
 
-    // Disabled optional fields must never reach the payload.
+    // A disabled dv must never reach the payload.
     update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
-        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1, 'dv' => 1, 'regime' => 1,
+        'idtype' => 1, 'identification' => 1,
     ]);
     $order = alegra_make_order(900, [
         'total' => 10.0, 'currency' => 'COP',
         'billing' => ['country' => 'CO', 'email' => 'x@example.test', 'first_name' => 'Jane', 'last_name' => 'Doe'],
         'meta' => [
-            '_billing_alegra_kindofperson'   => 'PERSON_ENTITY',
-            '_billing_alegra_idtype'         => 'CC',
-            '_billing_alegra_identification' => '1234567890',
-            '_billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
-            '_billing_alegra_observations'   => 'must not be sent',
-            '_billing_alegra_mobile'         => '3000000000',
+            '_billing_alegra_idtype'         => 'NIT',
+            '_billing_alegra_identification' => '900123456',
+            '_billing_alegra_dv'             => '7',
         ],
     ]);
     $payload = \Alegra\Connector\Billing_Fields::build_guest_contact_payload($order);
     TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
-    TestRunner::assertArrayNotHasKey('observations', $payload, 'a disabled observations field must not be sent');
-    TestRunner::assertArrayNotHasKey('mobile', $payload, 'a disabled mobile field must not be sent');
+    TestRunner::assertArrayNotHasKey('dv', $payload['identificationObject'] ?? [], 'a disabled dv must not be sent');
 });
 
 TestRunner::test('T9.2 AC-38 a disabled field is never saved', function (): void {
     alegra_test_reset();
     update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
-        'kindofperson' => 1, 'idtype' => 1, 'identification' => 1,
+        'idtype' => 1, 'dv' => 1,
     ]);
 
-    $_POST = ['billing_alegra_observations' => 'secret note'];
+    $_POST = ['billing_alegra_identification' => '1234567890'];
     $ref = new ReflectionMethod(\Alegra\Connector\Billing_Fields::class, 'save_registration');
     $ref->setAccessible(true);
     $ref->invoke(null, 55);
     $_POST = [];
 
-    TestRunner::assertSame('', (string) get_user_meta(55, 'billing_alegra_observations', true), 'a disabled field must not be persisted');
+    TestRunner::assertSame('', (string) get_user_meta(55, 'billing_alegra_identification', true), 'a disabled field must not be persisted');
 });
 
 TestRunner::test('T9.3 AC-40 the customers count is not the products count when the customers lock is held', function (): void {
@@ -828,10 +858,8 @@ TestRunner::test('T9.3 AC-40 the customers count is not the products count when 
 TestRunner::test('T9.4 AC-41 a payment-method change after the baseline still syncs', function (): void {
     alegra_test_reset();
     alegra_make_user(7, ['user_email' => 'pm@example.test'], [
-        'billing_alegra_kindofperson'   => 'PERSON_ENTITY',
         'billing_alegra_idtype'         => 'CC',
         'billing_alegra_identification' => '1234567890',
-        'billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
     ]);
     $order = alegra_make_order(910, [
         'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'customer_id' => 7,
@@ -934,14 +962,12 @@ TestRunner::test('T9.9 AC-25 the Consumidor Final cache is invalidated on settin
     TestRunner::assertFalse(\Alegra\Connector\Consumidor_Final::is_consumidor_final($cf), 'a delete-client webhook must drop the CF cache');
 });
 
-TestRunner::test('T9.10 AC-49 Colombia-only fields are gated on the account country', function (): void {
+TestRunner::test('T9.10 the identification shape is gated on the account country and no extra fiscal fields are sent', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_company_country', 'MX');
     $user = alegra_make_user(8, ['user_email' => 'mx@example.test', 'display_name' => 'MX Person'], [
-        'billing_alegra_kindofperson'   => 'PERSON_ENTITY',
         'billing_alegra_idtype'         => 'CC',
         'billing_alegra_identification' => '1234567890',
-        'billing_alegra_regime'         => 'SIMPLIFIED_REGIME',
     ]);
 
     $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
@@ -953,9 +979,10 @@ TestRunner::test('T9.10 AC-49 Colombia-only fields are gated on the account coun
 
     update_option('alegra_connector_company_country', 'CO');
     $co_payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
-    TestRunner::assertSame('PERSON_ENTITY', $co_payload['kindOfPerson'] ?? null, 'CO sends kindOfPerson');
+    TestRunner::assertArrayNotHasKey('kindOfPerson', $co_payload, 'CO must not send kindOfPerson');
+    TestRunner::assertArrayNotHasKey('regime', $co_payload, 'CO must not send regime');
     TestRunner::assertArrayHasKey('identificationObject', $co_payload, 'CO sends identificationObject');
-    TestRunner::assertArrayHasKey('regime', $co_payload, 'CO sends regime');
+    TestRunner::assertSame('CC', $co_payload['identificationObject']['type'] ?? null, 'CO identificationObject.type');
 });
 
 TestRunner::test('T9.11 AC-52 "Run now" schedules a single event and the dead dispatcher is gone', function (): void {
@@ -1158,7 +1185,7 @@ TestRunner::test('T10.8 AC-28/AC-57 uninstall drops every table, deletes the mis
         'alegra_connector_consumidor_final_contact_id',
         'alegra_kill_switch',
         'alegra_connector_dry_run',
-        'alegra_connector_stamp_enabled',
+        'alegra_connector_invoice_status',
         'alegra_connector_push_category_strategy',
         'alegra_connector_import_category_parent',
         'alegra_connector_customer_resolution_mode',

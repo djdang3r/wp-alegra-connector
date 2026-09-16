@@ -298,7 +298,6 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
             'status' => 'open',
             'total' => alegra_mock_body_total($body),
             'balance' => alegra_mock_body_total($body),
-            'emission_status' => 'STAMPED',
         ]);
         $GLOBALS['alegra_mock_state']['invoices'][$id] = $stored;
         return alegra_mock_response(200, $stored);
@@ -317,6 +316,12 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     }
     if ($method === 'POST' && preg_match('#^/invoices/([^/]+)/void$#', $path, $m)) {
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'void']);
+    }
+    if ($method === 'POST' && preg_match('#^/invoices/([^/]+)/open$#', $path, $m)) {
+        if (isset($GLOBALS['alegra_mock_state']['invoices'][$m[1]])) {
+            $GLOBALS['alegra_mock_state']['invoices'][$m[1]]['status'] = 'open';
+        }
+        return alegra_mock_response(200, ['id' => $m[1], 'status' => 'open']);
     }
 
     // --- PUT ---

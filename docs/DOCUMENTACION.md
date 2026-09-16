@@ -279,7 +279,6 @@ POST   /invoices                       Crear factura
 PUT    /invoices/{id}                  Actualizar factura
 POST   /invoices/{id}/void             Anular factura
 POST   /invoices/{id}/open             Reabrir factura
-POST   /invoices/{id}/stamp            Timbrar factura
 PUT    /invoices/{id}/retentions-applied  Editar retenciones
 ```
 
@@ -423,7 +422,7 @@ WooCommerce: Pedido completado
         items: [{id, name, price, quantity, tax}]
         numberTemplate: {id: auto-detectado}
         currency: {code: COP/USD/...}
-        paymentForm/paymentMethod: mapeado desde gateway
+        status: borrador (o abierta, segun configuracion)
     → 3. API::create_invoice(data)
     → 4. sync_inventory_to_alegra()
     → 5. prepare_payment_data() + API::create_payment()

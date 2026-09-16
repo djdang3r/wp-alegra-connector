@@ -32,7 +32,7 @@ class Orders
         $this->logger = $logger;
     }
 
-    public function create_invoice(\WC_Order $order): array|\WP_Error
+    public function create_invoice(\WC_Order $order, ?string $status_override = null): array|\WP_Error
     {
         $order_id = (int) $order->get_id();
         $lock_key = 'alegra_invoice_lock_' . $order_id;
@@ -61,7 +61,7 @@ class Orders
                 return ['id' => $alegra_id, 'already_exists' => true];
             }
 
-            $data = $this->prepare_invoice_data($order);
+            $data = $this->prepare_invoice_data($order, $status_override);
             if (is_wp_error($data)) {
                 return $data;
             }
@@ -91,53 +91,11 @@ class Orders
             $result = $this->api->create_invoice($data);
 
             if (is_wp_error($result)) {
-                $error_data = $result->get_error_data();
-                $response   = is_array($error_data) ? ($error_data['response'] ?? null) : null;
-
-                // AC-13: a failed stamp still creates the invoice as a draft and
-                // returns HTTP 400 with the created invoice in the body. Persist
-                // its id so a retry does not create a SECOND invoice.
-                $created_invoice = is_array($response) ? ($response['invoice'] ?? null) : null;
-                $created_id = is_array($created_invoice) ? (string) ($created_invoice['id'] ?? '') : '';
-
-                if ($created_id !== '') {
-                    $this->persist_invoice_result($order, $created_id, $created_invoice);
-
-                    $stamp_error = '';
-                    if (is_array($response) && isset($response['error'])) {
-                        $err = $response['error'];
-                        $stamp_error = is_array($err) ? (string) ($err['message'] ?? '') : (string) $err;
-                    }
-                    if ($stamp_error === '') {
-                        $stamp_error = $result->get_error_message();
-                    }
-
-                    $order->add_order_note(sprintf(
-                        __('[Alegra] La factura #%s se creó en Alegra pero NO se emitió ante la DIAN: %s. No se reintentará la creación; vuelve a emitirla manualmente.', 'alegra-connector'),
-                        $created_id,
-                        $stamp_error
-                    ));
-                    $this->logger->error('Invoice created as draft but stamp failed', [
-                        'order_id'   => $order_id,
-                        'invoice_id' => $created_id,
-                        'error'      => $stamp_error,
+                if ($this->logger) {
+                    $this->logger->error('Invoice creation failed', [
+                        'order_id' => $order_id,
+                        'error'    => $result->get_error_message(),
                     ]);
-                } else {
-                    if ($this->logger) {
-                        $this->logger->error('Invoice creation failed', [
-                            'order_id' => $order_id,
-                            'error'    => $result->get_error_message(),
-                        ]);
-                    }
-
-                    $http_code = is_array($error_data) ? (int) ($error_data['code'] ?? 0) : 0;
-                    $message   = $result->get_error_message();
-                    if ($http_code === 400 && preg_match('/stamp|emisi[oó]n|DIAN/i', $message)) {
-                        $order->add_order_note(sprintf(
-                            __('[Alegra] La DIAN rechazó la emisión de la factura: %s', 'alegra-connector'),
-                            $message
-                        ));
-                    }
                 }
 
                 return $result;
@@ -166,9 +124,8 @@ class Orders
     /**
      * Persist an Alegra invoice id/number on the order.
      *
-     * Used on success, when a failed stamp still returned the created draft
-     * (AC-13), and when the idempotency pre-search recovers an existing invoice
-     * (AC-14).
+     * Used on success and when the idempotency pre-search recovers an existing
+     * invoice (AC-14).
      *
      * @param array<string, mixed> $invoice The Alegra invoice payload.
      */
@@ -280,7 +237,14 @@ class Orders
 
     public function create_invoice_with_payment(\WC_Order $order): array|\WP_Error
     {
-        $invoice_result = $this->create_invoice($order);
+        // A payment is recorded separately (POST /payments) after the invoice.
+        // Alegra only allows a payment on an OPEN invoice, so when a bank
+        // account is configured the invoice is created open instead of the
+        // configured draft status.
+        $will_record_payment = (string) get_option('alegra_connector_payment_account_id', '') !== ''
+            && (string) $order->get_meta('_alegra_payment_id', true) === '';
+
+        $invoice_result = $this->create_invoice($order, $will_record_payment ? 'open' : null);
 
         if (is_wp_error($invoice_result)) {
             return $invoice_result;
@@ -296,6 +260,13 @@ class Orders
         $existing_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment_id !== '') {
             return $invoice_result;
+        }
+
+        // Alegra only accepts a payment on an OPEN invoice. When the invoice
+        // was created earlier as a draft (the default, e.g. by the
+        // `woocommerce_new_order` hook) open it before applying the payment.
+        if ($will_record_payment && !empty($invoice_result['already_exists'])) {
+            $this->ensure_invoice_open((string) $invoice_result['id']);
         }
 
         // AC-14: recover a payment Alegra committed but whose response was lost.
@@ -343,12 +314,41 @@ class Orders
     }
 
     /**
+     * Open a draft invoice so a payment can be applied to it.
+     *
+     * No-op when the invoice is already open or cannot be read; failures are
+     * logged so the payment attempt still surfaces Alegra's own error.
+     */
+    private function ensure_invoice_open(string $invoice_id): void
+    {
+        if ($invoice_id === '') {
+            return;
+        }
+
+        $invoice = $this->api->get_invoice($invoice_id);
+        if (is_wp_error($invoice) || !is_array($invoice)) {
+            return;
+        }
+        if ((string) ($invoice['status'] ?? '') !== 'draft') {
+            return;
+        }
+
+        $opened = $this->api->open_invoice($invoice_id);
+        if (is_wp_error($opened) && $this->logger) {
+            $this->logger->warning('Could not open a draft invoice before recording a payment', [
+                'invoice_id' => $invoice_id,
+                'error'      => $opened->get_error_message(),
+            ]);
+        }
+    }
+
+    /**
      * Create a credit note for the whole order (legacy entry point).
      *
      * Naming-drift collapse (root cause of AC-04): this used to be a SECOND,
      * independent credit-note implementation with its own idempotency key
      * (`_alegra_credit_note_id`) and its own payload shape. Together with the
-     * per-refund path it let one full refund issue two DIAN credit notes. It now
+     * per-refund path it let one full refund issue two credit notes. It now
      * delegates to the single implementation, create_credit_note_for_refund(),
      * so every caller shares one payload builder, one cumulative cap and one
      * idempotency key.
@@ -426,15 +426,6 @@ class Orders
         }
 
         $invoice = $this->api->get_invoice($invoice_id);
-        if (!is_wp_error($invoice) && is_array($invoice)) {
-            $emission = (string) ($invoice['emission_status'] ?? '');
-            if ($emission === 'PENDING' || $emission === '') {
-                return new \WP_Error(
-                    'invoice_not_stamped',
-                    __('No se puede crear la nota de crédito: la factura original no está emitida ante la DIAN.', 'alegra-connector')
-                );
-            }
-        }
 
         // Cumulative cap: never credit more than the original invoice total.
         $credited = (float) $order->get_meta('_alegra_credited_amount', true);
@@ -469,7 +460,7 @@ class Orders
             }
         } else {
             // Partial refund: a single line for exactly the refunded amount, so the
-            // credit note total matches the refund (no DIAN over-crediting).
+            // credit note total matches the refund (no over-crediting).
             $items = [[
                 'name'        => __('Reembolso parcial', 'alegra-connector'),
                 'description' => $reason !== '' ? $reason : __('Reembolso parcial', 'alegra-connector'),
@@ -500,10 +491,6 @@ class Orders
             ]],
             'items'    => $items,
         ];
-
-        if (get_option('alegra_connector_stamp_enabled', true)) {
-            $data['stamp'] = ['generateStamp' => true];
-        }
 
         $result = $this->api->create_credit_note($data);
 
@@ -602,7 +589,7 @@ class Orders
         return $result;
     }
 
-    private function prepare_invoice_data(\WC_Order $order): array|\WP_Error
+    private function prepare_invoice_data(\WC_Order $order, ?string $status_override = null): array|\WP_Error
     {
         // Sync customer first if needed
         $customer_alegra_id = $this->ensure_customer_synced($order);
@@ -615,13 +602,18 @@ class Orders
 
         $client_data = $this->build_client_data($order, $customer_alegra_id);
 
-        // Country must be resolved BEFORE being used (PHP 8+ safe + correct logic).
-        $country = (string) $order->get_billing_country();
-
         // AC-10: invoice lines require an Alegra item id; abort if unresolvable.
         $items = $this->prepare_invoice_items($order);
         if (is_wp_error($items)) {
             return $items;
+        }
+
+        // Alegra creates the invoice as a draft when `status` is omitted and no
+        // payments are sent. The default is therefore draft so the merchant can
+        // review it; an OPEN invoice is only forced when a payment is applied.
+        $status = $status_override ?? (string) get_option('alegra_connector_invoice_status', 'draft');
+        if (!in_array($status, ['draft', 'open'], true)) {
+            $status = 'draft';
         }
 
         $data = [
@@ -631,39 +623,8 @@ class Orders
             'items' => $items,
             'currency' => ['code' => $order->get_currency() ?: get_option('alegra_connector_currency', 'COP')],
             'observations' => sprintf(__('Pedido WooCommerce #%d', 'alegra-connector'), $order->get_id()),
-            'status' => 'open',
+            'status' => $status,
         ];
-
-        // Payment method mapping.
-        // Colombia (DIAN, FE 2.1) uses paymentForm (CASH/CREDIT) + the uppercase
-        // DIAN "Medio de pago" catalog. Every other country keeps the lowercase
-        // global codes (the /payments schema is lowercase; the invoice-level
-        // paymentMethod is only defined per-country and is optional elsewhere).
-        $payment = $this->map_payment_method($order);
-        if ($payment) {
-            if ($country === 'CO') {
-                $data['paymentForm'] = $payment['form'];
-                $dian_method = $this->map_dian_payment_method($order);
-                if ($dian_method !== '') {
-                    $data['paymentMethod'] = $dian_method;
-                } else {
-                    // Never guess: omit so Alegra applies its default. Log it.
-                    if ($this->logger) {
-                        $this->logger->info('Colombia invoice: no DIAN payment method for gateway, omitting paymentMethod', [
-                            'order_id' => $order->get_id(),
-                            'gateway'  => $order->get_payment_method(),
-                        ]);
-                    }
-                }
-            } else {
-                $data['paymentMethod'] = $payment['method'];
-            }
-        }
-
-        // Country-specific fields
-        if ($country === 'CO') {
-            $data['type'] = 'NATIONAL';
-        }
 
         // Number template (auto-detect preferred)
         $template = $this->get_preferred_number_template();
@@ -681,11 +642,6 @@ class Orders
         $warehouse = (string) get_option('alegra_connector_warehouse_id', '');
         if ($warehouse !== '' && get_option('alegra_connector_warehouse_enabled')) {
             $data['warehouse'] = $warehouse;
-        }
-
-        // Issue the e-invoice to DIAN (required for Colombian e-invoicing)
-        if (get_option('alegra_connector_stamp_enabled', true) && $country === 'CO') {
-            $data['stamp'] = ['generateStamp' => true];
         }
 
         return $data;
@@ -1111,21 +1067,6 @@ class Orders
         return (string) get_option('alegra_connector_payment_term_id', '');
     }
 
-    private function map_payment_method(\WC_Order $order): ?array
-    {
-        $method = $order->get_payment_method();
-
-        $mappings = $this->get_payment_gateway_mappings();
-
-        foreach ($mappings as $slug => $data) {
-            if (strpos($method, $slug) !== false) {
-                return $data;
-            }
-        }
-
-        return ['form' => 'CREDIT', 'method' => 'transfer'];
-    }
-
     private function get_payment_method_code(\WC_Order $order): string
     {
         $method = $order->get_payment_method();
@@ -1155,108 +1096,6 @@ class Orders
         }
 
         return 'cash';
-    }
-
-    /**
-     * Payment gateway → Alegra form/method mapping
-     */
-    private function get_payment_gateway_mappings(): array
-    {
-        return [
-            'bacs' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'cod' => ['form' => 'CASH', 'method' => 'cash'],
-            'cheque' => ['form' => 'CREDIT', 'method' => 'check'],
-            'paypal' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'stripe' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'mercadopago' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'woocommerce-mercado-pago' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'woo-mercado-pago' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'payu' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'epayco' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'woocommerce_payments' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'square' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'razorpay' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'payfast' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'dlocal' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'ebanx' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'woo-wompi' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'openpay' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'clip' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'culqi' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'pse' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'efecty' => ['form' => 'CASH', 'method' => 'cash'],
-            'baloto' => ['form' => 'CASH', 'method' => 'cash'],
-            'oxxo' => ['form' => 'CASH', 'method' => 'cash'],
-            'spei' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'webpay' => ['form' => 'CREDIT', 'method' => 'credit-card'],
-            'flow' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'khipu' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'mach' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'servipag' => ['form' => 'CASH', 'method' => 'cash'],
-            'safetypay' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'multicaja' => ['form' => 'CASH', 'method' => 'cash'],
-            'billetera' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'transferencia' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'nequi' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'daviplata' => ['form' => 'CREDIT', 'method' => 'transfer'],
-            'bancolombia' => ['form' => 'CREDIT', 'method' => 'transfer'],
-        ];
-    }
-
-    /**
-     * Map a WooCommerce gateway to a DIAN "Medio de pago" code (Colombia).
-     *
-     * Catalog: https://developer.alegra.com/docs/colombia.md ("Medios de pago").
-     * Returns '' when the gateway has no unambiguous DIAN code — the caller then
-     * omits `paymentMethod` (Alegra applies its default) rather than guessing.
-     */
-    private function map_dian_payment_method(\WC_Order $order): string
-    {
-        $method = (string) $order->get_payment_method();
-
-        foreach ($this->get_dian_payment_method_mappings() as $slug => $code) {
-            if (strpos($method, $slug) !== false) {
-                return $code;
-            }
-        }
-
-        return '';
-    }
-
-    /**
-     * WC gateway slug → DIAN "Medio de pago" code (Colombia only).
-     *
-     * Only gateways whose DIAN equivalent is unambiguous are listed. PayPal and
-     * wallet gateways (Nequi/Daviplata/Wompi) are intentionally omitted so the
-     * field is left to Alegra's default instead of sending a wrong code.
-     */
-    private function get_dian_payment_method_mappings(): array
-    {
-        return [
-            'bacs'                    => 'CREDIT_TRANSFER',
-            'cheque'                  => 'CHECK',
-            'cod'                     => 'CASH',
-            'pse'                     => 'CREDIT_TRANSFER',
-            'bancolombia'             => 'CREDIT_TRANSFER',
-            'transferencia'           => 'CREDIT_TRANSFER',
-            'stripe'                  => 'CREDIT_CARD',
-            'woocommerce_payments'    => 'CREDIT_CARD',
-            'mercadopago'             => 'CREDIT_CARD',
-            'woocommerce-mercado-pago' => 'CREDIT_CARD',
-            'woo-mercado-pago'        => 'CREDIT_CARD',
-            'payu'                    => 'CREDIT_CARD',
-            'epayco'                  => 'CREDIT_CARD',
-            'square'                  => 'CREDIT_CARD',
-            'razorpay'                => 'CREDIT_CARD',
-            'payfast'                 => 'CREDIT_CARD',
-            'dlocal'                  => 'CREDIT_CARD',
-            'ebanx'                   => 'CREDIT_CARD',
-            'openpay'                 => 'CREDIT_CARD',
-            'clip'                    => 'CREDIT_CARD',
-            'culqi'                   => 'CREDIT_CARD',
-            'efecty'                  => 'CASH',
-            'baloto'                  => 'CASH',
-        ];
     }
 
     /**

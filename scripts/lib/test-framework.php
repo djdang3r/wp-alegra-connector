@@ -171,7 +171,7 @@ function alegra_test_reset(): void
     $GLOBALS['wp_options']['alegra_connector_api_url'] = ALEGRA_MOCK_BASE;
     $GLOBALS['wp_options']['alegra_connector_email'] = 'harness@example.test';
     $GLOBALS['wp_options']['alegra_connector_token'] = 'harness-token';
-    $GLOBALS['wp_options']['alegra_connector_stamp_enabled'] = true;
+    $GLOBALS['wp_options']['alegra_connector_invoice_status'] = 'draft';
     $GLOBALS['wp_options']['alegra_connector_sync_method'] = 'both';
     $GLOBALS['wp_options']['alegra_connector_push_orders_enabled'] = true;
     $GLOBALS['wp_options']['alegra_connector_push_products_enabled'] = false;
@@ -180,9 +180,9 @@ function alegra_test_reset(): void
     $GLOBALS['wp_options']['alegra_connector_auto_complete_order'] = true;
     $GLOBALS['wp_options']['alegra_connector_sync_images'] = false;
 
-    // Configured store: every billing field enabled. Mirrors enable_all() and
-    // the Group A seeding the settings sanitizer performs on an install. A test
-    // that needs a DISABLED field overrides this option explicitly.
+    // Configured store: every billing field enabled. Mirrors the Group A
+    // seeding the settings sanitizer performs on an install. A test that needs
+    // a DISABLED field overrides this option explicitly.
     $billing_enabled = [];
     foreach (\Alegra\Connector\Billing_Fields::CATALOG as $bf_key => $bf_field) {
         $billing_enabled[$bf_key] = 1;

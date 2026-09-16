@@ -96,8 +96,6 @@ class Checkout_Integration
         add_action('woocommerce_init', static function (): void {
             if (self::detect() === 'blocks') {
                 self::register_blocks_fields();
-            } else {
-                self::register_legacy_fields();
             }
         }, 20);
 
@@ -131,7 +129,7 @@ class Checkout_Integration
     private static function register_blocks_fields(): void
     {
         if (!function_exists('woocommerce_register_additional_checkout_field')) {
-            self::register_legacy_fields();
+            // Billing_Fields injects the fields through `woocommerce_checkout_fields`.
             return;
         }
 
@@ -142,43 +140,6 @@ class Checkout_Integration
 
             woocommerce_register_additional_checkout_field(self::block_field_args($key, $field));
         }
-    }
-
-    /**
-     * Legacy checkout: Billing_Fields already injects the fields through its
-     * own `woocommerce_checkout_fields` filter, so here we only guarantee the
-     * group C collapse marker class is present for the JS layer.
-     */
-    private static function register_legacy_fields(): void
-    {
-        add_filter('woocommerce_checkout_fields', static function (array $fields): array {
-            if (!isset($fields['billing']) || !is_array($fields['billing'])) {
-                return $fields;
-            }
-
-            foreach (Billing_Fields::CATALOG as $key => $field) {
-                if ((string) ($field['group'] ?? '') !== 'C') {
-                    continue;
-                }
-
-                $name = 'billing_alegra_' . $key;
-                if (!isset($fields['billing'][$name])) {
-                    continue;
-                }
-
-                $classes = isset($fields['billing'][$name]['class'])
-                    ? (array) $fields['billing'][$name]['class']
-                    : [];
-
-                if (!in_array('alegra-group-c', $classes, true)) {
-                    $classes[] = 'alegra-group-c';
-                }
-
-                $fields['billing'][$name]['class'] = $classes;
-            }
-
-            return $fields;
-        }, 20);
     }
 
     /**
@@ -221,18 +182,13 @@ class Checkout_Integration
     /**
      * Options for a select field, in the Blocks API shape.
      *
-     * For idtype/regime the union of person + legal options is registered;
-     * the JS repopulates per person type and the server validates.
-     *
      * @param array<string, mixed> $field Catalog entry.
      * @return array<int, array<string, string>>
      */
     private static function block_options(string $key, array $field): array
     {
         if ($key === 'idtype') {
-            $map = array_merge(Billing_Fields::ID_TYPES_PERSON, Billing_Fields::ID_TYPES_LEGAL);
-        } elseif ($key === 'regime') {
-            $map = array_merge(Billing_Fields::REGIMES_PERSON, Billing_Fields::REGIMES_LEGAL);
+            $map = Billing_Fields::ID_TYPES;
         } else {
             $map = isset($field['options']) && is_array($field['options']) ? $field['options'] : [];
         }
@@ -270,17 +226,6 @@ class Checkout_Integration
                     'required' => $schema([self::FIELD_NAMESPACE . '/idtype' => ['const' => 'NIT']]),
                     'hidden'   => $schema([self::FIELD_NAMESPACE . '/idtype' => ['not' => ['const' => 'NIT']]]),
                 ];
-            case 'company':
-                return [
-                    'required' => $schema([self::FIELD_NAMESPACE . '/kindofperson' => ['const' => 'LEGAL_ENTITY']]),
-                    'hidden'   => $schema([self::FIELD_NAMESPACE . '/kindofperson' => ['not' => ['const' => 'LEGAL_ENTITY']]]),
-                ];
-            case 'secondname':
-            case 'secondlastname':
-                return [
-                    'required' => false,
-                    'hidden'   => $schema([self::FIELD_NAMESPACE . '/kindofperson' => ['not' => ['const' => 'PERSON_ENTITY']]]),
-                ];
         }
 
         return null;
@@ -308,15 +253,10 @@ class Checkout_Integration
         );
 
         wp_localize_script('alegra-checkout-conditions', 'alegraCheckout', [
-            'idTypesPerson' => Billing_Fields::ID_TYPES_PERSON,
-            'idTypesLegal'  => Billing_Fields::ID_TYPES_LEGAL,
-            'regimesPerson' => Billing_Fields::REGIMES_PERSON,
-            'regimesLegal'  => Billing_Fields::REGIMES_LEGAL,
             'prefix'        => 'billing_alegra_',
             // AC-35d: user-facing strings, no longer hardcoded in the JS file.
             'strings'       => [
                 'selectPlaceholder' => __('Seleccione…', 'alegra-connector'),
-                'moreData'          => __('Más datos (opcional)', 'alegra-connector'),
             ],
         ]);
     }

@@ -71,7 +71,6 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_skip_cron_next', [$this, 'ajax_skip_cron_next']);
         add_action('wp_ajax_alegra_unschedule_cron', [$this, 'ajax_unschedule_cron']);
         add_action('wp_ajax_alegra_change_cron_frequency', [$this, 'ajax_change_cron_frequency']);
-        add_action('wp_ajax_alegra_enable_all_billing_fields', [$this, 'ajax_enable_all_billing_fields']);
     }
 
     /**
@@ -360,9 +359,12 @@ class Admin_Dashboard
             },
             'default' => 'auto',
         ]);
-        register_setting('alegra_connector_settings', 'alegra_connector_stamp_enabled', [
-            'sanitize_callback' => 'rest_sanitize_boolean',
-            'default' => true,
+        register_setting('alegra_connector_settings', 'alegra_connector_invoice_status', [
+            'sanitize_callback' => function ($value) {
+                $allowed = ['draft', 'open'];
+                return in_array($value, $allowed, true) ? $value : 'draft';
+            },
+            'default' => 'draft',
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_dry_run', [
             'sanitize_callback' => 'rest_sanitize_boolean',
@@ -404,8 +406,8 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_consumidor_final_manual_id'),
         ]);
 
-        // Per-field billing toggles. Group A (Obligatorios) is force-enabled here
-        // so an admin can never break e-invoicing from the UI.
+        // Per-field billing toggles. Group A (identification) is force-enabled
+        // here so the identification is always collected.
         register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
             'sanitize_callback' => function ($value) {
                 $enabled = [];
@@ -427,9 +429,9 @@ class Admin_Dashboard
         ]);
 
         // Seed the required (Group A) fields whenever the catalog is empty so
-        // e-invoicing works out of the box instead of silently rendering no
-        // fields at checkout. Once saved, the sanitizer always keeps Group A,
-        // so this only ever writes on an unconfigured install.
+        // the identification is collected out of the box instead of silently
+        // rendering no fields at checkout. Once saved, the sanitizer always
+        // keeps Group A, so this only ever writes on an unconfigured install.
         $current_billing_fields = get_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, []);
         if (!is_array($current_billing_fields) || empty($current_billing_fields)) {
             $seed = [];
@@ -449,7 +451,7 @@ class Admin_Dashboard
         add_settings_section('alegra_connector_sync_settings', __('Sincronización', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_currency_section', __('Moneda', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_warehouse_section', __('Bodegas', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_billing_section', __('Facturación electrónica', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
+        add_settings_section('alegra_connector_billing_section', __('Datos de facturación', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_advanced', __('Avanzado', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
     }
 
@@ -2494,25 +2496,6 @@ class Admin_Dashboard
 
         wp_send_json_success([
             'message' => __('Plugin reactivado. Las operaciones volveran a funcionar.', 'alegra-connector'),
-        ]);
-    }
-
-    /**
-     * AJAX: Enable every billing field in the catalog at once.
-     */
-    public function ajax_enable_all_billing_fields(): void
-    {
-        check_ajax_referer('alegra_connector_nonce');
-        if (!current_user_can('manage_woocommerce')) {
-            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
-        }
-
-        $count = \Alegra\Connector\Billing_Fields::enable_all();
-
-        wp_send_json_success([
-            'count' => $count,
-            /* translators: %d: number of billing fields enabled. */
-            'message' => sprintf(__('Se habilitaron los %d campos de facturación.', 'alegra-connector'), $count),
         ]);
     }
 

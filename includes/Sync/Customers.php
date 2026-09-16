@@ -394,13 +394,7 @@ class Customers
             update_user_meta($user_id, 'alegra_notes', $contact['observations']);
         }
 
-        // Mirror the new Alegra fields (2.3.0). Normalize enums to uppercase.
-        if (!empty($contact['kindOfPerson'])) {
-            update_user_meta($user_id, 'billing_alegra_kindofperson', strtoupper((string) $contact['kindOfPerson']));
-        }
-        if (!empty($contact['regime'])) {
-            update_user_meta($user_id, 'billing_alegra_regime', strtoupper((string) $contact['regime']));
-        }
+        // Mirror the identification Alegra returns. Normalize enums to uppercase.
         $id_obj = $contact['identificationObject'] ?? null;
         if (is_array($id_obj)) {
             if (!empty($id_obj['type'])) {

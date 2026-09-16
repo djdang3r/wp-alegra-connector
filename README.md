@@ -14,7 +14,8 @@ Alegra Connector allows you to synchronize your WooCommerce store with the Alegr
 
 * **Products Sync**: Synchronize products and services bidirectionally with images
 * **Customers Sync**: Keep your customers updated across both platforms (WC lookup table)
-* **Orders to Invoices**: Automatically create invoices in Alegra from WooCommerce orders with number feedback
+* **Orders to Invoices**: Automatically (or manually) create invoices in Alegra from WooCommerce orders, as drafts by default so you can review them
+* **Customer identification**: Collect the document type/number (the only billing datum WooCommerce does not collect) and link each invoice to the right contact
 * **Payment Recording**: Register payments against Alegra invoices from WC orders
 * **Categories Sync**: Synchronize product categories
 * **Multi-currency**: Support for COP, USD, MXN, EUR, and more

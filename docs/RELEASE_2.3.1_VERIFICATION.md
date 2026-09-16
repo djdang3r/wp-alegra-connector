@@ -3,16 +3,20 @@
 Esta guía es la **lista de validación** de la versión 2.3.1. La 2.3.1 **reemplaza
 a la 2.3.0**, que se publicó rota: traía dos errores fatales
 (`update_transient()` no existe en WordPress; `map_product_tax()` devolvía `int`
-desde un método `: string` bajo `strict_types`), una nota crédito duplicada ante
-la DIAN y varios defectos de correctitud. La 2.3.1 corrige los 68 hallazgos de
+desde un método `: string` bajo `strict_types`), una nota crédito duplicada y
+varios defectos de correctitud. La 2.3.1 corrige los 68 hallazgos de
 la auditoría (lotes 0–3).
+
+> **Nota posterior:** la emisión electrónica DIAN (timbrado) que traía la 2.3.0
+> fue **eliminada**; era una feature no pedida y activada por defecto. Ver el
+> ítem 5 más abajo. El plugin solo crea el documento en Alegra.
 
 La 2.3.0 se construyó contra la **documentación oficial** de Alegra y de
 WooCommerce, pero **nueve comportamientos concretos nunca se probaron contra la
 API real de Alegra ni contra una tienda real**. La auditoría posterior resolvió
 parte de ellos:
 
-- **4 resueltos por la documentación** (2, 3, 5 y 6): ya no hace falta probarlos.
+- **3 resueltos por la documentación** (2, 3 y 6): ya no hace falta probarlos.
 - **2 resultaron ser bugs** (8 y 9): no eran "verificar", eran errores reales,
   y quedaron **corregidos** en la 2.3.1.
 - **3 siguen necesitando prueba en vivo** (1, 4 y 7).
@@ -151,21 +155,20 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 ---
 
-## 5. `stamp.generateStamp` (emisión ante la DIAN) — ✅ RESUELTO (documentación)
+## 5. Emisión electrónica ante la DIAN — ❌ ELIMINADA
 
-**Estado: resuelto. Ya no hace falta probarlo en vivo.**
+**Estado: la funcionalidad de timbrado electrónico fue eliminada del plugin.**
 
-- **Qué se asumía:** que el campo `stamp.generateStamp` emite de verdad la
-  factura ante la DIAN.
-- **Qué dice la documentación:** para Colombia, el body de `POST /invoices`
-  acepta el objeto `stamp: { "generateStamp": true }` para emitir la factura.
-  La documentación además describe el caso de fallo que el plugin ya maneja:
-  si el timbrado falla, Alegra crea el documento y devuelve `400` con el error y
-  el documento creado en la respuesta.
-  - https://developer.alegra.com/reference/post_invoices
-- **Conclusión:** la forma del payload es la documentada. (La emisión real ante
-  la DIAN depende de que tu cuenta tenga configurado el certificado y la llave
-  privada; eso sí es config de cuenta, no del plugin.)
+- **Qué pasó:** la 2.3.0 agregó el timbrado electrónico DIAN
+  (`stamp.generateStamp`) como una feature **no pedida y activada por defecto**.
+  Un comercio colombiano que instalaba el plugin emitía facturas legales ante la
+  DIAN para cada pedido y cada reembolso, de forma irreversible.
+- **Qué se hizo:** se eliminó todo el timbrado, el catálogo DIAN de medios de
+  pago, el `paymentForm`, la opción `stamp_enabled`, su UI y su indicador de
+  salud. Las facturas ahora se crean como **borrador** (o abiertas, según la
+  opción "Estado de las facturas") y **no se envían a la DIAN**.
+- **Ya no hace falta probar nada de esto.** Si necesitas emitir ante la DIAN,
+  hacelo desde Alegra; el plugin solo crea el documento.
 
 ---
 
@@ -188,8 +191,7 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 - **Qué se asume:** que el contacto **"Consumidor Final"** ya existe en tu
   cuenta de Alegra con estos datos exactos: identificación
-  **`222222222222`**, tipo **`CC`**, persona **`PERSON_ENTITY`**, régimen
-  **`SIMPLIFIED_REGIME`**. El plugin lo **busca pero nunca lo crea**
+  **`222222222222`** y tipo **`CC`**. El plugin lo **busca pero nunca lo crea**
   (`includes/Consumidor_Final.php:20`). Es el respaldo cuando un pedido no
   trae datos de facturación suficientes.
 - **Por qué importa:** si el contacto no existe y el pedido no tiene datos, la
@@ -205,7 +207,7 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 - **Si falla:** el widget dirá **"No encontrado en Alegra"** (ámbar) y te
   pedirá crearlo. Créalo a mano con los datos exactos de arriba. Si prefieres
   usar otro contacto, actívalo en
-  `Alegra Connector → Configuración → Facturación electrónica → "Consumidor
+  `Alegra Connector → Configuración → Datos de facturación → "Consumidor
   Final manual"`.
 - **Riesgo: Alto.** Sin Consumidor Final, los pedidos sin datos completos no se
   facturan.
@@ -243,7 +245,7 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
   eran atómicos (`get_transient` + `set_transient`, AC-03): dos workers podían
   leer vacío, ambos escribir y ambos ganar. Y el camino de nota crédito sin
   guardia **nunca** actualizaba `_alegra_credited_amount` (AC-09). Resultado:
-  reembolsos concurrentes podían acreditar de más ante la DIAN, por encima del
+  reembolsos concurrentes podían acreditar de más, por encima del
   total de la factura.
 - **Qué se corrigió:** los locks ahora usan un **compare-and-swap** sobre
   `add_option()` (`wp_options.option_name` es UNIQUE), con reclamación de locks
@@ -268,9 +270,9 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 5. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
    prueba del paso anterior.
 6. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
-7. **Pedido real de bajo valor + emisión DIAN.** Acá empieza lo que toca dinero
-   real: confirma que la factura queda emitida (el payload es el documentado,
-   ítem 5, pero la emisión depende de tu cuenta).
+7. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirma
+   que la factura se crea en Alegra (en borrador por defecto) y que queda
+   vinculada al cliente correcto.
 8. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
    crédito ligada a la factura (el formato es el documentado, ítem 6; el cap es
    atómico, ítem 9).
@@ -292,9 +294,9 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
    - **Ojo:** la 2.3.0 migró las columnas `alegra_id` de `BIGINT` a
      `VARCHAR(36)`; eso **no** se revierte. Con IDs numéricos, 2.2.0 sigue
      funcionando.
-4. **Mientras esté en duda la emisión DIAN**, puedes desmarcar **"Emitir
-   facturas ante la DIAN"** para que las facturas queden en borrador y no se
-   envíen a la DIAN, y seguir operando con cautela.
+4. **Estado de las facturas:** por defecto se crean como **borrador** para que
+   las revises antes de emitirlas. Si querés que se creen abiertas, cambialo en
+   `Alegra Connector → Configuración → Datos de facturación`.
 5. **No borres** pedidos, notas crédito ni facturas de Alegra para "limpiar":
    primero entiende qué pasó.
 
@@ -311,20 +313,19 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 ### Las 3 verificaciones que quedan
 - [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
       (webhook o poll).
-- [ ] **4.** En Blocks: NIT → aparece Dígito de verificación; Persona Jurídica
-      → aparece Razón social (y se ocultan al revés).
+- [ ] **4.** En Blocks: al elegir NIT aparece el Dígito de verificación (y se
+      oculta con los demás tipos de documento).
 - [ ] **7.** Consumidor Final: widget en verde **"Disponible"**.
 
 ### Ya resueltos (no requieren prueba en vivo)
 - [x] **2.** `idItemCategory` es un valor único; el push de una categoría es
       correcto (documentación).
 - [x] **3.** El push de categoría acepta `{id}` (documentación).
-- [x] **5.** `stamp.generateStamp` es la forma documentada (documentación).
 - [x] **6.** `invoices: [{id, amount}]` es la forma documentada (documentación).
 - [x] **8.** HPOS: era un `get_post_meta()` en el panel; corregido.
 - [x] **9.** Cap de reembolsos: locks no atómicos; corregidos.
 
 ### Cierre
 - [ ] "Modo de prueba" **desactivado**.
-- [ ] "Emitir facturas ante la DIAN" en el estado deseado.
+- [ ] "Estado de las facturas" en el estado deseado (borrador por defecto).
 - [ ] Logs revisados y sin errores `[Alegra]` repetidos.
