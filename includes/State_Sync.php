@@ -129,25 +129,27 @@ class State_Sync
             }
 
             $orders = self::make_orders_handler();
-            if ($orders === null || !method_exists($orders, 'create_credit_note_for_refund')) {
-                return new \WP_Error('not_implemented', 'Pending Phase 2');
+            if ($orders === null) {
+                return new \WP_Error('orders_handler_unavailable', 'No se pudo inicializar el manejador de pedidos.');
             }
 
-            $result = $orders->create_credit_note_for_refund($order, $refund_id, $amount);
+            $result = $orders->create_credit_note_for_refund($order_id, $amount, '', $refund_id);
             if (is_wp_error($result)) {
+                self::log('error', 'Failed to create credit note for refund', [
+                    'order_id'  => $order_id,
+                    'refund_id' => $refund_id,
+                    'error'     => $result->get_error_message(),
+                ]);
+                $order->add_order_note(sprintf(
+                    __('[Alegra] No se pudo crear la nota de crédito del reembolso: %s', 'alegra-connector'),
+                    $result->get_error_message()
+                ));
                 return $result;
             }
 
             $credit_note_id = (string) ($result['id'] ?? '');
             if ($refund_id > 0 && $credit_note_id !== '') {
                 update_post_meta($order_id, sprintf(self::REFUND_META_FMT, $refund_id), $credit_note_id);
-            }
-
-            if ($credit_note_id !== '') {
-                $order->add_order_note(sprintf(
-                    __('Nota de crédito Alegra #%s creada por el reembolso.', 'alegra-connector'),
-                    $credit_note_id
-                ));
             }
 
             self::log('info', 'Refund synced to Alegra', [

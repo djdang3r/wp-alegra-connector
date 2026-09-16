@@ -105,16 +105,54 @@ class Customers
             }
         }
 
-        // Try by identification (NIT/RFC) as fallback
-        $identification = $data['identification'] ?? '';
-        if (!empty($identification)) {
-            $contacts = $this->api->get_contacts(['identification' => $identification, 'limit' => 30]);
-            if (!is_wp_error($contacts) && !empty($contacts)) {
-                foreach ($contacts as $contact) {
-                    if (isset($contact['identification']) && $contact['identification'] === $identification) {
-                        return (string) $contact['id'];
+        // Try by identification (NIT/RFC) as fallback.
+        // 2.3.0: prepare_customer_data() returns the Billing_Fields payload, which
+        // nests the document as identificationObject.{type,number,dv} with no
+        // top-level `identification`. Read BOTH shapes so NIT dedup keeps working.
+        $identification = '';
+        if (!empty($data['identification'])) {
+            $identification = (string) $data['identification'];
+        } elseif (!empty($data['identificationObject']['number'])) {
+            $identification = (string) $data['identificationObject']['number'];
+        }
+
+        $id_type = '';
+        if (!empty($data['identificationObject']['type'])) {
+            $id_type = strtoupper((string) $data['identificationObject']['type']);
+        }
+
+        if ($identification !== '') {
+            $contact = null;
+
+            // Prefer the typed lookup when we know the document type.
+            if ($id_type !== '') {
+                $dv = !empty($data['identificationObject']['dv'])
+                    ? (string) $data['identificationObject']['dv']
+                    : null;
+                $contact = $this->api->find_contact_by_identification($id_type, $identification, $dv);
+            }
+
+            // Fallback / legacy: plain identification search.
+            if ($contact === null) {
+                $contacts = $this->api->get_contacts(['identification' => $identification, 'limit' => 30]);
+                if (!is_wp_error($contacts) && !empty($contacts)) {
+                    foreach ($contacts as $c) {
+                        $number = '';
+                        if (!empty($c['identification'])) {
+                            $number = (string) $c['identification'];
+                        } elseif (!empty($c['identificationObject']['number'])) {
+                            $number = (string) $c['identificationObject']['number'];
+                        }
+                        if ($number === $identification) {
+                            $contact = $c;
+                            break;
+                        }
                     }
                 }
+            }
+
+            if (is_array($contact) && isset($contact['id'])) {
+                return (string) $contact['id'];
             }
         }
 
@@ -325,32 +363,45 @@ class Customers
         if (isset($contact['observations'])) {
             update_user_meta($user_id, 'alegra_notes', $contact['observations']);
         }
+
+        // Mirror the new Alegra fields (2.3.0). Normalize enums to uppercase.
+        if (!empty($contact['kindOfPerson'])) {
+            update_user_meta($user_id, 'billing_alegra_kindofperson', strtoupper((string) $contact['kindOfPerson']));
+        }
+        if (!empty($contact['regime'])) {
+            update_user_meta($user_id, 'billing_alegra_regime', strtoupper((string) $contact['regime']));
+        }
+        $id_obj = $contact['identificationObject'] ?? null;
+        if (is_array($id_obj)) {
+            if (!empty($id_obj['type'])) {
+                update_user_meta($user_id, 'billing_alegra_idtype', strtoupper((string) $id_obj['type']));
+            }
+            if (!empty($id_obj['number'])) {
+                update_user_meta($user_id, 'billing_alegra_identification', (string) $id_obj['number']);
+            }
+            if (!empty($id_obj['dv'])) {
+                update_user_meta($user_id, 'billing_alegra_dv', (string) $id_obj['dv']);
+            }
+        }
     }
 
     private function prepare_customer_data(\WP_User $customer): array
     {
-        $data = [
-            'name' => $customer->display_name ?: $customer->first_name . ' ' . $customer->last_name,
-            'email' => $customer->user_email,
-            'phonePrimary' => get_user_meta($customer->ID, 'billing_phone', true) ?: '',
-            'address' => [
-                'address' => get_user_meta($customer->ID, 'billing_address_1', true) ?: '',
-                'city' => get_user_meta($customer->ID, 'billing_city', true) ?: '',
-            ],
-            'type' => 'client',
+        if (class_exists('\Alegra\Connector\Billing_Fields')) {
+            $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($customer);
+            if (!is_wp_error($payload)) {
+                return $payload;
+            }
+        }
+
+        // Fallback: minimal payload for customers without billing data.
+        // The invoice flow uses Consumidor Final; this keeps the customer-sync
+        // flow working for legacy/partial records.
+        return [
+            'name'     => $customer->display_name ?: $customer->user_email,
+            'email'    => $customer->user_email,
+            'type'     => 'client',
         ];
-
-        $nit = get_user_meta($customer->ID, 'billing_nit', true);
-        if (!empty($nit)) {
-            $data['identification'] = $nit;
-        }
-
-        $company = get_user_meta($customer->ID, 'billing_company', true);
-        if (!empty($company)) {
-            $data['business'] = $company;
-        }
-
-        return $data;
     }
 
     private function parse_name(string $full_name): array

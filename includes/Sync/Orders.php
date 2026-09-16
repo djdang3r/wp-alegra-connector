@@ -62,8 +62,30 @@ class Orders
             }
 
             $data = $this->prepare_invoice_data($order);
+            if (is_wp_error($data)) {
+                return $data;
+            }
 
             $result = $this->api->create_invoice($data);
+
+            if (is_wp_error($result)) {
+                if ($this->logger) {
+                    $this->logger->error('Invoice creation failed', [
+                        'order_id' => $order_id,
+                        'error'    => $result->get_error_message(),
+                    ]);
+                }
+
+                $error_data = $result->get_error_data();
+                $http_code  = is_array($error_data) ? (int) ($error_data['code'] ?? 0) : 0;
+                $message    = $result->get_error_message();
+                if ($http_code === 400 && preg_match('/stamp|emisi[oó]n|DIAN/i', $message)) {
+                    $order->add_order_note(sprintf(
+                        __('[Alegra] La DIAN rechazó la emisión de la factura: %s', 'alegra-connector'),
+                        $message
+                    ));
+                }
+            }
 
             if (!is_wp_error($result) && isset($result['id'])) {
                 update_post_meta($order_id, '_alegra_invoice_id', (string) $result['id']);
@@ -135,6 +157,17 @@ class Orders
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
         }
 
+        $invoice = $this->api->get_invoice($alegra_invoice_id);
+        if (!is_wp_error($invoice) && is_array($invoice)) {
+            $emission = (string) ($invoice['emission_status'] ?? '');
+            if ($emission === 'PENDING' || $emission === '') {
+                return new \WP_Error(
+                    'invoice_not_stamped',
+                    __('No se puede crear la nota de crédito: la factura original no está emitida ante la DIAN.', 'alegra-connector')
+                );
+            }
+        }
+
         $refunds = $order->get_refunds();
         if (!empty($refunds)) {
             $items = [];
@@ -162,6 +195,10 @@ class Orders
             'items' => $items,
         ];
 
+        if (get_option('alegra_connector_stamp_enabled', true)) {
+            $data['stamp'] = ['generateStamp' => true];
+        }
+
         $result = $this->api->create_credit_note($data);
 
         if (!is_wp_error($result)) {
@@ -170,6 +207,151 @@ class Orders
             $this->logger->info('Credit note created in Alegra', [
                 'order_id' => $order->get_id(),
                 'credit_note_id' => $cn_id,
+            ]);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Create a credit note for a WooCommerce refund.
+     *
+     * Idempotent: tracks the cumulative credited amount in _alegra_credited_amount
+     * and refuses to over-credit the original invoice.
+     *
+     * @param int    $order_id   The WC order id.
+     * @param float  $amount     The refund amount (positive).
+     * @param string $reason     Optional reason, becomes the item description.
+     * @param int    $refund_id  Optional WC refund id, for idempotency.
+     * @return array|\WP_Error   The Alegra credit note, or an error.
+     */
+    public function create_credit_note_for_refund(int $order_id, float $amount, string $reason = '', int $refund_id = 0): array|\WP_Error
+    {
+        if ($amount <= 0) {
+            return new \WP_Error(
+                'invalid_amount',
+                __('El monto del reembolso debe ser mayor a cero.', 'alegra-connector')
+            );
+        }
+
+        $order = wc_get_order($order_id);
+        if (!$order instanceof \WC_Order) {
+            return new \WP_Error('invalid_order', __('Pedido no válido.', 'alegra-connector'));
+        }
+
+        $invoice_id = (string) get_post_meta($order_id, '_alegra_invoice_id', true);
+        if ($invoice_id === '') {
+            return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
+        }
+
+        // Idempotency: this specific refund was already credited.
+        $refund_meta_key = '_alegra_credit_note_for_refund_' . $refund_id;
+        if ($refund_id > 0) {
+            $stored = get_post_meta($order_id, $refund_meta_key, true);
+            if (!empty($stored)) {
+                return ['id' => (string) $stored, 'already_exists' => true];
+            }
+        }
+
+        $invoice = $this->api->get_invoice($invoice_id);
+        if (!is_wp_error($invoice) && is_array($invoice)) {
+            $emission = (string) ($invoice['emission_status'] ?? '');
+            if ($emission === 'PENDING' || $emission === '') {
+                return new \WP_Error(
+                    'invoice_not_stamped',
+                    __('No se puede crear la nota de crédito: la factura original no está emitida ante la DIAN.', 'alegra-connector')
+                );
+            }
+        }
+
+        // Cumulative cap: never credit more than the original invoice total.
+        $credited = (float) get_post_meta($order_id, '_alegra_credited_amount', true);
+        $invoice_total = (!is_wp_error($invoice) && isset($invoice['total']))
+            ? (float) $invoice['total']
+            : (float) $order->get_total();
+        if ($credited + $amount > $invoice_total + 0.01) {
+            return new \WP_Error(
+                'refund_exceeds_invoice',
+                __('El monto acumulado de reembolsos supera el total de la factura.', 'alegra-connector')
+            );
+        }
+
+        $is_full_refund = $amount >= ($invoice_total - 0.01);
+
+        if ($is_full_refund && !is_wp_error($invoice) && is_array($invoice) && !empty($invoice['items']) && is_array($invoice['items'])) {
+            // Full refund: reuse the original invoice lines verbatim.
+            $items = [];
+            foreach ($invoice['items'] as $line) {
+                if (!is_array($line)) {
+                    continue;
+                }
+                $items[] = array_filter([
+                    'id'          => $line['id']          ?? null,
+                    'name'        => $line['name']        ?? null,
+                    'description' => $line['description'] ?? null,
+                    'price'       => $line['price']       ?? null,
+                    'quantity'    => $line['quantity']    ?? null,
+                    'tax'         => $line['tax']         ?? null,
+                    'discount'    => $line['discount']    ?? null,
+                ], static fn($v) => $v !== null);
+            }
+        } else {
+            // Partial refund: a single line for exactly the refunded amount, so the
+            // credit note total matches the refund (no DIAN over-crediting).
+            $items = [[
+                'name'        => __('Reembolso parcial', 'alegra-connector'),
+                'description' => $reason !== '' ? $reason : __('Reembolso parcial', 'alegra-connector'),
+                'price'       => round($amount, 2),
+                'quantity'    => 1,
+            ]];
+        }
+
+        $data = [
+            'date'     => date('Y-m-d'),
+            'client'   => ['id' => (string) get_post_meta($order_id, '_billing_alegra_contact_id', true)],
+            'invoices' => [[
+                'id'     => $invoice_id,
+                'amount' => round($amount, 2),
+            ]],
+            'items'    => $items,
+        ];
+
+        if (get_option('alegra_connector_stamp_enabled', true)) {
+            $data['stamp'] = ['generateStamp' => true];
+        }
+
+        $result = $this->api->create_credit_note($data);
+
+        if (is_wp_error($result)) {
+            if ($this->logger) {
+                $this->logger->error('Credit note for refund failed', [
+                    'order_id'  => $order_id,
+                    'refund_id' => $refund_id,
+                    'error'     => $result->get_error_message(),
+                ]);
+            }
+            return $result;
+        }
+
+        $cn_id = (string) ($result['id'] ?? '');
+
+        update_post_meta($order_id, '_alegra_credited_amount', $credited + $amount);
+        if ($refund_id > 0) {
+            update_post_meta($order_id, $refund_meta_key, $cn_id);
+        }
+
+        $order->add_order_note(sprintf(
+            __('Nota de crédito Alegra #%s creada por reembolso de %s.', 'alegra-connector'),
+            $cn_id,
+            number_format_i18n($amount, 2)
+        ));
+
+        if ($this->logger) {
+            $this->logger->info('Credit note for refund created in Alegra', [
+                'order_id'       => $order_id,
+                'refund_id'      => $refund_id,
+                'credit_note_id' => $cn_id,
+                'amount'         => $amount,
             ]);
         }
 
@@ -231,10 +413,16 @@ class Orders
         return $result;
     }
 
-    private function prepare_invoice_data(\WC_Order $order): array
+    private function prepare_invoice_data(\WC_Order $order): array|\WP_Error
     {
         // Sync customer first if needed
         $customer_alegra_id = $this->ensure_customer_synced($order);
+        if ($customer_alegra_id === '') {
+            return new \WP_Error(
+                'customer_unresolved',
+                __('No se pudo resolver el cliente en Alegra ni usar el Consumidor Final. La factura no se creó.', 'alegra-connector')
+            );
+        }
 
         $client_data = $this->build_client_data($order, $customer_alegra_id);
 
@@ -268,8 +456,8 @@ class Orders
 
         // Number template (auto-detect preferred)
         $template = $this->get_preferred_number_template();
-        if ($template) {
-            $data['numberTemplate'] = ['id' => (string) $template];
+        if ($template !== null && $template !== '') {
+            $data['numberTemplate'] = ['id' => $template];
         }
 
         // Payment term
@@ -284,131 +472,190 @@ class Orders
             $data['warehouse'] = $warehouse;
         }
 
+        // Issue the e-invoice to DIAN (required for Colombian e-invoicing)
+        if (get_option('alegra_connector_stamp_enabled', true) && $country === 'CO') {
+            $data['stamp'] = ['generateStamp' => true];
+        }
+
         return $data;
     }
 
+    /**
+     * Resolve the Alegra contact for an order.
+     *
+     * 7-step algorithm:
+     *  1. Cached alegra_contact_id (user_meta or order_meta) -> return
+     *  2. Lookup by email in Alegra -> link + return
+     *  3. Lookup by identification (new format) OR legacy billing_nit -> link + return
+     *  4. Build the payload from billing_alegra_* (registered) or _billing_alegra_* (guest).
+     *     If critical data is missing -> step 6
+     *  5. POST /contacts (with 2039 retry) -> persist + return. On failure -> step 6
+     *  6. Consumidor Final fallback -> persist + return
+     *  7. (persist happens in each branch)
+     *
+     * @return string The resolved Alegra contact id, or '' on total failure.
+     */
     private function ensure_customer_synced(\WC_Order $order): string
     {
+        $order_id = (int) $order->get_id();
         $customer = $order->get_user();
 
-        // Registered user: check if already linked first
+        // Customer resolution mode: auto (default) | always_generic | require_data.
+        // `require_data` is enforced at checkout (validation), so here it behaves like `auto`.
+        $mode = (string) get_option('alegra_connector_customer_resolution_mode', 'auto');
+
+        // Mode: always use the generic client (Consumidor Final).
+        if ($mode === 'always_generic') {
+            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            if ($cf !== false && $cf !== '') {
+                $this->persist_contact_id($order, $customer, (string) $cf);
+                return (string) $cf;
+            }
+            return '';
+        }
+
+        // Step 1 — cached contact id (order meta, then user meta).
+        $cached = (string) get_post_meta($order_id, '_billing_alegra_contact_id', true);
+        if ($cached !== '') {
+            return $cached;
+        }
         if ($customer) {
-            $alegra_id = (string) get_user_meta($customer->ID, 'alegra_contact_id', true);
-            if ($alegra_id !== '') {
-                return $alegra_id;
+            $cached = (string) get_user_meta($customer->ID, 'alegra_contact_id', true);
+            if ($cached !== '') {
+                update_post_meta($order_id, '_billing_alegra_contact_id', $cached);
+                return $cached;
             }
+        }
 
-            // Search by email before creating (prevents duplicates)
-            $email = $customer->user_email;
-            if (!empty($email)) {
-                $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 1]);
-                if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-                    $existing_id = (string) $contacts[0]['id'];
-                    update_user_meta($customer->ID, 'alegra_contact_id', $existing_id);
-                    $this->logger->info('Linked existing Alegra contact by email (order sync)', [
-                        'user_id' => $customer->ID,
-                        'alegra_id' => $existing_id,
-                    ]);
-                    return $existing_id;
+        // Step 2 — lookup by email.
+        $email = $customer ? $customer->user_email : $order->get_billing_email();
+        if ($email !== '') {
+            $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 5]);
+            if (!is_wp_error($contacts) && !empty($contacts)) {
+                foreach ($contacts as $c) {
+                    if (isset($c['id']) && isset($c['email']) && strcasecmp((string) $c['email'], $email) === 0) {
+                        $found = (string) $c['id'];
+                        $this->persist_contact_id($order, $customer, $found);
+                        return $found;
+                    }
                 }
             }
+        }
 
-            // Search by NIT/identification before creating
-            $nit = get_user_meta($customer->ID, 'billing_nit', true);
-            if (!empty($nit)) {
-                $contacts = $this->api->get_contacts(['identification' => $nit, 'limit' => 1]);
-                if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-                    $existing_id = (string) $contacts[0]['id'];
-                    update_user_meta($customer->ID, 'alegra_contact_id', $existing_id);
-                    $this->logger->info('Linked existing Alegra contact by NIT (order sync)', [
-                        'user_id' => $customer->ID,
-                        'alegra_id' => $existing_id,
-                    ]);
-                    return $existing_id;
+        // Steps 3-5 run under a transient lock to avoid duplicate contact creation.
+        $lock_key = 'alegra_contact_create_lock_' . $order_id;
+        if (get_transient($lock_key)) {
+            usleep(500000);
+            // Re-check cache once after the concurrent request had time to persist.
+            $cached = (string) get_post_meta($order_id, '_billing_alegra_contact_id', true);
+            if ($cached !== '') {
+                return $cached;
+            }
+            // Fall through to the Consumidor Final fallback.
+        } else {
+            set_transient($lock_key, 1, 30);
+            try {
+                // Step 3a — lookup by identification (new format).
+                $idtype = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_idtype', true) : (string) get_post_meta($order_id, '_billing_alegra_idtype', true);
+                $idnum  = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_identification', true) : (string) get_post_meta($order_id, '_billing_alegra_identification', true);
+                $dv     = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_dv', true) : (string) get_post_meta($order_id, '_billing_alegra_dv', true);
+                if ($idtype !== '' && $idnum !== '') {
+                    $contact = $this->api->find_contact_by_identification($idtype, $idnum, $dv !== '' ? $dv : null);
+                    if ($contact && isset($contact['id'])) {
+                        $found = (string) $contact['id'];
+                        $this->persist_contact_id($order, $customer, $found);
+                        return $found;
+                    }
                 }
+
+                // Step 3b — legacy billing_nit lookup.
+                $nit = $customer ? (string) get_user_meta($customer->ID, 'billing_nit', true) : (string) $order->get_meta('billing_nit');
+                if ($nit !== '') {
+                    $contacts = $this->api->get_contacts(['identification' => $nit, 'limit' => 5]);
+                    if (!is_wp_error($contacts) && !empty($contacts)) {
+                        foreach ($contacts as $c) {
+                            if (isset($c['id'])) {
+                                $found = (string) $c['id'];
+                                $this->persist_contact_id($order, $customer, $found);
+                                return $found;
+                            }
+                        }
+                    }
+                }
+
+                // Steps 4-5 — build the payload and create the contact (only with critical data).
+                $values = $this->collect_billing_values($order, $customer);
+                if (\Alegra\Connector\Billing_Fields::has_critical_data($values)) {
+                    $payload = $customer
+                        ? \Alegra\Connector\Billing_Fields::build_contact_payload($customer)
+                        : \Alegra\Connector\Billing_Fields::build_guest_contact_payload($order);
+                    if (!is_wp_error($payload)) {
+                        $result = $this->api->create_contact_with_2039_retry($payload);
+                        if (!is_wp_error($result) && isset($result['id'])) {
+                            $found = (string) $result['id'];
+                            $this->persist_contact_id($order, $customer, $found);
+                            return $found;
+                        }
+                        if (is_wp_error($result)) {
+                            $this->logger->warning('Contact creation failed, falling back to Consumidor Final', [
+                                'order_id' => $order_id,
+                                'error'    => $result->get_error_message(),
+                            ]);
+                        }
+                    }
+                }
+            } finally {
+                delete_transient($lock_key);
             }
-
-            // No existing contact found, create new one in Alegra
-            $customers_sync = new Customers($this->api, $this->logger);
-            $sync_result = $customers_sync->sync_to_alegra($customer);
-            if (!is_wp_error($sync_result) && isset($sync_result['id'])) {
-                return (string) $sync_result['id'];
-            }
-            return '';
         }
 
-        // Guest checkout: search by email first, then by NIT, then create
-        $email = $order->get_billing_email();
-        if (empty($email)) {
-            return '';
+        // Step 6 — Consumidor Final fallback.
+        $cf = \Alegra\Connector\Consumidor_Final::get_id();
+        if ($cf !== false && $cf !== '') {
+            $this->persist_contact_id($order, $customer, (string) $cf);
+            $this->logger->info('Using Consumidor Final for order', ['order_id' => $order_id]);
+            return (string) $cf;
         }
-
-        // Search by email first
-        $contacts = $this->api->get_contacts(['email' => $email, 'limit' => 1]);
-        if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-            $this->logger->info('Found existing Alegra contact by email (guest order)', [
-                'order_id' => $order->get_id(),
-                'alegra_id' => (string) $contacts[0]['id'],
-            ]);
-            return (string) $contacts[0]['id'];
-        }
-
-        // Search by NIT/identification as fallback
-        $nit = $order->get_meta('billing_nit');
-        if (!empty($nit)) {
-            $contacts = $this->api->get_contacts(['identification' => $nit, 'limit' => 1]);
-            if (!is_wp_error($contacts) && !empty($contacts) && isset($contacts[0]['id'])) {
-                $this->logger->info('Found existing Alegra contact by NIT (guest order)', [
-                    'order_id' => $order->get_id(),
-                    'alegra_id' => (string) $contacts[0]['id'],
-                ]);
-                return (string) $contacts[0]['id'];
-            }
-        }
-
-        // No existing contact found, create new one in Alegra
-        $contact_data = [
-            'name' => trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()) ?: $email,
-            'email' => $email,
-            'phonePrimary' => $order->get_billing_phone() ?: '',
-            'address' => [
-                'address' => $order->get_billing_address_1() ?: '',
-                'city' => $order->get_billing_city() ?: '',
-            ],
-            'type' => 'client',
-        ];
-
-        if (!empty($nit)) {
-            $contact_data['identification'] = $nit;
-        }
-
-        $result = $this->api->create_contact($contact_data);
-        if (!is_wp_error($result) && isset($result['id'])) {
-            $this->logger->info('New Alegra contact created from guest order', [
-                'order_id' => $order->get_id(),
-                'alegra_id' => (string) $result['id'],
-            ]);
-            return (string) $result['id'];
-        }
-
+        $this->logger->error('Consumidor Final could not be resolved', ['order_id' => $order_id]);
         return '';
+    }
+
+    /**
+     * Persist the resolved Alegra contact id on the order and, when present,
+     * on the customer.
+     */
+    private function persist_contact_id(\WC_Order $order, ?\WP_User $customer, string $contact_id): void
+    {
+        update_post_meta($order->get_id(), '_billing_alegra_contact_id', $contact_id);
+        if ($customer) {
+            update_user_meta($customer->ID, 'alegra_contact_id', $contact_id);
+        }
+    }
+
+    /**
+     * Collect the catalog billing values for an order, keyed by catalog key.
+     *
+     * Reads from user_meta for registered customers, or from the order meta
+     * (prefixed with `_`) for guests.
+     *
+     * @return array<string, string>
+     */
+    private function collect_billing_values(\WC_Order $order, ?\WP_User $customer): array
+    {
+        $values = [];
+        foreach (\Alegra\Connector\Billing_Fields::CATALOG as $key => $field) {
+            $meta_key = (string) $field['meta_key'];
+            $values[$key] = $customer
+                ? (string) get_user_meta($customer->ID, $meta_key, true)
+                : (string) $order->get_meta('_' . $meta_key, true);
+        }
+
+        return $values;
     }
 
     private function build_client_data(\WC_Order $order, string $customer_alegra_id): array
     {
-        if ($customer_alegra_id !== '') {
-            return ['id' => $customer_alegra_id];
-        }
-
-        return [
-            'name' => trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()) ?: $order->get_billing_email(),
-            'email' => $order->get_billing_email(),
-            'phonePrimary' => $order->get_billing_phone(),
-            'address' => [
-                'address' => $order->get_billing_address_1(),
-                'city' => $order->get_billing_city(),
-            ],
-        ];
+        return ['id' => $customer_alegra_id];
     }
 
     private function calculate_due_date(\WC_Order $order): string
@@ -565,20 +812,26 @@ class Orders
 
     private function get_preferred_number_template(): ?string
     {
-        $templates = $this->api->get_number_templates();
+        $templates = $this->api->get_number_templates(['documentType' => 'invoice']);
         if (is_wp_error($templates) || empty($templates)) {
             return null;
         }
 
+        // Prefer the electronic invoice template
         foreach ($templates as $tpl) {
-            // Prefer electronic invoice template for Colombia
-            if (isset($tpl['type']) && $tpl['type'] === 'electronic') {
+            if (($tpl['isElectronic'] ?? false) === true && ($tpl['documentType'] ?? '') === 'invoice') {
                 return (string) $tpl['id'];
             }
         }
 
-        // Fallback to first template
-        return isset($templates[0]['id']) ? (string) $templates[0]['id'] : null;
+        // Fallback: the default invoice template
+        foreach ($templates as $tpl) {
+            if (($tpl['isDefault'] ?? false) === true) {
+                return (string) $tpl['id'];
+            }
+        }
+
+        return null;
     }
 
     private function get_default_payment_term(): string
