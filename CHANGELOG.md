@@ -2,6 +2,60 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.0] - 2026-09-16
+
+### 🐛 Critical Fixes
+
+- **FIX: "el cliente no existe" when invoicing** — Orders sent the customer inline inside the invoice payload, which Alegra rejects because every invoice must reference an existing contact by `id`. `Orders::ensure_customer_synced()` now resolves (or creates) the contact with a 7-step algorithm and falls back to the **Consumidor Final** contact when there is not enough data, so invoicing no longer fails for customers without billing data.
+
+- **FIX: Alegra UUIDs truncated by `(int)` casts** — Alegra IDs are UUIDs (`VARCHAR(36)`), but they were cast to `int` throughout (invoices, contacts, categories, push queue). The plugin now treats Alegra IDs as strings end-to-end, and `Schema::maybe_migrate_alegra_id_columns()` migrates the `alegra_id` columns of `wp_alegra_tombstones`, `wp_alegra_pull_queue`, `wp_alegra_push_log` and `wp_alegra_entity_map` from `BIGINT` to `VARCHAR(36)`.
+
+- **FIX: HPOS compatibility** — Order data was read/written through post meta, so under High-Performance Order Storage the invoice id was never found (duplicate invoices), refunds reported "no invoice" and the Alegra contact id was never persisted. Order meta now goes through the WooCommerce CRUD API (`$order->get_meta()` / `update_meta_data()`), which works with both post and HPOS storage.
+
+- **FIX: Credit notes never tied to their invoice** — Credit notes were sent with an undocumented singular `invoice` field, so Alegra never linked them. They now use the documented plural `invoices: [{ id, amount }]` array.
+
+- **FIX: Partial refunds over-credited the full invoice** — A partial refund produced a credit note for the FULL invoice amount. The credit note now uses the refunded amount, is idempotent per refund id, and is capped by the cumulative `_alegra_credited_amount` so it can never exceed the original invoice total.
+
+- **FIX: Number-template selection never matched** — The invoice template lookup tested for `type === 'electronic'`, which never matched Alegra's response, so invoices could not be stamped. It now selects the template with `isElectronic === true` (falling back to `isDefault`).
+
+- **FIX: UUID settings truncated to 0 on save** — `warehouse_id`, `payment_account_id` and `payment_term_id` were saved via `intval`, truncating UUID values to `0`. They are now stored and read as strings.
+
+- **FIX: Category import / re-push** — Imported products now get their Alegra category assigned; pushing a product sends the category as `{ id }` instead of `{ name }`; and `assign_product_category()` no longer wipes the merchant's existing categories.
+
+### ✨ New Features
+
+- **NEW: 11 pre-defined billing fields for Colombia** — Obligatorios (tipo de persona, tipo de documento, número de documento, dígito de verificación, régimen tributario), recomendados (razón social, segundo nombre, segundo apellido) and opcionales (teléfono secundario, celular, observaciones), with support for both the classic checkout and Cart/Checkout Blocks.
+
+- **NEW: Consumidor Final fallback contact** — Used when a customer cannot be resolved or has no billing data. The plugin never creates it; it must already exist in Alegra.
+
+- **NEW: DIAN stamping** — Invoices and credit notes are stamped (`stamp.generateStamp`) when `stamp_enabled` is on; otherwise they stay as drafts.
+
+- **NEW: Customer resolution modes** — `auto` / `always_generic` / `require_data`, configurable under Ajustes → Facturación electrónica.
+
+- **NEW: Refund credit notes** — Idempotent per refund, with a cumulative cap per order.
+
+- **NEW: "Facturación electrónica" admin section** plus an invoicing health widget on the dashboard.
+
+- **NEW: Dry Run mode** — Blocks every write (POST) to Alegra while keeping reads, for safe production testing.
+
+- **NEW: State sync** — Refunds, profile updates and payment-method changes propagate to Alegra.
+
+### 📝 Technical
+
+- Plugin version: **2.2.0 → 2.3.0** (MINOR bump — additive changes, no breaking API).
+- Plugin header `Version:` and the `ALEGRA_CONNECTOR_VERSION` constant bumped to `2.3.0`.
+- New files: `includes/Billing_Fields.php`, `includes/Consumidor_Final.php`, `includes/Checkout_Integration.php`, `includes/State_Sync.php`, `assets/js/alegra-checkout-conditions.js`, `docs/RELEASE_2.3.0_DEPLOY.md`.
+- Modified files: `includes/Sync/Orders.php`, `includes/Sync/Products.php`, `includes/Schema.php`, `includes/API/Client.php`, `includes/Entity_Map.php`, `admin/Admin/Admin_Dashboard.php`, templates, `README.md`, `CHANGELOG.md`.
+- Smoke-test extended to 37 assertions (all passing).
+
+### ✅ Upgrade Notes
+
+- **Safe upgrade from 2.2.0.** All changes are additive. The `alegra_id` column migration from `BIGINT` to `VARCHAR(36)` runs automatically on load and is **not** reversed by a rollback.
+- **Rollback safe for numeric IDs.** Reverting to 2.2.0 keeps working with numeric IDs (the columns simply stay as text); the new options (`customer_resolution_mode`, `stamp_enabled`, `dry_run`) are ignored by 2.2.0.
+- See `docs/RELEASE_2.3.0_DEPLOY.md` for the full deploy, verification and rollback guide.
+
+---
+
 ## [2.2.0] - 2026-09-10
 
 ### ⚡ Performance & Robustness
