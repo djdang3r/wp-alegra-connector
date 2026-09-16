@@ -2,7 +2,12 @@
 
 All notable changes to Alegra Connector.
 
-## [Unreleased]
+## [2.3.2] - 2026-09-16
+
+> **⚠️ This release REMOVES functionality shipped in 2.3.0/2.3.1.** If you rely
+> on the plugin to emit e-invoices to the DIAN, that is gone: **stamp in Alegra**
+> (or use Alegra's own stamping) instead. Existing invoices are untouched. The
+> `alegra_connector_stamp_enabled` option is removed.
 
 ### 🗑️ Removed — DIAN e-invoicing was never a requirement
 
@@ -20,8 +25,16 @@ consequences. It is removed.
   CASH/CREDIT `paymentForm`.
 - **REMOVED: the `emission_status` gate** — credit notes are no longer blocked
   on the original invoice's DIAN emission state.
-- **REMOVED: the `alegra_connector_stamp_enabled` option**, its settings UI, its
-  dashboard health indicator and its uninstall cleanup.
+- **REMOVED: the Colombia country gating** — contact and invoice fields are no
+  longer conditioned on the account country.
+- **REMOVED: the `alegra_connector_stamp_enabled` option**, its settings
+  checkbox, its dashboard health indicator and its uninstall cleanup.
+- **REMOVED: `kindOfPerson` and `regime` from the contact payload** — the
+  official docs show they are required only for the e-invoicing contact schema,
+  not to create a plain contact.
+
+### ✨ Changed
+
 - **CHANGED: invoices are now created as DRAFTS** — the plugin sent
   `status: open` unconditionally, contradicting its own documentation ("en
   borrador"). Alegra's documented behaviour is that omitting `status` (with no
@@ -30,13 +43,25 @@ consequences. It is removed.
   payment is created open because Alegra only accepts payments on open invoices.
 - **CHANGED: the billing catalog is reduced from 11 fields to the
   identification** — the document type, the number and the DV for a NIT are the
-  only things WooCommerce does not already collect. `kindOfPerson` and `regime`
-  are only required by Alegra's *e-invoicing* contact schema; they are not
-  required to create a plain contact, so they are gone. The admin section is
-  renamed from "Facturación electrónica" to **"Datos de facturación"**.
-- **KEPT:** customer resolution, the Consumidor Final fallback, the atomic
-  locks and the HPOS fixes — those fix the original bug and are unrelated to
-  DIAN.
+  only things WooCommerce does not already collect. The admin section is renamed
+  from "Facturación electrónica" to **"Datos de facturación"**.
+- **CHANGED: the invoice-status option replaced `stamp_enabled`** — the removed
+  stamp toggle is superseded by the new invoice-status setting.
+
+### ✨ Added
+
+- **NEW: an order note when the invoice is issued to Consumidor Final** — when a
+  customer has no identification and the resolution mode is `auto`, the invoice
+  falls back to the generic Consumidor Final contact. The order now gets a
+  Spanish note naming the missing field(s), so the merchant finds out instead of
+  discovering it later on a real invoice. `always_generic` (an intentional
+  choice) and `require_data` (which aborts instead of falling back) never get
+  the note.
+
+### ✅ Kept (from 2.3.1)
+
+- The customer resolution, the Consumidor Final fallback, the atomic locks, the
+  HPOS fixes and the performance work.
 
 ## [2.3.1] - 2026-09-16
 
@@ -142,7 +167,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.1_VERIFICATION.md` for the three assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.2_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 

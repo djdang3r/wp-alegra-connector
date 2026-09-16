@@ -1,15 +1,16 @@
-# Verificación en Producción — Alegra Connector 2.3.1
+# Verificación en Producción — Alegra Connector 2.3.2
 
-Esta guía es la **lista de validación** de la versión 2.3.1. La 2.3.1 **reemplaza
-a la 2.3.0**, que se publicó rota: traía dos errores fatales
-(`update_transient()` no existe en WordPress; `map_product_tax()` devolvía `int`
-desde un método `: string` bajo `strict_types`), una nota crédito duplicada y
-varios defectos de correctitud. La 2.3.1 corrige los 68 hallazgos de
-la auditoría (lotes 0–3).
+Esta guía es la **lista de validación** de la versión 2.3.2. La 2.3.2 **elimina**
+la emisión electrónica DIAN que traía la 2.3.0 (era una feature no pedida y
+activada por defecto) y agrega una **nota de pedido** cuando la factura sale a
+nombre del Consumidor Final. El plugin solo crea el documento en Alegra; el
+timbrado, si lo necesitás, se hace en Alegra.
 
-> **Nota posterior:** la emisión electrónica DIAN (timbrado) que traía la 2.3.0
-> fue **eliminada**; era una feature no pedida y activada por defecto. Ver el
-> ítem 5 más abajo. El plugin solo crea el documento en Alegra.
+La base sigue siendo la 2.3.1, que corrigió los 68 hallazgos de la auditoría
+(lotes 0–3) sobre la 2.3.0.
+
+> **El riesgo más alto de esta versión está en el ítem 5 (CO + facturación
+> electrónica). Leelo primero.**
 
 La 2.3.0 se construyó contra la **documentación oficial** de Alegra y de
 WooCommerce, pero **nueve comportamientos concretos nunca se probaron contra la
@@ -20,8 +21,12 @@ parte de ellos:
 - **2 resultaron ser bugs** (8 y 9): no eran "verificar", eran errores reales,
   y quedaron **corregidos** en la 2.3.1.
 - **3 siguen necesitando prueba en vivo** (1, 4 y 7).
+- **1 es nuevo y es el más importante** (5): que una cuenta **con facturación
+  electrónica habilitada** acepte el contacto mínimo (sin
+  `kindOfPerson`/`regime`).
 
-> **Sé honesto contigo mismo:** los ítems 1, 4 y 7 **no** están "probados en
+
+> **Sé honesto contigo mismo:** los ítems 1, 4, 5 y 7 **no** están "probados en
 > producción". Están implementados según la documentación y con el mayor
 > cuidado, pero la única prueba válida es tu cuenta real de Alegra y tu tienda
 > real. Si algo falla, el detalle importa más que el "sí funcionó".
@@ -36,13 +41,13 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 - Dónde ver el **estado de facturación:** `Alegra Connector → Dashboard` →
   tarjeta **"Estado de facturación"**.
 - Dónde cambiar los **ajustes:** `Alegra Connector → Configuración` →
-  pestaña **"Facturación electrónica"**.
+  pestaña **"Datos de facturación"**.
 
 **Leyenda de riesgo**
 
 | Riesgo | Significado |
 |---|---|
-| **Alto** | Si falla, la facturación electrónica no sirve. **Bloquea** el uso real de la 2.3.1 hasta resolverse. |
+| **Alto** | Si falla, la factura sale con el **destinatario equivocado** (o no se factura). **Bloquea** el uso real de la 2.3.2 hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
 
@@ -155,20 +160,36 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 ---
 
-## 5. Emisión electrónica ante la DIAN — ❌ ELIMINADA
+## 5. CO + Facturación Electrónica: ¿Alegra acepta el contacto mínimo? — ⚠️ EL RIESGO MÁS ALTO
 
-**Estado: la funcionalidad de timbrado electrónico fue eliminada del plugin.**
+**Estado: NO probado. Requiere prueba en vivo. Si falla, es silencioso.**
 
-- **Qué pasó:** la 2.3.0 agregó el timbrado electrónico DIAN
-  (`stamp.generateStamp`) como una feature **no pedida y activada por defecto**.
-  Un comercio colombiano que instalaba el plugin emitía facturas legales ante la
-  DIAN para cada pedido y cada reembolso, de forma irreversible.
-- **Qué se hizo:** se eliminó todo el timbrado, el catálogo DIAN de medios de
-  pago, el `paymentForm`, la opción `stamp_enabled`, su UI y su indicador de
-  salud. Las facturas ahora se crean como **borrador** (o abiertas, según la
-  opción "Estado de las facturas") y **no se envían a la DIAN**.
-- **Ya no hace falta probar nada de esto.** Si necesitas emitir ante la DIAN,
-  hacelo desde Alegra; el plugin solo crea el documento.
+- **Qué se asume:** que una cuenta de Alegra **colombiana con facturación
+  electrónica habilitada** acepta el contacto **mínimo** que envía el plugin
+  (sin `kindOfPerson` ni `regime`). La documentación oficial define un esquema
+  de contacto aparte — "con facturación electrónica" — que **sí** exige esos
+  campos; el plugin los eliminó en la 2.3.2 porque el esquema de contacto
+  "pelado" no los pide.
+- **Por qué importa:** si la cuenta con FE rechaza el contacto mínimo, la
+  creación del contacto **falla**, el plugin cae al respaldo **Consumidor
+  Final** y **la factura sale a nombre del genérico en vez del cliente** —
+  exactamente lo que la resolución de clientes de la 2.3.1 buscaba evitar.
+  Falla **en silencio**: el fallback lo enmascara.
+- **Cómo verificarlo:**
+  1. Hacé un pedido de prueba con un cliente que **tenga** identificación
+     (cédula/NIT) registrada.
+  2. En Alegra, abrí la factura creada y mirá **a nombre de quién** quedó:
+     ¿el **cliente** o **Consumidor Final**?
+  3. Revisá las **notas del pedido** en WooCommerce. La nueva nota de la 2.3.2
+     dice explícitamente si se cayó al Consumidor Final y qué campo faltaba.
+- **Resultado esperado:** la factura sale a nombre del **cliente** y **no**
+  aparece la nota de Consumidor Final.
+- **Si falla (cayó al Consumidor Final):** la cuenta tiene facturación
+  electrónica habilitada y necesita `regime`/`kindOfPerson`. **Reportalo** para
+  restaurar esos dos campos de forma condicional (solo cuando la cuenta los
+  exija).
+- **Riesgo: Alto.** Produce en silencio una factura con el **destinatario
+  equivocado**.
 
 ---
 
@@ -257,23 +278,28 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 ---
 
-## Orden de prueba recomendado (solo los 3 que quedan)
+## Orden de prueba recomendado (los 4 que quedan)
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la 2.3.1. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
+2. **Desplegar** e instalar la 2.3.2. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **Ítem 5 — CO + facturación electrónica (el más importante).** Pedido de
+   prueba con un cliente que **tenga** identificación; confirmá en Alegra que la
+   factura sale a nombre del **cliente** y que **no** aparece la nota de
+   Consumidor Final. Si cayó al genérico, reportalo.
+4. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
    se crea a mano antes de facturar.
-4. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
+5. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
    revisa el log (`[DRY RUN] Blocked POST ...`) y que no se cree nada en
    Alegra. Ver `RELEASE_2.3.0_DEPLOY.md` §4. **Desactívalo al terminar.**
-5. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
+6. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
    prueba del paso anterior.
-6. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
-7. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirma
-   que la factura se crea en Alegra (en borrador por defecto) y que queda
-   vinculada al cliente correcto.
-8. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
+7. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
+8. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirma
+   que la factura se crea en Alegra (en borrador por defecto), que queda
+   vinculada al cliente correcto y que **no** aparece la nota de Consumidor
+   Final.
+9. **Reembolso parcial** del pedido anterior → confirma que se crea la nota
    crédito ligada a la factura (el formato es el documentado, ítem 6; el cap es
    atómico, ítem 9).
 
@@ -308,13 +334,15 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.1 instalado y la versión figura como **2.3.1** en **Plugins**.
+- [ ] 2.3.2 instalado y la versión figura como **2.3.2** en **Plugins**.
 
-### Las 3 verificaciones que quedan
+### Las 4 verificaciones que quedan
 - [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
       (webhook o poll).
 - [ ] **4.** En Blocks: al elegir NIT aparece el Dígito de verificación (y se
       oculta con los demás tipos de documento).
+- [ ] **5.** CO + FE: la factura sale a nombre del **cliente** (no de Consumidor
+      Final) y **no** aparece la nota de fallback.
 - [ ] **7.** Consumidor Final: widget en verde **"Disponible"**.
 
 ### Ya resueltos (no requieren prueba en vivo)

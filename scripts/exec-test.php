@@ -580,6 +580,35 @@ TestRunner::test('T5.5 always_generic mode always uses Consumidor Final', functi
     TestRunner::assertSame($cf, $invoice['client']['id'] ?? null, 'invoice must use Consumidor Final');
 });
 
+TestRunner::test('T5.6 an unintentional Consumidor Final fallback (auto, missing data) adds an actionable order note', function (): void {
+    alegra_test_reset();
+    seed_consumidor_final();
+    alegra_make_user(2, ['user_email' => 'nodata@example.test']);
+    $order = make_invoice_order(605, 2, 'nodata@example.test');
+
+    make_orders()->create_invoice($order);
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('Consumidor Final', $notes, 'the fallback must be surfaced in an order note');
+    TestRunner::assertStringContains('no tiene tipo de documento ni número de documento', $notes, 'the note must name the missing field(s)');
+    TestRunner::assertStringContains('vuelve a facturar', $notes, 'the note must be actionable');
+});
+
+TestRunner::test('T5.7 always_generic mode does NOT add the Consumidor Final note (intentional)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_customer_resolution_mode', 'always_generic');
+    seed_consumidor_final();
+    // Even a customer with NO identification must not be noted: the merchant
+    // chose the generic consumer on purpose.
+    alegra_make_user(2, ['user_email' => 'nodata@example.test']);
+    $order = make_invoice_order(606, 2, 'nodata@example.test');
+
+    make_orders()->create_invoice($order);
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringNotContains('Consumidor Final', $notes, 'always_generic must never add the fallback note');
+});
+
 // ===========================================================================
 // T6 — Concurrency (the lock)
 // ===========================================================================

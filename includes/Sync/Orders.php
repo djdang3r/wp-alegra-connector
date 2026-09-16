@@ -812,6 +812,14 @@ class Orders
             if ($cf !== false && $cf !== '') {
                 $this->persist_contact_id($order, $customer, (string) $cf);
                 $this->logger->info('Using Consumidor Final for order', ['order_id' => $order_id]);
+                // Visibility: in `auto` mode this fallback is UNINTENTIONAL, so
+                // the merchant must learn that the invoice went to the generic
+                // consumer instead of the customer. `always_generic` returned
+                // early above (intentional choice — no note) and `require_data`
+                // is excluded here (it aborts instead of falling back).
+                if ($mode === 'auto') {
+                    $this->add_consumidor_final_fallback_note($order, $customer);
+                }
                 return (string) $cf;
             }
             $this->logger->error('Consumidor Final could not be resolved', ['order_id' => $order_id]);
@@ -819,6 +827,58 @@ class Orders
             $this->logger->error('Customer data required but could not be resolved', ['order_id' => $order_id]);
         }
         return '';
+    }
+
+    /**
+     * Add an order note when the Consumidor Final fallback is UNINTENTIONAL
+     * (resolution mode `auto`) because the customer is missing identification.
+     *
+     * Returns early — no note — when no catalog field is actually missing, so a
+     * fallback caused by an API failure is never mislabelled as missing data.
+     */
+    private function add_consumidor_final_fallback_note(\WC_Order $order, ?\WP_User $customer): void
+    {
+        $missing = $this->missing_billing_field_labels($order, $customer);
+        if ($missing === []) {
+            return;
+        }
+
+        $order->add_order_note(sprintf(
+            /* translators: %s: the billing field(s) the customer is missing, e.g. "número de documento". */
+            __('Alegra: la factura se emitirá a nombre del Consumidor Final porque el cliente no tiene %s registrado. Si necesitas la factura a nombre del cliente, agrega su cédula/NIT y vuelve a facturar.', 'alegra-connector'),
+            implode(' ni ', $missing)
+        ));
+    }
+
+    /**
+     * Labels of the enabled catalog fields that are empty for this order's
+     * customer, lowercased for inline use in a sentence. Empty when every
+     * critical field is present.
+     *
+     * @return list<string>
+     */
+    private function missing_billing_field_labels(\WC_Order $order, ?\WP_User $customer): array
+    {
+        $values = $this->collect_billing_values($order, $customer);
+        if (\Alegra\Connector\Billing_Fields::has_critical_data($values)) {
+            return [];
+        }
+
+        $labels = [];
+        foreach (\Alegra\Connector\Billing_Fields::CATALOG as $key => $field) {
+            if (!\Alegra\Connector\Billing_Fields::is_field_enabled($key)) {
+                continue;
+            }
+            // `dv` is only required for a NIT; skip it for every other id type.
+            if ($key === 'dv' && ($values['idtype'] ?? '') !== 'NIT') {
+                continue;
+            }
+            if (trim((string) ($values[$key] ?? '')) === '') {
+                $labels[] = strtolower((string) ($field['label'] ?? $key));
+            }
+        }
+
+        return $labels;
     }
 
     /**
