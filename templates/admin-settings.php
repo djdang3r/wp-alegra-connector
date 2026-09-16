@@ -130,13 +130,13 @@
 <tr><th><?php esc_html_e('Bodega por defecto:','alegra-connector');?></th><td>
 <select name="alegra_connector_warehouse_id">
     <option value="0"><?php esc_html_e('-- Principal (ID: 1) --','alegra-connector');?></option>
-    <?php foreach($alegra_warehouses as $wh): $id=(int)($wh['id']??0);?>
-    <option value="<?php echo esc_attr($id);?>" <?php selected((int)get_option('alegra_connector_warehouse_id',0),$id);?>><?php echo esc_html(($wh['name']??'').' (ID: '.$id.')');?></option>
+    <?php foreach($alegra_warehouses as $wh): $id=(string)($wh['id']??'');?>
+    <option value="<?php echo esc_attr($id);?>" <?php selected((string)get_option('alegra_connector_warehouse_id',''),$id);?>><?php echo esc_html(($wh['name']??'').' (ID: '.$id.')');?></option>
     <?php endforeach;?>
 </select>
 <p class="description"><?php esc_html_e('Bodegas sincronizadas desde Alegra. Al crear productos y facturas se usara esta bodega.','alegra-connector');?></p></td></tr>
 <?php else:?>
-<tr><th><?php esc_html_e('Bodega por defecto:','alegra-connector');?></th><td><input type="number" name="alegra_connector_warehouse_id" value="<?php echo esc_attr(get_option('alegra_connector_warehouse_id',''));?>" class="small-text" min="0" placeholder="ID"><p class="description"><?php esc_html_e('Conecta con Alegra para ver tus bodegas o ingresa el ID manualmente.','alegra-connector');?></p></td></tr>
+<tr><th><?php esc_html_e('Bodega por defecto:','alegra-connector');?></th><td><input type="text" name="alegra_connector_warehouse_id" value="<?php echo esc_attr(get_option('alegra_connector_warehouse_id',''));?>" class="small-text" placeholder="ID o UUID"><p class="description"><?php esc_html_e('Conecta con Alegra para ver tus bodegas o ingresa el ID manualmente.','alegra-connector');?></p></td></tr>
 <?php endif;?>
 </table>
 </div>
@@ -164,13 +164,13 @@
 <?php if(!empty($alegra_bank_accounts)):?>
 <select name="alegra_connector_payment_account_id">
     <option value="0"><?php esc_html_e('-- Sin cuenta (no se registraran pagos) --','alegra-connector');?></option>
-    <?php foreach($alegra_bank_accounts as $ba): $id=(int)($ba['id']??0);?>
-    <option value="<?php echo esc_attr($id);?>" <?php selected((int)get_option('alegra_connector_payment_account_id',0),$id);?>><?php echo esc_html(($ba['name']??'Banco').' (ID: '.$id.')');?></option>
+    <?php foreach($alegra_bank_accounts as $ba): $id=(string)($ba['id']??'');?>
+    <option value="<?php echo esc_attr($id);?>" <?php selected((string)get_option('alegra_connector_payment_account_id',''),$id);?>><?php echo esc_html(($ba['name']??'Banco').' (ID: '.$id.')');?></option>
     <?php endforeach;?>
 </select>
 <p class="description"><?php esc_html_e('Sincronizado desde Alegra. Sin una cuenta seleccionada NO se registraran pagos automaticos en Alegra al completar pedidos.','alegra-connector');?></p>
 <?php else:?>
-<input type="number" name="alegra_connector_payment_account_id" value="<?php echo esc_attr(get_option('alegra_connector_payment_account_id',''));?>" class="small-text" min="1" placeholder="ID en Alegra">
+<input type="text" name="alegra_connector_payment_account_id" value="<?php echo esc_attr(get_option('alegra_connector_payment_account_id',''));?>" class="small-text" placeholder="ID o UUID en Alegra">
 <p class="description"><?php esc_html_e('ID de la cuenta bancaria en Alegra donde se registraran los pagos. Conecta con Alegra para ver tus cuentas o ingresa el ID manualmente.','alegra-connector');?></p>
 <?php endif;?>
 </td></tr>
@@ -180,13 +180,13 @@
 <?php if(!empty($alegra_terms)):?>
 <select name="alegra_connector_payment_term_id">
     <option value="0"><?php esc_html_e('-- Sin termino (15 dias por defecto) --','alegra-connector');?></option>
-    <?php foreach($alegra_terms as $tm): $id=(int)($tm['id']??0);?>
-    <option value="<?php echo esc_attr($id);?>" <?php selected((int)get_option('alegra_connector_payment_term_id',0),$id);?>><?php echo esc_html(($tm['name']??'Termino').' - '.($tm['days']??0).' '.__('dias','alegra-connector'));?></option>
+    <?php foreach($alegra_terms as $tm): $id=(string)($tm['id']??'');?>
+    <option value="<?php echo esc_attr($id);?>" <?php selected((string)get_option('alegra_connector_payment_term_id',''),$id);?>><?php echo esc_html(($tm['name']??'Termino').' - '.($tm['days']??0).' '.__('dias','alegra-connector'));?></option>
     <?php endforeach;?>
 </select>
 <p class="description"><?php esc_html_e('Define cuantos dias despues de la fecha de factura vence el pago. Sincronizado desde Alegra.','alegra-connector');?></p>
 <?php else:?>
-<input type="number" name="alegra_connector_payment_term_id" value="<?php echo esc_attr(get_option('alegra_connector_payment_term_id',''));?>" class="small-text" min="1" placeholder="ID en Alegra">
+<input type="text" name="alegra_connector_payment_term_id" value="<?php echo esc_attr(get_option('alegra_connector_payment_term_id',''));?>" class="small-text" placeholder="ID o UUID en Alegra">
 <p class="description"><?php esc_html_e('ID del termino de pago en Alegra. Conecta con Alegra para ver tus terminos.','alegra-connector');?></p>
 <?php endif;?>
 </td></tr>

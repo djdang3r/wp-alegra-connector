@@ -100,6 +100,16 @@ class Client
 
     public function request(string $method, string $endpoint, array $data = [], array $args = []): array|\WP_Error
     {
+        // Dry Run: block all write verbs (POST/PUT/PATCH/DELETE) at the single
+        // choke point before any network call. GETs always pass through.
+        $verb = strtoupper($method);
+        if ($verb !== 'GET' && get_option('alegra_connector_dry_run', false)) {
+            if ($this->logger) {
+                $this->logger->warning('[DRY RUN] Blocked ' . $verb . ' ' . $endpoint, ['payload' => $data]);
+            }
+            return ['dry_run' => true, 'blocked' => $verb . ' ' . $endpoint];
+        }
+
         // Throttle: wait if we're at the rate limit
         if (!$this->throttle()) {
             if ($this->logger) $this->logger->warning('API rate limit hard-reached', [
@@ -734,6 +744,13 @@ class Client
     // Item attachments (images)
     public function upload_item_image(string $item_id, string $file_path): array|\WP_Error
     {
+        if (get_option('alegra_connector_dry_run', false)) {
+            if ($this->logger) {
+                $this->logger->warning('[DRY RUN] Blocked POST /items/' . $item_id . '/attachment', ['file' => $file_path]);
+            }
+            return ['dry_run' => true, 'blocked' => 'POST /items/' . $item_id . '/attachment'];
+        }
+
         if (!file_exists($file_path)) {
             return new \WP_Error('file_not_found', 'Image file not found');
         }

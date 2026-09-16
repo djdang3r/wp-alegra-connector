@@ -348,6 +348,9 @@ final class Alegra_Connector
             'alegra_connector_log_retention_days' => 30,
             'alegra_connector_conflict_resolution' => 'alegra_wins',
             'alegra_connector_inventory_source' => 'alegra',
+            'alegra_connector_customer_resolution_mode' => 'auto',
+            'alegra_connector_stamp_enabled' => true,
+            'alegra_connector_dry_run' => false,
         ];
 
         foreach ($defaults as $key => $value) {

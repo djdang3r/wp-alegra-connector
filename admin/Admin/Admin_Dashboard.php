@@ -261,6 +261,22 @@ class Admin_Dashboard
 
     public function register_settings(): void
     {
+        // Alegra migrated all IDs to UUID (VARCHAR(36)) on 2025-01-06.
+        // intval() truncates a UUID to 0 on save, silently breaking config.
+        // This sanitizer accepts a UUID or a legacy numeric id and preserves the
+        // previous value when the input is neither (rejecting garbage).
+        $alegra_id_sanitizer = function ($value, $option_name) {
+            $value = trim((string) $value);
+            if ($value === '') {
+                return '';
+            }
+            $is_uuid = (bool) preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $value);
+            if ($is_uuid || ctype_digit($value)) {
+                return $value;
+            }
+            return (string) get_option($option_name, '');
+        };
+
         register_setting('alegra_connector_settings', 'alegra_connector_email', ['sanitize_callback' => 'sanitize_email']);
         register_setting('alegra_connector_settings', 'alegra_connector_token', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_api_url', [
@@ -281,10 +297,16 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_sync_orders', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_categories', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_inventory_source', ['sanitize_callback' => 'sanitize_text_field']);
-        register_setting('alegra_connector_settings', 'alegra_connector_warehouse_id', ['sanitize_callback' => 'intval']);
+        register_setting('alegra_connector_settings', 'alegra_connector_warehouse_id', [
+            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_warehouse_id'),
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_warehouse_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
-        register_setting('alegra_connector_settings', 'alegra_connector_payment_account_id', ['sanitize_callback' => 'intval']);
-        register_setting('alegra_connector_settings', 'alegra_connector_payment_term_id', ['sanitize_callback' => 'intval']);
+        register_setting('alegra_connector_settings', 'alegra_connector_payment_account_id', [
+            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_payment_account_id'),
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_payment_term_id', [
+            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_payment_term_id'),
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_auto_complete_order', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_inactive_products', ['sanitize_callback' => 'rest_sanitize_boolean']);
@@ -300,6 +322,21 @@ class Admin_Dashboard
                 return is_array($value) ? map_deep($value, 'sanitize_text_field') : [];
             },
         ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_customer_resolution_mode', [
+            'sanitize_callback' => function ($value) {
+                $allowed = ['auto', 'always_generic', 'require_data'];
+                return in_array($value, $allowed, true) ? $value : 'auto';
+            },
+            'default' => 'auto',
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_stamp_enabled', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => true,
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_dry_run', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
 
         // Mapping settings group
         register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping');
@@ -309,6 +346,7 @@ class Admin_Dashboard
         add_settings_section('alegra_connector_sync_settings', __('Sincronización', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_currency_section', __('Moneda', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_warehouse_section', __('Bodegas', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
+        add_settings_section('alegra_connector_billing_section', __('Facturación electrónica', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
         add_settings_section('alegra_connector_advanced', __('Avanzado', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
     }
 
@@ -1416,8 +1454,8 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('El pago ya est  registrado en Alegra.', 'alegra-connector')]);
         }
 
-        $account_id = (int) get_option('alegra_connector_payment_account_id', 0);
-        if ($account_id <= 0) {
+        $account_id = (string) get_option('alegra_connector_payment_account_id', '');
+        if ($account_id === '' || $account_id === '0') {
             wp_send_json_error(['message' => __('Configura una cuenta bancaria en Ajustes > Avanzado.', 'alegra-connector')]);
         }
 
