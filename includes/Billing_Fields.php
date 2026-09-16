@@ -1044,8 +1044,10 @@ class Billing_Fields
     /**
      * Build the Alegra `nameObject` for a natural person.
      *
-     * Falls back to `nameObject.fullname` when no first/last name is available,
-     * and derives the first name from the display name when missing.
+     * Colombia requires BOTH `firstName` and `lastName` (post_contacts.md);
+     * `fullname` is not part of the schema and must never be emitted. Missing
+     * parts are derived from the display name, and each field falls back to the
+     * other so the required pair is always present.
      *
      * @param array<string, string> $values  Catalog values.
      * @param array<string, mixed>  $contact Contact data.
@@ -1057,36 +1059,37 @@ class Billing_Fields
         $last = trim((string) ($contact['last_name'] ?? ''));
         $display = trim((string) ($contact['display_name'] ?? ''));
 
-        if ($first === '' && $last === '' && $display !== '') {
-            return ['fullname' => $display];
-        }
-
-        if ($first === '' && $display !== '') {
+        // Derive whatever is missing from the display name.
+        if (($first === '' || $last === '') && $display !== '') {
             $parts = preg_split('/\s+/', $display);
             if (is_array($parts) && !empty($parts)) {
-                $first = (string) array_shift($parts);
+                if ($first === '') {
+                    $first = (string) array_shift($parts);
+                }
                 if ($last === '' && !empty($parts)) {
                     $last = (string) array_pop($parts);
                 }
             }
         }
 
-        $name_object = [];
-        if ($first !== '') {
-            $name_object['firstName'] = $first;
+        // Never emit `fullname`; guarantee the required pair.
+        if ($first === '' && $last !== '') {
+            $first = $last;
         }
+        if ($last === '' && $first !== '') {
+            $last = $first;
+        }
+        if ($first === '' && $last === '') {
+            return [];
+        }
+
+        $name_object = ['firstName' => $first];
         if ((string) $values['secondname'] !== '') {
             $name_object['secondName'] = (string) $values['secondname'];
         }
-        if ($last !== '') {
-            $name_object['lastName'] = $last;
-        }
+        $name_object['lastName'] = $last;
         if ((string) $values['secondlastname'] !== '') {
             $name_object['secondLastName'] = (string) $values['secondlastname'];
-        }
-
-        if (empty($name_object) && $display !== '') {
-            return ['fullname' => $display];
         }
 
         return $name_object;

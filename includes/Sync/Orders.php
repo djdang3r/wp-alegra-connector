@@ -66,39 +66,88 @@ class Orders
                 return $data;
             }
 
-            $result = $this->api->create_invoice($data);
-
-            if (is_wp_error($result)) {
-                if ($this->logger) {
-                    $this->logger->error('Invoice creation failed', [
-                        'order_id' => $order_id,
-                        'error'    => $result->get_error_message(),
-                    ]);
-                }
-
-                $error_data = $result->get_error_data();
-                $http_code  = is_array($error_data) ? (int) ($error_data['code'] ?? 0) : 0;
-                $message    = $result->get_error_message();
-                if ($http_code === 400 && preg_match('/stamp|emisi[oó]n|DIAN/i', $message)) {
+            // AC-14: idempotency pre-search. If a previous POST committed in
+            // Alegra but its response was lost (timeout/reset), there is no
+            // _alegra_invoice_id. Look for an invoice whose observations carry
+            // this WC order marker before creating a duplicate.
+            $client_id = (string) ($data['client']['id'] ?? '');
+            $existing_invoice = $this->find_existing_invoice($order, $client_id);
+            if ($existing_invoice !== null) {
+                $existing_id = (string) ($existing_invoice['id'] ?? '');
+                if ($existing_id !== '') {
+                    $this->persist_invoice_result($order, $existing_id, $existing_invoice);
                     $order->add_order_note(sprintf(
-                        __('[Alegra] La DIAN rechazó la emisión de la factura: %s', 'alegra-connector'),
-                        $message
+                        __('[Alegra] Se encontró una factura existente (#%s) para este pedido; no se creó una nueva.', 'alegra-connector'),
+                        $existing_id
                     ));
+                    $this->logger->warning('Recovered pre-existing Alegra invoice (idempotency pre-search)', [
+                        'order_id'   => $order_id,
+                        'invoice_id' => $existing_id,
+                    ]);
+                    return ['id' => $existing_id, 'already_exists' => true, 'recovered' => true];
                 }
             }
 
-            if (!is_wp_error($result) && isset($result['id'])) {
-                $order->update_meta_data('_alegra_invoice_id', (string) $result['id']);
-                $invoice_number = $result['number'] ?? $result['id'];
-                if (isset($result['numberTemplate']['fullNumber'])) {
-                    $invoice_number = $result['numberTemplate']['fullNumber'];
+            $result = $this->api->create_invoice($data);
+
+            if (is_wp_error($result)) {
+                $error_data = $result->get_error_data();
+                $response   = is_array($error_data) ? ($error_data['response'] ?? null) : null;
+
+                // AC-13: a failed stamp still creates the invoice as a draft and
+                // returns HTTP 400 with the created invoice in the body. Persist
+                // its id so a retry does not create a SECOND invoice.
+                $created_invoice = is_array($response) ? ($response['invoice'] ?? null) : null;
+                $created_id = is_array($created_invoice) ? (string) ($created_invoice['id'] ?? '') : '';
+
+                if ($created_id !== '') {
+                    $this->persist_invoice_result($order, $created_id, $created_invoice);
+
+                    $stamp_error = '';
+                    if (is_array($response) && isset($response['error'])) {
+                        $err = $response['error'];
+                        $stamp_error = is_array($err) ? (string) ($err['message'] ?? '') : (string) $err;
+                    }
+                    if ($stamp_error === '') {
+                        $stamp_error = $result->get_error_message();
+                    }
+
+                    $order->add_order_note(sprintf(
+                        __('[Alegra] La factura #%s se creó en Alegra pero NO se emitió ante la DIAN: %s. No se reintentará la creación; vuelve a emitirla manualmente.', 'alegra-connector'),
+                        $created_id,
+                        $stamp_error
+                    ));
+                    $this->logger->error('Invoice created as draft but stamp failed', [
+                        'order_id'   => $order_id,
+                        'invoice_id' => $created_id,
+                        'error'      => $stamp_error,
+                    ]);
+                } else {
+                    if ($this->logger) {
+                        $this->logger->error('Invoice creation failed', [
+                            'order_id' => $order_id,
+                            'error'    => $result->get_error_message(),
+                        ]);
+                    }
+
+                    $http_code = is_array($error_data) ? (int) ($error_data['code'] ?? 0) : 0;
+                    $message   = $result->get_error_message();
+                    if ($http_code === 400 && preg_match('/stamp|emisi[oó]n|DIAN/i', $message)) {
+                        $order->add_order_note(sprintf(
+                            __('[Alegra] La DIAN rechazó la emisión de la factura: %s', 'alegra-connector'),
+                            $message
+                        ));
+                    }
                 }
-                $order->update_meta_data('_alegra_invoice_number', (string) $invoice_number);
-                $order->save();
-                // Add note to WC order
+
+                return $result;
+            }
+
+            if (isset($result['id'])) {
+                $this->persist_invoice_result($order, (string) $result['id'], $result);
                 $order->add_order_note(sprintf(
                     __('Factura Alegra #%s creada.', 'alegra-connector'),
-                    $invoice_number
+                    (string) $order->get_meta('_alegra_invoice_number', true)
                 ));
                 $this->logger->info('Invoice created in Alegra', [
                     'order_id' => $order_id,
@@ -114,6 +163,117 @@ class Orders
         }
     }
 
+    /**
+     * Persist an Alegra invoice id/number on the order.
+     *
+     * Used on success, when a failed stamp still returned the created draft
+     * (AC-13), and when the idempotency pre-search recovers an existing invoice
+     * (AC-14).
+     *
+     * @param array<string, mixed> $invoice The Alegra invoice payload.
+     */
+    private function persist_invoice_result(\WC_Order $order, string $invoice_id, array $invoice): void
+    {
+        $order->update_meta_data('_alegra_invoice_id', $invoice_id);
+
+        $invoice_number = $invoice_id;
+        if (isset($invoice['numberTemplate']['fullNumber'])) {
+            $invoice_number = (string) $invoice['numberTemplate']['fullNumber'];
+        } elseif (isset($invoice['numberTemplate']['number'])) {
+            $invoice_number = (string) $invoice['numberTemplate']['number'];
+        } elseif (isset($invoice['number'])) {
+            $invoice_number = (string) $invoice['number'];
+        }
+        $order->update_meta_data('_alegra_invoice_number', $invoice_number);
+        $order->save();
+    }
+
+    /**
+     * Find an Alegra invoice that belongs to this WC order (AC-14).
+     *
+     * GET /invoices supports `client_id` but NOT an observations/query filter
+     * (see get_invoices.md), so we filter server-side by client and scan the
+     * returned page for the "Pedido WooCommerce #<id>" marker written by
+     * prepare_invoice_data().
+     *
+     * @return array<string, mixed>|null
+     */
+    private function find_existing_invoice(\WC_Order $order, string $client_id): ?array
+    {
+        $params = [
+            'limit'           => 30,
+            'order_field'     => 'date',
+            'order_direction' => 'DESC',
+        ];
+        if ($client_id !== '') {
+            $params['client_id'] = $client_id;
+        }
+
+        $invoices = $this->api->get_invoices($params);
+        if (is_wp_error($invoices) || !is_array($invoices)) {
+            return null;
+        }
+
+        $order_id = (int) $order->get_id();
+        foreach ($invoices as $invoice) {
+            if (!is_array($invoice)) {
+                continue;
+            }
+            $observations = (string) ($invoice['observations'] ?? '');
+            // Anchor the id so "#123" never matches "#1234".
+            if ($observations !== '' && preg_match('/Pedido WooCommerce #(\d+)/', $observations, $m)) {
+                if ((int) $m[1] === $order_id) {
+                    return $invoice;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Find an Alegra payment already applied to an invoice (AC-14).
+     *
+     * GET /payments supports `client_id`; we match on the invoice association
+     * returned in each payment.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function find_existing_payment(string $invoice_id, string $client_id): ?array
+    {
+        if ($invoice_id === '') {
+            return null;
+        }
+
+        $params = ['limit' => 30, 'order_direction' => 'DESC'];
+        if ($client_id !== '') {
+            $params['client_id'] = $client_id;
+        }
+
+        $payments = $this->api->get_payments($params);
+        if (is_wp_error($payments) || !is_array($payments)) {
+            return null;
+        }
+
+        foreach ($payments as $payment) {
+            if (!is_array($payment)) {
+                continue;
+            }
+            $invoices = $payment['invoices'] ?? [];
+            if (!is_array($invoices)) {
+                continue;
+            }
+            foreach ($invoices as $inv) {
+                $inv_id = is_array($inv) ? (string) ($inv['id'] ?? '') : (string) $inv;
+                if ($inv_id !== '' && $inv_id === $invoice_id) {
+                    return $payment;
+                }
+            }
+        }
+
+        return null;
+    }
+
     public function create_invoice_with_payment(\WC_Order $order): array|\WP_Error
     {
         $invoice_result = $this->create_invoice($order);
@@ -124,6 +284,26 @@ class Orders
 
         $existing_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment_id !== '') {
+            return $invoice_result;
+        }
+
+        // AC-14: recover a payment Alegra committed but whose response was lost.
+        $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
+        $existing_payment = $this->find_existing_payment((string) $invoice_result['id'], $client_id);
+        if ($existing_payment !== null) {
+            $order->update_meta_data('_alegra_payment_id', (string) ($existing_payment['id'] ?? ''));
+            if (!empty($existing_payment['number'])) {
+                $order->update_meta_data('_alegra_payment_number', $existing_payment['number']);
+            }
+            $order->save();
+            $order->add_order_note(sprintf(
+                __('[Alegra] Se encontró un pago existente (#%s) para esta factura; no se registró uno nuevo.', 'alegra-connector'),
+                $existing_payment['number'] ?? $existing_payment['id'] ?? ''
+            ));
+            $this->logger->warning('Recovered pre-existing Alegra payment (idempotency pre-search)', [
+                'order_id'   => $order->get_id(),
+                'payment_id' => $existing_payment['id'] ?? 'unknown',
+            ]);
             return $invoice_result;
         }
 
@@ -488,23 +668,45 @@ class Orders
         // Country must be resolved BEFORE being used (PHP 8+ safe + correct logic).
         $country = (string) $order->get_billing_country();
 
+        // AC-10: invoice lines require an Alegra item id; abort if unresolvable.
+        $items = $this->prepare_invoice_items($order);
+        if (is_wp_error($items)) {
+            return $items;
+        }
+
         $data = [
             'date' => $order->get_date_created() ? $order->get_date_created()->date('Y-m-d') : date('Y-m-d'),
             'dueDate' => $this->calculate_due_date($order),
             'client' => $client_data,
-            'items' => $this->prepare_invoice_items($order),
+            'items' => $items,
             'currency' => ['code' => $order->get_currency() ?: get_option('alegra_connector_currency', 'COP')],
             'observations' => sprintf(__('Pedido WooCommerce #%d', 'alegra-connector'), $order->get_id()),
             'status' => 'open',
         ];
 
-        // Payment method mapping
+        // Payment method mapping.
+        // Colombia (DIAN, FE 2.1) uses paymentForm (CASH/CREDIT) + the uppercase
+        // DIAN "Medio de pago" catalog. Every other country keeps the lowercase
+        // global codes (the /payments schema is lowercase; the invoice-level
+        // paymentMethod is only defined per-country and is optional elsewhere).
         $payment = $this->map_payment_method($order);
         if ($payment) {
-            // paymentForm is only for Colombia; other countries just use paymentMethod
-            $data['paymentMethod'] = $payment['method'];
             if ($country === 'CO') {
                 $data['paymentForm'] = $payment['form'];
+                $dian_method = $this->map_dian_payment_method($order);
+                if ($dian_method !== '') {
+                    $data['paymentMethod'] = $dian_method;
+                } else {
+                    // Never guess: omit so Alegra applies its default. Log it.
+                    if ($this->logger) {
+                        $this->logger->info('Colombia invoice: no DIAN payment method for gateway, omitting paymentMethod', [
+                            'order_id' => $order->get_id(),
+                            'gateway'  => $order->get_payment_method(),
+                        ]);
+                    }
+                }
+            } else {
+                $data['paymentMethod'] = $payment['method'];
             }
         }
 
@@ -741,7 +943,7 @@ class Orders
         return date('Y-m-d', strtotime('+15 days'));
     }
 
-    private function prepare_invoice_items(\WC_Order $order): array
+    private function prepare_invoice_items(\WC_Order $order): array|\WP_Error
     {
         $items = [];
 
@@ -751,18 +953,29 @@ class Orders
 
             $alegra_item_id = $this->resolve_item_alegra_id($product_id, $variation_id);
 
+            // AC-10: `items[].id` is obligatory for Alegra invoices. An id-less
+            // line is either a 400 or a free-text line that breaks inventory.
+            // Refuse to build the invoice rather than send a malformed one.
+            if ($alegra_item_id === '') {
+                return new \WP_Error(
+                    'invoice_item_unlinked',
+                    sprintf(
+                        /* translators: %s: WooCommerce product name */
+                        __('No se pudo vincular el producto "%s" con un ítem de Alegra. Sincroniza el producto antes de facturar.', 'alegra-connector'),
+                        $item_obj->get_name()
+                    )
+                );
+            }
+
             $price = (float) ($item_obj->get_subtotal() / max(1, $item_obj->get_quantity()));
             $quantity = (int) $item_obj->get_quantity();
 
             $item_data = [
+                'id' => $alegra_item_id,
                 'name' => $item_obj->get_name(),
                 'price' => $price,
                 'quantity' => $quantity,
             ];
-
-            if ($alegra_item_id !== '') {
-                $item_data['id'] = $alegra_item_id;
-            }
 
             $tax_ids = $this->map_item_taxes($item_obj);
             if (!empty($tax_ids)) {
@@ -778,6 +991,13 @@ class Orders
         return $items;
     }
 
+    /**
+     * Resolve the Alegra item id for a WC product/variation.
+     *
+     * Order: stored meta → SKU lookup → push the product to Alegra (which
+     * creates/links the item and stores `_alegra_item_id`). Returns '' when the
+     * item cannot be resolved.
+     */
     private function resolve_item_alegra_id(int $product_id, int $variation_id): string
     {
         if ($variation_id > 0) {
@@ -796,6 +1016,25 @@ class Orders
                     $found_id = (string) $items[0]['id'];
                     update_post_meta($product_id, '_alegra_item_id', $found_id);
                     return $found_id;
+                }
+            }
+        }
+
+        // Last resort: push the product (or variation) so Alegra assigns an id.
+        $target_id = $variation_id > 0 ? $variation_id : $product_id;
+        if ($target_id > 0 && function_exists('wc_get_product')) {
+            $product = wc_get_product($target_id);
+            if ($product instanceof \WC_Product) {
+                $sync = new Products($this->api, $this->logger);
+                $result = $sync->sync_to_alegra($product);
+                if (!is_wp_error($result) && isset($result['id'])) {
+                    return (string) $result['id'];
+                }
+                if ($this->logger) {
+                    $this->logger->warning('Could not push product to resolve Alegra item id', [
+                        'product_id' => $target_id,
+                        'error'      => is_wp_error($result) ? $result->get_error_message() : 'missing id',
+                    ]);
                 }
             }
         }
@@ -996,6 +1235,62 @@ class Orders
             'nequi' => ['form' => 'CREDIT', 'method' => 'transfer'],
             'daviplata' => ['form' => 'CREDIT', 'method' => 'transfer'],
             'bancolombia' => ['form' => 'CREDIT', 'method' => 'transfer'],
+        ];
+    }
+
+    /**
+     * Map a WooCommerce gateway to a DIAN "Medio de pago" code (Colombia).
+     *
+     * Catalog: https://developer.alegra.com/docs/colombia.md ("Medios de pago").
+     * Returns '' when the gateway has no unambiguous DIAN code — the caller then
+     * omits `paymentMethod` (Alegra applies its default) rather than guessing.
+     */
+    private function map_dian_payment_method(\WC_Order $order): string
+    {
+        $method = (string) $order->get_payment_method();
+
+        foreach ($this->get_dian_payment_method_mappings() as $slug => $code) {
+            if (strpos($method, $slug) !== false) {
+                return $code;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * WC gateway slug → DIAN "Medio de pago" code (Colombia only).
+     *
+     * Only gateways whose DIAN equivalent is unambiguous are listed. PayPal and
+     * wallet gateways (Nequi/Daviplata/Wompi) are intentionally omitted so the
+     * field is left to Alegra's default instead of sending a wrong code.
+     */
+    private function get_dian_payment_method_mappings(): array
+    {
+        return [
+            'bacs'                    => 'CREDIT_TRANSFER',
+            'cheque'                  => 'CHECK',
+            'cod'                     => 'CASH',
+            'pse'                     => 'CREDIT_TRANSFER',
+            'bancolombia'             => 'CREDIT_TRANSFER',
+            'transferencia'           => 'CREDIT_TRANSFER',
+            'stripe'                  => 'CREDIT_CARD',
+            'woocommerce_payments'    => 'CREDIT_CARD',
+            'mercadopago'             => 'CREDIT_CARD',
+            'woocommerce-mercado-pago' => 'CREDIT_CARD',
+            'woo-mercado-pago'        => 'CREDIT_CARD',
+            'payu'                    => 'CREDIT_CARD',
+            'epayco'                  => 'CREDIT_CARD',
+            'square'                  => 'CREDIT_CARD',
+            'razorpay'                => 'CREDIT_CARD',
+            'payfast'                 => 'CREDIT_CARD',
+            'dlocal'                  => 'CREDIT_CARD',
+            'ebanx'                   => 'CREDIT_CARD',
+            'openpay'                 => 'CREDIT_CARD',
+            'clip'                    => 'CREDIT_CARD',
+            'culqi'                   => 'CREDIT_CARD',
+            'efecty'                  => 'CASH',
+            'baloto'                  => 'CASH',
         ];
     }
 

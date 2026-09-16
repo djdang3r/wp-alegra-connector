@@ -174,11 +174,9 @@ final class Alegra_Connector
         // DB migrations on plugins_loaded (idempotent via dbDelta)
         add_action('plugins_loaded', [\Alegra\Connector\Schema::class, 'migrate'], 5);
 
-        // Billing fields + checkout integration (2.3.0)
-        \Alegra\Connector\Checkout_Integration::register();
-
-        // State sync: refunds, profile updates, payment method changes (2.3.0)
-        \Alegra\Connector\State_Sync::register_hooks();
+        // NOTE: Checkout_Integration::register() and State_Sync::register_hooks()
+        // are wired from on_plugins_loaded() AFTER the WooCommerce guard (AC-17),
+        // so they are never registered when WooCommerce is inactive.
 
         // Tombstone hook: track products deleted in WC
         add_action('before_delete_post', [\Alegra\Connector\Tombstone_Manager::class, 'on_post_delete']);
@@ -234,14 +232,38 @@ final class Alegra_Connector
      */
     public function on_plugins_loaded(): void
     {
-        // Logger first - everyone depends on it
+        // Logger first - everyone depends on it. It has no WooCommerce
+        // dependency, so it must load even when WC is missing (otherwise the
+        // priority-999 self-check below would wrongly deactivate the plugin).
         $this->init_logger();
+
+        // AC-17: hard guard. This plugin loads before WooCommerce (alphabetical),
+        // so if WC is missing every `wc_*`/`WC_*` call in templates and AJAX
+        // handlers would fatal (white screen / HTTP 500). Bail out early with a
+        // notice and load no sync/admin components.
+        if (!class_exists('WooCommerce') || !function_exists('wc_get_order')) {
+            add_action('admin_notices', static function (): void {
+                echo '<div class="notice notice-error"><p>';
+                echo esc_html__(
+                    'Alegra Connector requiere WooCommerce activo. La sincronización está desactivada hasta que actives WooCommerce.',
+                    'alegra-connector'
+                );
+                echo '</p></div>';
+            });
+            return;
+        }
 
         // API client next
         $this->init_api();
 
         // Sync controller
         $this->init_sync();
+
+        // Billing fields + checkout integration (2.3.0)
+        \Alegra\Connector\Checkout_Integration::register();
+
+        // State sync: refunds, profile updates, payment method changes (2.3.0)
+        \Alegra\Connector\State_Sync::register_hooks();
 
         // Public facing (for REST API + WooCommerce hooks) - needed for all requests
         $this->init_public();
