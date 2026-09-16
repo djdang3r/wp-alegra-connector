@@ -164,7 +164,7 @@ class Controller
             $result['orders'] = ($poll_result['completed'] ?? 0);
         }
 
-        update_transient('alegra_connector_last_sync', time());
+        set_transient('alegra_connector_last_sync', time(), DAY_IN_SECONDS);
 
         Heartbeat::set($run_id, ['step' => 'done', 'message' => sprintf(
             __('Completado: %d productos, %d clientes, %d ordenes, %d categorias', 'alegra-connector'),

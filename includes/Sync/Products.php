@@ -339,7 +339,7 @@ class Products
     {
         $tax_class = $product->get_tax_class();
         if (empty($tax_class) || $tax_class === 'zero-rate') {
-            return 0;
+            return '';
         }
 
         $tax_mapping = get_option('alegra_connector_tax_mapping', []);

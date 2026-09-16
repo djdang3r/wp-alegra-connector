@@ -159,6 +159,21 @@ class Orders
             return new \WP_Error('no_invoice', 'Order has no linked Alegra invoice');
         }
 
+        // Idempotency: never issue a second credit note for the same order.
+        // State_Sync::handle_refund() (the refund owner) records its per-refund
+        // keys AND the cumulative cap; either marker means a credit note exists.
+        $existing_credit_note = (string) $order->get_meta('_alegra_credit_note_id', true);
+        if ($existing_credit_note !== '') {
+            return ['id' => $existing_credit_note, 'already_exists' => true];
+        }
+        $credited_before = (float) $order->get_meta('_alegra_credited_amount', true);
+        if ($credited_before > 0) {
+            return new \WP_Error(
+                'credit_note_already_issued',
+                __('Ya se emitió una nota de crédito para este pedido.', 'alegra-connector')
+            );
+        }
+
         $invoice = $this->api->get_invoice($alegra_invoice_id);
         if (!is_wp_error($invoice) && is_array($invoice)) {
             $emission = (string) ($invoice['emission_status'] ?? '');
@@ -194,7 +209,32 @@ class Orders
             $total += (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
         }
 
+        // Cumulative cap: never credit more than the original invoice total.
+        $invoice_total = (!is_wp_error($invoice) && isset($invoice['total']))
+            ? (float) $invoice['total']
+            : (float) $order->get_total();
+        if ($credited_before + $total > $invoice_total + 0.01) {
+            return new \WP_Error(
+                'credit_note_exceeds_invoice',
+                __('El monto de la nota de crédito supera el total de la factura.', 'alegra-connector')
+            );
+        }
+
+        // Resolve the client — required by POST /credit-notes.
+        $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
+        if ($client_id === '') {
+            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            $client_id = $cf !== false ? (string) $cf : '';
+        }
+        if ($client_id === '') {
+            return new \WP_Error(
+                'customer_unresolved',
+                __('No se pudo resolver el cliente para la nota de crédito.', 'alegra-connector')
+            );
+        }
+
         $data = [
+            'client' => ['id' => $client_id],
             'invoices' => [
                 [
                     'id'     => $alegra_invoice_id,
@@ -216,6 +256,8 @@ class Orders
         if (!is_wp_error($result)) {
             $cn_id = $result['id'] ?? '';
             $order->update_meta_data('_alegra_credit_note_id', (string) $cn_id);
+            // Maintain the cumulative cap so a later refund cannot over-credit.
+            $order->update_meta_data('_alegra_credited_amount', $credited_before + $total);
             $order->save();
             $this->logger->info('Credit note created in Alegra', [
                 'order_id' => $order->get_id(),
