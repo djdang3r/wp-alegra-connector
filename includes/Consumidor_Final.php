@@ -88,10 +88,9 @@ class Consumidor_Final
     {
         $lock_key = self::cache_key(self::LOCK_KEY);
 
-        // Acquire a lock so concurrent requests do not hammer the API.
-        // NOTE: set_transient() returns true even when the key already exists,
-        // so existence must be checked with get_transient() first.
-        if (get_transient($lock_key)) {
+        // Acquire an atomic lock so concurrent requests do not hammer the API.
+        $token = \Alegra\Connector\Sync\Controller::acquire_lock($lock_key, self::LOCK_TTL);
+        if ($token === false) {
             usleep(500000); // 500ms
 
             $cached = get_transient(self::cache_key(self::CACHE_TRANSIENT));
@@ -106,8 +105,6 @@ class Consumidor_Final
 
             return false;
         }
-
-        set_transient($lock_key, 1, self::LOCK_TTL);
 
         try {
             if ($client === null) {
@@ -160,7 +157,7 @@ class Consumidor_Final
 
             return false;
         } finally {
-            delete_transient($lock_key);
+            \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
         }
     }
 

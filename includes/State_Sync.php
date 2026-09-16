@@ -68,13 +68,13 @@ class State_Sync
     {
         $lock_key = sprintf('alegra_sync_refund_lock_%d_%d', $order_id, $refund_id);
 
-        if (get_transient($lock_key)) {
+        $token = \Alegra\Connector\Sync\Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
             return new \WP_Error(
                 'refund_in_progress',
                 __('Ya hay un reembolso en proceso para este pedido.', 'alegra-connector')
             );
         }
-        set_transient($lock_key, 1, 30);
 
         try {
             if (!function_exists('wc_get_order')) {
@@ -162,7 +162,7 @@ class State_Sync
 
             return $result;
         } finally {
-            delete_transient($lock_key);
+            \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
         }
     }
 

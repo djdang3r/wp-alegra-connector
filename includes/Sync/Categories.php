@@ -89,12 +89,24 @@ class Categories
 
     public function import_from_alegra(): array|\WP_Error
     {
+        // Kill switch guard
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $this->logger->info('Categories import skipped: kill switch active');
+            return new \WP_Error('kill_switch_active', 'Plugin is disconnected or deactivated');
+        }
+
         $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
         $current_page = 1;
         $max_pages = 200;
         set_time_limit(300);
 
         for ($p = 1; $p <= $max_pages; $p++) {
+            // Re-check the kill switch every page so an in-flight run stops.
+            if (\Alegra\Connector\Kill_Switch::is_active()) {
+                $this->logger->info('Categories import stopped: kill switch active');
+                break;
+            }
+
             $alegra_categories = $this->api->get_item_categories([
                 'start' => ($current_page - 1) * 30,
                 'limit' => 30,

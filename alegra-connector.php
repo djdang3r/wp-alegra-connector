@@ -378,11 +378,18 @@ final class Alegra_Connector
      */
     public function deactivate(): void
     {
-        // 1. Activate kill switch so any in-flight request stops
+        // 1. Activate kill switch so any in-flight request stops.
+        //    The kill switch is an OPTION (see Kill_Switch), so the transient
+        //    sweep below cannot wipe it.
         Kill_Switch::activate('plugin_deactivated');
 
-        // 2. Clear ALL alegra_* transients (1 query, efficient)
+        // 2. Count THEN clear ALL alegra_* transients (1 query, efficient).
+        //    Count first — otherwise it is always 0 after the DELETE.
         global $wpdb;
+        $cleaned_transients = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->options}
+             WHERE option_name LIKE '_transient_alegra\\_%' ESCAPE '\\\\'"
+        );
         $wpdb->query(
             "DELETE FROM {$wpdb->options}
              WHERE option_name LIKE '_transient_alegra\\_%'
@@ -396,12 +403,9 @@ final class Alegra_Connector
             wp_clear_scheduled_hook($hook);
         }
 
-        // 4. Count cleaned items for deactivation summary
+        // 4. Build deactivation summary from the pre-delete counts
         $cleaned_count = [
-            'transients' => (int) $wpdb->get_var(
-                "SELECT COUNT(*) FROM {$wpdb->options}
-                 WHERE option_name LIKE '_transient_alegra\\_%' ESCAPE '\\\\'"
-            ),
+            'transients' => $cleaned_transients,
             'cron_jobs' => count($cron_hooks),
             'timestamp' => current_time('mysql'),
         ];

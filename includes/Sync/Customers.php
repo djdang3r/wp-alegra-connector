@@ -204,6 +204,12 @@ class Customers
 
     public function import_from_alegra(int $page = 1, int $per_page = 30): array|\WP_Error
     {
+        // Kill switch guard
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $this->logger->info('Customers import skipped: kill switch active');
+            return new \WP_Error('kill_switch_active', 'Plugin is disconnected or deactivated');
+        }
+
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('customers');
         if ($lock === false) {
             $this->logger->info('Customers import skipped: another sync is running');
@@ -220,6 +226,12 @@ class Customers
                 if (get_transient('alegra_sync_cancelled')) {
                     delete_transient('alegra_sync_cancelled');
                     $this->logger->info('Customers import cancelled by user');
+                    break;
+                }
+
+                // Re-check the kill switch every page so an in-flight run stops.
+                if (\Alegra\Connector\Kill_Switch::is_active()) {
+                    $this->logger->info('Customers import stopped: kill switch active');
                     break;
                 }
 

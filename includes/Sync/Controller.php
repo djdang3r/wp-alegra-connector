@@ -283,7 +283,55 @@ class Controller
     }
 
     /**
-     * Try to acquire a transient lock for the given sync type.
+     * Acquire an atomic lock.
+     *
+     * add_option() is a real compare-and-swap: wp_options.option_name has a
+     * UNIQUE index, so only one caller can create the row. Unlike the old
+     * get_transient()+set_transient() pattern — an unconditional UPSERT — this
+     * cannot be won by two concurrent PHP-FPM workers at once.
+     *
+     * @param string $key Lock identifier (stored as alegra_lock_<key>).
+     * @param int    $ttl Lock lifetime in seconds; used to reclaim stale locks.
+     * @return string|false The lock token on success, false if already held.
+     */
+    public static function acquire_lock(string $key, int $ttl = 300): string|false
+    {
+        $option = 'alegra_lock_' . $key;
+        $token  = wp_generate_password(20, false);
+
+        if (!add_option($option, ['token' => $token, 'expires' => time() + $ttl], '', 'no')) {
+            // Lock exists — reclaim it only if it is stale (a crashed worker).
+            $existing = get_option($option);
+            if (is_array($existing) && isset($existing['expires']) && (int) $existing['expires'] < time()) {
+                delete_option($option);
+                if (!add_option($option, ['token' => $token, 'expires' => time() + $ttl], '', 'no')) {
+                    return false;
+                }
+                return $token;
+            }
+            return false;
+        }
+
+        return $token;
+    }
+
+    /**
+     * Release a lock, but only if we still own it (never release someone else's).
+     *
+     * @param string $key   Same key passed to acquire_lock().
+     * @param string $token Token returned by acquire_lock().
+     */
+    public static function release_lock(string $key, string $token): void
+    {
+        $option   = 'alegra_lock_' . $key;
+        $existing = get_option($option);
+        if (is_array($existing) && isset($existing['token']) && $existing['token'] === $token) {
+            delete_option($option);
+        }
+    }
+
+    /**
+     * Try to acquire an atomic lock for the given sync type.
      *
      * Returns a unique token string on success, or false if another process
      * already holds the lock. TTL is 300 seconds (5 min) so a crashed run
@@ -294,22 +342,11 @@ class Controller
      */
     private function acquire_sync_lock(string $type): string|false
     {
-        $key = "alegra_sync_running_{$type}";
-        $existing = get_transient($key);
-        if ($existing !== false) {
-            return false;
-        }
-        $token = wp_generate_password(20, false);
-        set_transient($key, $token, 300);
-        $winner = get_transient($key);
-        if ($winner !== $token) {
-            return false;
-        }
-        return $token;
+        return self::acquire_lock('alegra_sync_running_' . $type, 300);
     }
 
     /**
-     * Release a transient lock — only if the token matches.
+     * Release a sync lock — only if the token matches.
      *
      * This prevents a stale process from accidentally releasing a fresh lock
      * after a 5-min TTL turnover.
@@ -319,11 +356,7 @@ class Controller
      */
     private function release_sync_lock(string $type, string $token): void
     {
-        $key = "alegra_sync_running_{$type}";
-        $current = get_transient($key);
-        if ($current === $token) {
-            delete_transient($key);
-        }
+        self::release_lock('alegra_sync_running_' . $type, $token);
     }
 
     /**

@@ -38,8 +38,9 @@ class Orders
         $lock_key = 'alegra_invoice_lock_' . $order_id;
 
         // Anti-duplication mutex: prevent two concurrent requests creating duplicate invoices.
-        // Transient is atomic via MySQL row lock (works in PHP-FPM multi-worker).
-        if (get_transient($lock_key)) {
+        // Atomic via add_option()'s UNIQUE index (real compare-and-swap).
+        $token = Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
             $this->logger->warning('Invoice creation already in progress for this order', [
                 'order_id' => $order_id,
             ]);
@@ -48,7 +49,6 @@ class Orders
                 __('Ya hay una creacion de factura en curso para este pedido. Espera unos segundos.', 'alegra-connector')
             );
         }
-        set_transient($lock_key, 1, 30); // 30s lock
 
         try {
             $alegra_id = (string) $order->get_meta('_alegra_invoice_id', true);
@@ -110,7 +110,7 @@ class Orders
             return $result;
         } finally {
             // Always release lock, even on error
-            delete_transient($lock_key);
+            Controller::release_lock($lock_key, $token);
         }
     }
 
@@ -603,9 +603,10 @@ class Orders
             }
         }
 
-        // Steps 3-5 run under a transient lock to avoid duplicate contact creation.
+        // Steps 3-5 run under an atomic lock to avoid duplicate contact creation.
         $lock_key = 'alegra_contact_create_lock_' . $order_id;
-        if (get_transient($lock_key)) {
+        $token = Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
             usleep(500000);
             // Re-check cache once after the concurrent request had time to persist.
             $cached = (string) $order->get_meta('_billing_alegra_contact_id', true);
@@ -614,7 +615,6 @@ class Orders
             }
             // Fall through to the Consumidor Final fallback.
         } else {
-            set_transient($lock_key, 1, 30);
             try {
                 // Step 3a — lookup by identification (new format).
                 $idtype = $customer ? (string) get_user_meta($customer->ID, 'billing_alegra_idtype', true) : (string) $order->get_meta('_billing_alegra_idtype', true);
@@ -666,7 +666,7 @@ class Orders
                     }
                 }
             } finally {
-                delete_transient($lock_key);
+                Controller::release_lock($lock_key, $token);
             }
         }
 
@@ -1074,6 +1074,12 @@ class Orders
     {
         $result = ['checked' => 0, 'completed' => 0, 'errors' => 0];
 
+        // Kill switch guard
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $this->logger->info('Invoice status poll skipped: kill switch active');
+            return $result;
+        }
+
         $orders = wc_get_orders([
             'limit' => 50,
             'status' => ['processing', 'pending', 'on-hold'],
@@ -1092,6 +1098,12 @@ class Orders
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
         foreach ($order_ids as $order_id => $invoice_id) {
+            // Re-check the kill switch so an in-flight poll stops.
+            if (\Alegra\Connector\Kill_Switch::is_active()) {
+                $this->logger->info('Invoice status poll stopped: kill switch active');
+                break;
+            }
+
             $result['checked']++;
 
             $invoice = $this->api->get_invoice($invoice_id);

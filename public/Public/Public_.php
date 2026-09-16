@@ -271,21 +271,21 @@ class Public_
      * Trigger sync only if not already syncing (prevents loops during import)
      * and sync method allows real-time sync.
      *
-     * Uses a transient-based mutex (atomic via MySQL row lock) so the guard
-     * works correctly across multiple PHP-FPM workers.
+     * Uses an atomic lock (add_option UNIQUE index) so the guard works
+     * correctly across multiple PHP-FPM workers.
      */
     private function trigger_sync(string $type, int $id, string $action): void
     {
         $lock_key = 'alegra_sync_guard_' . $type . '_' . $id;
 
         // Prevent re-entrant sync across workers/processes
-        if (get_transient($lock_key)) {
+        $token = Sync\Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
             if ($this->logger) {
                 $this->logger->debug('Skipping re-entrant sync (lock held)', ['type' => $type, 'id' => $id, 'action' => $action]);
             }
             return;
         }
-        set_transient($lock_key, 1, 30); // 30s lock
 
         // Also keep the static for in-request re-entrancy
         self::$is_syncing = true;
@@ -299,7 +299,7 @@ class Public_
             }
         } finally {
             self::$is_syncing = false;
-            delete_transient($lock_key);
+            Sync\Controller::release_lock($lock_key, $token);
         }
     }
 

@@ -512,6 +512,12 @@ class Products
                 break;
             }
 
+            // Re-check the kill switch every page so an in-flight run stops.
+            if (\Alegra\Connector\Kill_Switch::is_active()) {
+                $this->logger->info('Products import stopped: kill switch active');
+                break;
+            }
+
             // Update progress transient
             set_transient('alegra_sync_progress', [
                 'type' => 'products',
@@ -1017,14 +1023,14 @@ class Products
 
         // Process lock: prevent two concurrent calls from racing on the same URL
         $lock_key = 'alegra_img_dedup_' . $url_hash;
-        if (get_transient($lock_key)) {
+        $token = \Alegra\Connector\Sync\Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
             // Another process is handling this URL right now; wait briefly and re-check
             usleep(500000); // 0.5s
             $existing_id = $this->get_attachment_by_url($product_id, $normalized_url);
             if ($existing_id > 0) return $existing_id;
-            // Fall through - we'll try ourselves
+            // Fall through - we'll try ourselves (best effort, without the lock)
         }
-        set_transient($lock_key, 1, 30);
 
         try {
             // Check if this URL was already imported for this product (by hash first, then URL)
@@ -1086,7 +1092,9 @@ class Products
 
             return (int) $attachment_id;
         } finally {
-            delete_transient($lock_key);
+            if ($token !== false) {
+                \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
+            }
         }
     }
 

@@ -23,39 +23,31 @@ if (!defined('ABSPATH')) {
 
 class Kill_Switch
 {
-    private const TRANSIENT_KEY = 'alegra_kill_switch';
+    /**
+     * Stored as an OPTION (not a transient) so the deactivation transient
+     * sweep (`_transient_alegra_%`) cannot wipe the kill switch it just set.
+     */
+    private const OPTION_KEY = 'alegra_kill_switch';
     private const REASON_OPTION = 'alegra_connector_disconnected_reason';
-    private const TTL = 86400; // 24h
-
-    /** Per-request cache to avoid repeated get_transient() calls. */
-    private static ?bool $cached_state = null;
 
     /**
      * Check if the kill switch is currently active.
-     * Fast (<0.1ms) thanks to static cache.
      *
-     * Only the explicit transient is checked. We deliberately do NOT check
-     * connection_tested here because:
-     * - Fresh installs don't have connection_tested=true yet (default false),
-     *   which would incorrectly show the plugin as "disconnected" even though
-     *   it's just not configured yet.
-     * - The connection check is done at action time (ajax_test_connection,
-     *   sync entrypoints) where missing credentials produce a clear, actionable
-     *   error to the user.
-     *
-     * The transient is set ONLY when the user explicitly disconnects (or the
-     * plugin is deactivated). To clear it, the user clicks "Reactivar" in the
-     * notice or runs ajax_test_connection successfully.
+     * Reads straight from the options table on every call, bypassing every
+     * layer of the object cache (`options`, `alloptions`, `notoptions`) so a
+     * long import loop in one worker actually sees a flip made by another
+     * request (admin emergency stop / disconnect). One indexed lookup.
      */
     public static function is_active(): bool
     {
-        if (self::$cached_state !== null) {
-            return self::$cached_state;
-        }
+        global $wpdb;
 
-        $transient_active = (bool) get_transient(self::TRANSIENT_KEY);
-        self::$cached_state = $transient_active;
-        return self::$cached_state;
+        $value = $wpdb->get_var($wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            self::OPTION_KEY
+        ));
+
+        return $value !== null && $value !== '' && $value !== '0';
     }
 
     /**
@@ -65,10 +57,9 @@ class Kill_Switch
      */
     public static function activate(string $reason = 'manual'): void
     {
-        set_transient(self::TRANSIENT_KEY, $reason, self::TTL);
+        update_option(self::OPTION_KEY, $reason, false);
         update_option(self::REASON_OPTION, $reason);
         update_option('alegra_connector_connection_tested', false);
-        self::$cached_state = true;
 
         do_action('alegra_kill_switch_activated', $reason);
     }
@@ -78,10 +69,9 @@ class Kill_Switch
      */
     public static function deactivate(): void
     {
-        delete_transient(self::TRANSIENT_KEY);
+        delete_option(self::OPTION_KEY);
         delete_option(self::REASON_OPTION);
         update_option('alegra_connector_connection_tested', true);
-        self::$cached_state = false;
 
         do_action('alegra_kill_switch_deactivated');
     }
@@ -95,10 +85,14 @@ class Kill_Switch
     }
 
     /**
-     * Reset the per-request cache (useful in long-running processes).
+     * Reset any cached state (kept for backwards compatibility; is_active()
+     * already reads straight from the database every time).
      */
     public static function reset_cache(): void
     {
-        self::$cached_state = null;
+        if (function_exists('wp_cache_delete')) {
+            wp_cache_delete(self::OPTION_KEY, 'options');
+            wp_cache_delete('notoptions', 'options');
+        }
     }
 }
