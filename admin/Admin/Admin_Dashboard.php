@@ -75,6 +75,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_skip_cron_next', [$this, 'ajax_skip_cron_next']);
         add_action('wp_ajax_alegra_unschedule_cron', [$this, 'ajax_unschedule_cron']);
         add_action('wp_ajax_alegra_change_cron_frequency', [$this, 'ajax_change_cron_frequency']);
+        add_action('wp_ajax_alegra_enable_all_billing_fields', [$this, 'ajax_enable_all_billing_fields']);
     }
 
     /**
@@ -337,6 +338,43 @@ class Admin_Dashboard
             'sanitize_callback' => 'rest_sanitize_boolean',
             'default' => false,
         ]);
+
+        // Per-field billing toggles. Group A (Obligatorios) is force-enabled here
+        // so an admin can never break e-invoicing from the UI.
+        register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
+            'sanitize_callback' => function ($value) {
+                $enabled = [];
+                if (is_array($value)) {
+                    foreach ($value as $key => $on) {
+                        if ($on && isset(\Alegra\Connector\Billing_Fields::CATALOG[$key])) {
+                            $enabled[$key] = 1;
+                        }
+                    }
+                }
+                foreach (\Alegra\Connector\Billing_Fields::CATALOG as $key => $field) {
+                    if (($field['group'] ?? '') === 'A') {
+                        $enabled[$key] = 1;
+                    }
+                }
+                return $enabled;
+            },
+            'default' => [],
+        ]);
+
+        // Seed the required (Group A) fields whenever the catalog is empty so
+        // e-invoicing works out of the box instead of silently rendering no
+        // fields at checkout. Once saved, the sanitizer always keeps Group A,
+        // so this only ever writes on an unconfigured install.
+        $current_billing_fields = get_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, []);
+        if (!is_array($current_billing_fields) || empty($current_billing_fields)) {
+            $seed = [];
+            foreach (\Alegra\Connector\Billing_Fields::CATALOG as $key => $field) {
+                if (($field['group'] ?? '') === 'A') {
+                    $seed[$key] = 1;
+                }
+            }
+            update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, $seed);
+        }
 
         // Mapping settings group
         register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping');
@@ -2112,6 +2150,25 @@ class Admin_Dashboard
 
         wp_send_json_success([
             'message' => __('Plugin reactivado. Las operaciones volveran a funcionar.', 'alegra-connector'),
+        ]);
+    }
+
+    /**
+     * AJAX: Enable every billing field in the catalog at once.
+     */
+    public function ajax_enable_all_billing_fields(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $count = \Alegra\Connector\Billing_Fields::enable_all();
+
+        wp_send_json_success([
+            'count' => $count,
+            /* translators: %d: number of billing fields enabled. */
+            'message' => sprintf(__('Se habilitaron los %d campos de facturación.', 'alegra-connector'), $count),
         ]);
     }
 

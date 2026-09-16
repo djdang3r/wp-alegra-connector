@@ -1,5 +1,11 @@
 <?php if(!defined('ABSPATH'))exit;$page_title=__('Configuración','alegra-connector');$page_subtitle=__('Ajusta la conexion y el comportamiento del plugin','alegra-connector');include __DIR__.'/header.php';?>
 <div class="alegra-connector-wrap">
+<?php if(get_option('alegra_connector_dry_run',false)):?>
+<div class="alegra-dryrun-banner">
+<span class="alegra-dryrun-badge"><?php esc_html_e('MODO PRUEBA ACTIVADO','alegra-connector');?></span>
+<span><?php esc_html_e('El plugin NO envía nada a Alegra: no se crean facturas, clientes ni productos. Desactívalo antes de facturar de verdad.','alegra-connector');?></span>
+</div>
+<?php endif;?>
 <?php if(isset($_GET['settings-updated']) && $_GET['settings-updated']):?>
 <div class="ac-notice success" style="margin-bottom:16px;"><?php esc_html_e('Configuración guardada correctamente.','alegra-connector');?></div>
 <?php endif;?>
@@ -9,6 +15,7 @@
 <button type="button" class="ac-settings-tab" data-tab="sync"><?php esc_html_e('Sincronización','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="currency"><?php esc_html_e('Moneda','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="warehouse"><?php esc_html_e('Bodegas','alegra-connector');?></button>
+<button type="button" class="ac-settings-tab" data-tab="billing"><?php esc_html_e('Facturación electrónica','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="advanced"><?php esc_html_e('Avanzado','alegra-connector');?></button>
 </div>
 <div class="ac-settings-content">
@@ -141,6 +148,83 @@
 </table>
 </div>
 
+<!-- ==================== FACTURACION ELECTRONICA ==================== -->
+<div class="ac-tab-content" id="tab-billing" style="display:none;">
+<h2><?php esc_html_e('Facturación electrónica','alegra-connector');?></h2>
+<?php
+$ac_country = strtoupper(trim((string) get_option('alegra_connector_company_country','')));
+$ac_is_colombia = ($ac_country === '') || (strpos($ac_country,'COLOMBIA') !== false) || ($ac_country === 'CO');
+$ac_resolution_mode = get_option('alegra_connector_customer_resolution_mode','auto');
+?>
+<div class="ac-notice info" style="margin-bottom:16px;"><?php esc_html_e('Aquí defines a nombre de quién se emiten las facturas, si se envían a la DIAN y qué datos de facturación se le piden al cliente.','alegra-connector');?></div>
+
+<table class="form-table">
+<!-- 1a. Customer resolution mode -->
+<tr><th><label for="alegra_connector_customer_resolution_mode"><?php esc_html_e('¿A nombre de quién se factura?','alegra-connector');?></label></th><td>
+<select id="alegra_connector_customer_resolution_mode" name="alegra_connector_customer_resolution_mode">
+<option value="auto" <?php selected($ac_resolution_mode,'auto');?>><?php esc_html_e('Automático (recomendado)','alegra-connector');?></option>
+<option value="always_generic" <?php selected($ac_resolution_mode,'always_generic');?>><?php esc_html_e('Siempre Consumidor Final','alegra-connector');?></option>
+<option value="require_data" <?php selected($ac_resolution_mode,'require_data');?>><?php esc_html_e('Exigir datos al cliente','alegra-connector');?></option>
+</select>
+<p class="description" style="margin-top:8px;"><?php esc_html_e('Qué hace cada opción:','alegra-connector');?></p>
+<ul class="alegra-mode-legend">
+<li><strong><?php esc_html_e('Automático (recomendado):','alegra-connector');?></strong> <?php esc_html_e('Usa los datos de facturación del cliente. Si faltan, factura al Consumidor Final.','alegra-connector');?></li>
+<li><strong><?php esc_html_e('Siempre Consumidor Final:','alegra-connector');?></strong> <?php esc_html_e('Todas las facturas se emiten al Consumidor Final. El cliente no recibe factura a su nombre.','alegra-connector');?></li>
+<li><strong><?php esc_html_e('Exigir datos al cliente:','alegra-connector');?></strong> <?php esc_html_e('No se puede pagar sin NIT/cédula. No se factura al Consumidor Final.','alegra-connector');?></li>
+</ul>
+</td></tr>
+
+<!-- 1b. DIAN stamp toggle -->
+<tr><th><?php esc_html_e('Emisión ante la DIAN:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_stamp_enabled" value="1" <?php checked(get_option('alegra_connector_stamp_enabled',true));?>> <strong><?php esc_html_e('Emitir facturas ante la DIAN','alegra-connector');?></strong></label>
+<p class="description"><?php esc_html_e('Si lo desactivas, las facturas quedan en borrador y NO se envían a la DIAN. Solo desactívalo si estás probando.','alegra-connector');?></p>
+<?php if(!$ac_is_colombia):?>
+<div class="ac-notice warning" style="margin-top:8px;"><?php esc_html_e('La emisión ante la DIAN solo aplica a cuentas de Colombia. Tu cuenta está configurada en otro país, por lo que esta opción no tendrá efecto.','alegra-connector');?></div>
+<?php endif;?>
+</td></tr>
+
+<!-- 1c. Dry run toggle -->
+<tr><th><?php esc_html_e('Modo de prueba:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_dry_run" value="1" <?php checked(get_option('alegra_connector_dry_run',false));?>> <strong><?php esc_html_e('Modo de prueba (Dry Run)','alegra-connector');?></strong></label>
+<div class="ac-notice warning" style="margin-top:8px;"><strong><?php esc_html_e('Atención:','alegra-connector');?></strong> <?php esc_html_e('Con esto activado, el plugin NO envía nada a Alegra. No se crean facturas, clientes ni productos. Ideal para probar la configuración. ACUÉRDATE de desactivarlo.','alegra-connector');?></div>
+</td></tr>
+</table>
+
+<?php
+$ac_catalog = \Alegra\Connector\Billing_Fields::CATALOG;
+$ac_groups = ['A'=>__('Obligatorios','alegra-connector'),'B'=>__('Recomendados','alegra-connector'),'C'=>__('Opcionales','alegra-connector')];
+$ac_group_hint = [
+'A'=>__('Siempre activos: sin ellos la factura electrónica no es válida. No se pueden desactivar.','alegra-connector'),
+'B'=>__('Recomendados para facturar a empresas o a personas con nombre y apellido completos.','alegra-connector'),
+'C'=>__('Opcionales. Actívalos solo si realmente los usas.','alegra-connector'),
+];
+$ac_group_badge = ['A'=>'danger','B'=>'warning','C'=>'neutral'];
+?>
+<h3 style="margin:24px 0 4px 0;"><?php esc_html_e('Campos de facturación','alegra-connector');?></h3>
+<div class="ac-notice info" style="margin-bottom:16px;"><?php esc_html_e('Activa los campos que se le pedirán al cliente en el checkout y en su cuenta. Los campos obligatorios están fijos para que la facturación nunca se rompa.','alegra-connector');?></div>
+<input type="hidden" name="alegra_connector_billing_field_catalog_enabled[__submitted]" value="1">
+<div style="margin-bottom:8px;">
+<button type="button" class="ac-btn ac-btn-primary" id="alegra-enable-all-fields"><?php esc_html_e('Habilitar todos los campos','alegra-connector');?></button>
+<span id="alegra-enable-all-status" style="margin-left:8px;font-size:12px;color:var(--ac-text-secondary);"></span>
+</div>
+<?php foreach($ac_groups as $ac_gk=>$ac_glabel):?>
+<h4 class="alegra-billing-group-title"><?php echo esc_html($ac_glabel);?> <span class="ac-badge <?php echo esc_attr($ac_group_badge[$ac_gk]);?>"><?php echo esc_html($ac_gk);?></span></h4>
+<p class="description" style="margin:0;"><?php echo esc_html($ac_group_hint[$ac_gk]);?></p>
+<div class="alegra-billing-field-list">
+<?php foreach($ac_catalog as $ac_key=>$ac_field): if(($ac_field['group']??'')!==$ac_gk)continue; $ac_locked=($ac_gk==='A'); $ac_enabled=$ac_locked||\Alegra\Connector\Billing_Fields::is_field_enabled($ac_key);?>
+<label class="alegra-billing-field-row<?php echo $ac_locked?' is-locked':'';?>">
+<input type="checkbox" name="alegra_connector_billing_field_catalog_enabled[<?php echo esc_attr($ac_key);?>]" value="1" <?php checked($ac_enabled);?> <?php disabled($ac_locked);?>>
+<?php if($ac_locked):?><input type="hidden" name="alegra_connector_billing_field_catalog_enabled[<?php echo esc_attr($ac_key);?>]" value="1"><?php endif;?>
+<span class="alegra-billing-field-info">
+<span class="alegra-billing-field-label"><?php echo esc_html((string)$ac_field['label']);?> <?php if($ac_locked):?><span class="alegra-lock-tag"><?php esc_html_e('Obligatorio','alegra-connector');?></span><?php endif;?></span>
+<span class="alegra-billing-field-help"><?php echo esc_html((string)$ac_field['help']);?></span>
+</span>
+</label>
+<?php endforeach;?>
+</div>
+<?php endforeach;?>
+</div>
+
 <!-- ==================== AVANZADO ==================== -->
 <div class="ac-tab-content" id="tab-advanced" style="display:none;">
 <h2><?php esc_html_e('Configuración Avanzada','alegra-connector');?></h2>
@@ -249,4 +333,33 @@
 
 </div>
 <?php submit_button(esc_html__('Guardar Cambios','alegra-connector'));?></form>
+<script>
+(function($){
+    'use strict';
+    $(function(){
+        $('#alegra-enable-all-fields').on('click', function(){
+            var $btn = $(this), $status = $('#alegra-enable-all-status');
+            $btn.prop('disabled', true);
+            $status.text('<?php echo esc_js(__('Habilitando campos...','alegra-connector'));?>');
+            $.ajax({
+                url: alegraConnector.ajaxUrl, type: 'POST',
+                data: { action: 'alegra_enable_all_billing_fields', _ajax_nonce: alegraConnector.nonce },
+                success: function(r){
+                    if (r && r.success) {
+                        $status.text(r.data && r.data.message ? r.data.message : 'OK');
+                        location.reload();
+                    } else {
+                        $status.text(r && r.data && r.data.message ? r.data.message : 'Error');
+                        $btn.prop('disabled', false);
+                    }
+                },
+                error: function(){
+                    $status.text('<?php echo esc_js(__('Error de conexión','alegra-connector'));?>');
+                    $btn.prop('disabled', false);
+                }
+            });
+        });
+    });
+})(jQuery);
+</script>
 <?php include __DIR__ . '/footer.php'; ?></div>

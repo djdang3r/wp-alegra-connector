@@ -1063,3 +1063,136 @@ body.ac-modal-open {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
 }
+
+/* ============ Billing settings (2.3.0) ============ */
+.alegra-mode-legend {
+    margin: 8px 0 0 0;
+    padding: 0;
+    list-style: none;
+}
+.alegra-mode-legend li {
+    position: relative;
+    padding: 4px 0 4px 18px;
+    font-size: 12px;
+    color: var(--ac-text-secondary);
+    line-height: 1.5;
+}
+.alegra-mode-legend li::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 11px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ac-text-muted);
+}
+.alegra-mode-legend li strong { color: var(--ac-text); }
+
+.alegra-billing-group-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ac-text);
+    margin: 20px 0 2px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.alegra-billing-field-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+.alegra-billing-field-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 10px 12px;
+    border: 1px solid var(--ac-border);
+    border-radius: var(--ac-radius-xs);
+    background: var(--ac-surface);
+}
+.alegra-billing-field-row.is-locked { background: var(--ac-surface-alt); }
+.alegra-billing-field-row input[type="checkbox"] { margin-top: 2px; }
+.alegra-billing-field-info { display: flex; flex-direction: column; gap: 2px; }
+.alegra-billing-field-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ac-text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.alegra-billing-field-help { font-size: 12px; color: var(--ac-text-secondary); }
+.alegra-lock-tag {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--ac-text-muted);
+}
+
+/* ============ Dry run banner (2.3.0) ============ */
+.alegra-dryrun-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--ac-danger-bg);
+    border: 1px solid #fecaca;
+    color: var(--ac-danger);
+    border-radius: var(--ac-radius-sm);
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+.alegra-dryrun-badge {
+    background: var(--ac-danger);
+    color: #fff;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    white-space: nowrap;
+}
+
+/* ============ Billing health card (2.3.0) ============ */
+.alegra-health-rows { display: flex; flex-direction: column; }
+.alegra-health-row {
+    display: grid;
+    grid-template-columns: 14px 200px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--ac-border-light);
+    font-size: 13px;
+}
+.alegra-health-row:last-child { border-bottom: none; }
+.alegra-health-row.is-danger {
+    background: var(--ac-danger-bg);
+    margin: 0 -12px;
+    padding: 10px 12px;
+    border-radius: var(--ac-radius-xs);
+    border-bottom: none;
+}
+.alegra-health-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}
+.alegra-health-dot.is-green { background: var(--ac-success); box-shadow: 0 0 0 3px rgba(5,150,105,0.15); }
+.alegra-health-dot.is-amber { background: var(--ac-warning); box-shadow: 0 0 0 3px rgba(217,119,6,0.15); }
+.alegra-health-dot.is-red { background: var(--ac-danger); box-shadow: 0 0 0 3px rgba(220,38,38,0.15); }
+.alegra-health-label { font-weight: 500; color: var(--ac-text); }
+.alegra-health-status { color: var(--ac-text-secondary); }
+.alegra-health-action { font-size: 12px; text-align: right; }
+.alegra-health-action a { text-decoration: none; }
+
+@media (max-width: 782px) {
+    .alegra-health-row { grid-template-columns: 14px 1fr; }
+    .alegra-health-status,
+    .alegra-health-action { grid-column: 2; text-align: left; }
+}

@@ -12,10 +12,25 @@ $running_runs = \Alegra\Connector\Runs::currently_running();
 $pending_push = \Alegra\Connector\Push_Queue::get_pending(50);
 $kill_switch = \Alegra\Connector\Kill_Switch::is_active();
 
+// Billing health data.
+$stamp_enabled = (bool) get_option('alegra_connector_stamp_enabled', true);
+$dry_run = (bool) get_option('alegra_connector_dry_run', false);
+$consumidor_final_checked = $is_connected && class_exists('\Alegra\Connector\Consumidor_Final');
+$consumidor_final_available = $consumidor_final_checked
+    ? \Alegra\Connector\Consumidor_Final::is_available()
+    : false;
+
 $page_title = __('Dashboard', 'alegra-connector');
 include __DIR__ . '/header.php';
 ?>
 <div class="alegra-connector-wrap">
+
+<?php if ($dry_run): ?>
+<div class="alegra-dryrun-banner">
+    <span class="alegra-dryrun-badge"><?php esc_html_e('MODO PRUEBA ACTIVADO', 'alegra-connector'); ?></span>
+    <span><?php esc_html_e('El plugin NO envía nada a Alegra: no se crean facturas, clientes ni productos. Desactívalo antes de facturar de verdad.', 'alegra-connector'); ?></span>
+</div>
+<?php endif; ?>
 
 <?php if ($kill_switch): ?>
 <div class="ac-notice error ac-notice-killswitch" style="margin-bottom:16px;">
@@ -96,6 +111,76 @@ include __DIR__ . '/header.php';
         <div style="font-size:11px;font-weight:600;color:var(--ac-text-secondary);text-transform:uppercase;"><?php esc_html_e('Última sincronizacion', 'alegra-connector'); ?></div>
         <div style="font-size:18px;font-weight:600;margin-top:4px;">
             <?php echo $last_sync ? esc_html(human_time_diff($last_sync, time()) . ' ' . __('atras', 'alegra-connector')) : esc_html__('Nunca', 'alegra-connector'); ?>
+        </div>
+    </div>
+</div>
+
+<!-- Billing health -->
+<div class="ac-card alegra-health-card" style="margin-bottom:16px;">
+    <div class="ac-card-header">
+        <h2><?php esc_html_e('Estado de facturación', 'alegra-connector'); ?></h2>
+        <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>" class="ac-btn ac-btn-sm"><?php esc_html_e('Configurar facturación', 'alegra-connector'); ?></a>
+    </div>
+    <div class="alegra-health-rows">
+        <div class="alegra-health-row">
+            <span class="alegra-health-dot <?php echo $is_connected ? 'is-green' : 'is-red'; ?>"></span>
+            <span class="alegra-health-label"><?php esc_html_e('Conexión con Alegra', 'alegra-connector'); ?></span>
+            <span class="alegra-health-status">
+                <?php echo $is_connected
+                    ? esc_html__('Conectado', 'alegra-connector')
+                    : '<strong>' . esc_html__('Desconectado', 'alegra-connector') . '</strong>'; ?>
+            </span>
+            <span class="alegra-health-action">
+                <?php if (!$is_connected): ?>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>"><?php esc_html_e('Conectar ahora', 'alegra-connector'); ?> &rarr;</a>
+                <?php endif; ?>
+            </span>
+        </div>
+        <div class="alegra-health-row">
+            <span class="alegra-health-dot <?php echo $consumidor_final_available ? 'is-green' : 'is-amber'; ?>"></span>
+            <span class="alegra-health-label"><?php esc_html_e('Consumidor Final', 'alegra-connector'); ?></span>
+            <span class="alegra-health-status">
+                <?php if (!$is_connected): ?>
+                    <?php esc_html_e('No verificado (sin conexión)', 'alegra-connector'); ?>
+                <?php elseif ($consumidor_final_available): ?>
+                    <?php esc_html_e('Disponible', 'alegra-connector'); ?>
+                <?php else: ?>
+                    <strong><?php esc_html_e('No encontrado en Alegra', 'alegra-connector'); ?></strong>
+                <?php endif; ?>
+            </span>
+            <span class="alegra-health-action">
+                <?php if ($consumidor_final_checked && !$consumidor_final_available): ?>
+                    <?php esc_html_e('Créalo en Alegra con identificación CC 222222222222.', 'alegra-connector'); ?>
+                <?php endif; ?>
+            </span>
+        </div>
+        <div class="alegra-health-row">
+            <span class="alegra-health-dot <?php echo $stamp_enabled ? 'is-green' : 'is-amber'; ?>"></span>
+            <span class="alegra-health-label"><?php esc_html_e('Emisión DIAN', 'alegra-connector'); ?></span>
+            <span class="alegra-health-status">
+                <?php echo $stamp_enabled
+                    ? esc_html__('Activada', 'alegra-connector')
+                    : '<strong>' . esc_html__('Desactivada (las facturas no se envían a la DIAN)', 'alegra-connector') . '</strong>'; ?>
+            </span>
+            <span class="alegra-health-action">
+                <?php if (!$stamp_enabled): ?>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>"><?php esc_html_e('Reactivar', 'alegra-connector'); ?> &rarr;</a>
+                <?php endif; ?>
+            </span>
+        </div>
+        <div class="alegra-health-row<?php echo $dry_run ? ' is-danger' : ''; ?>">
+            <span class="alegra-health-dot <?php echo $dry_run ? 'is-red' : 'is-green'; ?>"></span>
+            <span class="alegra-health-label"><?php esc_html_e('Modo de prueba', 'alegra-connector'); ?></span>
+            <span class="alegra-health-status">
+                <?php echo $dry_run
+                    ? '<strong>' . esc_html__('ACTIVADO — no se envía nada a Alegra', 'alegra-connector') . '</strong>'
+                    : esc_html__('Desactivado', 'alegra-connector'); ?>
+            </span>
+            <span class="alegra-health-action">
+                <?php if ($dry_run): ?>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>"><?php esc_html_e('Desactivar antes de facturar', 'alegra-connector'); ?> &rarr;</a>
+                <?php endif; ?>
+            </span>
         </div>
     </div>
 </div>
