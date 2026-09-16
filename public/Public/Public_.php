@@ -41,10 +41,12 @@ class Public_
 
         add_action('rest_api_init', [$this, 'register_rest_routes']);
 
-        // Orders hook: enabled by default. When a sale happens in WC, the invoice
-        // and payment are automatically pushed to Alegra. This can be disabled in
-        // the settings if the user prefers manual control.
-        if (get_option('alegra_connector_push_orders_enabled', true)) {
+        // Orders hook: DISABLED by default (manual mode). Only when the merchant
+        // enables this option does a WC sale push the invoice (and, on payment,
+        // the payment) to Alegra automatically. This option is the ONLY switch
+        // for outbound order uploads; the inbound `sync_method` option must not
+        // gate it (that overlap silently disabled the toggle).
+        if (get_option('alegra_connector_push_orders_enabled', false)) {
             add_action('woocommerce_new_order', [$this, 'on_new_order'], 10, 1);
             add_action('woocommerce_payment_complete', [$this, 'on_payment_complete'], 10, 1);
             add_action('woocommerce_order_status_completed', [$this, 'on_order_completed'], 10, 1);
@@ -269,8 +271,13 @@ class Public_
     }
 
     /**
-     * Trigger sync only if not already syncing (prevents loops during import)
-     * and sync method allows real-time sync.
+     * Trigger sync only if not already syncing (prevents loops during import).
+     *
+     * Outbound (WC → Alegra) pushes are gated exclusively by the per-entity
+     * push options at hook-registration time (see __construct). This method
+     * must NOT consult `sync_method`: that option controls the inbound
+     * (Alegra → WC) method only, and reading it here made the push toggles
+     * silently ineffective whenever the method was 'cron' or 'disabled'.
      *
      * Uses an atomic lock (add_option UNIQUE index) so the guard works
      * correctly across multiple PHP-FPM workers.
@@ -302,12 +309,8 @@ class Public_
         self::$is_syncing = true;
 
         try {
-            $sync_method = get_option('alegra_connector_sync_method', 'both');
-
-            if ($sync_method === 'real-time' || $sync_method === 'both') {
-                $sync_controller = new Sync\Controller($this->api, $this->logger);
-                $sync_controller->sync_entity($type, $id, $action);
-            }
+            $sync_controller = new Sync\Controller($this->api, $this->logger);
+            $sync_controller->sync_entity($type, $id, $action);
         } finally {
             self::$is_syncing = false;
             Sync\Controller::release_lock($lock_key, $token);

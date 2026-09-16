@@ -172,8 +172,8 @@ function alegra_test_reset(): void
     $GLOBALS['wp_options']['alegra_connector_email'] = 'harness@example.test';
     $GLOBALS['wp_options']['alegra_connector_token'] = 'harness-token';
     $GLOBALS['wp_options']['alegra_connector_invoice_status'] = 'draft';
-    $GLOBALS['wp_options']['alegra_connector_sync_method'] = 'both';
-    $GLOBALS['wp_options']['alegra_connector_push_orders_enabled'] = true;
+    $GLOBALS['wp_options']['alegra_connector_sync_method'] = 'cron';
+    $GLOBALS['wp_options']['alegra_connector_push_orders_enabled'] = false;
     $GLOBALS['wp_options']['alegra_connector_push_products_enabled'] = false;
     $GLOBALS['wp_options']['alegra_connector_customer_resolution_mode'] = 'auto';
     $GLOBALS['wp_options']['alegra_connector_dry_run'] = false;

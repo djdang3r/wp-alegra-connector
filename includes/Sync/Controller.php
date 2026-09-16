@@ -59,6 +59,17 @@ class Controller
             return;
         }
 
+        // `sync_method` gates the INBOUND pull: 'real-time' is webhooks-only and
+        // 'disabled' means no automatic inbound sync at all. This self-check
+        // also neutralises a cron event left scheduled by an older version.
+        $sync_method = (string) get_option('alegra_connector_sync_method', 'cron');
+        if (!in_array($sync_method, ['cron', 'both'], true)) {
+            $this->logger->info('Cron sync skipped: sync_method does not include periodic pull', [
+                'sync_method' => $sync_method,
+            ]);
+            return;
+        }
+
         // AC-20: one global mutex around the WHOLE run. Per-entity locks alone
         // let two ticks interleave (each holding a different entity lock),
         // producing duplicate runs, double API traffic and double writes.

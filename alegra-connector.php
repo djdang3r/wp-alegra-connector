@@ -368,8 +368,8 @@ final class Alegra_Connector
         $defaults = [
             'alegra_connector_version' => ALEGRA_CONNECTOR_VERSION,
             'alegra_connector_sync_frequency' => 15,
-            'alegra_connector_sync_method' => 'both',
-            'alegra_connector_push_orders_enabled' => true,
+            'alegra_connector_sync_method' => 'cron',
+            'alegra_connector_push_orders_enabled' => false,
             'alegra_connector_push_products_enabled' => false,
             'alegra_connector_sync_products' => false,
             'alegra_connector_sync_customers' => false,
@@ -491,7 +491,12 @@ final class Alegra_Connector
         // Clear any previously-scheduled events to avoid stale schedules
         wp_clear_scheduled_hook($hook);
 
-        if (!wp_next_scheduled($hook)) {
+        // `sync_method` controls the INBOUND (Alegra → WooCommerce) sync only.
+        // 'real-time' is webhooks-only and 'disabled' means nothing automatic,
+        // so neither schedules the periodic cron. Outbound order uploads are
+        // governed by `alegra_connector_push_orders_enabled`, never by this.
+        $sync_method = (string) get_option('alegra_connector_sync_method', 'cron');
+        if (in_array($sync_method, ['cron', 'both'], true) && !wp_next_scheduled($hook)) {
             wp_schedule_event(time() + 60, $schedule, $hook);
         }
 

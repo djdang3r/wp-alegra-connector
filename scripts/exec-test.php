@@ -1321,4 +1321,107 @@ TestRunner::test('T11.6 AC-63 N products sharing a category issue ONE lookup', f
     TestRunner::assertSame(1, (int) $GLOBALS['alegra_category_lookups'], 'four products sharing a category must resolve it with one lookup');
 });
 
+// ===========================================================================
+// T12 — Auto vs manual order uploads
+// ===========================================================================
+echo "\nT12 — Auto vs manual order uploads (push_orders_enabled is the only gate)\n";
+
+/**
+ * Build a fresh world (user + order that create_invoice() can process) and a
+ * Public_ instance wired with the given outbound push setting.
+ *
+ * @return array{0:int,1:\Alegra\Connector\Public\Public_}
+ */
+function build_public_for_orders(bool $auto_upload, int $order_id, string $sync_method = 'cron'): array
+{
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', $auto_upload);
+    update_option('alegra_connector_sync_method', $sync_method);
+    alegra_make_user(1, ['user_email' => 'auto@example.test', 'display_name' => 'Auto SA'], [
+        'billing_alegra_idtype'         => 'NIT',
+        'billing_alegra_identification' => '900123456',
+        'billing_alegra_dv'             => '1',
+        'billing_first_name'            => 'Auto',
+        'billing_last_name'             => 'SA',
+    ]);
+    make_invoice_order($order_id, 1, 'auto@example.test');
+    $logger = make_logger();
+    $public = new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
+    return [$order_id, $public];
+}
+
+TestRunner::test('T12.1 manual is the default and Public_ registers no order hooks when the option is absent', function (): void {
+    alegra_test_reset();
+    TestRunner::assertFalse(
+        (bool) get_option('alegra_connector_push_orders_enabled', false),
+        'push_orders_enabled must default to false (manual)'
+    );
+
+    // Simulate a fresh install where the option was never stored.
+    unset($GLOBALS['wp_options']['alegra_connector_push_orders_enabled']);
+    $logger = make_logger();
+    $public = new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
+
+    TestRunner::assertFalse(has_action('woocommerce_new_order', [$public, 'on_new_order']), 'no auto hook when the option is absent');
+    TestRunner::assertFalse(has_action('woocommerce_payment_complete', [$public, 'on_payment_complete']), 'no payment hook when the option is absent');
+});
+
+TestRunner::test('T12.2 auto OFF: firing the WC order hooks creates ZERO invoices', function (): void {
+    [$order_id, $public] = build_public_for_orders(false, 700);
+    TestRunner::assertFalse(has_action('woocommerce_new_order', [$public, 'on_new_order']), 'the new-order hook must not be registered when auto is off');
+
+    do_action('woocommerce_new_order', $order_id);
+    do_action('woocommerce_payment_complete', $order_id);
+    do_action('woocommerce_order_status_completed', $order_id);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'auto off must create no invoice');
+});
+
+TestRunner::test('T12.3 auto ON: firing the WC order hooks creates EXACTLY ONE invoice', function (): void {
+    [$order_id, $public] = build_public_for_orders(true, 701);
+    TestRunner::assertTrue(has_action('woocommerce_new_order', [$public, 'on_new_order']) !== false, 'the new-order hook must be registered when auto is on');
+
+    do_action('woocommerce_new_order', $order_id);
+    do_action('woocommerce_payment_complete', $order_id);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'auto on must create exactly one invoice');
+});
+
+TestRunner::test('T12.4 auto OFF: the manual path still creates one invoice', function (): void {
+    [$order_id] = build_public_for_orders(false, 702);
+
+    // Exactly what Admin_Dashboard::ajax_sync_single() does for an order.
+    $result = make_controller()->sync_entity('order', $order_id, 'create');
+
+    TestRunner::assertFalse(is_wp_error($result), 'the manual invoice must succeed');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'manual invoicing must work with auto off');
+});
+
+TestRunner::test('T12.5 regression: sync_method=cron no longer suppresses the auto upload', function (): void {
+    [$order_id] = build_public_for_orders(true, 703, 'cron');
+
+    do_action('woocommerce_new_order', $order_id);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), "push_orders_enabled=true must upload even when sync_method='cron'");
+});
+
+TestRunner::test('T12.6 regression: sync_method=disabled no longer suppresses the auto upload', function (): void {
+    [$order_id] = build_public_for_orders(true, 704, 'disabled');
+
+    do_action('woocommerce_new_order', $order_id);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), "push_orders_enabled=true must upload even when sync_method='disabled'");
+});
+
+TestRunner::test('T12.7 sync_method gates the INBOUND cron: disabled skips the run', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'disabled');
+    update_option('alegra_connector_sync_products', true);
+
+    make_controller()->run_cron_sync();
+
+    TestRunner::assertFalse(get_transient('alegra_connector_last_sync') !== false, 'disabled must skip the cron pull');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'disabled must not pull items');
+});
+
 exit(TestRunner::summary());

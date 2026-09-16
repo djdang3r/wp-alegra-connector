@@ -64,6 +64,16 @@ Sincronizar **bidireccionalmente** los datos entre una tienda WooCommerce y el s
 | **Manual** | Boton "Sincronizar Ahora" en Dashboard | Inmediato |
 | **Polling (Alegra→WC)** | El cron verifica si facturas vinculadas fueron pagadas en Alegra | Segun intervalo del cron |
 
+### Facturacion automatica vs manual
+
+La subida de pedidos/facturas a Alegra se controla con **una sola opcion**: *Configuracion → Sincronizacion → Subir pedidos a Alegra*. Es independiente del metodo de sincronizacion entrante (`sync_method`).
+
+- **Manual (por defecto)**: ninguna venta se sube sola. La factura se crea en Alegra cuando el usuario la dispara desde **Pedidos** con "Facturar", "Facturar seleccionados" o "Facturar pendientes".
+- **Automatico**: cada pedido nuevo se envia a Alegra como factura (borrador) y, al completarse el pago, se registra el pago. Requiere marcar "Subir pedidos a Alegra".
+
+La subida automatica de **productos y clientes** es una opcion aparte (*Subir productos a Alegra*, desactivada por defecto).
+
+
 ---
 
 ## 02 Arquitectura
@@ -214,8 +224,10 @@ Menu lateral: Alegra Connector
 
 | Configuracion | Opciones | Recomendado |
 |---------------|----------|:-----------:|
-| Metodo | Tiempo real / Periodica / Ambos | Ambos |
+| Metodo (Alegra → WooCommerce) | Periodica / Tiempo real / Ambos / Desactivada | Periodica |
 | Frecuencia | 5 / 15 / 30 / 60 minutos | 15 min |
+| Subir pedidos a Alegra (WooCommerce → Alegra) | Automatico / Manual | **Manual** |
+| Subir productos y clientes a Alegra (WooCommerce → Alegra) | Automatico / Manual | **Manual** |
 | Productos | on/off | on |
 | Clientes | on/off | on |
 | Pedidos | on/off | on |
@@ -359,18 +371,17 @@ El plugin se suscribe a los siguientes hooks de WooCommerce para sincronizacion 
 | `woocommerce_order_status_cancelled` | Anula factura en Alegra + restaura inventario |
 | `woocommerce_new_customer` | Sincroniza cliente a Alegra |
 
-Estos hooks se disparan instantaneamente cuando ocurre el evento en WooCommerce. La sincronizacion respeta la configuracion de `sync_method` (real-time, cron, both).
+Estos hooks se disparan instantaneamente cuando ocurre el evento en WooCommerce. La subida automatica se controla EXCLUSIVAMENTE con las opciones de subida (`alegra_connector_push_orders_enabled` para pedidos/ventas y `alegra_connector_push_products_enabled` para productos/clientes). Por defecto ambas estan **desactivadas** (modo manual). `sync_method` NO afecta a la subida: solo controla la traida desde Alegra hacia WooCommerce.
 
 ### Sincronizacion Alegra → WooCommerce (inbound)
 
-El plugin **no depende de webhooks** de Alegra porque la documentacion oficial no los documenta. En su lugar, usa **polling via cron**:
+El plugin **no depende de webhooks** de Alegra porque la documentacion oficial no los documenta. En su lugar, usa **polling via cron** (que solo se programa si el metodo de sincronizacion es *Periodica* o *Periodica + Tiempo Real*):
 
 - **Cada vez que corre el cron** (segun la frecuencia configurada: 5/15/30/60 min), el plugin:
-  1. Sincroniza pedidos pendientes a Alegra (`sync_recent`)
-  2. **Verifica facturas vinculadas**: consulta a Alegra el estado de cada factura con `_alegra_invoice_id`
-  3. Si `auto_complete_order` esta activado y la factura aparece como `paid` con balance 0, marca el pedido WC como `completed`
+  1. **Verifica facturas vinculadas**: consulta a Alegra el estado de cada factura con `_alegra_invoice_id`
+  2. Si `auto_complete_order` esta activado y la factura aparece como `paid` con balance 0, marca el pedido WC como `completed`
 
-Este polling reemplaza el enfoque anterior de webhooks que no estaba respaldado por documentacion oficial.
+El cron **no sube pedidos** a Alegra. La subida es responsabilidad exclusiva de la opcion "Subir pedidos a Alegra" y del boton manual "Facturar pendientes".
 
 ---
 

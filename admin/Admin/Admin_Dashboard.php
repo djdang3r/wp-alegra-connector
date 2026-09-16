@@ -313,8 +313,22 @@ class Admin_Dashboard
             },
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_frequency', ['sanitize_callback' => 'intval']);
-        register_setting('alegra_connector_settings', 'alegra_connector_sync_method', ['sanitize_callback' => 'sanitize_text_field']);
-        register_setting('alegra_connector_settings', 'alegra_connector_push_orders_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
+        // `sync_method` selects the INBOUND (Alegra → WooCommerce) method only.
+        // Allowlist it so garbage cannot silently disable the pull, and default
+        // to the UI default ('cron', periodic) for installs with no stored value.
+        register_setting('alegra_connector_settings', 'alegra_connector_sync_method', [
+            'sanitize_callback' => function ($value) {
+                $allowed = ['cron', 'both', 'real-time', 'disabled'];
+                return in_array($value, $allowed, true) ? $value : 'cron';
+            },
+            'default' => 'cron',
+        ]);
+        // Outbound order uploads. Manual (false) is the default; only an explicit
+        // opt-in enables automatic invoicing.
+        register_setting('alegra_connector_settings', 'alegra_connector_push_orders_enabled', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_push_products_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_currency', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_log_retention_days', ['sanitize_callback' => 'intval']);
