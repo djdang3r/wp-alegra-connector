@@ -357,8 +357,18 @@
                     success: function(r) {
                         $btn.prop('disabled', false).text(S.registerWebhooks);
                         if (r.success) {
-                            showNotice(r.data.message || S.webhooksRegistered, 'success');
-                            setTimeout(function(){ location.reload(); }, 2000);
+                            var d = r.data || {};
+                            var msg = d.message || S.webhooksRegistered;
+                            // The handler always returns success; the error
+                            // count is what tells whether anything failed.
+                            // Show the real message either way, and keep it on
+                            // screen (no reload) when there are errors.
+                            var hasErrors = Number(d.errores || 0) > 0;
+                            showNotice(msg, hasErrors ? 'warning' : 'success');
+                            $status.text(msg);
+                            if (!hasErrors) {
+                                setTimeout(function(){ location.reload(); }, 2000);
+                            }
                         } else {
                             showNotice(r.data.message || S.error, 'error');
                             $status.html('<span style="color:var(--ac-danger);">' + S.error + '</span>');

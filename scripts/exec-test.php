@@ -2935,7 +2935,9 @@ TestRunner::test('T19.3 BUG 2 registration counts the NESTED subscription id', f
 
     $expected = count(Client::get_webhook_events());
     TestRunner::assertTrue($response !== null && $response->success, 'registration must succeed');
-    TestRunner::assertSame($expected, (int) ($response->payload['created'] ?? -1), 'every event must be counted as created');
+    TestRunner::assertSame($expected, (int) ($response->payload['creados'] ?? -1), 'every event must be counted as created');
+    TestRunner::assertSame(0, (int) ($response->payload['ya_existian'] ?? -1), 'nothing existed before');
+    TestRunner::assertSame(0, (int) ($response->payload['errores'] ?? -1), 'a first registration must have no errors');
     TestRunner::assertSame($expected, count((array) get_option('alegra_connector_webhook_subscriptions', [])), 'every subscription must be stored');
 
     // The registered URL must carry the shared secret.
@@ -2946,6 +2948,54 @@ TestRunner::test('T19.3 BUG 2 registration counts the NESTED subscription id', f
     $token = (string) get_option('alegra_connector_webhook_token', '');
     TestRunner::assertTrue($token !== '', 'a token must be generated');
     TestRunner::assertStringContains($token, $url, 'the URL token must match the stored token');
+});
+
+TestRunner::test('T19.3b BUG 2 re-registering counts "Ya existe" as already registered, not an error', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    // First registration: everything is created.
+    $first = alegra_capture_json(fn() => $admin->ajax_register_webhooks());
+    $events = count(Client::get_webhook_events());
+    TestRunner::assertSame($events, (int) ($first->payload['creados'] ?? -1), 'the first run must create every subscription');
+
+    // Second registration: Alegra answers 400 "Ya existe una suscripción con
+    // el mismo evento y URL" for all of them. That is success, not failure.
+    $second = alegra_capture_json(fn() => $admin->ajax_register_webhooks());
+
+    TestRunner::assertTrue($second->success, 'a re-register must still be a success response');
+    TestRunner::assertSame(0, (int) ($second->payload['creados'] ?? -1), 'nothing new must be created');
+    TestRunner::assertSame($events, (int) ($second->payload['ya_existian'] ?? -1), 'every event must count as already registered');
+    TestRunner::assertSame(0, (int) ($second->payload['errores'] ?? -1), 'an already-registered subscription is NOT an error');
+
+    $message = (string) ($second->payload['message'] ?? '');
+    TestRunner::assertStringContains('0 webhooks registrados', $message, 'the message must report the created count');
+    TestRunner::assertStringContains((string) $events . ' ya existían', $message, 'the message must report the already-registered count');
+    TestRunner::assertStringContains('0 errores', $message, 'the message must report zero errors');
+
+    // The local list must keep the ids so the DELETE flow can still remove
+    // them: an "already exists" 400 carries no id, so dropping them would
+    // orphan the remote subscriptions.
+    $stored = (array) get_option('alegra_connector_webhook_subscriptions', []);
+    TestRunner::assertSame($events, count($stored), 'the stored subscription list must survive a re-register');
+    foreach ($stored as $sub) {
+        TestRunner::assertTrue(!empty($sub['id']), 'every stored subscription must keep its id for DELETE');
+    }
+});
+
+TestRunner::test('T19.3c BUG 2 a genuine failure is still counted as an error', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+    // An invalid URL (documented 400) must NOT be mistaken for "already
+    // exists": the narrow match must let it through as an error.
+    alegra_mock_fail('POST', '/webhooks/subscriptions', 400, ['error' => 'La URL ingresada no es válida']);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $response = alegra_capture_json(fn() => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(0, (int) ($response->payload['ya_existian'] ?? -1), 'an invalid URL is not an already-registered subscription');
+    TestRunner::assertSame(count(Client::get_webhook_events()), (int) ($response->payload['errores'] ?? -1), 'every genuine failure must count as an error');
 });
 
 TestRunner::test('T19.4 BUG 3 "Run now" does not destroy the recurring schedule', function (): void {

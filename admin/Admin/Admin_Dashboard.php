@@ -2214,11 +2214,20 @@ class Admin_Dashboard
         $webhook_url = \Alegra\Connector\Webhooks\Receiver::registration_url();
         $events = API\Client::get_webhook_events();
         $created = [];
+        $already = [];
         $errors = [];
 
         foreach ($events as $event) {
             $result = $this->api->create_webhook_subscription($event, $webhook_url);
             if (is_wp_error($result)) {
+                if (self::is_webhook_already_registered($result)) {
+                    // Alegra answers 400 "Ya existe una suscripción con el
+                    // mismo evento y URL" when the subscription is already
+                    // there. Re-registering right after an update is the
+                    // expected action, so this is success — not an error.
+                    $already[] = $event;
+                    continue;
+                }
                 $errors[] = $event . ': ' . $result->get_error_message();
                 continue;
             }
@@ -2245,22 +2254,113 @@ class Admin_Dashboard
             }
         }
 
-        if (!empty($created)) {
+        // Persist every subscription we know about, not only the newly created
+        // ones. The DELETE flow deletes by id, and a 400 "already exists"
+        // carries no id, so dropping the previously stored entry would orphan
+        // the remote subscription and make it impossible to remove.
+        $subscriptions = $this->merge_webhook_subscriptions($created, $already);
+        if (!empty($subscriptions)) {
             // AC-81: the subscription list grows with configuration; do not
             // autoload it on every request.
-            update_option('alegra_connector_webhook_subscriptions', $created, false);
+            update_option('alegra_connector_webhook_subscriptions', $subscriptions, false);
         }
 
-        $message = sprintf(__('%d webhooks registrados.', 'alegra-connector'), count($created));
+        $message = sprintf(
+            __('%d webhooks registrados, %d ya existían, %d errores.', 'alegra-connector'),
+            count($created),
+            count($already),
+            count($errors)
+        );
         if (!empty($errors)) {
-            $message .= ' ' . sprintf(__('%d errores: %s', 'alegra-connector'), count($errors), implode(', ', $errors));
+            $message .= ' ' . sprintf(__('Errores: %s', 'alegra-connector'), implode(', ', $errors));
         }
 
         wp_send_json_success([
             'message' => $message,
-            'created' => count($created),
-            'errors' => $errors,
+            'creados' => count($created),
+            'ya_existian' => count($already),
+            'errores' => count($errors),
         ]);
+    }
+
+    /**
+     * Whether a create_webhook_subscription() failure is the documented
+     * "already exists" response.
+     *
+     * Matched NARROWLY against the documented Spanish message
+     * (post_webhooks-subscriptions, 400 existingSubscription) so a genuine
+     * failure — invalid URL, auth, 5xx — is never swallowed. The check is
+     * accent-safe by matching only the unaccented prefix of the phrase.
+     */
+    private static function is_webhook_already_registered(\WP_Error $error): bool
+    {
+        if (stripos($error->get_error_message(), 'ya existe una suscripci') === false) {
+            return false;
+        }
+
+        $data = $error->get_error_data();
+        $code = is_array($data) ? (int) ($data['code'] ?? 0) : 0;
+        return $code === 0 || $code === 400;
+    }
+
+    /**
+     * Build the local subscription list from this run's registrations plus the
+     * ones already stored, keyed by event so a partial re-register never drops
+     * an id the DELETE flow needs.
+     *
+     * The id of an "already exists" subscription is recovered from the API
+     * listing (GET /webhooks/subscriptions) when it is unknown locally.
+     *
+     * @param array<int, array{id:string, event:string}> $created
+     * @param array<int, string>                          $already
+     * @return array<int, array{id:string, event:string}>
+     */
+    private function merge_webhook_subscriptions(array $created, array $already): array
+    {
+        $by_event = [];
+        foreach ((array) get_option('alegra_connector_webhook_subscriptions', []) as $sub) {
+            if (is_array($sub) && !empty($sub['event'])) {
+                $by_event[(string) $sub['event']] = $sub;
+            }
+        }
+        foreach ($created as $sub) {
+            $by_event[(string) $sub['event']] = $sub;
+        }
+
+        $unknown = array_filter($already, static fn($event) => empty($by_event[$event]['id']));
+        if (!empty($unknown)) {
+            $remote = $this->remote_webhook_ids_by_event();
+            foreach ($unknown as $event) {
+                if (!empty($remote[$event])) {
+                    $by_event[$event] = ['id' => $remote[$event], 'event' => $event];
+                }
+            }
+        }
+
+        return array_values($by_event);
+    }
+
+    /**
+     * Remote subscription ids keyed by event. Best-effort: any failure (or an
+     * unexpected shape) yields an empty map rather than aborting registration.
+     *
+     * @return array<string, string>
+     */
+    private function remote_webhook_ids_by_event(): array
+    {
+        $result = $this->api->get_webhook_subscriptions();
+        if (is_wp_error($result) || !is_array($result)) {
+            return [];
+        }
+
+        $list = $result['subscriptions'] ?? (isset($result[0]) && is_array($result[0]) ? $result : []);
+        $map = [];
+        foreach ((array) $list as $sub) {
+            if (is_array($sub) && !empty($sub['id']) && !empty($sub['event'])) {
+                $map[(string) $sub['event']] = (string) $sub['id'];
+            }
+        }
+        return $map;
     }
 
     public function ajax_delete_webhooks(): void
