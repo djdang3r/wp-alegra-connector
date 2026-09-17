@@ -1579,7 +1579,7 @@ TestRunner::test('T11.6 AC-63 N products sharing a category issue ONE lookup', f
     alegra_test_reset();
     $cat = ['id' => 'cat-1', 'name' => 'Ropa'];
     for ($i = 1; $i <= 4; $i++) {
-        alegra_mock_seed_item('c-' . $i, ['name' => 'P' . $i, 'reference' => 'C-' . $i, 'type' => 'simple', 'category' => $cat]);
+        alegra_mock_seed_item('c-' . $i, ['name' => 'P' . $i, 'reference' => 'C-' . $i, 'type' => 'simple', 'itemCategory' => $cat]);
     }
     $GLOBALS['alegra_category_lookups'] = 0;
 
@@ -1758,7 +1758,8 @@ TestRunner::test('T-hotfix-3 update still sends name, price, tax, category and u
     TestRunner::assertSame('Regress', $body['name'] ?? null, 'name must survive the update');
     TestRunner::assertEquals(44.0, $body['price'][0]['price'] ?? null, 'price must survive the update');
     TestRunner::assertSame('tax-h3', $body['tax'][0]['id'] ?? null, 'tax must survive the update');
-    TestRunner::assertSame('cat-h3', $body['category']['id'] ?? null, 'category must survive the update');
+    TestRunner::assertSame('cat-h3', $body['itemCategory']['id'] ?? null, 'the commercial category must be sent under itemCategory');
+    TestRunner::assertArrayNotHasKey('category', $body, 'the accounting category must not receive the item-category id');
     TestRunner::assertArrayNotHasKey('inventory', $body, 'update must omit inventory entirely (R3): a partial {unit} is undocumented');
 });
 
@@ -2016,6 +2017,242 @@ TestRunner::test('T15.6e variable product with dry run OFF still creates the var
     TestRunner::assertFalse(is_wp_error($result), 'the variantParent must be created: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
     TestRunner::assertSame(1, alegra_mock_count('POST', '/items'), 'exactly one item write (the parent)');
     TestRunner::assertSame('variantParent', alegra_mock_last_request('POST', '/items')['body']['type'] ?? null, 'the write must be a variantParent');
+});
+
+// ===========================================================================
+// T16 — Products batch 1: itemCategory, inventory_source, stock landing, pull
+//
+// Bug 1: the push sent the /item-categories id under `category` (Alegra's
+//        ACCOUNTING category); the commercial category is `itemCategory`.
+//        The import read `category` and created WC terms named after accounts.
+// Bug 2: the import wrote stock ignoring `alegra_connector_inventory_source`.
+// Bug 3: `_manage_stock` was never set (WC ignores `_stock` without it) and
+//        `_stock_status` was never written (WC does not derive it).
+// Bug 4: `sync_inventory_from_alegra()` had no production caller.
+// ===========================================================================
+echo "\nT16 — Products batch 1 (itemCategory, inventory_source, stock, pull)\n";
+
+TestRunner::test('T16.1 push sends the commercial category as itemCategory, never as the accounting category', function (): void {
+    alegra_test_reset();
+    // Unique term id: resolve_alegra_category_id() caches per WC term id in a
+    // process-static array, so reusing the default 500 leaks a previous test.
+    $GLOBALS['alegra_next_term_id'] = 9101;
+    $term = wp_insert_term('Ropa', 'product_cat');
+    update_term_meta($term['term_id'], 'alegra_category_id', 'cat-com');
+    alegra_make_product(60, [
+        'name' => 'CatPush', 'sku' => 'CP-1', 'regular_price' => '10',
+        'category_ids' => [$term['term_id']],
+    ]);
+
+    make_products()->sync_to_alegra(wc_get_product(60));
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('cat-com', $body['itemCategory']['id'] ?? null, 'the commercial category must be sent under itemCategory');
+    TestRunner::assertArrayNotHasKey('category', $body, 'the accounting `category` field must not receive the item-category id');
+});
+
+TestRunner::test('T16.2 a variantParent push also uses itemCategory, never category', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo']],
+    ]);
+    $GLOBALS['alegra_next_term_id'] = 9102;
+    $term = wp_insert_term('Ropa', 'product_cat');
+    update_term_meta($term['term_id'], 'alegra_category_id', 'cat-var');
+    alegra_make_variable_product(61, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo']],
+    ], [
+        62 => ['name' => 'P - Rojo', 'sku' => 'VP-1', 'variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10'],
+    ], ['name' => 'VarParent', 'sku' => 'VP-P', 'regular_price' => '10', 'category_ids' => [$term['term_id']]]);
+
+    make_products()->sync_to_alegra(wc_get_product(61));
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('cat-var', $body['itemCategory']['id'] ?? null, 'the variantParent must send the commercial category under itemCategory');
+    TestRunner::assertArrayNotHasKey('category', $body, 'the variantParent must not send the accounting category');
+});
+
+TestRunner::test('T16.3 import reads itemCategory and ignores the accounting category', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('item-ic', [
+        'name' => 'ImpCat', 'reference' => 'IC-1', 'type' => 'simple',
+        'itemCategory' => ['id' => 'cat-com', 'name' => 'Ropa'],
+        'category'     => ['id' => 'acc-1', 'name' => 'Ventas'],
+    ]);
+
+    make_products()->import_from_alegra();
+
+    $names = array_map(static fn ($t) => $t->name, array_values($GLOBALS['wp_terms']));
+    TestRunner::assertTrue(in_array('Ropa', $names, true), 'the itemCategory name must create/assign a WC term');
+    TestRunner::assertFalse(in_array('Ventas', $names, true), 'the accounting category must NOT create a WC term');
+});
+
+TestRunner::test('T16.4 with inventory_source=woocommerce an import does not write stock or manage_stock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    // manage_stock=true is the regression trigger: the old code wrote the
+    // Alegra quantity whenever the product managed stock, ignoring the setting.
+    alegra_make_product(70, ['name' => 'WC wins', 'sku' => 'WCW-1', 'regular_price' => '10', 'stock' => 5, 'manage_stock' => true]);
+    update_post_meta(70, '_alegra_item_id', 'item-wcw');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-wcw', 'name' => 'WC wins', 'reference' => 'WCW-1', 'type' => 'simple',
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => 99],
+    ]);
+
+    $product = wc_get_product(70);
+    TestRunner::assertTrue($product->get_manage_stock(), 'manage_stock must stay untouched when WooCommerce owns inventory');
+    TestRunner::assertSame(5, $product->get_stock_quantity(), 'the WC stock must not be overwritten');
+});
+
+TestRunner::test('T16.5 with inventory_source=alegra an inventariable item lands manage_stock + stock + status', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(71, ['name' => 'Alegra wins', 'sku' => 'ALW-1', 'regular_price' => '10']);
+    update_post_meta(71, '_alegra_item_id', 'item-alw');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-alw', 'name' => 'Alegra wins', 'reference' => 'ALW-1', 'type' => 'simple',
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => 12],
+    ]);
+
+    $product = wc_get_product(71);
+    TestRunner::assertTrue($product->get_manage_stock(), '_manage_stock must be enabled (WC ignores _stock otherwise)');
+    TestRunner::assertSame(12, $product->get_stock_quantity(), '_stock must receive the Alegra quantity');
+    TestRunner::assertSame('instock', $product->get_stock_status(), '_stock_status must be set explicitly (WC does not derive it)');
+});
+
+TestRunner::test('T16.6 a service (no inventory key) disables manage_stock and never writes stock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(72, ['name' => 'Service', 'sku' => 'SRV-1', 'regular_price' => '10', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(72, '_alegra_item_id', 'item-srv');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-srv', 'name' => 'Service', 'reference' => 'SRV-1', 'type' => 'service',
+    ]);
+
+    $product = wc_get_product(72);
+    TestRunner::assertFalse($product->get_manage_stock(), 'a service must not manage stock');
+    TestRunner::assertSame(7, $product->get_stock_quantity(), 'a service must not touch the existing stock value');
+});
+
+TestRunner::test('T16.7 a null/absent availableQuantity never becomes 0', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    // manage_stock=false: the fix must ENABLE it (inventariable item) without
+    // writing a quantity, proving the null branch is the new behaviour.
+    alegra_make_product(73, ['name' => 'NullQty', 'sku' => 'NQ-1', 'regular_price' => '10', 'stock' => 4, 'manage_stock' => false]);
+    update_post_meta(73, '_alegra_item_id', 'item-nq');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-nq', 'name' => 'NullQty', 'reference' => 'NQ-1', 'type' => 'simple',
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => null],
+    ]);
+
+    $product = wc_get_product(73);
+    TestRunner::assertSame(4, $product->get_stock_quantity(), 'a null availableQuantity must not become 0');
+    TestRunner::assertTrue($product->get_manage_stock(), 'the item is inventariable, so manage_stock is enabled even without a quantity');
+
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(74, ['name' => 'AbsentQty', 'sku' => 'AQ-1', 'regular_price' => '10', 'stock' => 6, 'manage_stock' => true]);
+    update_post_meta(74, '_alegra_item_id', 'item-aq');
+    make_products()->import_single_item_public([
+        'id' => 'item-aq', 'name' => 'AbsentQty', 'reference' => 'AQ-1', 'type' => 'simple',
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1],
+    ]);
+    TestRunner::assertSame(6, wc_get_product(74)->get_stock_quantity(), 'an absent availableQuantity must not become 0');
+});
+
+TestRunner::test('T16.8 stock lands on the variation object, never on the variable parent', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_variable_product(80, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo']],
+    ], [
+        81 => ['name' => 'Parent - Rojo', 'sku' => 'VAR-1', 'variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10'],
+    ], ['name' => 'Parent', 'sku' => 'PAR-1', 'regular_price' => '10', 'stock' => 3, 'manage_stock' => true]);
+
+    $parent = wc_get_product(80);
+    $variation = wc_get_product(81);
+
+    alegra_call_private(make_products(), 'update_product_from_alegra', $parent, [
+        'id' => 'parent-80', 'name' => 'Parent', 'status' => 'active',
+        'price' => [['idPriceList' => 1, 'price' => 10]],
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => 99],
+    ]);
+    TestRunner::assertFalse($parent->get_manage_stock(), 'the variable parent must not manage stock');
+    TestRunner::assertSame(3, $parent->get_stock_quantity(), 'the variable parent stock must be untouched');
+
+    alegra_call_private(make_products(), 'update_product_from_alegra', $variation, [
+        'id' => 'child-81', 'name' => 'Parent - Rojo', 'status' => 'active',
+        'price' => [['idPriceList' => 1, 'price' => 10]],
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => 8],
+    ]);
+    TestRunner::assertTrue($variation->get_manage_stock(), 'the variation must manage stock');
+    TestRunner::assertSame(8, $variation->get_stock_quantity(), 'the variation stock must receive the quantity');
+    TestRunner::assertSame('instock', $variation->get_stock_status(), 'the variation stock status must be set');
+});
+
+TestRunner::test('T16.9 the cron pulls inventory only when inventory_source=alegra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('item-1', ['name' => 'P1', 'reference' => 'SKU-1', 'type' => 'simple']);
+
+    make_controller()->run_cron_sync();
+    // One GET for the products import + one for the dedicated inventory pull.
+    TestRunner::assertSame(2, alegra_mock_count('GET', '/items'), 'the cron must run the inventory pull when Alegra owns inventory');
+
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    alegra_mock_seed_item('item-1', ['name' => 'P1', 'reference' => 'SKU-1', 'type' => 'simple']);
+
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'the cron must NOT run the inventory pull when WooCommerce owns inventory');
+});
+
+TestRunner::test('T16.10 the inventory pull aborts when the kill switch is active', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $result = make_products()->sync_inventory_from_alegra();
+    \Alegra\Connector\Kill_Switch::deactivate();
+
+    TestRunner::assertTrue(!empty($result['skipped']), 'the pull must report skipped');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'no items may be fetched');
+});
+
+TestRunner::test('T16.11 the documented alegra_sync_inventory_from_alegra action is registered and runs the pull', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    $logger = make_logger();
+    $controller = new Controller(new Client($logger), $logger);
+    $controller->register_cron_hook();
+
+    TestRunner::assertTrue(has_action('alegra_sync_inventory_from_alegra') !== false, 'the inventory action must be registered');
+    TestRunner::assertTrue(has_action('alegra_connector_cron_sync') !== false, 'the cron hook must stay registered');
+
+    do_action('alegra_sync_inventory_from_alegra');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'the action must run the inventory pull');
+});
+
+TestRunner::test('T16.12 a negative Alegra quantity is clamped to 0 and never propagated to WC', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(75, ['name' => 'Neg', 'sku' => 'NEG-1', 'regular_price' => '10']);
+    update_post_meta(75, '_alegra_item_id', 'item-neg');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-neg', 'name' => 'Neg', 'reference' => 'NEG-1', 'type' => 'simple',
+        'inventory' => ['unit' => 'unit', 'unitCost' => 1, 'availableQuantity' => -3],
+    ]);
+
+    $product = wc_get_product(75);
+    TestRunner::assertSame(0, $product->get_stock_quantity(), 'a negative quantity must be clamped to 0');
+    TestRunner::assertSame('outofstock', $product->get_stock_status(), 'a clamped quantity must be out of stock');
 });
 
 exit(TestRunner::summary());

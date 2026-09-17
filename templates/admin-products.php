@@ -92,6 +92,12 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
             <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
             <?php esc_html_e('Traer todo desde Alegra', 'alegra-connector'); ?>
         </button>
+        <?php if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') : ?>
+        <button type="button" class="ac-btn ac-btn-sm alegra-sync-inventory" title="<?php esc_attr_e('Trae las existencias desde Alegra y actualiza el stock de WooCommerce.', 'alegra-connector'); ?>">
+            <span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;"></span>
+            <?php esc_html_e('Sincronizar inventario', 'alegra-connector'); ?>
+        </button>
+        <?php endif; ?>
         <button type="button" class="ac-btn ac-btn-sm alegra-bulk-import" data-type="product">
             <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
             <?php esc_html_e('Traer seleccionados', 'alegra-connector'); ?>

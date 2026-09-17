@@ -483,6 +483,25 @@
                 });
             });
 
+            // Pull inventory Alegra → WC stock
+            $('.alegra-sync-inventory').on('click', function() {
+                var $btn = $(this).prop('disabled', true).text(S.syncing);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_sync_inventory', _ajax_nonce: alegraConnector.nonce },
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, S.completed), 'success');
+                            setTimeout(function(){ location.reload(); }, 1500);
+                        } else {
+                            showNotice(safeMsg(r, S.error), 'error');
+                            $btn.prop('disabled', false).text(S.syncInventory);
+                        }
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false).text(S.syncInventory); }
+                });
+            });
+
             // Per-item pull Alegra → WC
             $('.alegra-import-single').on('click', function() {
                 var $btn = $(this).prop('disabled', true);

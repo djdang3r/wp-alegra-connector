@@ -41,6 +41,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_sync_single', [$this, 'ajax_sync_single']);
         add_action('wp_ajax_alegra_record_payment', [$this, 'ajax_record_payment']);
         add_action('wp_ajax_alegra_import_from_api', [$this, 'ajax_import_from_api']);
+        add_action('wp_ajax_alegra_sync_inventory', [$this, 'ajax_sync_inventory']);
         add_action('wp_ajax_alegra_export_csv', [$this, 'ajax_export_csv']);
         add_action('wp_ajax_alegra_bulk_sync', [$this, 'ajax_bulk_sync']);
         add_action('wp_ajax_alegra_get_invoice_pdf', [$this, 'ajax_get_invoice_pdf']);
@@ -541,6 +542,7 @@ class Admin_Dashboard
             'gettingCount'          => __('Obteniendo conteo de Alegra...', 'alegra-connector'),
             'elapsed'               => __('Tiempo: %1$dm %2$ds', 'alegra-connector'),
             'syncAll'               => __('Sincronizar Todo', 'alegra-connector'),
+            'syncInventory'         => __('Sincronizar inventario', 'alegra-connector'),
             'syncCancelled'         => __('Sincronización cancelada', 'alegra-connector'),
             'completed'             => __('Completado', 'alegra-connector'),
             'retry'                 => __('Reintentar', 'alegra-connector'),
@@ -1494,6 +1496,39 @@ class Admin_Dashboard
         }
         // For specific types, redirect to chunked sync via JS (handled by ajax_sync_start + ajax_sync_page)
         wp_send_json_success(['message' => __('ok', 'alegra-connector'), 'use_chunked' => true, 'type' => $sync_type]);
+    }
+
+    /**
+     * AJAX: pull inventory from Alegra (Alegra → WooCommerce stock).
+     *
+     * Manual counterpart of the documented `alegra_sync_inventory_from_alegra`
+     * action. The pull enforces the inventory_source / kill-switch / lock /
+     * cancellation gates itself.
+     */
+    public function ajax_sync_inventory(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $result = (new Sync\Controller($this->api, $this->logger))->run_inventory_sync();
+
+        if (!empty($result['skipped'])) {
+            wp_send_json_error(['message' => __('La copia de inventario está desactivada: la fuente de inventario es WooCommerce.', 'alegra-connector')]);
+        }
+        if (!empty($result['locked'])) {
+            wp_send_json_error(['message' => __('Ya hay una sincronización en curso. Intenta de nuevo en unos segundos.', 'alegra-connector')]);
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: %d: number of products whose stock was updated */
+                __('Inventario sincronizado: %d productos actualizados.', 'alegra-connector'),
+                (int) ($result['updated'] ?? 0)
+            ),
+            'updated' => (int) ($result['updated'] ?? 0),
+        ]);
     }
 
     /**

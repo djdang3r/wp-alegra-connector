@@ -497,7 +497,13 @@ class Products
 
         $alegra_cat_id = $this->resolve_alegra_category_id($product);
         if ($alegra_cat_id !== '') {
-            $data['category'] = ['id' => $alegra_cat_id];
+            // Alegra has TWO category fields: `category` is the ACCOUNTING
+            // category (a chart-of-accounts entry, e.g. "Ventas") and
+            // `itemCategory` is the COMMERCIAL item category managed by
+            // /item-categories. The id resolved here is an item-category id, so
+            // it must be sent under `itemCategory`.
+            // @see https://developer.alegra.com/reference/items__createitem.md
+            $data['itemCategory'] = ['id' => $alegra_cat_id];
         }
 
         return ['data' => $data, 'selections' => $selections];
@@ -965,10 +971,13 @@ class Products
             $data['tax'] = [['id' => $tax_id]];
         }
 
-        // Category
+        // Category. `itemCategory` is the COMMERCIAL item category (the one
+        // /item-categories manages); `category` is Alegra's ACCOUNTING category
+        // and must NOT receive an item-category id.
+        // @see https://developer.alegra.com/reference/items__createitem.md
         $alegra_cat_id = $this->resolve_alegra_category_id($product);
         if ($alegra_cat_id !== '') {
-            $data['category'] = ['id' => $alegra_cat_id];
+            $data['itemCategory'] = ['id' => $alegra_cat_id];
         }
 
         return $data;
@@ -1077,6 +1086,15 @@ class Products
     public function sync_inventory_from_alegra(): array
     {
         $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false];
+
+        // Kill switch guard: the pull is a sync entry point like any other and
+        // must abort when the plugin is disconnected/deactivated. This was the
+        // only entry point missing the check.
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $this->logger->info('Inventory pull skipped: kill switch active');
+            $result['skipped'] = true;
+            return $result;
+        }
 
         // AC-16: the inventory-source setting was never read. When the merchant
         // selects WooCommerce as the source, the pull must not overwrite stock.
@@ -1648,7 +1666,7 @@ class Products
                 $this->update_product_from_alegra($variation, $item);
                 $this->assign_variation_attributes((int) $variation_id, $item);
                 $this->assign_variation_sku((int) $variation_id, $item);
-                if (!empty($item['category'])) {
+                if (!empty($item['itemCategory'])) {
                     $this->assign_product_category((int) $variation_id, $item);
                 }
                 return;
@@ -1679,18 +1697,23 @@ class Products
         $this->assign_variation_attributes((int) $variation_id, $item);
         $this->assign_variation_sku((int) $variation_id, $item);
 
-        if (!empty($item['category'])) {
+        if (!empty($item['itemCategory'])) {
             $this->assign_product_category((int) $variation_id, $item);
         }
     }
 
     /**
-     * Assign the Alegra item's category to the WC product.
-     * Reads $item['category'] (object with id/name) and finds or creates the WC term.
+     * Assign the Alegra item's COMMERCIAL category to the WC product.
+     *
+     * Reads `$item['itemCategory']` — NOT `$item['category']`, which is Alegra's
+     * ACCOUNTING category (chart of accounts, e.g. "Ventas"). Reading `category`
+     * created WooCommerce product categories named after accounting accounts.
+     *
+     * @see https://developer.alegra.com/reference/get_items.md
      */
     private function assign_product_category(int $product_id, array $item): void
     {
-        $category = $item['category'] ?? null;
+        $category = $item['itemCategory'] ?? null;
         if (empty($category)) {
             return;
         }
@@ -1831,12 +1854,13 @@ class Products
                 $product->set_description($item['description']);
             }
 
-            if (isset($item['inventory']['availableQuantity']) && $product->get_manage_stock()) {
-                try {
-                    $product->set_stock_quantity((int) $item['inventory']['availableQuantity']);
-                } catch (\Exception $e) {
-                    $this->logger->warning('Failed to update stock: ' . $e->getMessage());
-                }
+            // Inventory. The setting was ignored here before: a merchant who
+            // chose WooCommerce as the source still had stock overwritten on
+            // every import. When WooCommerce owns inventory the plugin must not
+            // touch stock at all. A variable PARENT never manages stock in WC
+            // (its variations do), so it is skipped too.
+            if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') {
+                $this->apply_inventory_to_product($product, $item);
             }
 
             if (!empty($item['reference'])) {
@@ -1854,6 +1878,80 @@ class Products
             // Release the guard - keep it a bit longer to catch any delayed hooks
             delete_transient($guard_key);
         }
+    }
+
+    /**
+     * Land Alegra inventory on the WooCommerce entity that manages stock.
+     *
+     * WooCommerce ignores `_stock` unless `_manage_stock` is enabled, and it
+     * does NOT derive `_stock_status` from `set_stock_quantity()`+`save()`, so
+     * all three fields must be written explicitly. Without this the stock value
+     * was written but never shown — the root cause of "no trae la existencia".
+     *
+     * The presence of the `inventory` object is what marks an Alegra item as
+     * inventariable ("Si este objeto está presente indica que el artículo es
+     * inventariable, si no lo está se asume como servicio").
+     *
+     *  - inventariable                    → `_manage_stock=yes` + `_stock` + `_stock_status`
+     *  - servicio (no `inventory`)        → `_manage_stock=no`, stock untouched
+     *  - `availableQuantity` null/absent  → manage_stock only, NEVER write 0
+     *  - `availableQuantity` negative     → clamp to 0 + WARN (Alegra allows it, WC does not)
+     *
+     * `_backorders` is not exposed by Alegra and is deliberately left untouched.
+     * A variable PARENT is forced to `_manage_stock=no` and its stock left
+     * alone; simple products and variations receive the three fields, so the
+     * data lands on the entity that actually owns stock.
+     *
+     * @see https://developer.alegra.com/reference/get_items.md
+     */
+    private function apply_inventory_to_product(\WC_Product $product, array $item): void
+    {
+        // A variable PARENT never manages stock in WC: its variations do.
+        // Writing stock on the parent is silently ignored and leaves
+        // inconsistent data, so the parent is forced to `_manage_stock=no`
+        // while each variation receives its own quantity below.
+        if ($product->is_type('variable')) {
+            $product->set_manage_stock(false);
+            return;
+        }
+
+        $inventory = $item['inventory'] ?? null;
+
+        if (!is_array($inventory)) {
+            // Service: WC must not manage stock for it. Stock is left as-is.
+            $product->set_manage_stock(false);
+            return;
+        }
+
+        // Inventariable: WC only honors `_stock` when `_manage_stock` is on.
+        $product->set_manage_stock(true);
+
+        $qty = $inventory['availableQuantity'] ?? null;
+        if ($qty === null || $qty === '' || !is_numeric($qty)) {
+            // "No sé" is not "cero": leave quantity/status untouched instead of
+            // marking the product out of stock.
+            $this->logger->warning('Skipping stock update: Alegra returned no usable availableQuantity', [
+                'product_id' => $product->get_id(),
+                'alegra_id'  => (string) ($item['id'] ?? ''),
+            ]);
+            return;
+        }
+
+        $qty = (int) $qty;
+        if ($qty < 0) {
+            // Alegra permits negative stock; WooCommerce does not. Clamping is
+            // always reversible, propagating a negative is not.
+            $this->logger->warning('Clamping negative Alegra stock to 0', [
+                'product_id' => $product->get_id(),
+                'alegra_id'  => (string) ($item['id'] ?? ''),
+                'original'   => $qty,
+            ]);
+            $qty = 0;
+        }
+
+        $product->set_stock_quantity($qty);
+        // WC does not recompute the status on save(); it must be set explicitly.
+        $product->set_stock_status($qty > 0 ? 'instock' : 'outofstock');
     }
 
     /**

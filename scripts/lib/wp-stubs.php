@@ -742,6 +742,8 @@ class WC_Product
     public function get_tax_class(): string { return (string) ($this->data['tax_class'] ?? ''); }
     public function get_stock_quantity(): ?int { return isset($this->data['stock']) ? (int) $this->data['stock'] : null; }
     public function get_manage_stock(): bool { return (bool) ($this->data['manage_stock'] ?? false); }
+    public function get_stock_status(): string { return (string) ($this->data['stock_status'] ?? 'instock'); }
+    public function get_backorders(): string { return (string) ($this->data['backorders'] ?? 'no'); }
     public function get_image_id(): int { return (int) ($this->data['image_id'] ?? 0); }
     public function get_category_ids(): array { return (array) ($this->data['category_ids'] ?? []); }
     public function get_children(): array { return (array) ($this->data['children'] ?? []); }
@@ -767,6 +769,9 @@ class WC_Product
     public function set_status($s) { $this->data['status'] = $s; return $this; }
     public function set_catalog_visibility($v) { return $this; }
     public function set_stock_quantity($q) { $this->data['stock'] = $q; return $this; }
+    public function set_manage_stock($m) { $this->data['manage_stock'] = (bool) $m; return $this; }
+    public function set_stock_status($s) { $this->data['stock_status'] = $s; return $this; }
+    public function set_backorders($b) { $this->data['backorders'] = $b; return $this; }
     public function set_sku($s) { $this->data['sku'] = $s; return $this; }
     public function save() { return $this->id; }
 }

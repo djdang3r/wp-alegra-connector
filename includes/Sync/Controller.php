@@ -47,6 +47,25 @@ class Controller
         if (!has_action('alegra_connector_cron_sync', [$this, 'run_cron_sync'])) {
             add_action('alegra_connector_cron_sync', [$this, 'run_cron_sync']);
         }
+
+        // Documented manual trigger (docs/RELEASE_2.1.9_DEPLOY.md:359):
+        //   wp eval 'do_action("alegra_sync_inventory_from_alegra");'
+        // The action was documented but never registered. The pull enforces
+        // every gate itself (kill switch, lock, cancellation, inventory_source).
+        if (!has_action('alegra_sync_inventory_from_alegra', [$this, 'run_inventory_sync'])) {
+            add_action('alegra_sync_inventory_from_alegra', [$this, 'run_inventory_sync']);
+        }
+    }
+
+    /**
+     * Manual inventory-pull entry point for the
+     * `alegra_sync_inventory_from_alegra` action (WP-CLI / do_action).
+     */
+    public function run_inventory_sync(): array
+    {
+        $result = $this->products->sync_inventory_from_alegra();
+        $this->logger->info('Inventory pull triggered', $result);
+        return $result;
     }
 
     public function run_cron_sync(): void
@@ -126,6 +145,18 @@ class Controller
                 $result['products'] = ($products_result['imported'] ?? 0) + ($products_result['updated'] ?? 0);
             } elseif (isset($products_result) && is_wp_error($products_result)) {
                 $result['errors']['products'] = $products_result->get_error_message();
+            }
+
+            // Inventory pull (Alegra → WC stock). Only when the merchant chose
+            // Alegra as the source. It runs AFTER the products import released
+            // the 'products' lock, so it does not contend with it. The pull
+            // itself re-checks the kill switch, the lock, the cancellation
+            // transient and inventory_source.
+            if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'alegra') {
+                $inventory_result = $this->products->sync_inventory_from_alegra();
+                if (!empty($inventory_result['updated'])) {
+                    $result['inventory'] = (int) $inventory_result['updated'];
+                }
             }
         }
 
