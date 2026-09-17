@@ -2,9 +2,15 @@
 /**
  * Products Sync Handler
  *
- * Full bidirectional sync with variant support.
- * Each WooCommerce variation becomes a variant item in Alegra,
- * linked as subitems to the parent variantParent.
+ * Bidirectional sync for simple products and for the item import (including
+ * variant parents read from Alegra).
+ *
+ * PUSHING a variable product is a documented gap: Alegra requires
+ * `type=variantParent` + `variantAttributes` (min 1) + optional `itemVariants`,
+ * and the plugin does not build `variantAttributes` yet, so variable/variation
+ * pushes are refused instead of sending a schema-invalid payload.
+ *
+ * @see self::variable_product_gap_error()
  */
 
 declare(strict_types=1);
@@ -175,113 +181,77 @@ class Products
     }
 
     /**
-     * Sync variable product (parent with variants as subitems)
+     * Documented gap: variable products cannot be pushed to Alegra yet.
+     *
+     * Alegra models a variable product as a single item with
+     * `type=variantParent` that carries `variantAttributes` (min 1) — an array
+     * of `{id, options:[{id}]}` referencing EXISTING Alegra variant attribute
+     * IDs and option IDs — plus an optional `itemVariants` list. It is NOT a
+     * `kit`: `subitems` only applies to `type=kit`, and `variant` is not in the
+     * WRITE enum (`product|service|variantParent|kit`) — `variant` is a
+     * READ-only value returned by GET /items for a child.
+     *
+     * This plugin does not build `variantAttributes`: it would first have to
+     * resolve (or create, via POST /variant-attributes) the Alegra variant
+     * attributes and their option IDs from the WooCommerce variation
+     * attributes. The previous push sent `variantParent` + `subitems` (a kit
+     * field) and created each child as a standalone `type=variant` item; both
+     * are schema-invalid and Alegra rejects them with a 400. Refusing loudly is
+     * correct: it stops the plugin from sending an invalid payload.
+     *
+     * Required change (not implemented here):
+     *  1. Resolve/create the Alegra variant attributes + option IDs from the
+     *     WooCommerce variation attributes (API\Client::get_variant_attributes,
+     *     create_variant_attribute).
+     *  2. Build `variantAttributes` on the parent and an `itemVariants` entry
+     *     per WC variation (its attribute combination + per-variation
+     *     `inventory.warehouses`).
+     *  3. Map the child variant IDs returned in the parent response back to the
+     *     WC variations; drop the standalone variation create.
+     *
+     * @see https://developer.alegra.com/reference/items__createitem.md
      */
-    private function sync_variable_product(\WC_Product $product): array|\WP_Error
+    private function variable_product_gap_error(): \WP_Error
     {
-        $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
-
-        // First, sync each variation individually to get their Alegra IDs
-        $variation_ids = $product->get_children();
-        $subitems = [];
-
-        foreach ($variation_ids as $variation_id) {
-            $variation = wc_get_product($variation_id);
-            if (!$variation) {
-                continue;
-            }
-            // Sync each variation
-            $var_result = $this->sync_variation($variation);
-            if (!is_wp_error($var_result) && isset($var_result['id'])) {
-                $subitems[] = [
-                    'id' => (string) $var_result['id'],
-                    'reference' => $variation->get_sku(),
-                    'price' => (float) $variation->get_regular_price(),
-                    'quantity' => (int) ($variation->get_stock_quantity() ?? 0),
-                ];
-            }
-        }
-
-        $data = $this->prepare_variable_product_data($product, $subitems);
-
-        if ($alegra_id !== '') {
-            $result = $this->api->update_item($alegra_id, $data);
-            $this->logger->info('Variable product updated in Alegra', [
-                'product_id' => $product->get_id(),
-                'alegra_id' => $alegra_id,
-                'variations' => count($subitems),
-            ]);
-        } else {
-            // AC-44: a variable product is always a `variantParent` in Alegra
-            // (create and update must agree; `kit` is for composed items only).
-            // AC-16: the mapped "default status" only applies on creation.
-            $data['status'] = $this->field_mapping('default_status', 'active');
-            $result = $this->api->create_item($data);
-            if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
-                $this->logger->info('Variable product created in Alegra', [
-                    'product_id' => $product->get_id(),
-                    'alegra_id' => $result['id'],
-                    'variations' => count($subitems),
-                ]);
-            }
-        }
-
-        return $result;
+        return new \WP_Error(
+            'variable_product_unsupported',
+            __(
+                'Los productos variables todavía no se pueden enviar a Alegra: la API exige type=variantParent con variantAttributes (que el plugin aún no construye) y no acepta subitems ni el tipo variant. El producto no se sincronizó.',
+                'alegra-connector'
+            )
+        );
     }
 
     /**
-     * Sync a single variation to Alegra as an individual item
+     * Sync variable product.
+     *
+     * Documented gap: see variable_product_gap_error(). The parent cannot be
+     * emitted as a schema-valid `variantParent` until `variantAttributes` are
+     * built, so the push is refused rather than sent invalid.
+     */
+    private function sync_variable_product(\WC_Product $product): array|\WP_Error
+    {
+        $this->logger->warning('Variable product push skipped: variantAttributes not built yet', [
+            'product_id' => $product->get_id(),
+        ]);
+
+        return $this->variable_product_gap_error();
+    }
+
+    /**
+     * Sync a single variation.
+     *
+     * Documented gap: see variable_product_gap_error(). A child variation has
+     * no standalone WRITE type — it only exists as an `itemVariants` entry on
+     * its `variantParent` — so there is nothing schema-valid to POST yet.
      */
     private function sync_variation(\WC_Product $variation): array|\WP_Error
     {
-        $alegra_id = (string) get_post_meta($variation->get_id(), '_alegra_item_id', true);
-        $linked_by_sku = false;
+        $this->logger->warning('Variation push skipped: variantAttributes not built yet', [
+            'variation_id' => $variation->get_id(),
+        ]);
 
-        // Resolve an existing Alegra item by SKU BEFORE building the payload:
-        // the builder needs the final create-vs-update intent so it never
-        // re-sends `initialQuantity` on an update (R2 hotfix).
-        if ($alegra_id === '') {
-            // Search by SKU in Alegra before creating (prevent duplicates)
-            $sku = $variation->get_sku();
-            if (!empty($sku)) {
-                $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
-                if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
-                    $alegra_id = (string) $items[0]['id'];
-                    $linked_by_sku = true;
-                    update_post_meta($variation->get_id(), '_alegra_item_id', $alegra_id);
-                }
-            }
-        }
-
-        $is_create = ($alegra_id === '');
-        $data = $this->prepare_variation_data($variation, $is_create);
-
-        if (!$is_create) {
-            $result = $this->api->update_item($alegra_id, $data);
-            if ($linked_by_sku) {
-                $this->logger->info('Variation linked to existing Alegra item by SKU', [
-                    'variation_id' => $variation->get_id(),
-                    'alegra_id' => $alegra_id,
-                ]);
-            }
-
-            return $result;
-        }
-
-        $data['type'] = 'variant';
-        // AC-16: the mapped "default status" only applies on creation.
-        $data['status'] = $this->field_mapping('default_status', 'active');
-        $result = $this->api->create_item($data);
-        if (!is_wp_error($result) && isset($result['id'])) {
-            update_post_meta($variation->get_id(), '_alegra_item_id', (string) $result['id']);
-            $this->logger->info('Variation synced to Alegra', [
-                'variation_id' => $variation->get_id(),
-                'alegra_id' => $result['id'],
-            ]);
-        }
-
-        return $result;
+        return $this->variable_product_gap_error();
     }
 
     /**
@@ -352,81 +322,6 @@ class Products
 
         // Category
         $alegra_cat_id = $this->resolve_alegra_category_id($product);
-        if ($alegra_cat_id !== '') {
-            $data['category'] = ['id' => $alegra_cat_id];
-        }
-
-        return $data;
-    }
-
-    /**
-     * Prepare data for variable product parent
-     */
-    private function prepare_variable_product_data(\WC_Product $product, array $subitems): array
-    {
-        $data = [
-            'name' => $product->get_name(),
-            'reference' => $product->get_sku(),
-            'description' => wp_strip_all_tags($product->get_description()),
-            'type' => 'variantParent',
-            'price' => [
-                [
-                    'idPriceList' => 1,
-                    'price' => (float) $product->get_price(),
-                ],
-            ],
-            'subitems' => $subitems,
-        ];
-
-        // Category
-        $alegra_cat_id = $this->resolve_alegra_category_id($product);
-        if ($alegra_cat_id !== '') {
-            $data['category'] = ['id' => $alegra_cat_id];
-        }
-
-        return $data;
-    }
-
-    /**
-     * Prepare data for a single variation
-     */
-    private function prepare_variation_data(\WC_Product $variation, bool $is_create): array
-    {
-        $parent = wc_get_product($variation->get_parent_id());
-        $attributes = $variation->get_attributes();
-        $name_parts = [$parent ? $parent->get_name() : 'Variation'];
-        foreach ($attributes as $attr => $value) {
-            $name_parts[] = $value;
-        }
-        $variation_name = implode(' - ', $name_parts);
-
-        $data = [
-            'name' => $variation_name,
-            'reference' => $variation->get_sku(),
-            'description' => wp_strip_all_tags($variation->get_description()),
-            'price' => [
-                [
-                    'idPriceList' => $this->price_list_id(),
-                    'price' => (float) $variation->get_regular_price(),
-                ],
-            ],
-        ];
-
-        // R3 hotfix: see prepare_simple_product_data(). A variation's whole
-        // `inventory` object is only sent on create, never on update.
-        if ($is_create) {
-            $data['inventory'] = [
-                'unit' => $this->field_mapping('default_unit', 'unit'),
-                'unitCost' => $this->product_unit_cost($variation),
-                'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
-            ];
-        }
-
-        $this->apply_warehouse($data, $variation, $is_create);
-
-        // Category (variations inherit from their parent)
-        $cat_source = ($parent && $parent->get_category_ids()) ? $parent : $variation;
-        $alegra_cat_id = $this->resolve_alegra_category_id($cat_source);
         if ($alegra_cat_id !== '') {
             $data['category'] = ['id' => $alegra_cat_id];
         }

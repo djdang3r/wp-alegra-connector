@@ -17,6 +17,17 @@ if (!defined('ALEGRA_MOCK_BASE')) {
     define('ALEGRA_MOCK_BASE', 'https://api.alegra.test/v1');
 }
 
+/**
+ * Documented WRITE enum for the item `type` field (POST/PUT /items).
+ *
+ * `simple` and `variant` are READ-only values returned by GET /items; sending
+ * them on write is rejected by Alegra. This constant is the source of truth the
+ * mock validates against.
+ *
+ * @see https://developer.alegra.com/reference/post_items.md
+ */
+const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
+
 $GLOBALS['alegra_mock_requests'] = [];
 $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
 $GLOBALS['alegra_mock_failures'] = [];
@@ -188,7 +199,243 @@ function alegra_mock_dispatch(string $url, array $args)
         }
     }
 
+    // Schema validation. The mock used to accept ANY write body with a 200, so
+    // a payload that violated the documented schema passed CI — that is how
+    // `type: 'simple'` shipped. A write payload is now validated against the
+    // documented schema and rejected with the same 400 Alegra returns, so an
+    // invalid payload fails the suite instead of silently passing.
+    $validation_error = alegra_mock_validate_write($method, $path, $body);
+    if ($validation_error !== null) {
+        return alegra_mock_response(400, $validation_error);
+    }
+
     return alegra_mock_route($method, $path, $query, $body);
+}
+
+// ---------------------------------------------------------------------------
+// Write-payload schema validation
+//
+// Source of truth: https://developer.alegra.com/reference/post_items.md,
+// post_contacts.md, post_invoices.md, post_credit-notes.md.
+//
+// Adding an endpoint is cheap: add a rule to alegra_mock_write_validators().
+// ---------------------------------------------------------------------------
+
+/**
+ * Write endpoints mapped to their validator callables.
+ *
+ * Each rule is `{method, pattern, validator}`. `pattern` is a PCRE matched
+ * against the request path (use `{id}`-style segments as `[^/]+`). The
+ * validator receives the decoded body and returns an error-body array when the
+ * payload is invalid, or null when it conforms.
+ *
+ * @return array<int, array{method:string, pattern:string, validator:callable}>
+ */
+function alegra_mock_write_validators(): array
+{
+    return [
+        ['method' => 'POST', 'pattern' => '#^/items$#',        'validator' => 'alegra_mock_validate_item_create'],
+        ['method' => 'PUT',  'pattern' => '#^/items/[^/]+$#',  'validator' => 'alegra_mock_validate_item_update'],
+        ['method' => 'POST', 'pattern' => '#^/contacts$#',     'validator' => 'alegra_mock_validate_contact'],
+        ['method' => 'POST', 'pattern' => '#^/invoices$#',     'validator' => 'alegra_mock_validate_invoice'],
+        ['method' => 'POST', 'pattern' => '#^/credit-notes$#', 'validator' => 'alegra_mock_validate_credit_note'],
+    ];
+}
+
+/**
+ * Validate a write request against the documented schema.
+ *
+ * @return array|null Error body to return (a 400), or null when valid.
+ */
+function alegra_mock_validate_write(string $method, string $path, mixed $body): ?array
+{
+    foreach (alegra_mock_write_validators() as $rule) {
+        if ($rule['method'] !== $method) {
+            continue;
+        }
+        if (!preg_match($rule['pattern'], $path)) {
+            continue;
+        }
+        return ($rule['validator'])(is_array($body) ? $body : []);
+    }
+
+    return null;
+}
+
+/**
+ * Realistic Alegra error body: `{code, message}` with the HTTP status in
+ * `code`. Application-level errors (e.g. 2039) carry their own code inside the
+ * message — the API client scans for it there.
+ */
+function alegra_mock_validation_error(string $message, int $code = 400): array
+{
+    return ['code' => $code, 'message' => $message];
+}
+
+function alegra_mock_validate_item_create(array $body): ?array
+{
+    return alegra_mock_validate_item($body, true);
+}
+
+function alegra_mock_validate_item_update(array $body): ?array
+{
+    return alegra_mock_validate_item($body, false);
+}
+
+/**
+ * POST /items and PUT /items/{id}.
+ *
+ * The WRITE enum for `type` is product|service|variantParent|kit. `simple` and
+ * `variant` are READ-only values returned by GET /items and must never be sent
+ * on write — that mismatch is the bug that shipped.
+ *
+ * On create `name` and `price` are obligatorios; `price` is an array of
+ * `{idPriceList, price}`. `inventory`, when present, must carry `unit` (string),
+ * `unitCost` (number) and `initialQuantity` (number) — all documented
+ * obligatorios. A `variantParent` must carry `variantAttributes` (min 1);
+ * `subitems` is a kit-only field.
+ */
+function alegra_mock_validate_item(array $body, bool $is_create): ?array
+{
+    $write_enum = ALEGRA_MOCK_ITEM_WRITE_ENUM;
+
+    if (array_key_exists('type', $body)) {
+        if (!is_string($body['type']) || !in_array($body['type'], $write_enum, true)) {
+            return alegra_mock_validation_error(
+                'El campo type no es valido: ' . json_encode($body['type'])
+                . '. Valores permitidos: ' . implode(', ', $write_enum)
+            );
+        }
+    }
+
+    if ($is_create) {
+        if (empty($body['name']) || !is_string($body['name'])) {
+            return alegra_mock_validation_error('El campo name es obligatorio');
+        }
+        if (!isset($body['price']) || !is_array($body['price']) || $body['price'] === []) {
+            return alegra_mock_validation_error('El campo price es obligatorio y debe ser un arreglo con al menos una lista de precio');
+        }
+        foreach (array_values($body['price']) as $i => $price) {
+            if (!is_array($price) || !array_key_exists('idPriceList', $price) || !array_key_exists('price', $price)) {
+                return alegra_mock_validation_error('El campo price[' . $i . '] debe contener idPriceList y price');
+            }
+        }
+    }
+
+    if (array_key_exists('inventory', $body)) {
+        $inventory = $body['inventory'];
+        if (!is_array($inventory)) {
+            return alegra_mock_validation_error('El campo inventory debe ser un objeto');
+        }
+        foreach (['unit', 'unitCost', 'initialQuantity'] as $field) {
+            if (!array_key_exists($field, $inventory)) {
+                return alegra_mock_validation_error('El campo inventory.' . $field . ' es obligatorio cuando se envia inventory');
+            }
+        }
+        if (!is_string($inventory['unit'])) {
+            return alegra_mock_validation_error('El campo inventory.unit debe ser texto');
+        }
+        if (!is_numeric($inventory['unitCost'])) {
+            return alegra_mock_validation_error('El campo inventory.unitCost debe ser numerico');
+        }
+        if (!is_numeric($inventory['initialQuantity'])) {
+            return alegra_mock_validation_error('El campo inventory.initialQuantity debe ser numerico');
+        }
+    }
+
+    if (($body['type'] ?? null) === 'variantParent') {
+        if (empty($body['variantAttributes']) || !is_array($body['variantAttributes'])) {
+            return alegra_mock_validation_error('El campo variantAttributes es obligatorio para type=variantParent (subitems solo aplica a type=kit)');
+        }
+    }
+
+    return null;
+}
+
+/**
+ * POST /contacts.
+ *
+ * `name` and `nameObject` are mutually exclusive (Alegra error 2039) and at
+ * least one is required. When `identificationObject` is present it must carry
+ * `type` and `number`.
+ */
+function alegra_mock_validate_contact(array $body): ?array
+{
+    $has_name = array_key_exists('name', $body) && $body['name'] !== null && $body['name'] !== '';
+    $has_name_object = array_key_exists('nameObject', $body) && !empty($body['nameObject']);
+
+    if ($has_name && $has_name_object) {
+        return alegra_mock_validation_error('2039: los campos name y nameObject son mutuamente excluyentes');
+    }
+    if (!$has_name && !$has_name_object) {
+        return alegra_mock_validation_error('El campo name o nameObject es obligatorio');
+    }
+
+    if (array_key_exists('identificationObject', $body)) {
+        $identification = $body['identificationObject'];
+        if (!is_array($identification) || empty($identification['type']) || !isset($identification['number']) || $identification['number'] === '') {
+            return alegra_mock_validation_error('El campo identificationObject debe contener type y number');
+        }
+    }
+
+    return null;
+}
+
+/**
+ * POST /invoices. Required: client, items (non-empty, every line with an id),
+ * date and dueDate (post_invoices.md).
+ */
+function alegra_mock_validate_invoice(array $body): ?array
+{
+    if (empty($body['client']) || !is_array($body['client']) || empty($body['client']['id'])) {
+        return alegra_mock_validation_error('El campo client es obligatorio');
+    }
+    if (empty($body['items']) || !is_array($body['items'])) {
+        return alegra_mock_validation_error('El campo items es obligatorio y no puede estar vacio');
+    }
+    foreach (array_values($body['items']) as $i => $item) {
+        if (!is_array($item) || empty($item['id'])) {
+            return alegra_mock_validation_error('El campo items[' . $i . '].id es obligatorio');
+        }
+    }
+    if (empty($body['date']) || !is_string($body['date'])) {
+        return alegra_mock_validation_error('El campo date es obligatorio');
+    }
+    if (empty($body['dueDate']) || !is_string($body['dueDate'])) {
+        return alegra_mock_validation_error('El campo dueDate es obligatorio');
+    }
+
+    return null;
+}
+
+/**
+ * POST /credit-notes. Required: date, client, items (non-empty). When
+ * `invoices` is present every entry must carry `{id, amount}`
+ * (post_credit-notes.md).
+ */
+function alegra_mock_validate_credit_note(array $body): ?array
+{
+    if (empty($body['client']) || !is_array($body['client']) || empty($body['client']['id'])) {
+        return alegra_mock_validation_error('El campo client es obligatorio');
+    }
+    if (empty($body['items']) || !is_array($body['items'])) {
+        return alegra_mock_validation_error('El campo items es obligatorio y no puede estar vacio');
+    }
+    if (empty($body['date']) || !is_string($body['date'])) {
+        return alegra_mock_validation_error('El campo date es obligatorio');
+    }
+    if (array_key_exists('invoices', $body)) {
+        if (!is_array($body['invoices'])) {
+            return alegra_mock_validation_error('El campo invoices debe ser un arreglo');
+        }
+        foreach (array_values($body['invoices']) as $i => $invoice) {
+            if (!is_array($invoice) || empty($invoice['id']) || !array_key_exists('amount', $invoice)) {
+                return alegra_mock_validation_error('El campo invoices[' . $i . '] debe contener id y amount');
+            }
+        }
+    }
+
+    return null;
 }
 
 function alegra_mock_response(int $code, mixed $body): array

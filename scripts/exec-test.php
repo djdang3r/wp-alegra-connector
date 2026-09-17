@@ -1155,16 +1155,25 @@ TestRunner::test('T10.2 AC-45 an imported variation gets its attributes and SKU'
     );
 });
 
-TestRunner::test('T10.3 AC-44 a variable product is pushed as variantParent, never kit', function (): void {
+// AC-44 + documented gap: Alegra models a variable product as a single
+// `variantParent` carrying `variantAttributes` (min 1) and optional
+// `itemVariants`. `subitems` is a kit-only field and `variant` is not in the
+// WRITE enum. Until the plugin builds `variantAttributes`, the push must be
+// REFUSED — never sent as a schema-invalid payload (the mock now 400s those).
+TestRunner::test('T10.3 AC-44 a variable product push is refused, never sent as variantParent/kit/variant', function (): void {
     alegra_test_reset();
     alegra_make_product(20, ['name' => 'Var', 'sku' => 'VAR-S', 'type' => 'variation', 'regular_price' => '5']);
     alegra_make_product(21, ['name' => 'Parent', 'sku' => 'PAR', 'type' => 'variable', 'regular_price' => '10', 'children' => [20]]);
 
-    make_products()->sync_to_alegra(wc_get_product(21));
+    $result = make_products()->sync_to_alegra(wc_get_product(21));
 
-    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
-    TestRunner::assertSame('variantParent', $body['type'] ?? null, 'create must use variantParent');
-    TestRunner::assertStringNotContains('"type":"kit"', json_encode($body), 'a variable product must never be created as a kit');
+    TestRunner::assertTrue(is_wp_error($result), 'a variable product push must be refused (documented gap)');
+    TestRunner::assertSame('variable_product_unsupported', $result->get_error_code(), 'the refusal must carry the documented-gap code');
+
+    $item_writes = array_filter($GLOBALS['alegra_mock_requests'], static function ($r) {
+        return in_array($r['method'], ['POST', 'PUT'], true) && strpos($r['path'], '/items') === 0;
+    });
+    TestRunner::assertCount(0, $item_writes, 'no item write may be sent for a variable product');
 });
 
 TestRunner::test('T10.4 AC-64 the CSV export paginates past 500 rows', function (): void {
@@ -1538,7 +1547,10 @@ TestRunner::test('T-hotfix-3 update still sends name, price, tax, category and u
     TestRunner::assertArrayNotHasKey('inventory', $body, 'update must omit inventory entirely (R3): a partial {unit} is undocumented');
 });
 
-TestRunner::test('T-hotfix-4 variation create sends inventory, variation update omits it', function (): void {
+// Documented gap: a variation has no standalone WRITE type — it only exists as
+// an `itemVariants` entry on its `variantParent`. The old `type=variant` create
+// was schema-invalid (400). The push must be refused instead of sent.
+TestRunner::test('T-hotfix-4 variation push is refused, never sent as type=variant', function (): void {
     alegra_test_reset();
     alegra_make_product(50, ['name' => 'Parent', 'sku' => 'PAR-1', 'type' => 'variable', 'regular_price' => '10']);
     alegra_make_product(51, [
@@ -1547,35 +1559,16 @@ TestRunner::test('T-hotfix-4 variation create sends inventory, variation update 
         'attributes' => ['color' => 'Rojo'],
     ]);
 
-    $create_result = make_products()->sync_to_alegra(wc_get_product(51));
-    TestRunner::assertFalse(is_wp_error($create_result), 'variation create must not error');
-
-    $create_body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
-    TestRunner::assertSame('variant', $create_body['type'] ?? null, 'a variation create must be type=variant');
-    TestRunner::assertArrayHasKey('initialQuantity', $create_body['inventory'] ?? [], 'variation create must send initialQuantity');
-    TestRunner::assertSame(4, $create_body['inventory']['initialQuantity'] ?? null, 'variation create must send the WC stock');
-    TestRunner::assertArrayHasKey('unitCost', $create_body['inventory'] ?? [], 'variation create must send inventory.unitCost (obligatorio)');
-
-    // --- UPDATE ---
-    alegra_test_reset();
-    alegra_make_product(60, ['name' => 'Parent2', 'sku' => 'PAR-2', 'type' => 'variable', 'regular_price' => '10']);
-    alegra_make_product(61, [
-        'name' => 'Parent2 - Azul', 'sku' => 'VAR-UPDATE', 'type' => 'variation',
-        'parent_id' => 60, 'regular_price' => '10', 'stock' => 6, 'manage_stock' => true,
-        'attributes' => ['color' => 'Azul'],
-    ]);
-    update_post_meta(61, '_alegra_item_id', 'item-var-61');
-
-    make_products()->sync_to_alegra(wc_get_product(61));
-
-    $update_body = alegra_mock_last_request('PUT', '/items/item-var-61')['body'] ?? [];
-    TestRunner::assertArrayNotHasKey('inventory', $update_body, 'variation update must omit inventory entirely (R3)');
+    $result = make_products()->sync_to_alegra(wc_get_product(51));
+    TestRunner::assertTrue(is_wp_error($result), 'a variation push must be refused (documented gap)');
+    TestRunner::assertSame('variable_product_unsupported', $result->get_error_code(), 'the refusal must carry the documented-gap code');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'the invalid type=variant create must never be sent');
 });
 
 // R3 regression guard: the exact UPDATE payload key set must never contain
 // `inventory`. This is the assertion that fails if anyone reintroduces either
 // the old partial `{unit}` or the R2 `initialQuantity` on update.
-TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple + variation)', function (): void {
+TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple) and variations are refused', function (): void {
     alegra_test_reset();
     alegra_make_product(70, [
         'name' => 'R3 simple', 'sku' => 'R3-S', 'regular_price' => '15',
@@ -1594,9 +1587,9 @@ TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple + varia
         'attributes' => ['color' => 'Verde'],
     ]);
     update_post_meta(81, '_alegra_item_id', 'item-r3-v');
-    make_products()->sync_to_alegra(wc_get_product(81));
-    $variation = alegra_mock_last_request('PUT', '/items/item-r3-v')['body'] ?? [];
-    TestRunner::assertArrayNotHasKey('inventory', $variation, 'variation UPDATE must not carry inventory');
+    $variation_result = make_products()->sync_to_alegra(wc_get_product(81));
+    TestRunner::assertTrue(is_wp_error($variation_result), 'a variation push must be refused (documented gap)');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/items/item-r3-v'), 'a variation update must never be sent');
 });
 
 exit(TestRunner::summary());
