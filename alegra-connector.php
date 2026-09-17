@@ -30,7 +30,6 @@ define('ALEGRA_CONNECTOR_VERSION', '2.3.4');
 define('ALEGRA_CONNECTOR_PATH', plugin_dir_path(__FILE__));
 define('ALEGRA_CONNECTOR_URL', plugin_dir_url(__FILE__));
 define('ALEGRA_CONNECTOR_BASENAME', plugin_basename(__FILE__));
-define('ALEGRA_CONNECTOR_API_URL', 'https://api.alegra.com/api/v1');
 define('ALEGRA_CONNECTOR_FILE', __FILE__);
 
 /**

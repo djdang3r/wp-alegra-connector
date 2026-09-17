@@ -241,6 +241,11 @@ class Products
             if (is_wp_error($result)) {
                 return $result;
             }
+            // Dry Run: no item was created. Return the marker (consistent with
+            // the simple-product path) instead of a misleading "no id" error.
+            if (API\Client::is_dry_run_response($result)) {
+                return $result;
+            }
             $parent_id = (string) ($result['id'] ?? '');
             if ($parent_id === '') {
                 return new \WP_Error(
@@ -1786,9 +1791,10 @@ class Products
         try {
             // Price extraction
             $price = 0;
+            $target_price_list = $this->price_list_id();
             if (isset($item['price']) && is_array($item['price'])) {
                 foreach ($item['price'] as $pe) {
-                    if (isset($pe['idPriceList']) && (int) $pe['idPriceList'] === 1) {
+                    if (isset($pe['idPriceList']) && (int) $pe['idPriceList'] === $target_price_list) {
                         $price = (float) ($pe['price'] ?? 0);
                         break;
                     }

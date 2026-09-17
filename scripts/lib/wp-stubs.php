@@ -398,6 +398,41 @@ function wp_get_current_user() { return new WP_User(1, ['user_login' => 'tester'
 function get_current_user_id() { return 1; }
 function current_user_can($cap) { return true; }
 function wp_die($message = '', $title = '', $args = []) { return; }
+
+/**
+ * Thrown by the wp_send_json_* stubs to emulate WordPress's wp_die() exit.
+ *
+ * Real wp_send_json_success()/error() print JSON and terminate the request.
+ * Returning instead would let an AJAX handler keep running past its response
+ * (and, in the dry-run tests, persist state after it already answered). Tests
+ * that invoke an AJAX handler must catch this exception to read the payload.
+ */
+class Alegra_Test_JSON_Response extends \Exception
+{
+    public bool $success;
+    /** @var array<string, mixed> */
+    public array $payload;
+
+    public function __construct(bool $success, array $payload)
+    {
+        parent::__construct('wp_send_json response');
+        $this->success = $success;
+        $this->payload = $payload;
+    }
+}
+
+function wp_send_json_success($data = null, $status_code = null)
+{
+    throw new Alegra_Test_JSON_Response(true, is_array($data) ? $data : ['data' => $data]);
+}
+function wp_send_json_error($data = null, $status_code = null)
+{
+    throw new Alegra_Test_JSON_Response(false, is_array($data) ? $data : ['data' => $data]);
+}
+function wp_send_json($data, $status_code = null)
+{
+    throw new Alegra_Test_JSON_Response(true, is_array($data) ? $data : ['data' => $data]);
+}
 function deactivate_plugins($plugin) { return; }
 function flush_rewrite_rules($hard = true) { return; }
 function load_plugin_textdomain($domain, $deprecated = false, $path = false) { return true; }
@@ -761,6 +796,7 @@ class WC_Order
     protected string $currency = 'COP';
     protected string $status = 'processing';
     protected ?\DateTime $date_created = null;
+    protected ?\DateTime $date_paid = null;
     protected int $customer_id = 0;
     protected ?WP_User $user = null;
     protected array $notes = [];
@@ -781,6 +817,7 @@ class WC_Order
         $this->items = (array) ($data['items'] ?? []);
         $this->refunds = (array) ($data['refunds'] ?? []);
         $this->date_created = $data['date_created'] ?? new WC_DateTime();
+        $this->date_paid = $data['date_paid'] ?? null;
         if (isset($data['user']) && $data['user'] instanceof WP_User) {
             $this->user = $data['user'];
         } elseif ($this->customer_id > 0) {
@@ -813,6 +850,7 @@ class WC_Order
     public function get_status(): string { return $this->status; }
     public function update_status($status) { $this->status = (string) $status; return true; }
     public function get_date_created(): ?\DateTime { return $this->date_created; }
+    public function get_date_paid(): ?\DateTime { return $this->date_paid; }
     public function set_refunds(array $refunds) { $this->refunds = $refunds; return $this; }
     public function add_refund(WC_Order_Refund $refund) { $this->refunds[] = $refund; return $this; }
     public function get_customer_id(): int { return $this->customer_id; }

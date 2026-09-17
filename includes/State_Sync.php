@@ -152,6 +152,17 @@ class State_Sync
                 return $result;
             }
 
+            // Dry Run: create_credit_note_for_refund() already added the honest
+            // note. Do not log a false "synced" success.
+            if (API\Client::is_dry_run_response($result)) {
+                self::log('warning', 'Refund sync skipped (dry run)', [
+                    'order_id'  => $order_id,
+                    'refund_id' => $refund_id,
+                    'amount'    => $amount,
+                ]);
+                return $result;
+            }
+
             $credit_note_id = (string) ($result['id'] ?? '');
             if ($refund_id > 0 && $credit_note_id !== '') {
                 $order->update_meta_data(sprintf(self::REFUND_META_FMT, $refund_id), $credit_note_id);
@@ -286,6 +297,16 @@ class State_Sync
             self::log('error', 'Failed to update payment method in Alegra', [
                 'order_id' => $order_id,
                 'error' => $result->get_error_message(),
+            ]);
+            return;
+        }
+
+        // Dry Run: the invoice was NOT updated. Do not claim it happened.
+        if (API\Client::is_dry_run_response($result)) {
+            $order->add_order_note(__('Alegra (modo de prueba): el método de pago NO se actualizó. Desactiva el modo de prueba para sincronizar de verdad.', 'alegra-connector'));
+            self::log('warning', 'Payment method update skipped (dry run)', [
+                'order_id' => $order_id,
+                'payment_method' => $payment_method,
             ]);
             return;
         }

@@ -275,3 +275,18 @@ function alegra_call_private(object $object, string $method, mixed ...$args): mi
     $ref->setAccessible(true);
     return $ref->invokeArgs($object, $args);
 }
+
+/**
+ * Invoke an admin AJAX handler and capture the wp_send_json_* response it
+ * emits. The stub throws Alegra_Test_JSON_Response (see wp-stubs.php) instead
+ * of exiting, so the payload is observable.
+ */
+function alegra_capture_json(callable $fn): Alegra_Test_JSON_Response
+{
+    try {
+        $fn();
+    } catch (Alegra_Test_JSON_Response $e) {
+        return $e;
+    }
+    throw new \RuntimeException('the handler emitted no wp_send_json_* response');
+}

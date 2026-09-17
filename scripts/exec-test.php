@@ -1825,4 +1825,197 @@ TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple) and a 
     TestRunner::assertArrayNotHasKey('inventory', $parent_body['itemVariants'][0] ?? [], 'update must not re-send per-variant inventory');
 });
 
+// ===========================================================================
+// T15 — Dry Run must never persist fake success
+//
+// Client::request() blocks write verbs and returns ['dry_run' => true, ...].
+// That marker is an ARRAY, so an is_wp_error()-only check treats it as success.
+// Each test proves the caller does NOT persist state when the marker comes back.
+// ===========================================================================
+echo "\nT15 — Dry Run correctness (no ghost state)\n";
+
+TestRunner::test('T15.1 refund credit note under dry run does not mark the refund credited', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    [$order] = build_refund_world(100.0, 100.0, 600, 900);
+    register_refund_owner_hook();
+
+    $result = State_Sync::handle_refund(600, 900);
+
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::is_dry_run_response($result), 'the dry-run marker must be returned unchanged');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_credited_amount', true), '_alegra_credited_amount must NOT be written');
+    TestRunner::assertSame('', (string) $order->get_meta(sprintf(State_Sync::REFUND_META_FMT, 900), true), 'the refund credit-note meta must NOT be written');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'no credit note may be POSTed in dry run');
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('modo de prueba', $notes, 'an honest dry-run note must be added');
+    TestRunner::assertStringNotContains('creada por reembolso', $notes, 'the false "credit note created" note must NOT be added');
+});
+
+TestRunner::test('T15.2 ajax_record_payment under dry run does not save a payment id nor report success', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    $order = alegra_make_order(960, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'meta' => ['_alegra_invoice_id' => '1nv-960'],
+    ]);
+
+    $_POST['order_id'] = 960;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn() => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'the response must be a success envelope');
+    TestRunner::assertSame(true, $resp->payload['dry_run'] ?? null, 'the response must be flagged dry_run');
+    TestRunner::assertStringContains('NO se registró', (string) ($resp->payload['message'] ?? ''), 'the message must say the payment was NOT registered');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), '_alegra_payment_id must NOT be written');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be POSTed in dry run');
+    TestRunner::assertStringNotContains('registrado', implode("\n", $order->get_notes()), 'no false success note may be added');
+});
+
+TestRunner::test('T15.3 payment-method change under dry run does not claim the update happened', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    alegra_make_user(7, ['user_email' => 'pm@example.test'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+    ]);
+    $order = alegra_make_order(970, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'cod', 'customer_id' => 7,
+        'meta' => ['_alegra_invoice_id' => '1nv-970', '_alegra_last_payment_method' => 'bacs'],
+    ]);
+
+    State_Sync::handle_payment_method_change(970);
+
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/1nv-970'), 'the PUT must be blocked by dry run');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringNotContains('actualizado en Alegra', $notes, 'the false "updated" note must NOT be added');
+    TestRunner::assertStringContains('modo de prueba', $notes, 'an honest dry-run note must be added');
+});
+
+TestRunner::test('T15.4 ajax_delete_webhooks under dry run keeps the local subscription list', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    $subs = [
+        ['id' => 'wh-1', 'event' => 'new-invoice'],
+        ['id' => 'wh-2', 'event' => 'new-client'],
+    ];
+    update_option('alegra_connector_webhook_subscriptions', $subs, false);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn() => $admin->ajax_delete_webhooks());
+
+    TestRunner::assertSame(true, $resp->payload['dry_run'] ?? null, 'the response must be flagged dry_run');
+    TestRunner::assertSame(0, $resp->payload['deleted'] ?? null, 'nothing may be counted as deleted');
+    TestRunner::assertSame(0, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-1'), 'no DELETE may be sent in dry run');
+    TestRunner::assertSame($subs, get_option('alegra_connector_webhook_subscriptions', null), 'the local subscription list must be preserved');
+});
+
+TestRunner::test('T15.5 variable product dry run returns the marker, not a misleading error', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo']],
+    ]);
+    alegra_make_variable_product(90, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo']],
+    ], [
+        91 => ['name' => 'Dry parent - Rojo', 'sku' => 'DRY-V', 'variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10', 'stock' => 4, 'manage_stock' => true],
+    ], ['name' => 'Dry parent', 'sku' => 'DRY-P', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(91));
+
+    TestRunner::assertFalse(is_wp_error($result), 'a dry-run variable push must NOT return a WP_Error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::is_dry_run_response($result), 'the dry-run marker must be returned');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'no item may be POSTed in dry run');
+});
+
+// --- T15.6 — the same four paths with dry run OFF persist normally ----------
+
+TestRunner::test('T15.6a refund credit note with dry run OFF still marks the refund credited', function (): void {
+    alegra_test_reset();
+    [$order] = build_refund_world(100.0, 100.0, 601, 901);
+    register_refund_owner_hook();
+
+    $result = State_Sync::handle_refund(601, 901);
+
+    TestRunner::assertFalse(is_wp_error($result), 'the credit note must be created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/credit-notes'), 'one credit note must be POSTed');
+    TestRunner::assertEquals(100.0, (float) $order->get_meta('_alegra_credited_amount', true), '_alegra_credited_amount must be written');
+    TestRunner::assertStringContains('creada por reembolso', implode("\n", $order->get_notes()), 'the real success note must be added');
+});
+
+TestRunner::test('T15.6b ajax_record_payment with dry run OFF persists the payment normally', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    $order = alegra_make_order(961, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'meta' => ['_alegra_invoice_id' => '1nv-961'],
+    ]);
+
+    $_POST['order_id'] = 961;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn() => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'the response must be a success envelope');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be POSTed');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_payment_id', true) !== '', '_alegra_payment_id must be written');
+    TestRunner::assertStringContains('registrado', implode("\n", $order->get_notes()), 'the real success note must be added');
+});
+
+TestRunner::test('T15.6c payment-method change with dry run OFF updates Alegra and notes it', function (): void {
+    alegra_test_reset();
+    alegra_make_user(7, ['user_email' => 'pm@example.test'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+    ]);
+    $order = alegra_make_order(971, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'cod', 'customer_id' => 7,
+        'meta' => ['_alegra_invoice_id' => '1nv-971', '_alegra_last_payment_method' => 'bacs'],
+    ]);
+
+    State_Sync::handle_payment_method_change(971);
+
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/1nv-971'), 'the invoice must be updated');
+    TestRunner::assertStringContains('actualizado en Alegra', implode("\n", $order->get_notes()), 'the real success note must be added');
+});
+
+TestRunner::test('T15.6d ajax_delete_webhooks with dry run OFF deletes and clears the list', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_subscriptions', [['id' => 'wh-1', 'event' => 'new-invoice']], false);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn() => $admin->ajax_delete_webhooks());
+
+    TestRunner::assertSame(1, $resp->payload['deleted'] ?? null, 'the webhook must be counted as deleted');
+    TestRunner::assertSame(1, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-1'), 'the DELETE must be sent');
+    TestRunner::assertSame(null, get_option('alegra_connector_webhook_subscriptions', null), 'the local option must be cleared');
+});
+
+TestRunner::test('T15.6e variable product with dry run OFF still creates the variantParent', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-verde', 'value' => 'Verde']],
+    ]);
+    alegra_make_variable_product(92, [
+        'color' => ['name' => 'Color', 'options' => ['Verde']],
+    ], [
+        93 => ['name' => 'Real parent - Verde', 'sku' => 'REAL-V', 'variation_attributes' => ['attribute_color' => 'Verde'], 'regular_price' => '10', 'stock' => 5, 'manage_stock' => true],
+    ], ['name' => 'Real parent', 'sku' => 'REAL-P', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(93));
+
+    TestRunner::assertFalse(is_wp_error($result), 'the variantParent must be created: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'), 'exactly one item write (the parent)');
+    TestRunner::assertSame('variantParent', alegra_mock_last_request('POST', '/items')['body']['type'] ?? null, 'the write must be a variantParent');
+});
+
 exit(TestRunner::summary());

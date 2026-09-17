@@ -236,6 +236,22 @@ class Client
     }
 
     /**
+     * Whether a request() result is the Dry Run marker.
+     *
+     * Dry Run blocks every write verb and returns ['dry_run' => true, ...]
+     * instead of performing the call. That marker is a plain ARRAY, so a caller
+     * that only checks is_wp_error() treats it as a successful response and
+     * persists state for an operation that never happened. Every write call site
+     * must use this guard before touching meta, notes, or local options.
+     *
+     * @param mixed $result A value returned by a Client write method.
+     */
+    public static function is_dry_run_response(mixed $result): bool
+    {
+        return is_array($result) && ($result['dry_run'] ?? false) === true;
+    }
+
+    /**
      * Check if a WP_Error is retryable (timeout, connection issues)
      */
     private function is_retryable_wp_error(\WP_Error $error): bool

@@ -1812,6 +1812,19 @@ class Admin_Dashboard
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
         }
 
+        // Dry Run: the payment was NOT recorded. Do not save an empty payment id,
+        // do not add a success note, and tell the UI explicitly.
+        if (API\Client::is_dry_run_response($result)) {
+            $this->logger->warning('Payment recording skipped (dry run)', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+            ]);
+            wp_send_json_success([
+                'dry_run' => true,
+                'message' => __('Modo de prueba activo: el pago NO se registró en Alegra.', 'alegra-connector'),
+            ]);
+        }
+
         // Alegra payment ids are UUID strings.
         $payment_id = (string) ($result['id'] ?? '');
         $order->update_meta_data('_alegra_payment_id', $payment_id);
@@ -2156,19 +2169,42 @@ class Admin_Dashboard
         $subscriptions = (array) get_option('alegra_connector_webhook_subscriptions', []);
         $deleted = 0;
         $errors = [];
+        $remaining = [];
+        $dry_run_skipped = 0;
 
         foreach ($subscriptions as $sub) {
             $id = $sub['id'] ?? '';
-            if (empty($id)) continue;
+            if (empty($id)) {
+                $remaining[] = $sub;
+                continue;
+            }
             $result = $this->api->delete_webhook_subscription((string) $id);
             if (is_wp_error($result)) {
                 $errors[] = $sub['event'] . ': ' . $result->get_error_message();
+                $remaining[] = $sub;
+            } elseif (API\Client::is_dry_run_response($result)) {
+                // Dry Run: nothing was deleted in Alegra; keep it locally.
+                $dry_run_skipped++;
+                $remaining[] = $sub;
             } else {
                 $deleted++;
             }
         }
 
-        delete_option('alegra_connector_webhook_subscriptions');
+        // Only drop the subscriptions that were ACTUALLY deleted.
+        if (!empty($remaining)) {
+            update_option('alegra_connector_webhook_subscriptions', $remaining, false);
+        } else {
+            delete_option('alegra_connector_webhook_subscriptions');
+        }
+
+        if ($dry_run_skipped > 0) {
+            wp_send_json_success([
+                'dry_run' => true,
+                'message' => __('Modo de prueba activo: no se eliminó ningún webhook en Alegra.', 'alegra-connector'),
+                'deleted' => $deleted,
+            ]);
+        }
 
         $message = sprintf(__('%d webhooks eliminados.', 'alegra-connector'), $deleted);
         if (!empty($errors)) {

@@ -505,6 +505,20 @@ class Orders
             return $result;
         }
 
+        // Dry Run: the credit note was NOT created. Do not mark the refund as
+        // credited, do not store a refund meta id, and do not claim success.
+        if (API\Client::is_dry_run_response($result)) {
+            $order->add_order_note(__('Alegra (modo de prueba): no se creó la nota de crédito. Desactiva el modo de prueba para facturar de verdad.', 'alegra-connector'));
+            if ($this->logger) {
+                $this->logger->warning('Credit note for refund skipped (dry run)', [
+                    'order_id'  => $order_id,
+                    'refund_id' => $refund_id,
+                    'amount'    => $amount,
+                ]);
+            }
+            return $result;
+        }
+
         $cn_id = (string) ($result['id'] ?? '');
 
         $order->update_meta_data('_alegra_credited_amount', $credited + $amount);
