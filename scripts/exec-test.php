@@ -1424,4 +1424,102 @@ TestRunner::test('T12.7 sync_method gates the INBOUND cron: disabled skips the r
     TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'disabled must not pull items');
 });
 
+// ===========================================================================
+// T13 — R2 hotfix: initialQuantity only on CREATE, never on UPDATE
+// ===========================================================================
+echo "\nT13 — R2 hotfix (initialQuantity on create only)\n";
+
+TestRunner::test('T-hotfix-1 create sends inventory.initialQuantity with the WC stock', function (): void {
+    alegra_test_reset();
+    alegra_make_product(40, [
+        'name' => 'New', 'sku' => 'NEW-1', 'regular_price' => '25',
+        'stock' => 7, 'manage_stock' => true,
+    ]);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(40));
+    TestRunner::assertFalse(is_wp_error($result), 'create must not error');
+
+    $req = alegra_mock_last_request('POST', '/items');
+    TestRunner::assertTrue($req !== null, 'POST /items must have been sent');
+    $body = $req['body'] ?? [];
+    TestRunner::assertArrayHasKey('initialQuantity', $body['inventory'] ?? [], 'create must send inventory.initialQuantity');
+    TestRunner::assertSame(7, $body['inventory']['initialQuantity'] ?? null, 'create must send the WC stock as initialQuantity');
+});
+
+TestRunner::test('T-hotfix-2 update does NOT send inventory.initialQuantity', function (): void {
+    alegra_test_reset();
+    alegra_make_product(41, [
+        'name' => 'Existing', 'sku' => 'EX-1', 'regular_price' => '30',
+        'stock' => 3, 'manage_stock' => true,
+    ]);
+    update_post_meta(41, '_alegra_item_id', 'item-41');
+
+    $result = make_products()->sync_to_alegra(wc_get_product(41));
+    TestRunner::assertFalse(is_wp_error($result), 'update must not error');
+
+    $req = alegra_mock_last_request('PUT', '/items/item-41');
+    TestRunner::assertTrue($req !== null, 'PUT /items/item-41 must have been sent');
+    $body = $req['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('initialQuantity', $body['inventory'] ?? [], 'update must NOT send initialQuantity');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'an update must not create a new item');
+});
+
+TestRunner::test('T-hotfix-3 update still sends name, price, tax, category and unit (no regression)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_tax_mapping', ['iva19' => 'tax-h3']);
+    $term = wp_insert_term('Hogar', 'product_cat');
+    update_term_meta($term['term_id'], 'alegra_category_id', 'cat-h3');
+
+    alegra_make_product(42, [
+        'name' => 'Regress', 'sku' => 'RG-1', 'regular_price' => '44',
+        'tax_class' => 'iva19', 'category_ids' => [$term['term_id']],
+        'stock' => 9, 'manage_stock' => true,
+    ]);
+    update_post_meta(42, '_alegra_item_id', 'item-42');
+
+    make_products()->sync_to_alegra(wc_get_product(42));
+
+    $body = alegra_mock_last_request('PUT', '/items/item-42')['body'] ?? [];
+    TestRunner::assertSame('Regress', $body['name'] ?? null, 'name must survive the update');
+    TestRunner::assertEquals(44.0, $body['price'][0]['price'] ?? null, 'price must survive the update');
+    TestRunner::assertSame('tax-h3', $body['tax'][0]['id'] ?? null, 'tax must survive the update');
+    TestRunner::assertSame('cat-h3', $body['category']['id'] ?? null, 'category must survive the update');
+    TestRunner::assertSame('unit', $body['inventory']['unit'] ?? null, 'inventory.unit must survive the update');
+    TestRunner::assertArrayNotHasKey('initialQuantity', $body['inventory'] ?? [], 'update must still omit initialQuantity');
+});
+
+TestRunner::test('T-hotfix-4 variation create sends initialQuantity, variation update does not', function (): void {
+    alegra_test_reset();
+    alegra_make_product(50, ['name' => 'Parent', 'sku' => 'PAR-1', 'type' => 'variable', 'regular_price' => '10']);
+    alegra_make_product(51, [
+        'name' => 'Parent - Rojo', 'sku' => 'VAR-CREATE', 'type' => 'variation',
+        'parent_id' => 50, 'regular_price' => '10', 'stock' => 4, 'manage_stock' => true,
+        'attributes' => ['color' => 'Rojo'],
+    ]);
+
+    $create_result = make_products()->sync_to_alegra(wc_get_product(51));
+    TestRunner::assertFalse(is_wp_error($create_result), 'variation create must not error');
+
+    $create_body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('variant', $create_body['type'] ?? null, 'a variation create must be type=variant');
+    TestRunner::assertArrayHasKey('initialQuantity', $create_body['inventory'] ?? [], 'variation create must send initialQuantity');
+    TestRunner::assertSame(4, $create_body['inventory']['initialQuantity'] ?? null, 'variation create must send the WC stock');
+
+    // --- UPDATE ---
+    alegra_test_reset();
+    alegra_make_product(60, ['name' => 'Parent2', 'sku' => 'PAR-2', 'type' => 'variable', 'regular_price' => '10']);
+    alegra_make_product(61, [
+        'name' => 'Parent2 - Azul', 'sku' => 'VAR-UPDATE', 'type' => 'variation',
+        'parent_id' => 60, 'regular_price' => '10', 'stock' => 6, 'manage_stock' => true,
+        'attributes' => ['color' => 'Azul'],
+    ]);
+    update_post_meta(61, '_alegra_item_id', 'item-var-61');
+
+    make_products()->sync_to_alegra(wc_get_product(61));
+
+    $update_body = alegra_mock_last_request('PUT', '/items/item-var-61')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('initialQuantity', $update_body['inventory'] ?? [], 'variation update must NOT send initialQuantity');
+    TestRunner::assertSame('unit', $update_body['inventory']['unit'] ?? null, 'variation update must still send inventory.unit');
+});
+
 exit(TestRunner::summary());

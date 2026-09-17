@@ -122,41 +122,53 @@ class Products
     private function sync_simple_product(\WC_Product $product): array|\WP_Error
     {
         $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
-        $data = $this->prepare_simple_product_data($product);
+        $linked_by_sku = false;
 
-        if ($alegra_id !== '') {
-            $result = $this->api->update_item($alegra_id, $data);
-            $this->logger->info('Product updated in Alegra', [
-                'product_id' => $product->get_id(),
-                'alegra_id' => $alegra_id,
-            ]);
-        } else {
+        // Resolve an existing Alegra item by SKU BEFORE building the payload:
+        // the builder needs the final create-vs-update intent so it never
+        // re-sends `initialQuantity` on an update (R2 hotfix).
+        if ($alegra_id === '') {
             // Search by SKU in Alegra before creating (prevent duplicates)
             $sku = $product->get_sku();
             if (!empty($sku)) {
                 $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
                 if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
                     $alegra_id = (string) $items[0]['id'];
+                    $linked_by_sku = true;
                     update_post_meta($product->get_id(), '_alegra_item_id', $alegra_id);
-                    $result = $this->api->update_item($alegra_id, $data);
-                    $this->logger->info('Product linked to existing Alegra item by SKU', [
-                        'product_id' => $product->get_id(),
-                        'alegra_id' => $alegra_id,
-                    ]);
-                    return $result;
                 }
             }
+        }
 
-            // AC-16: the mapped "default status" only applies on creation.
-            $data['status'] = $this->field_mapping('default_status', 'active');
-            $result = $this->api->create_item($data);
-            if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
-                $this->logger->info('Product created in Alegra', [
+        $is_create = ($alegra_id === '');
+        $data = $this->prepare_simple_product_data($product, $is_create);
+
+        if (!$is_create) {
+            $result = $this->api->update_item($alegra_id, $data);
+            if ($linked_by_sku) {
+                $this->logger->info('Product linked to existing Alegra item by SKU', [
                     'product_id' => $product->get_id(),
-                    'alegra_id' => $result['id'],
+                    'alegra_id' => $alegra_id,
+                ]);
+            } else {
+                $this->logger->info('Product updated in Alegra', [
+                    'product_id' => $product->get_id(),
+                    'alegra_id' => $alegra_id,
                 ]);
             }
+
+            return $result;
+        }
+
+        // AC-16: the mapped "default status" only applies on creation.
+        $data['status'] = $this->field_mapping('default_status', 'active');
+        $result = $this->api->create_item($data);
+        if (!is_wp_error($result) && isset($result['id'])) {
+            update_post_meta($product->get_id(), '_alegra_item_id', (string) $result['id']);
+            $this->logger->info('Product created in Alegra', [
+                'product_id' => $product->get_id(),
+                'alegra_id' => $result['id'],
+            ]);
         }
 
         return $result;
@@ -224,38 +236,49 @@ class Products
     private function sync_variation(\WC_Product $variation): array|\WP_Error
     {
         $alegra_id = (string) get_post_meta($variation->get_id(), '_alegra_item_id', true);
-        $data = $this->prepare_variation_data($variation);
+        $linked_by_sku = false;
 
-        if ($alegra_id !== '') {
-            $result = $this->api->update_item($alegra_id, $data);
-        } else {
+        // Resolve an existing Alegra item by SKU BEFORE building the payload:
+        // the builder needs the final create-vs-update intent so it never
+        // re-sends `initialQuantity` on an update (R2 hotfix).
+        if ($alegra_id === '') {
             // Search by SKU in Alegra before creating (prevent duplicates)
             $sku = $variation->get_sku();
             if (!empty($sku)) {
                 $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
                 if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
                     $alegra_id = (string) $items[0]['id'];
+                    $linked_by_sku = true;
                     update_post_meta($variation->get_id(), '_alegra_item_id', $alegra_id);
-                    $result = $this->api->update_item($alegra_id, $data);
-                    $this->logger->info('Variation linked to existing Alegra item by SKU', [
-                        'variation_id' => $variation->get_id(),
-                        'alegra_id' => $alegra_id,
-                    ]);
-                    return $result;
                 }
             }
+        }
 
-            $data['type'] = 'variant';
-            // AC-16: the mapped "default status" only applies on creation.
-            $data['status'] = $this->field_mapping('default_status', 'active');
-            $result = $this->api->create_item($data);
-            if (!is_wp_error($result) && isset($result['id'])) {
-                update_post_meta($variation->get_id(), '_alegra_item_id', (string) $result['id']);
-                $this->logger->info('Variation synced to Alegra', [
+        $is_create = ($alegra_id === '');
+        $data = $this->prepare_variation_data($variation, $is_create);
+
+        if (!$is_create) {
+            $result = $this->api->update_item($alegra_id, $data);
+            if ($linked_by_sku) {
+                $this->logger->info('Variation linked to existing Alegra item by SKU', [
                     'variation_id' => $variation->get_id(),
-                    'alegra_id' => $result['id'],
+                    'alegra_id' => $alegra_id,
                 ]);
             }
+
+            return $result;
+        }
+
+        $data['type'] = 'variant';
+        // AC-16: the mapped "default status" only applies on creation.
+        $data['status'] = $this->field_mapping('default_status', 'active');
+        $result = $this->api->create_item($data);
+        if (!is_wp_error($result) && isset($result['id'])) {
+            update_post_meta($variation->get_id(), '_alegra_item_id', (string) $result['id']);
+            $this->logger->info('Variation synced to Alegra', [
+                'variation_id' => $variation->get_id(),
+                'alegra_id' => $result['id'],
+            ]);
         }
 
         return $result;
@@ -264,7 +287,7 @@ class Products
     /**
      * Prepare data for simple product
      */
-    private function prepare_simple_product_data(\WC_Product $product): array
+    private function prepare_simple_product_data(\WC_Product $product, bool $is_create): array
     {
         $data = [
             'name' => $product->get_name(),
@@ -279,11 +302,18 @@ class Products
             ],
             'inventory' => [
                 'unit' => $this->field_mapping('default_unit', 'unit'),
-                'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
             ],
         ];
 
-        $this->apply_warehouse($data, $product);
+        // R2 hotfix: `initialQuantity` is the quantity the item was CREATED
+        // with. It is the documented way to set the initial stock on create and
+        // must NEVER be re-sent on update, or every product edit would reset
+        // the current stock.
+        if ($is_create) {
+            $data['inventory']['initialQuantity'] = (int) ($product->get_stock_quantity() ?? 0);
+        }
+
+        $this->apply_warehouse($data, $product, $is_create);
 
         $sale_price = $product->get_sale_price();
         if (!empty($sale_price) && (float) $sale_price < $product->get_regular_price()) {
@@ -336,7 +366,7 @@ class Products
     /**
      * Prepare data for a single variation
      */
-    private function prepare_variation_data(\WC_Product $variation): array
+    private function prepare_variation_data(\WC_Product $variation, bool $is_create): array
     {
         $parent = wc_get_product($variation->get_parent_id());
         $attributes = $variation->get_attributes();
@@ -358,11 +388,16 @@ class Products
             ],
             'inventory' => [
                 'unit' => $this->field_mapping('default_unit', 'unit'),
-                'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
             ],
         ];
 
-        $this->apply_warehouse($data, $variation);
+        // R2 hotfix: see prepare_simple_product_data(). A variation's
+        // `initialQuantity` is only sent on create, never on update.
+        if ($is_create) {
+            $data['inventory']['initialQuantity'] = (int) ($variation->get_stock_quantity() ?? 0);
+        }
+
+        $this->apply_warehouse($data, $variation, $is_create);
 
         // Category (variations inherit from their parent)
         $cat_source = ($parent && $parent->get_category_ids()) ? $parent : $variation;
@@ -429,12 +464,22 @@ class Products
      * already honored this setting; the product path did not, contradicting
      * the settings UI.
      */
-    private function apply_warehouse(array &$data, \WC_Product $product): void
+    private function apply_warehouse(array &$data, \WC_Product $product, bool $is_create): void
     {
         $warehouse = $this->resolve_warehouse_id();
         if ($warehouse === '' || !isset($data['inventory']) || !is_array($data['inventory'])) {
             return;
         }
+
+        // R2 hotfix: a warehouse `initialQuantity` is still an initial
+        // quantity — it is only meaningful on create. On update we omit the
+        // whole `warehouses` array: the Alegra docs mark `initialQuantity` as
+        // obligatorio inside a warehouse object, so sending a partial object
+        // would be undocumented (and could reset the per-warehouse stock).
+        if (!$is_create) {
+            return;
+        }
+
         $data['inventory']['warehouses'] = [[
             'id' => $warehouse,
             'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
