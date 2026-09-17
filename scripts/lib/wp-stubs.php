@@ -538,11 +538,30 @@ function get_userdata($user_id)
 function get_users($args = [])
 {
     $users = array_values($GLOBALS['wp_users']);
+
+    // Support the documented meta_key / meta_value lookup used to dedupe
+    // imported customers by identification.
+    if (!empty($args['meta_key'])) {
+        $meta_key = (string) $args['meta_key'];
+        $meta_value = $args['meta_value'] ?? null;
+        $users = array_values(array_filter($users, static function ($user) use ($meta_key, $meta_value) {
+            $stored = $GLOBALS['wp_usermeta'][(int) $user->ID][$meta_key] ?? null;
+            if ($stored === null) { return false; }
+            if ($meta_value === null) { return true; }
+            return (string) $stored === (string) $meta_value;
+        }));
+    }
+
     $number = (int) ($args['number'] ?? -1);
     $offset = (int) ($args['offset'] ?? 0);
     if ($number > 0) {
         $users = array_slice($users, $offset, $number);
     }
+
+    if (($args['fields'] ?? '') === 'ID') {
+        return array_map(static fn($user) => (int) $user->ID, $users);
+    }
+
     return $users;
 }
 function get_user_by($field, $value)
@@ -553,6 +572,80 @@ function get_user_by($field, $value)
         if ($field === 'id' && (int) $user->ID === (int) $value) { return $user; }
     }
     return false;
+}
+function email_exists($email)
+{
+    foreach ($GLOBALS['wp_users'] as $user) {
+        if (strcasecmp((string) $user->user_email, (string) $email) === 0) {
+            return (int) $user->ID;
+        }
+    }
+    return false;
+}
+function is_email($email)
+{
+    return (bool) filter_var((string) $email, FILTER_VALIDATE_EMAIL);
+}
+function wp_insert_user($data)
+{
+    $data = is_array($data) ? $data : (array) $data;
+    $email = (string) ($data['user_email'] ?? '');
+    $login = (string) ($data['user_login'] ?? $email);
+
+    if ($email !== '' && email_exists($email)) {
+        return new WP_Error('existing_user_email', 'Sorry, that email address is already used!');
+    }
+    foreach ($GLOBALS['wp_users'] as $user) {
+        if ($user->user_login === $login) {
+            return new WP_Error('existing_user_login', 'Sorry, that username already exists!');
+        }
+    }
+
+    $id = 1;
+    foreach (array_keys($GLOBALS['wp_users']) as $existing) {
+        if ((int) $existing >= $id) { $id = (int) $existing + 1; }
+    }
+
+    $first = (string) ($data['first_name'] ?? '');
+    $last = (string) ($data['last_name'] ?? '');
+    $display = (string) ($data['display_name'] ?? trim($first . ' ' . $last));
+
+    $GLOBALS['wp_users'][$id] = new WP_User($id, [
+        'user_login'   => $login,
+        'user_email'   => $email,
+        'display_name' => $display,
+        'first_name'   => $first,
+        'last_name'    => $last,
+    ]);
+
+    return $id;
+}
+function wp_update_user($data)
+{
+    $data = is_array($data) ? $data : (array) $data;
+    $id = (int) ($data['ID'] ?? 0);
+    if ($id <= 0 || !isset($GLOBALS['wp_users'][$id])) {
+        return new WP_Error('invalid_user_id', 'Invalid user ID.');
+    }
+
+    $user = $GLOBALS['wp_users'][$id];
+
+    if (isset($data['user_email'])) {
+        $email = (string) $data['user_email'];
+        $owner = email_exists($email);
+        if ($owner && (int) $owner !== $id) {
+            return new WP_Error('existing_user_email', 'Sorry, that email address is already used!');
+        }
+        $user->user_email = $email;
+    }
+
+    foreach (['user_login', 'display_name', 'first_name', 'last_name'] as $field) {
+        if (isset($data[$field])) {
+            $user->{$field} = (string) $data[$field];
+        }
+    }
+
+    return $id;
 }
 
 // ---------------------------------------------------------------------------

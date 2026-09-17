@@ -334,6 +334,20 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_currency', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_log_retention_days', ['sanitize_callback' => 'intval']);
         register_setting('alegra_connector_settings', 'alegra_connector_conflict_resolution', ['sanitize_callback' => 'sanitize_text_field']);
+        // Colombia contact fiscal fields. Allowlisted so a bad value can never
+        // be POSTed to Alegra (which would 400 the contact create).
+        register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON, [
+            'sanitize_callback' => function ($value) {
+                $value = strtoupper(sanitize_text_field((string) $value));
+                return in_array($value, \Alegra\Connector\Billing_Fields::KIND_OF_PERSONS, true) ? $value : '';
+            },
+        ]);
+        register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_REGIME, [
+            'sanitize_callback' => function ($value) {
+                $value = strtoupper(sanitize_text_field((string) $value));
+                return in_array($value, \Alegra\Connector\Billing_Fields::REGIMES, true) ? $value : 'SIMPLIFIED_REGIME';
+            },
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_products', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_customers', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_orders', ['sanitize_callback' => 'rest_sanitize_boolean']);

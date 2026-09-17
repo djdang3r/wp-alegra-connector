@@ -77,9 +77,9 @@ class Consumidor_Final
     /**
      * Resolve the Consumidor Final contact from Alegra.
      *
-     * Looks up the pre-provisioned contact by identification. This method
-     * NEVER creates the contact — if it is missing from Alegra that is an
-     * anomaly the administrator must fix manually.
+     * Looks up the contact by identification and, when the search succeeds but
+     * the contact is missing, auto-creates it (idempotently). A manual override
+     * still wins, and a failed search never creates.
      *
      * @param Client|null $client Optional API client; one is built when omitted.
      * @return string|false Contact ID on success, false otherwise.
@@ -137,6 +137,9 @@ class Consumidor_Final
                     'Consumidor Final: error al consultar el contacto en Alegra',
                     ['error' => $contacts->get_error_message()]
                 );
+                // The search FAILED: do not create. We cannot tell "missing"
+                // apart from "the API is down", and creating blindly could
+                // duplicate a contact that does exist.
                 return false;
             }
 
@@ -149,17 +152,7 @@ class Consumidor_Final
                     continue;
                 }
 
-                $identification_object = $contact['identificationObject'] ?? null;
-                $matches = false;
-
-                if (is_array($identification_object)) {
-                    $matches = (($identification_object['type'] ?? '') === self::IDENTIFICATION_TYPE);
-                } elseif (($contact['identification'] ?? '') === self::IDENTIFICATION) {
-                    // Legacy flat format.
-                    $matches = true;
-                }
-
-                if (!$matches) {
+                if (!self::matches($contact)) {
                     continue;
                 }
 
@@ -168,7 +161,16 @@ class Consumidor_Final
                 return (string) $contact['id'];
             }
 
-            // AC-25: the contact is gone/replaced in Alegra. Drop every cached
+            // BUG 2: the search succeeded and the contact does not exist.
+            // Auto-create it so the Consumidor Final fallback is
+            // self-sufficient instead of failing the invoice with
+            // `customer_unresolved`.
+            $created = self::create($client);
+            if ($created !== false) {
+                return $created;
+            }
+
+            // AC-25: creation failed (or was blocked). Drop every cached
             // representation so a dead id is not served forever.
             self::invalidate_cache();
 
@@ -176,6 +178,110 @@ class Consumidor_Final
         } finally {
             \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
         }
+    }
+
+    /**
+     * Whether an Alegra contact is the Consumidor Final contact.
+     *
+     * Accepts the structured `identificationObject` shape (type CC) and the
+     * legacy flat `identification` string. Never trust the server-side filter
+     * alone: an undocumented param can be ignored, which would false-match.
+     */
+    private static function matches(array $contact): bool
+    {
+        $identification_object = $contact['identificationObject'] ?? null;
+
+        if (is_array($identification_object)) {
+            return (($identification_object['type'] ?? '') === self::IDENTIFICATION_TYPE)
+                && ((string) ($identification_object['number'] ?? '') === self::IDENTIFICATION);
+        }
+
+        return (string) ($contact['identification'] ?? '') === self::IDENTIFICATION;
+    }
+
+    /**
+     * Create the Consumidor Final contact in Alegra and return its id.
+     *
+     * Idempotent: only reached after a successful search found nothing, and the
+     * resolve lock serializes concurrent creators. If Alegra still rejects the
+     * duplicate identification (a concurrent creator or a contact the search
+     * missed), the contact is re-searched once and its id returned.
+     *
+     * @return string|false Contact id on success, false otherwise.
+     */
+    private static function create(Client $client): string|false
+    {
+        $result = $client->create_contact(self::build_create_payload());
+
+        // Dry run: the contact was NOT created. Never cache a fake id.
+        if (Client::is_dry_run_response($result)) {
+            self::log_error('Consumidor Final: no se creó el contacto (modo de prueba activo)');
+            return false;
+        }
+
+        if (is_wp_error($result)) {
+            // A duplicate-identification rejection means the contact exists
+            // after all. Re-search once so the operation stays idempotent.
+            $contacts = $client->get_contacts([
+                'identification' => self::IDENTIFICATION,
+                'limit'          => 5,
+            ]);
+            if (!is_wp_error($contacts) && is_array($contacts)) {
+                foreach ($contacts as $contact) {
+                    if (is_array($contact) && isset($contact['id']) && self::matches($contact)) {
+                        self::store_metadata($contact);
+                        return (string) $contact['id'];
+                    }
+                }
+            }
+
+            self::log_error(
+                'Consumidor Final: no se pudo crear el contacto en Alegra',
+                ['error' => $result->get_error_message()]
+            );
+            return false;
+        }
+
+        if (!is_array($result) || empty($result['id'])) {
+            return false;
+        }
+
+        self::store_metadata($result);
+
+        return (string) $result['id'];
+    }
+
+    /**
+     * Build the POST /contacts payload for the Consumidor Final contact.
+     *
+     * CO uses the structured identificationObject + the fiscal fields required
+     * by the "con facturación electrónica" schema; other countries use the
+     * generic flat identification.
+     *
+     * @return array<string, mixed>
+     */
+    private static function build_create_payload(): array
+    {
+        if (\Alegra\Connector\Billing_Fields::is_colombia_account()) {
+            return [
+                // kindOfPerson = PERSON_ENTITY, so the docs require nameObject
+                // (name alone is only valid for a non-natural person).
+                'nameObject'           => ['firstName' => 'Consumidor', 'lastName' => 'Final'],
+                'identificationObject' => [
+                    'type'   => self::IDENTIFICATION_TYPE,
+                    'number' => self::IDENTIFICATION,
+                ],
+                'kindOfPerson'         => self::KIND_OF_PERSON,
+                'regime'               => self::REGIME,
+                'type'                 => 'client',
+            ];
+        }
+
+        return [
+            'name'           => self::NAME,
+            'identification' => self::IDENTIFICATION,
+            'type'           => 'client',
+        ];
     }
 
     /**

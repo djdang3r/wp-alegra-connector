@@ -227,7 +227,11 @@ class Customers
         }
 
         try {
-            $result = ['imported' => 0, 'updated' => 0, 'errors' => 0];
+            // BUG 4: `skipped` is tracked separately from `errors`. A contact
+            // without an email is a legitimate skip (WooCommerce requires an
+            // email), not an error; counting it as an error inflated the count
+            // the merchant sees with no explanation.
+            $result = ['imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0];
             $current_page = $page;
             $max_pages = 200;
             set_time_limit(300);
@@ -252,7 +256,7 @@ class Customers
                     set_transient('alegra_sync_progress', [
                         'type' => 'customers',
                         'current_page' => $p,
-                        'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
+                        'items_processed' => $result['imported'] + $result['updated'] + $result['skipped'] + $result['errors'],
                         'imported' => $result['imported'],
                         'updated' => $result['updated'],
                         'message' => sprintf(__('Procesando clientes... Página %d', 'alegra-connector'), $p),
@@ -277,6 +281,7 @@ class Customers
                     $r = $this->import_single_contact($contact);
                     if ($r === true) $result['imported']++;
                     elseif ($r === 'updated') $result['updated']++;
+                    elseif ($r === 'skipped') $result['skipped']++;
                     else $result['errors']++;
                 }
 
@@ -287,11 +292,19 @@ class Customers
             set_transient('alegra_sync_progress', [
                 'type' => 'customers',
                 'current_page' => $current_page,
-                'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
+                'items_processed' => $result['imported'] + $result['updated'] + $result['skipped'] + $result['errors'],
                 'imported' => $result['imported'],
                 'updated' => $result['updated'],
+                'skipped' => $result['skipped'],
+                'errors' => $result['errors'],
                 'done' => true,
-                'message' => sprintf(__('Completado: %d importados, %d actualizados', 'alegra-connector'), $result['imported'], $result['updated']),
+                'message' => sprintf(
+                    __('Completado: %d importados, %d actualizados, %d omitidos, %d errores', 'alegra-connector'),
+                    $result['imported'],
+                    $result['updated'],
+                    $result['skipped'],
+                    $result['errors']
+                ),
             ], 60);
 
             $this->logger->info('Customers import from Alegra completed', $result);
@@ -320,6 +333,17 @@ class Customers
 
         try {
             $existing_user_id = email_exists($email);
+
+            // BUG 5: also match by identification before creating a user. A
+            // contact whose email changed (or a customer who registered with a
+            // different email but the same cédula) would otherwise create a
+            // duplicate WC user AND a duplicate link.
+            if (!$existing_user_id) {
+                $identification = $this->contact_identification($contact);
+                if ($identification !== '') {
+                    $existing_user_id = $this->find_user_by_identification($identification);
+                }
+            }
 
             if ($existing_user_id) {
                 update_user_meta($existing_user_id, 'alegra_contact_id', $alegra_id);
@@ -407,6 +431,109 @@ class Customers
                 update_user_meta($user_id, 'billing_alegra_dv', (string) $id_obj['dv']);
             }
         }
+
+        // BUG 6: `conflict_resolution = alegra_wins` must actually pull the
+        // IDENTITY (name + email), not just the address/phone/document.
+        $name = $this->contact_display_name($contact);
+        if ($name !== '') {
+            $parts = $this->parse_name($name);
+            update_user_meta($user_id, 'billing_first_name', $parts['first']);
+            update_user_meta($user_id, 'billing_last_name', $parts['last']);
+            if (function_exists('wp_update_user')) {
+                wp_update_user([
+                    'ID'           => $user_id,
+                    'first_name'   => $parts['first'],
+                    'last_name'    => $parts['last'],
+                    'display_name' => $name,
+                ]);
+            }
+        }
+
+        $email = (string) ($contact['email'] ?? '');
+        if ($email !== '' && (!function_exists('is_email') || is_email($email))) {
+            // Never steal another user's email. When it is free (or already
+            // ours) sync it; user_login is intentionally left untouched.
+            $owner = function_exists('email_exists') ? email_exists($email) : false;
+            if (!$owner || (int) $owner === $user_id) {
+                update_user_meta($user_id, 'billing_email', $email);
+                if (function_exists('wp_update_user')) {
+                    wp_update_user(['ID' => $user_id, 'user_email' => $email]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract the identification number from an Alegra contact (structured or
+     * legacy flat shape).
+     */
+    private function contact_identification(array $contact): string
+    {
+        $id_obj = $contact['identificationObject'] ?? null;
+        if (is_array($id_obj) && isset($id_obj['number']) && (string) $id_obj['number'] !== '') {
+            return (string) $id_obj['number'];
+        }
+
+        return (string) ($contact['identification'] ?? '');
+    }
+
+    /**
+     * Find a WC user whose identification meta matches, so an import never
+     * creates a duplicate user when only the email changed.
+     *
+     * Checks the new `billing_alegra_identification` key first, then the legacy
+     * `billing_nit` key. Returns 0 when no user matches.
+     */
+    private function find_user_by_identification(string $identification): int
+    {
+        if ($identification === '') {
+            return 0;
+        }
+
+        foreach (['billing_alegra_identification', 'billing_nit'] as $meta_key) {
+            $users = get_users([
+                'meta_key'   => $meta_key,
+                'meta_value' => $identification,
+                'number'     => 1,
+                'fields'     => 'ID',
+            ]);
+            if (empty($users)) {
+                continue;
+            }
+
+            $first = $users[0];
+            $id = is_object($first) ? (int) ($first->ID ?? 0) : (int) $first;
+            if ($id > 0) {
+                return $id;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Resolve a display name from an Alegra contact (`name`, else nameObject).
+     */
+    private function contact_display_name(array $contact): string
+    {
+        $name = trim((string) ($contact['name'] ?? ''));
+        if ($name !== '') {
+            return $name;
+        }
+
+        $obj = $contact['nameObject'] ?? null;
+        if (!is_array($obj)) {
+            return '';
+        }
+
+        $parts = array_filter([
+            (string) ($obj['firstName'] ?? ''),
+            (string) ($obj['secondName'] ?? ''),
+            (string) ($obj['lastName'] ?? ''),
+            (string) ($obj['secondLastName'] ?? ''),
+        ], static fn($v) => $v !== '');
+
+        return trim(implode(' ', $parts));
     }
 
     private function prepare_customer_data(\WP_User $customer): array

@@ -743,6 +743,12 @@ class Orders
             }
         }
 
+        // BUG 1 (visibility): track WHY the customer could not be created so the
+        // Consumidor Final fallback note names the real reason (an API
+        // rejection) instead of staying silent or blaming missing data.
+        $contact_create_error = '';
+        $create_attempted = false;
+
         // Steps 3-5 run under an atomic lock to avoid duplicate contact creation.
         $lock_key = 'alegra_contact_create_lock_' . $order_id;
         $token = Controller::acquire_lock($lock_key, 30);
@@ -799,6 +805,7 @@ class Orders
                         ? \Alegra\Connector\Billing_Fields::build_contact_payload($customer)
                         : \Alegra\Connector\Billing_Fields::build_guest_contact_payload($order);
                     if (!is_wp_error($payload)) {
+                        $create_attempted = true;
                         $result = $this->api->create_contact_with_2039_retry($payload);
                         if (!is_wp_error($result) && isset($result['id'])) {
                             $found = (string) $result['id'];
@@ -806,10 +813,16 @@ class Orders
                             return $found;
                         }
                         if (is_wp_error($result)) {
+                            // Remember the REAL reason so the fallback note can
+                            // distinguish "Alegra rejected the contact" from
+                            // "the customer is missing billing data".
+                            $contact_create_error = $result->get_error_message();
                             $this->logger->warning('Contact creation failed, falling back to Consumidor Final', [
                                 'order_id' => $order_id,
-                                'error'    => $result->get_error_message(),
+                                'error'    => $contact_create_error,
                             ]);
+                        } elseif (API\Client::is_dry_run_response($result)) {
+                            $contact_create_error = __('modo de prueba (dry run) activo', 'alegra-connector');
                         }
                     }
                 }
@@ -832,7 +845,7 @@ class Orders
                 // early above (intentional choice — no note) and `require_data`
                 // is excluded here (it aborts instead of falling back).
                 if ($mode === 'auto') {
-                    $this->add_consumidor_final_fallback_note($order, $customer);
+                    $this->add_consumidor_final_fallback_note($order, $customer, $contact_create_error, $create_attempted);
                 }
                 return (string) $cf;
             }
@@ -845,23 +858,49 @@ class Orders
 
     /**
      * Add an order note when the Consumidor Final fallback is UNINTENTIONAL
-     * (resolution mode `auto`) because the customer is missing identification.
+     * (resolution mode `auto`).
      *
-     * Returns early — no note — when no catalog field is actually missing, so a
-     * fallback caused by an API failure is never mislabelled as missing data.
+     * The note names the REAL reason:
+     *  - an API rejection of the contact create (e.g. a Colombian account with
+     *    e-invoicing rejecting a contact) — the merchant must see Alegra's
+     *    error, not a "missing data" message that does not apply;
+     *  - missing billing data (the identification the customer never entered);
+     *  - a concurrent sync that prevented the attempt.
      */
-    private function add_consumidor_final_fallback_note(\WC_Order $order, ?\WP_User $customer): void
-    {
-        $missing = $this->missing_billing_field_labels($order, $customer);
-        if ($missing === []) {
+    private function add_consumidor_final_fallback_note(
+        \WC_Order $order,
+        ?\WP_User $customer,
+        string $contact_create_error = '',
+        bool $create_attempted = false
+    ): void {
+        // 1. Alegra rejected the contact create. Surface the API reason.
+        if ($contact_create_error !== '') {
+            $order->add_order_note(sprintf(
+                /* translators: %s: the error Alegra returned when creating the contact. */
+                __('Alegra: no se pudo crear el contacto del cliente en Alegra (%s). La factura se emitirá a nombre del Consumidor Final. Corregí el dato o la conexión y volvé a facturar para emitirla a nombre del cliente.', 'alegra-connector'),
+                $contact_create_error
+            ));
             return;
         }
 
-        $order->add_order_note(sprintf(
-            /* translators: %s: the billing field(s) the customer is missing, e.g. "número de documento". */
-            __('Alegra: la factura se emitirá a nombre del Consumidor Final porque el cliente no tiene %s registrado. Si necesitas la factura a nombre del cliente, agrega su cédula/NIT y vuelve a facturar.', 'alegra-connector'),
-            implode(' ni ', $missing)
-        ));
+        // 2. Missing billing data.
+        $missing = $this->missing_billing_field_labels($order, $customer);
+        if ($missing !== []) {
+            $order->add_order_note(sprintf(
+                /* translators: %s: the billing field(s) the customer is missing, e.g. "número de documento". */
+                __('Alegra: la factura se emitirá a nombre del Consumidor Final porque el cliente no tiene %s registrado. Si necesitas la factura a nombre del cliente, agrega su cédula/NIT y vuelve a facturar.', 'alegra-connector'),
+                implode(' ni ', $missing)
+            ));
+            return;
+        }
+
+        // 3. Complete data but the create was never attempted (a concurrent
+        //    request held the lock). Still make the fallback visible.
+        if (!$create_attempted) {
+            $order->add_order_note(
+                __('Alegra: la factura se emitirá a nombre del Consumidor Final porque otra sincronización estaba en curso y no se pudo crear el contacto del cliente. Volvé a facturar en unos segundos para emitirla a nombre del cliente.', 'alegra-connector')
+            );
+        }
     }
 
     /**

@@ -392,32 +392,73 @@ class Controller
     }
 
     /**
-     * Try to acquire an atomic lock for the given sync type.
+     * Per-request registry of sync locks held by THIS process, with a nesting
+     * depth. The cron controller and the admin AJAX handler both hold the
+     * per-type lock and then call the entity import method, which holds the
+     * SAME lock again — a plain re-acquire would fail and silently skip the
+     * import. Tracking depth makes the lock re-entrant within one request while
+     * the underlying option lock still blocks other requests.
      *
-     * Returns a unique token string on success, or false if another process
-     * already holds the lock. TTL is 300 seconds (5 min) so a crashed run
-     * cannot block future runs forever.
+     * @var array<string, array{token:string, depth:int}>
+     */
+    private static array $held_sync_locks = [];
+
+    /**
+     * Try to acquire an atomic, re-entrant lock for the given sync type.
+     *
+     * Returns a unique token string on success, or false if another PROCESS
+     * already holds the lock. Re-acquiring the same type from the same request
+     * succeeds (depth++) and returns the existing token. TTL is 300 seconds
+     * (5 min) so a crashed run cannot block future runs forever.
      *
      * @param string $type One of: 'products', 'customers', 'categories'.
-     * @return string|false Token on success, false if locked.
+     * @return string|false Token on success, false if locked by another process.
      */
     private function acquire_sync_lock(string $type): string|false
     {
-        return self::acquire_lock('alegra_sync_running_' . $type, 300);
+        $key = 'alegra_sync_running_' . $type;
+
+        if (isset(self::$held_sync_locks[$key])) {
+            self::$held_sync_locks[$key]['depth']++;
+            return self::$held_sync_locks[$key]['token'];
+        }
+
+        $token = self::acquire_lock($key, 300);
+        if ($token === false) {
+            return false;
+        }
+
+        self::$held_sync_locks[$key] = ['token' => $token, 'depth' => 1];
+
+        return $token;
     }
 
     /**
-     * Release a sync lock — only if the token matches.
+     * Release a sync lock — only on the outermost release, and only if the
+     * token matches.
      *
      * This prevents a stale process from accidentally releasing a fresh lock
-     * after a 5-min TTL turnover.
+     * after a 5-min TTL turnover, and keeps a nested acquire/release pair from
+     * freeing the lock its caller still holds.
      *
      * @param string $type  Sync type (same key as acquire).
      * @param string $token Token from acquire_sync_lock().
      */
     private function release_sync_lock(string $type, string $token): void
     {
-        self::release_lock('alegra_sync_running_' . $type, $token);
+        $key = 'alegra_sync_running_' . $type;
+
+        if (!isset(self::$held_sync_locks[$key])) {
+            return;
+        }
+
+        self::$held_sync_locks[$key]['depth']--;
+        if (self::$held_sync_locks[$key]['depth'] > 0) {
+            return;
+        }
+
+        unset(self::$held_sync_locks[$key]);
+        self::release_lock($key, $token);
     }
 
     /**

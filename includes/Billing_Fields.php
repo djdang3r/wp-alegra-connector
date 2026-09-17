@@ -27,6 +27,44 @@ class Billing_Fields
     public const OPTION_ENABLED = 'alegra_connector_billing_field_catalog_enabled';
 
     /**
+     * Options controlling the Colombia fiscal fields sent with every contact.
+     *
+     * Colombia documents TWO contact schemas:
+     *  - "sin facturación electrónica": only `name` is required.
+     *  - "con facturación electrónica": `identificationObject`, `regime` and
+     *    `kindOfPerson` are required.
+     *
+     * GET /company exposes NO reliable "e-invoicing enabled" flag, and both
+     * fields are valid properties in BOTH schemas, so the plugin always sends
+     * `regime` + `kindOfPerson` for a CO account. Sending a valid extra field
+     * is safer than omitting a field the FE schema requires (which would 400
+     * and silently fall back to Consumidor Final).
+     *
+     * @see https://developer.alegra.com/reference/post_contacts.md
+     * @see https://developer.alegra.com/docs/colombia.md
+     */
+    public const OPTION_KIND_OF_PERSON = 'alegra_connector_contact_kind_of_person';
+    public const OPTION_REGIME         = 'alegra_connector_contact_regime';
+
+    /**
+     * `kindOfPerson` enum (post_contacts.md, Colombia).
+     */
+    public const KIND_OF_PERSONS = ['PERSON_ENTITY', 'LEGAL_ENTITY', 'OTHER_ENTITY'];
+
+    /**
+     * `regime` enum (post_contacts.md, Colombia). `NOT_REPONSIBLE_FOR_CONSUMPTION`
+     * keeps the exact spelling used by the official docs.
+     */
+    public const REGIMES = [
+        'SIMPLIFIED_REGIME',
+        'COMMON_REGIME',
+        'NATIONAL_CONSUMPTION_TAX',
+        'NOT_REPONSIBLE_FOR_CONSUMPTION',
+        'INC_IVA_RESPONSIBLE',
+        'SPECIAL_REGIME',
+    ];
+
+    /**
      * Pre-defined billing field catalog.
      *
      * The identification is the only billing datum WooCommerce does not
@@ -354,7 +392,7 @@ class Billing_Fields
      * country is stored when the connection is tested; when it is not known
      * yet the plugin keeps its CO-first default.
      */
-    private static function is_colombia_account(): bool
+    public static function is_colombia_account(): bool
     {
         $country = strtoupper(trim((string) get_option('alegra_connector_company_country', '')));
         if ($country !== '') {
@@ -362,6 +400,33 @@ class Billing_Fields
         }
 
         return true;
+    }
+
+    /**
+     * Resolve the `kindOfPerson` sent for a CO contact.
+     *
+     * Defaults to PERSON_ENTITY (natural person), the common case for a
+     * WooCommerce storefront. The merchant can override it in Advanced
+     * settings for a B2B-only store.
+     */
+    public static function resolve_kind_of_person(): string
+    {
+        $value = strtoupper(trim((string) get_option(self::OPTION_KIND_OF_PERSON, '')));
+
+        return in_array($value, self::KIND_OF_PERSONS, true) ? $value : 'PERSON_ENTITY';
+    }
+
+    /**
+     * Resolve the `regime` sent for a CO contact.
+     *
+     * Defaults to SIMPLIFIED_REGIME (no responsable de IVA), the common case
+     * for a small Colombian storefront. Overridable in Advanced settings.
+     */
+    public static function resolve_regime(): string
+    {
+        $value = strtoupper(trim((string) get_option(self::OPTION_REGIME, 'SIMPLIFIED_REGIME')));
+
+        return in_array($value, self::REGIMES, true) ? $value : 'SIMPLIFIED_REGIME';
     }
 
     /**
@@ -985,6 +1050,13 @@ class Billing_Fields
                 $identification['dv'] = (string) $values['dv'];
             }
             $payload['identificationObject'] = $identification;
+
+            // BUG 1: the "con facturación electrónica" CO schema requires
+            // `regime` + `kindOfPerson` (post_contacts.md). Always send them:
+            // both are valid in the non-FE schema too, and there is no reliable
+            // GET /company signal to detect e-invoicing.
+            $payload['kindOfPerson'] = self::resolve_kind_of_person();
+            $payload['regime'] = self::resolve_regime();
         } else {
             $payload['identification'] = (string) $values['identification'];
         }

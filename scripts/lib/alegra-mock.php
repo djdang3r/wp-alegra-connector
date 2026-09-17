@@ -32,6 +32,7 @@ $GLOBALS['alegra_mock_requests'] = [];
 $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
+$GLOBALS['alegra_mock_contact_fiscal_required'] = false;
 
 function alegra_mock_reset(): void
 {
@@ -40,6 +41,17 @@ function alegra_mock_reset(): void
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
+    $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
+}
+
+/**
+ * Model a Colombian account WITH electronic invoicing: POST /contacts then
+ * requires `regime` + `kindOfPerson` (post_contacts.md, "Contacto para version
+ * Colombia con facturación electrónica"). Off by default.
+ */
+function alegra_mock_set_contact_fiscal_required(bool $required): void
+{
+    $GLOBALS['alegra_mock_contact_fiscal_required'] = $required;
 }
 
 function alegra_mock_uuid(string $prefix = 'aaaaaaaa'): string
@@ -488,6 +500,16 @@ function alegra_mock_validate_contact(array $body): ?array
         $identification = $body['identificationObject'];
         if (!is_array($identification) || empty($identification['type']) || !isset($identification['number']) || $identification['number'] === '') {
             return alegra_mock_validation_error('El campo identificationObject debe contener type y number');
+        }
+    }
+
+    // Colombian account WITH electronic invoicing: the FE schema requires
+    // regime + kindOfPerson (post_contacts.md).
+    if (!empty($GLOBALS['alegra_mock_contact_fiscal_required'])) {
+        if (empty($body['regime']) || empty($body['kindOfPerson'])) {
+            return alegra_mock_validation_error(
+                'Los campos regime y kindOfPerson son obligatorios para contactos con facturación electrónica'
+            );
         }
     }
 

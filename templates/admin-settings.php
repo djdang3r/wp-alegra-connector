@@ -254,6 +254,44 @@ $ac_catalog = \Alegra\Connector\Billing_Fields::CATALOG;
 </select>
 <p class="description"><?php esc_html_e('Solo aplica a clientes: cuando un cliente ya existe en Alegra (mismo email o NIT), define si se conserva la version de Alegra o la de WooCommerce. No afecta a productos ni pedidos.','alegra-connector');?></p></td></tr>
 
+<!-- Colombia fiscal contact fields -->
+<tr><th><?php esc_html_e('Datos fiscales del contacto (Colombia):','alegra-connector');?></th><td>
+<?php
+$ac_kind_option   = \Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON;
+$ac_regime_option = \Alegra\Connector\Billing_Fields::OPTION_REGIME;
+$ac_kind_current  = strtoupper((string) get_option($ac_kind_option, ''));
+$ac_regime_current = strtoupper((string) get_option($ac_regime_option, 'SIMPLIFIED_REGIME'));
+$ac_kind_labels = [
+    'PERSON_ENTITY' => __('Persona natural','alegra-connector'),
+    'LEGAL_ENTITY'  => __('Persona jurídica','alegra-connector'),
+    'OTHER_ENTITY'  => __('Otro tipo de obligado','alegra-connector'),
+];
+$ac_regime_labels = [
+    'SIMPLIFIED_REGIME'              => __('No responsable de IVA (régimen simplificado)','alegra-connector'),
+    'COMMON_REGIME'                  => __('Responsable de IVA (régimen común)','alegra-connector'),
+    'NATIONAL_CONSUMPTION_TAX'       => __('Impuesto Nacional al Consumo (INC)','alegra-connector'),
+    'NOT_REPONSIBLE_FOR_CONSUMPTION' => __('No responsable de consumo (INC)','alegra-connector'),
+    'INC_IVA_RESPONSIBLE'            => __('Responsable de IVA e INC','alegra-connector'),
+    'SPECIAL_REGIME'                 => __('Régimen especial','alegra-connector'),
+];
+?>
+<label style="display:block;margin-bottom:6px;"><?php esc_html_e('Tipo de persona:','alegra-connector');?>
+<select name="<?php echo esc_attr($ac_kind_option); ?>">
+    <option value="" <?php selected($ac_kind_current, ''); ?>><?php esc_html_e('Automático (persona natural)','alegra-connector');?></option>
+    <?php foreach($ac_kind_labels as $ac_value=>$ac_label): ?>
+    <option value="<?php echo esc_attr($ac_value); ?>" <?php selected($ac_kind_current, $ac_value); ?>><?php echo esc_html($ac_label); ?></option>
+    <?php endforeach; ?>
+</select>
+</label>
+<label style="display:block;"><?php esc_html_e('Régimen:','alegra-connector');?>
+<select name="<?php echo esc_attr($ac_regime_option); ?>">
+    <?php foreach($ac_regime_labels as $ac_value=>$ac_label): ?>
+    <option value="<?php echo esc_attr($ac_value); ?>" <?php selected($ac_regime_current, $ac_value); ?>><?php echo esc_html($ac_label); ?></option>
+    <?php endforeach; ?>
+</select>
+</label>
+<p class="description"><?php esc_html_e('Solo aplica a cuentas de Colombia. Se envían en cada contacto nuevo para cumplir el esquema de Alegra (obligatorios con facturación electrónica). Por defecto: persona natural + régimen simplificado.','alegra-connector');?></p></td></tr>
+
 <!-- Log Retention -->
 <tr><th><?php esc_html_e('Retencion de logs:','alegra-connector');?></th><td>
 <input type="number" name="alegra_connector_log_retention_days" value="<?php echo esc_attr(get_option('alegra_connector_log_retention_days',30));?>" class="small-text" min="1" max="365"> <?php esc_html_e('dias','alegra-connector');?>

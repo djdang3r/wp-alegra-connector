@@ -64,6 +64,12 @@ function make_products(?Logger $logger = null): Products
     return new Products(new Client($logger), $logger);
 }
 
+function make_customers(?Logger $logger = null): \Alegra\Connector\Sync\Customers
+{
+    $logger = $logger ?? make_logger();
+    return new \Alegra\Connector\Sync\Customers(new Client($logger), $logger);
+}
+
 function make_controller(?Logger $logger = null): Controller
 {
     $logger = $logger ?? make_logger();
@@ -477,7 +483,10 @@ TestRunner::test('T4.6 refund with a missing contact meta falls back to Consumid
 
 TestRunner::test('T4.7 refund with an unresolvable client aborts with customer_unresolved and does NOT POST', function (): void {
     alegra_test_reset();
-    // No Consumidor Final contact seeded, so get_id() cannot resolve.
+    // The Consumidor Final lookup fails (API down), so it can neither be
+    // resolved nor safely created. The plugin must abort instead of POSTing a
+    // client-less credit note.
+    alegra_mock_fail('GET', '/contacts', 500, ['message' => 'API caída']);
 
     $invoice_id = '1nv-505';
     alegra_mock_seed_invoice($invoice_id, [
@@ -549,8 +558,8 @@ TestRunner::test('T5.1 a NIT contact sends identificationObject (with dv) and na
     TestRunner::assertSame('NIT', $body['identificationObject']['type'] ?? null, 'identificationObject.type');
     TestRunner::assertSame('900123456', $body['identificationObject']['number'] ?? null, 'identificationObject.number');
     TestRunner::assertSame('1', $body['identificationObject']['dv'] ?? null, 'identificationObject.dv');
-    TestRunner::assertArrayNotHasKey('kindOfPerson', $body, 'kindOfPerson must not be sent');
-    TestRunner::assertArrayNotHasKey('regime', $body, 'regime must not be sent');
+    TestRunner::assertSame('PERSON_ENTITY', $body['kindOfPerson'] ?? null, 'CO contacts must send kindOfPerson (FE schema requires it)');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $body['regime'] ?? null, 'CO contacts must send regime (FE schema requires it)');
     TestRunner::assertArrayHasKey('nameObject', $body, 'CO contacts use nameObject');
     TestRunner::assertArrayNotHasKey('name', $body, 'a contact must NOT also send name');
 
@@ -746,8 +755,8 @@ TestRunner::test('T7.2 the billing catalog is reduced to the identification and 
 
     $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
     TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
-    TestRunner::assertArrayNotHasKey('kindOfPerson', $payload, 'kindOfPerson must never be sent');
-    TestRunner::assertArrayNotHasKey('regime', $payload, 'regime must never be sent');
+    TestRunner::assertSame('PERSON_ENTITY', $payload['kindOfPerson'] ?? null, 'CO contacts must send kindOfPerson');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $payload['regime'] ?? null, 'CO contacts must send regime');
     TestRunner::assertArrayNotHasKey('stamp', $payload, 'a contact payload must never carry stamp');
     TestRunner::assertSame('CC', $payload['identificationObject']['type'] ?? null, 'CO sends identificationObject.type');
     TestRunner::assertSame('1234567890', $payload['identificationObject']['number'] ?? null, 'CO sends identificationObject.number');
@@ -1051,8 +1060,8 @@ TestRunner::test('T9.10 the identification shape is gated on the account country
 
     update_option('alegra_connector_company_country', 'CO');
     $co_payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
-    TestRunner::assertArrayNotHasKey('kindOfPerson', $co_payload, 'CO must not send kindOfPerson');
-    TestRunner::assertArrayNotHasKey('regime', $co_payload, 'CO must not send regime');
+    TestRunner::assertSame('PERSON_ENTITY', $co_payload['kindOfPerson'] ?? null, 'CO must send kindOfPerson');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $co_payload['regime'] ?? null, 'CO must send regime');
     TestRunner::assertArrayHasKey('identificationObject', $co_payload, 'CO sends identificationObject');
     TestRunner::assertSame('CC', $co_payload['identificationObject']['type'] ?? null, 'CO identificationObject.type');
 });
@@ -2253,6 +2262,154 @@ TestRunner::test('T16.12 a negative Alegra quantity is clamped to 0 and never pr
     $product = wc_get_product(75);
     TestRunner::assertSame(0, $product->get_stock_quantity(), 'a negative quantity must be clamped to 0');
     TestRunner::assertSame('outofstock', $product->get_stock_status(), 'a clamped quantity must be out of stock');
+});
+
+// ===========================================================================
+// T17 — Customers & Contacts batch 2 (CO fiscal fields, CF creation, import)
+// ===========================================================================
+echo "\nT17 — Customers & contacts batch 2\n";
+
+TestRunner::test('T17.1 the CO contact payload always carries regime + kindOfPerson and honours the configured values', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_company_country', 'CO');
+    $user = alegra_make_user(9, ['user_email' => 'co@example.test', 'display_name' => 'Ana Perez'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_first_name'            => 'Ana',
+        'billing_last_name'             => 'Perez',
+    ]);
+
+    $payload = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
+    TestRunner::assertSame('PERSON_ENTITY', $payload['kindOfPerson'] ?? null, 'default kindOfPerson');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $payload['regime'] ?? null, 'default regime');
+
+    // Merchant overrides are honoured (allowlisted enum values).
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON, 'LEGAL_ENTITY');
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_REGIME, 'COMMON_REGIME');
+    $override = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertSame('LEGAL_ENTITY', $override['kindOfPerson'] ?? null, 'configured kindOfPerson');
+    TestRunner::assertSame('COMMON_REGIME', $override['regime'] ?? null, 'configured regime');
+
+    // Garbage never reaches Alegra.
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON, 'NOT_A_KIND');
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_REGIME, 'NOT_A_REGIME');
+    $fallback = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
+    TestRunner::assertSame('PERSON_ENTITY', $fallback['kindOfPerson'] ?? null, 'invalid kindOfPerson falls back');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $fallback['regime'] ?? null, 'invalid regime falls back');
+});
+
+TestRunner::test('T17.2 a CO contact create succeeds against an e-invoicing account (regime/kindOfPerson required)', function (): void {
+    alegra_test_reset();
+    $cf = seed_consumidor_final();
+    // Model a Colombian account WITH electronic invoicing: POST /contacts 400s
+    // unless regime + kindOfPerson are present.
+    alegra_mock_set_contact_fiscal_required(true);
+    alegra_make_user(1, ['user_email' => 'buyer@example.test', 'display_name' => 'Ana Perez'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_first_name'            => 'Ana',
+        'billing_last_name'             => 'Perez',
+    ]);
+    $order = make_invoice_order(700, 1, 'buyer@example.test');
+
+    make_orders()->create_invoice($order);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'the contact create must be attempted once');
+    $invoice = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertTrue((string) ($invoice['client']['id'] ?? '') !== $cf, 'the invoice must NOT fall back to Consumidor Final when the FE contact is accepted');
+});
+
+TestRunner::test('T17.3 the fallback note names the API reason when the contact create failed', function (): void {
+    alegra_test_reset();
+    seed_consumidor_final();
+    alegra_make_user(1, ['user_email' => 'buyer@example.test', 'display_name' => 'Ana Perez'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+        'billing_first_name'            => 'Ana',
+        'billing_last_name'             => 'Perez',
+    ]);
+    $order = make_invoice_order(701, 1, 'buyer@example.test');
+    alegra_mock_fail('POST', '/contacts', 400, ['message' => 'Alegra rechazó el contacto de prueba']);
+
+    make_orders()->create_invoice($order);
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('Alegra rechazó el contacto de prueba', $notes, 'the note must name the API error');
+    TestRunner::assertStringContains('no se pudo crear el contacto', $notes, 'the note must say the create failed');
+    TestRunner::assertStringNotContains('no tiene', $notes, 'an API failure must NOT be mislabelled as missing data');
+});
+
+TestRunner::test('T17.4 Consumidor Final is auto-created when missing and is idempotent', function (): void {
+    alegra_test_reset();
+    // No CF seeded: the account does not have it.
+    alegra_make_user(2, ['user_email' => 'nodata@example.test']);
+    $order = make_invoice_order(702, 2, 'nodata@example.test');
+
+    make_orders()->create_invoice($order);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'the CF contact must be created once');
+
+    $created = null;
+    foreach ($GLOBALS['alegra_mock_state']['contacts'] as $contact) {
+        if ((string) ($contact['identificationObject']['number'] ?? '') === '222222222222') {
+            $created = $contact;
+        }
+    }
+    TestRunner::assertTrue($created !== null, 'the created contact must be the CF identification');
+    TestRunner::assertSame('PERSON_ENTITY', $created['kindOfPerson'] ?? null, 'CF kindOfPerson');
+    TestRunner::assertSame('SIMPLIFIED_REGIME', $created['regime'] ?? null, 'CF regime');
+
+    $invoice = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame((string) $created['id'], (string) ($invoice['client']['id'] ?? ''), 'the invoice must use the created CF');
+
+    // Second resolution is served from cache: no second create.
+    $again = \Alegra\Connector\Consumidor_Final::get_id();
+    TestRunner::assertSame((string) $created['id'], (string) $again, 'CF resolves to the created id');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'CF creation must be idempotent (no duplicate)');
+});
+
+TestRunner::test('T17.5 the import dedups by identification before creating a WC user', function (): void {
+    alegra_test_reset();
+    alegra_make_user(1, ['user_email' => 'old@example.test', 'display_name' => 'Old Name'], [
+        'billing_alegra_identification' => '900123456',
+    ]);
+    alegra_mock_seed_contact('c-900', [
+        'email' => 'new@example.test',
+        'name' => 'New Name',
+        'identificationObject' => ['type' => 'CC', 'number' => '900123456'],
+    ]);
+
+    $result = make_customers()->import_from_alegra();
+
+    TestRunner::assertSame(1, count($GLOBALS['wp_users']), 'no duplicate WC user may be created');
+    TestRunner::assertSame(1, (int) ($result['updated'] ?? 0), 'the existing user must be updated, not imported');
+    TestRunner::assertSame('c-900', (string) get_user_meta(1, 'alegra_contact_id', true), 'the existing user must be linked');
+    // BUG 6: "Alegra gana" pulls the identity too.
+    TestRunner::assertSame('new@example.test', (string) $GLOBALS['wp_users'][1]->user_email, 'the Alegra email must be pulled');
+    TestRunner::assertSame('New Name', (string) $GLOBALS['wp_users'][1]->display_name, 'the Alegra name must be pulled');
+});
+
+TestRunner::test('T17.6 contacts without an email are counted as skipped, not errors', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('c-ok', ['email' => 'ok@example.test', 'name' => 'Ok']);
+    alegra_mock_seed_contact('c-noemail', ['name' => 'No Email']);
+
+    $result = make_customers()->import_from_alegra();
+
+    TestRunner::assertSame(1, (int) ($result['imported'] ?? 0), 'the contact with an email must import');
+    TestRunner::assertSame(1, (int) ($result['skipped'] ?? 0), 'the contact without an email must be skipped');
+    TestRunner::assertSame(0, (int) ($result['errors'] ?? 0), 'a legitimate skip must NOT be counted as an error');
+});
+
+TestRunner::test('T17.7 the cron customer import is not self-blocked by its own lock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_customers', true);
+    alegra_mock_seed_contact('c-cron', ['email' => 'cron@example.test', 'name' => 'Cron User']);
+
+    make_controller()->run_cron_sync();
+
+    TestRunner::assertTrue(get_user_by('email', 'cron@example.test') !== false, 'the cron must actually import the customer (the inner lock must not conflict with the outer one)');
 });
 
 exit(TestRunner::summary());
