@@ -1,25 +1,29 @@
-# Verificación en Producción — Alegra Connector 2.3.4
+# Verificación en Producción — Alegra Connector 2.3.5
 
-Esta guía es la **lista de validación** de la versión 2.3.4. La 2.3.4 **corrige
-el push de productos**: el payload usaba `type: 'simple'` (que es el enum de
-**lectura**, no el de escritura), faltaba `inventory.unitCost`, se re-enviaba
-`inventory.initialQuantity` en cada edición (riesgo de resetear el stock) y el
-**push de productos variables nunca funcionó** (ver la **sección ★**, la más
-importante de esta versión). La 2.3.3 separa la sincronización entrante
-(Alegra → WooCommerce) de la subida de pedidos (WooCommerce → Alegra) y deja la
-subida en **manual por defecto** (sección 0). La 2.3.2 **eliminó** la emisión
-electrónica DIAN que traía la 2.3.0 (era una feature no pedida y activada por
-defecto). El plugin solo crea el documento en Alegra; el timbrado, si lo
-necesitás, se hace en Alegra.
+Esta guía es la **lista de validación** de la versión 2.3.5. La 2.3.5 **corrige
+el modo de prueba (Dry Run)**: el marcador que devuelve una escritura bloqueada
+es un arreglo, así que `is_wp_error()` lo dejaba pasar como éxito y **cuatro
+caminos guardaban estado de operaciones que nunca ocurrieron** (pago registrado,
+nota crédito creada, método de pago actualizado, webhooks borrados). Con Dry Run
+encendido el panel decía "listo" sin haber escrito nada en Alegra. La 2.3.5
+también hace que el push de productos variables devuelva el marcador de Dry Run
+en vez de un error engañoso, y que la importación de productos use la **lista de
+precios configurada** en vez de la lista 1. La sección nueva y más importante de
+esta versión es **★★ (Dry Run)**.
+
+Esta guía **conserva** los ítems de la 2.3.4 (push de productos simples y
+variables, sección ★), de la 2.3.3 (subida de pedidos automática vs manual,
+sección 0) y de la 2.3.2 (eliminación de la emisión DIAN). El plugin solo crea el
+documento en Alegra; el timbrado, si lo necesitás, se hace en Alegra.
 
 La base sigue siendo la 2.3.1, que corrigió los 68 hallazgos de la auditoría
 (lotes 0–3) sobre la 2.3.0.
 
-> **El riesgo más alto de esta versión está en la sección ★ (push de productos
-> simples y variables): el push simple estaba roto y el variable nunca funcionó.
-> Leela primero.**
+> **El riesgo más alto de esta versión está en la sección ★★ (Dry Run): el modo
+> de prueba reportaba éxito sin escribir nada. Leela primero.**
 >
-> El ítem 5 (CO + facturación electrónica) sigue siendo el otro riesgo alto.
+> El push de productos (sección ★, de la 2.3.4) sigue sin probarse en vivo, y el
+> ítem 5 (CO + facturación electrónica) sigue siendo el otro riesgo alto.
 
 La 2.3.0 se construyó contra la **documentación oficial** de Alegra y de
 WooCommerce, pero **nueve comportamientos concretos nunca se probaron contra la
@@ -56,13 +60,41 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 | Riesgo | Significado |
 |---|---|
-| **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, o se factura sin querer. **Bloquea** el uso real de la 2.3.4 hasta resolverse. |
+| **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, o se factura sin querer. **Bloquea** el uso real de la 2.3.5 hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
 
 ---
 
-## ★ Push de productos a Alegra (simple y variable) — ⚠️ LO NUEVO Y MÁS IMPORTANTE DE LA 2.3.4
+## ★★ Dry Run: cómo usarlo bien — ⚠️ LO NUEVO Y MÁS IMPORTANTE DE LA 2.3.5
+
+**Estado: NO probado en vivo. Requiere prueba en vivo.**
+
+El modo de prueba **no escribe nada en Alegra**: bloquea todo `POST`/`PUT`/`DELETE`
+y devuelve un marcador. Antes de la 2.3.5 ese marcador se confundía con un éxito y
+el panel mostraba "pago registrado" / "nota crédito creada" sin haber hecho nada.
+Ahora cada camino avisa que fue una **simulación**. El flujo correcto es:
+
+1. **Activá el modo de prueba.** En `Alegra Connector → Configuración →
+   Sincronización`, marcá **"Modo de prueba"**. El Dashboard lo refleja.
+2. **Hacé un pedido de prueba** de bajo valor y completá el pago.
+3. **Verificá el mensaje honesto.** El pedido debe mostrar una nota del tipo
+   **"Alegra (modo de prueba): … no se registró / no se creó …"** y el panel
+   **no** debe decir que la operación se completó. En `Alegra Connector → Logs`
+   buscá `[DRY RUN] Blocked POST ...`; ese es el marcador de que no se escribió.
+4. **Confirmá que Alegra no cambió:** en **Alegra → Facturas / Pagos /
+   Webhooks**, no debe haber ningún registro nuevo.
+5. **Desactivá el modo de prueba** y **hacé el pedido real** (o facturá el pedido
+   de prueba). Ahora sí la factura, el pago y las notas deben crearse en Alegra.
+
+- **Riesgo: Alto (regresión).** Si Dry Run vuelve a reportar éxito falso, el
+  comerciante cree que validó la integración cuando en realidad no se escribió
+  nada. La única prueba válida es que el mensaje diga **modo de prueba / no se
+  registró** y que Alegra no haya cambiado.
+
+---
+
+## ★ Push de productos a Alegra (simple y variable) — ⚠️ LO NUEVO DE LA 2.3.4, SIGUE VIGENTE
 
 **Estado: NO probado en vivo. El push simple estaba roto (Alegra lo habría
 rechazado) y el variable nunca funcionó. Requiere prueba en vivo.**
@@ -382,23 +414,24 @@ versión corrige.
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la 2.3.4. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **Sección ★ — push de productos (simple y variable).** Es lo nuevo y más
-   importante de la 2.3.4: empujá un producto simple y uno variable con 2+
-   variaciones y confirmá que se crean en Alegra. Antes de esta versión el
-   simple se rechazaba y el variable nunca funcionaba.
-4. **Ítem 0 — automático OFF (default) y manual.** Creá un pedido y confirmá
+2. **Desplegar** e instalar la 2.3.5. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **Sección ★★ — Dry Run (lo nuevo de la 2.3.5).** Activá "Modo de prueba",
+   hacé un pedido de prueba y confirmá que los mensajes digan **modo de prueba /
+   no se registró** y que **nada** se cree en Alegra. Después **desactivalo**.
+   Es el flujo que valida todo antes de ir a producción.
+4. **Sección ★ — push de productos (simple y variable).** Es lo nuevo de la
+   2.3.4 y sigue vigente: empujá un producto simple y uno variable con 2+
+   variaciones y confirmá que se crean en Alegra. Antes de la 2.3.4 el simple se
+   rechazaba y el variable nunca funcionaba.
+5. **Ítem 0 — automático OFF (default) y manual.** Creá un pedido y confirmá
    que **no** se factura solo; después usá "Crear factura" y confirmá que sí
    aparece. Es el cambio de la 2.3.3, sigue vigente.
-5. **Ítem 5 — CO + facturación electrónica (el más importante).** Pedido de
+6. **Ítem 5 — CO + facturación electrónica (el más importante).** Pedido de
    prueba con un cliente que **tenga** identificación; confirmá en Alegra que la
    factura sale a nombre del **cliente** y que **no** aparece la nota de
    Consumidor Final. Si cayó al genérico, reportalo.
-6. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
+7. **Ítem 7 — Consumidor Final.** Solo lectura en Alegra y el widget. Si falta,
    se crea a mano antes de facturar.
-7. **Dry Run** con un pedido de prueba: activa "Modo de prueba", haz el pedido,
-   revisa el log (`[DRY RUN] Blocked POST ...`) y que no se cree nada en
-   Alegra. Ver `RELEASE_2.3.0_DEPLOY.md` §4. **Desactívalo al terminar.**
 8. **Ítem 4 — condicionales de Blocks.** Aprovéchalos en el mismo checkout de
    prueba del paso anterior.
 9. **Ítem 1 — webhook/poll de stock.** Cambia stock en Alegra y observa.
@@ -441,9 +474,14 @@ versión corrige.
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.4 instalado y la versión figura como **2.3.4** en **Plugins**.
+- [ ] 2.3.5 instalado y la versión figura como **2.3.5** en **Plugins**.
 
-### Lo nuevo de la 2.3.4 (push de productos)
+### Lo nuevo de la 2.3.5 (Dry Run)
+- [ ] **★★** Con "Modo de prueba" activo, un pedido de prueba **no** escribe en
+      Alegra y el mensaje dice **modo de prueba / no se registró**.
+- [ ] **★★** Al desactivarlo, el pedido real **sí** crea la factura y el pago.
+
+### Push de productos — 2.3.4, sigue vigente
 - [ ] **★.a** Producto simple empujado → **se crea** el ítem en Alegra con
       `type: product` y `unitCost` (o `0`); editarlo **no** resetea el stock.
 - [ ] **★.b** Producto variable con 2+ variaciones → se crea el **padre** con

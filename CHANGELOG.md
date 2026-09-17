@@ -2,6 +2,32 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.5] - 2026-09-16
+
+### 🐛 Fixed
+
+- **FIX: dry run reported success for operations it never performed.** The
+  dry-run marker is an array, so `is_wp_error()` let it through as a success in
+  four places, which meant testing with dry run on showed "payment registered" /
+  "credit note created" for things that never happened:
+  - registering a payment from the admin no longer saves an empty Alegra payment
+    id or reports success;
+  - refund credit notes no longer mark the refund as credited;
+  - payment-method changes no longer claim the invoice was updated in Alegra;
+  - deleting webhooks no longer wipes the local subscription list when nothing
+    was deleted on Alegra's side.
+- **FIX: variable products returned a misleading "no id" error** under dry run
+  instead of the dry-run marker.
+- **FIX: the product import read only price list 1**, ignoring the configured
+  price list.
+- **CHANGED: removed an unused constant** (`ALEGRA_CONNECTOR_API_URL`).
+
+### ✅ Upgrade Notes
+
+- **Dry run now reports honestly:** nothing is written and the UI says so. If
+  you used dry run before, the previous "success" messages were not real.
+- **No change to live (dry run off) behaviour.**
+
 ## [2.3.4] - 2026-09-16
 
 ### 🐛 Fixed
@@ -235,7 +261,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.4_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.5_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 
