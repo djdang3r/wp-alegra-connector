@@ -1840,7 +1840,7 @@ class Admin_Dashboard
 
         $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
 
-        // BUG 7: a payment requires an OPEN invoice. The invoice may be a draft
+        // BUG 6: a payment requires an OPEN invoice. The invoice may be a draft
         // (the default), so open it first — exactly like the auto path does.
         $orders_sync->ensure_invoice_open($alegra_invoice_id);
 

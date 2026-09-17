@@ -23,6 +23,18 @@ if (!defined('ABSPATH')) {
 
 class Orders
 {
+    /**
+     * Reference of the SINGLE generic Alegra service item used for every
+     * non-product invoice/credit-note line (shipping, fees, partial refunds).
+     *
+     * Alegra requires `items[].id` on invoices and credit notes
+     * (post_invoices.md / post_credit-notes.md), so a free-text line is
+     * rejected. One shared find-or-create item keeps the merchant's catalog
+     * clean (no per-purpose duplicates); the line `name`/`description` carries
+     * the human-readable label ("Envío", the fee name, "Reembolso parcial").
+     */
+    private const GENERIC_ITEM_REFERENCE = 'alegra-connector-adjustment';
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -242,7 +254,7 @@ class Orders
         // account is configured the invoice is created open instead of the
         // configured draft status.
         //
-        // BUG 9: the settings <select> stores '0' for "no account", so both ''
+        // BUG 8: the settings <select> stores '0' for "no account", so both ''
         // and '0' mean UNCONFIGURED. The manual path already rejects both; the
         // auto path must too, otherwise it POSTs bankAccount.id = '0'.
         $payment_account = (string) get_option('alegra_connector_payment_account_id', '');
@@ -299,7 +311,7 @@ class Orders
         if (!empty($payment_data)) {
             $payment_result = $this->api->create_payment($payment_data);
             if (is_wp_error($payment_result)) {
-                // BUG 6: the failure used to be swallowed — the invoice existed
+                // BUG 5: the failure used to be swallowed — the invoice existed
                 // but the merchant was never told the payment was not recorded.
                 if ($this->logger) {
                     $this->logger->error('Payment recording failed after invoice creation', [
@@ -347,7 +359,7 @@ class Orders
      * No-op when the invoice is already open or cannot be read; failures are
      * logged so the payment attempt still surfaces Alegra's own error.
      *
-     * Public because the manual "Registrar pago" AJAX path (BUG 7) must open a
+     * Public because the manual "Registrar pago" AJAX path (BUG 6) must open a
      * draft invoice before posting the payment, exactly like the auto path.
      */
     public function ensure_invoice_open(string $invoice_id): void
@@ -496,7 +508,7 @@ class Orders
             //  - single-line invoice whose value covers the refund -> reuse that
             //    line's id (semantically exact: same product, partial value);
             //  - otherwise (multi-product order, or refund larger than the one
-            //    line) -> a dedicated "Reembolso" service item, resolved
+            //    line) -> the shared generic "Ajuste" service item, resolved
             //    find-or-create by reference so it is created at most once.
             $items = [];
 
@@ -518,13 +530,13 @@ class Orders
 
             if ($items === []) {
                 $refund_item_id = $this->resolve_generic_item_id(
-                    'alegra-connector-refund',
-                    __('Reembolso', 'alegra-connector')
+                    self::GENERIC_ITEM_REFERENCE,
+                    __('Ajuste', 'alegra-connector')
                 );
                 if ($refund_item_id === '') {
                     return new \WP_Error(
                         'refund_item_unlinked',
-                        __('No se pudo resolver el ítem "Reembolso" en Alegra para la nota de crédito.', 'alegra-connector')
+                        __('No se pudo resolver el ítem "Ajuste" en Alegra para la nota de crédito.', 'alegra-connector')
                     );
                 }
                 $items[] = [
@@ -726,117 +738,10 @@ class Orders
             $data['warehouse'] = $warehouse;
         }
 
-        // BUG 2: Colombia's electronic-invoicing schema requires `paymentForm`
-        // (and `paymentMethod` when it is CASH). See build_colombia_payment_fields().
-        $co_payment = $this->build_colombia_payment_fields($order);
-        if ($co_payment !== []) {
-            $data = array_merge($data, $co_payment);
-        }
-
+        // NOTE: this plugin creates a normal Alegra invoice only. It does NOT
+        // emit electronic invoices to the DIAN, so no DIAN-specific field is
+        // ever sent. The merchant emits/stamps from Alegra when they need to.
         return $data;
-    }
-
-    /**
-     * `paymentForm` / `paymentMethod` for a Colombian invoice (BUG 2).
-     *
-     * post_invoices.md (Factura de venta de Colombia): `paymentForm` admits
-     * CASH (contado) and CREDIT (crédito) and "si la compañía tiene activa la
-     * opción de facturación electrónica 2.1, este atributo se vuelve
-     * obligatorio". `paymentMethod` "sí el atributo paymentForm es CASH y la
-     * compañía tiene activa ... facturación electrónica 2.1, este atributo se
-     * vuelve obligatorio"; its values are the DIAN catalog in
-     * https://developer.alegra.com/docs/colombia.md ("Medios de pago").
-     *
-     * The plugin cannot read the FE flag, so it always sends `paymentForm` for
-     * a CO account (an extra valid field is harmless; omitting a required one
-     * is a 400) and sends `paymentMethod` only for gateways whose DIAN code is
-     * verified. An unmapped gateway omits it rather than guessing a code.
-     *
-     * @return array<string, string>
-     */
-    private function build_colombia_payment_fields(\WC_Order $order): array
-    {
-        if (!$this->is_colombia_order($order)) {
-            return [];
-        }
-
-        $paid = method_exists($order, 'is_paid') ? (bool) $order->is_paid() : false;
-        $form = $paid ? 'CASH' : 'CREDIT';
-        $fields = ['paymentForm' => $form];
-
-        if ($form === 'CASH') {
-            $method = $this->get_co_payment_method_code($order);
-            if ($method !== '') {
-                $fields['paymentMethod'] = $method;
-            } elseif ($this->logger) {
-                $this->logger->warning('No verified DIAN payment method for this gateway; paymentMethod omitted', [
-                    'order_id' => $order->get_id(),
-                    'gateway'  => $order->get_payment_method(),
-                ]);
-            }
-        }
-
-        return $fields;
-    }
-
-    /**
-     * Whether the connected Alegra company (or, when unknown, the order's
-     * billing country) is Colombian. paymentForm is a company-level field.
-     */
-    private function is_colombia_order(\WC_Order $order): bool
-    {
-        $company = strtoupper(trim((string) get_option('alegra_connector_company_country', '')));
-        if ($company !== '') {
-            return in_array($company, ['CO', 'COLOMBIA'], true);
-        }
-
-        return in_array(strtoupper(trim($order->get_billing_country())), ['CO', 'COLOMBIA'], true);
-    }
-
-    /**
-     * WooCommerce gateway slug → DIAN `paymentMethod` code (Colombia).
-     *
-     * Source: https://developer.alegra.com/docs/colombia.md ("Medios de pago").
-     * Only codes verified against that catalog are mapped; an unmapped gateway
-     * returns '' so the caller omits `paymentMethod` instead of guessing.
-     */
-    private function get_co_payment_method_code(\WC_Order $order): string
-    {
-        $method = strtolower($order->get_payment_method());
-
-        $map = [
-            'cod'                      => 'CASH',
-            'efecty'                   => 'CASH',
-            'baloto'                   => 'CASH',
-            'oxxo'                     => 'CASH',
-            'multicaja'                => 'CASH',
-            'bacs'                     => 'CREDIT_TRANSFER',
-            'pse'                      => 'CREDIT_TRANSFER',
-            'nequi'                    => 'CREDIT_TRANSFER',
-            'daviplata'                => 'CREDIT_TRANSFER',
-            'bancolombia'              => 'CREDIT_TRANSFER',
-            'spei'                     => 'CREDIT_TRANSFER',
-            'paypal'                   => 'CREDIT_TRANSFER',
-            'stripe'                   => 'CREDIT_CARD',
-            'mercadopago'              => 'CREDIT_CARD',
-            'woocommerce-mercado-pago' => 'CREDIT_CARD',
-            'woo-mercado-pago'         => 'CREDIT_CARD',
-            'payu'                     => 'CREDIT_CARD',
-            'epayco'                   => 'CREDIT_CARD',
-            'wompi'                    => 'CREDIT_CARD',
-            'openpay'                  => 'CREDIT_CARD',
-            'clip'                     => 'CREDIT_CARD',
-            'culqi'                    => 'CREDIT_CARD',
-            'cheque'                   => 'CHECK',
-        ];
-
-        foreach ($map as $slug => $code) {
-            if (strpos($method, $slug) !== false) {
-                return $code;
-            }
-        }
-
-        return '';
     }
 
     /**
@@ -1249,7 +1154,7 @@ class Orders
             $items[] = $item_data;
         }
 
-        // BUG 4: `$order->get_items()` returns ONLY line_item rows, so shipping
+        // BUG 2: `$order->get_items()` returns ONLY line_item rows, so shipping
         // and fees were dropped and the invoice total was smaller than the
         // order total. Map them as their own invoice lines.
         $shipping_lines = $this->build_shipping_lines($order);
@@ -1284,11 +1189,12 @@ class Orders
     }
 
     /**
-     * Invoice lines for the order's shipping charges (BUG 4).
+     * Invoice lines for the order's shipping charges (BUG 2).
      *
      * `get_items('shipping')` returns the WC_Order_Item_Shipping rows. Because
      * `items[].id` is obligatory (post_invoices.md), each shipping row is linked
-     * to a generic "Envío" service item resolved find-or-create by reference.
+     * to the shared generic "Ajuste" service item resolved find-or-create by
+     * reference (see GENERIC_ITEM_REFERENCE).
      * The line price is pre-tax; the shipping tax is mapped like a line tax.
      *
      * @return array<int, array<string, mixed>>|\WP_Error
@@ -1307,8 +1213,8 @@ class Orders
             }
 
             $item_id = $this->resolve_generic_item_id(
-                'alegra-connector-shipping',
-                __('Envío', 'alegra-connector')
+                self::GENERIC_ITEM_REFERENCE,
+                __('Ajuste', 'alegra-connector')
             );
             if ($item_id === '') {
                 return new \WP_Error(
@@ -1331,9 +1237,10 @@ class Orders
     }
 
     /**
-     * Invoice lines for the order's fees (BUG 4).
+     * Invoice lines for the order's fees (BUG 2).
      *
-     * All fees share ONE generic "Recargo" service item (find-or-create); the
+     * All fees share the generic "Ajuste" service item (find-or-create, see
+     * GENERIC_ITEM_REFERENCE); the
      * fee's own name is carried in the line `name`/`description` so it stays
      * readable. The line price is pre-tax and the fee tax is mapped like a line
      * tax.
@@ -1359,8 +1266,8 @@ class Orders
             }
 
             $item_id = $this->resolve_generic_item_id(
-                'alegra-connector-fee',
-                __('Recargo', 'alegra-connector')
+                self::GENERIC_ITEM_REFERENCE,
+                __('Ajuste', 'alegra-connector')
             );
             if ($item_id === '') {
                 return new \WP_Error(
@@ -1505,7 +1412,7 @@ class Orders
     private function prepare_payment_data(\WC_Order $order, string $invoice_id): array
     {
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
-        // BUG 9: '' and '0' both mean UNCONFIGURED (the settings <select> stores
+        // BUG 8: '' and '0' both mean UNCONFIGURED (the settings <select> stores
         // '0' for "no account"), matching the manual path's guard.
         if (in_array($account_id, ['', '0'], true)) {
             return [];
@@ -1653,7 +1560,7 @@ class Orders
     }
 
     /**
-     * Resolve the Alegra tax id for a WooCommerce tax RATE id (BUG 5).
+     * Resolve the Alegra tax id for a WooCommerce tax RATE id (BUG 3).
      *
      * Resolution order:
      *  1. explicit mapping by rate id;

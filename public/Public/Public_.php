@@ -312,7 +312,7 @@ class Public_
             $sync_controller = new Sync\Controller($this->api, $this->logger);
             $result = $sync_controller->sync_entity($type, $id, $action);
 
-            // BUG 8: the auto path used to discard the result, so a failed order
+            // BUG 7: the auto path used to discard the result, so a failed order
             // push was only logged. Surface the real reason on the order. No
             // note on success (avoids noise on every order event).
             if (is_wp_error($result) && $type === 'order') {
