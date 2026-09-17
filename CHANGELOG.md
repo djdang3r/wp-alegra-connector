@@ -2,6 +2,56 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.7] - 2026-09-16
+
+> **⚠️ Webhook reliability release.** A `new-client` webhook crashed the
+> receiver with a fatal (HTTP 500), and every delivery counted as a failure —
+> which matters because Alegra **deletes a subscription after 10 consecutive
+> failures**. On top of that, re-registering the webhooks (the expected action
+> right after updating) reported **"12 errores"** even when everything was
+> already correctly registered. Both are fixed.
+
+### 🐛 Fixed
+
+**Webhooks**
+
+- **FIX (crítico): a `new-client` webhook crashed with a fatal.** The docs send
+  `name` as an **object** (`{firstName, lastName}` / `{fullname}`), but the
+  plugin passed it to a function expecting a **string** → `TypeError` → **HTTP
+  500**. Every client webhook counted as a failure, and since Alegra **deletes a
+  subscription after 10 consecutive failures**, the client webhooks would have
+  deleted themselves. The name parsing now accepts a string, the documented
+  object, and `fullname`.
+- **FIX (crítico): a malformed body, an unknown `subject`, or a non-array
+  `message` returned a non-2XX**, which counted toward the 10-failure deletion.
+  They now return **200 (ignored)**. Only an authentication failure returns 401.
+- **FIX: a `Throwable` inside a handler returned 500.** It is now logged and
+  acked with **200**, so a bug in one event can no longer make Alegra delete the
+  subscription.
+- **FIX: webhook registration reported "12 errores" on a re-register.** Alegra
+  returns **400** `"Ya existe una suscripción con el mismo evento y URL"` when a
+  subscription already exists. Already-registered subscriptions are no longer
+  counted as errors; the result now reports `creados`, `ya_existian` and
+  `errores` separately, and the local subscription ids are preserved so the
+  DELETE flow keeps working.
+
+### 📝 Notes for the merchant
+
+- **The handshake was verified working.** Alegra POSTs an **empty body** to
+  verify the URL and requires a **2XX in under 5 seconds**; the endpoint answers
+  it (no token required for an empty body).
+- **Handlers are synchronous.** A slow Alegra API call inside a handler could
+  exceed the **5-second** budget and count as a failure. This is a known
+  limitation, not fixed in this release.
+
+### ✅ Upgrade Notes
+
+- **Re-register the webhooks** (Alegra Connector → Configuración → pestaña
+  Avanzado → "Sincronización en Tiempo Real (Webhooks)") so they point at the
+  URL that carries the security token. **Re-registering is now safe and
+  idempotent:** if the subscriptions already exist, the result says how many
+  already existed instead of reporting errors.
+
 ## [2.3.6] - 2026-09-16
 
 > **⚠️ This is a large correctness release.** Four fix batches from a
@@ -368,7 +418,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.6_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.7_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 

@@ -1,31 +1,26 @@
-# Verificación en Producción — Alegra Connector 2.3.6
+# Verificación en Producción — Alegra Connector 2.3.7
 
-Esta guía es la **lista de validación** de la versión 2.3.6. La 2.3.6 es una
-**versión grande de correcciones** (cuatro lotes: Productos, Clientes, Pedidos y
-Orquestación) salida de un análisis de funcionamiento real. El hallazgo central
-es el **reporte original del comerciante: el stock nunca aparecía en
-WooCommerce**. La causa raíz era que el plugin **nunca activaba `_manage_stock`**,
-y WooCommerce **ignora** `_stock` si la gestión de inventario está desactivada;
-`_stock_status` tampoco se seteaba. Además, la categoría **comercial** del
-producto nunca se asignaba porque se enviaba bajo `category` (la categoría
-**contable** de Alegra) en vez de `itemCategory`. Ambas direcciones quedaron
-corregidas, junto con el **lock doble que rompía la importación de clientes**, los
-**totales de pedidos con envío**, y un endpoint de **webhooks sin autenticación**.
+Esta guía es la **lista de validación** de la versión **2.3.7**. La 2.3.7 es una
+**versión de confiabilidad de webhooks**: un webhook `new-client` **crasheaba con
+un fatal (HTTP 500)** —Alegra manda `name` como **objeto**, no como string— y
+**cada entrega contaba como fallo**. Eso importa porque **Alegra elimina una
+suscripción tras 10 fallos consecutivos**: los webhooks de clientes se habrían
+borrado solos. Además, **re-registrar** los webhooks (la acción esperada después
+de actualizar) reportaba **"12 errores"** aunque todo estuviera ya registrado.
 
-La guía **conserva** los ítems que siguen necesitando prueba en vivo: el
-webhook/poll de stock (ítem 1), los condicionales de Blocks (ítem 4) y la
-pregunta CO + facturación electrónica (ítem 5), que ahora se maneja de forma
-**defensiva** pero **igual necesita una prueba real**. Los ítems ya resueltos en
-versiones anteriores (categoría única, `invoices:[{id,amount}]`, HPOS, cap de
-reembolsos, Consumidor Final preexistente) se retiraron de esta guía por quedar
-obsoletos o corregidos.
+La 2.3.7 **conserva** las verificaciones de la 2.3.6 (stock, categoría comercial,
+clientes, pedidos y orquestación): siguen siendo válidas y están más abajo. Lo
+**nuevo** es la sección de webhooks (★), que ahora incluye los **hechos
+confirmados** en la documentación oficial, el **paso a paso de configuración** y
+la **verificación en vivo del token en la URL**.
 
 > **⚠️ ANTES QUE NADA: re-registrá los webhooks.** Las suscripciones viejas
 > apuntan a la URL **sin el token secreto** y el endpoint nuevo **las rechaza**.
 > Hacelo en **Alegra Connector → Configuración → pestaña Avanzado → sección
 > "Sincronización en Tiempo Real (Webhooks)" → "Registrar webhooks en Alegra"**.
 > Si no lo hacés, los webhooks quedan mudos (el cron periódico sigue como
-> respaldo, pero perdés el tiempo real).
+> respaldo, pero perdés el tiempo real). **Re-registrar es seguro e idempotente**:
+> si ya existen, el mensaje dirá cuántos **ya existían**, no "errores".
 
 **Guía complementaria:** este documento **no** repite cómo instalar ni cómo
 revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
@@ -43,45 +38,123 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 | Riesgo | Significado |
 |---|---|
-| **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, se factura sin querer, o el stock queda desalineado. **Bloquea** el uso real de la 2.3.6 hasta resolverse. |
+| **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, se factura sin querer, el stock queda desalineado, o los webhooks se **borran solos**. **Bloquea** el uso real hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
 
 ---
 
-## ★ Re-registrar los webhooks — ⚠️ OBLIGATORIO DESPUÉS DE ACTUALIZAR
+## ★ Webhooks — lo nuevo de la 2.3.7
+
+### ★.a — Hechos confirmados en la documentación oficial
+
+Fuente: [`developer.alegra.com/docs/descripción-general.md`](https://developer.alegra.com/docs/descripci%C3%B3n-general.md)
+y [`reference/post_webhooks-subscriptions.md`](https://developer.alegra.com/reference/post_webhooks-subscriptions.md).
+
+- **NO hay autenticación.** Alegra **no firma** los webhooks: **no hay firma, ni
+  header, ni secreto, ni lista de IPs**. Por eso el plugin mete un **token secreto
+  en la URL** (`?token=...`) y lo valida con `hash_equals`, con criterio
+  **fail-closed** (sin token configurado, rechaza).
+- **Handshake de creación.** Al crear una suscripción, Alegra hace un **POST con
+  cuerpo vacío** a la URL y exige **2XX en menos de 5 segundos**; si no,
+  **la suscripción NO se crea**. El plugin responde ese handshake con **2XX** (sin
+  token: un cuerpo vacío no trae nada que procesar).
+- **10 fallos consecutivos → la suscripción se elimina sola.** Cada entrega debe
+  responder **2XX en menos de 5 segundos**. Si no ocurre en **10 intentos
+  consecutivos**, Alegra **borra la suscripción automáticamente**. Por eso un
+  handler que devuelve **500** no es "un error más": **acerca la suscripción a su
+  borrado**.
+- **Forma del payload.** `{ "subject": "<evento>", "message": { "item" | "client" | "invoice": { ... } } }`.
+  El cuerpo del mensaje va bajo `message.item`, `message.client` o
+  `message.invoice` según el evento.
+
+### ★.b — Lo que arregló la 2.3.7
+
+- **`new-client` ya no crashea.** Alegra manda `name` como **objeto**
+  (`{firstName, lastName, ...}` o `{fullname}`). El plugin lo pasaba a una función
+  que esperaba **string** → `TypeError` → **HTTP 500**. Ahora acepta string, el
+  objeto documentado y `fullname`.
+- **Un body malformado, un `subject` desconocido o un `message` no-array** ya no
+  devuelven un no-2XX: responden **200 (ignorado)**. Solo un fallo de
+  **autenticación** devuelve **401**.
+- **Un `Throwable` dentro de un handler** se registra en el log y se responde
+  **200**, en vez de 500.
+- **Re-registrar es idempotente.** Alegra devuelve **400**
+  `"Ya existe una suscripción con el mismo evento y URL"` si ya existe. Eso ya
+  **no** se cuenta como error: el resultado informa **creados / ya existían /
+  errores** por separado.
+
+### ★.c — Configuración paso a paso (lo que pidió el comerciante)
+
+1. **HTTPS obligatorio.** La URL debe ser **pública** y responder por **HTTPS**.
+   Alegra exige POST por HTTPS. Si el sitio no tiene HTTPS válido, los webhooks
+   no se crean.
+2. **Borrá las suscripciones viejas (si querés empezar limpio).** En **Alegra
+   Connector → Configuración → pestaña Avanzado → "Sincronización en Tiempo Real
+   (Webhooks)"**, hacé clic en **"Eliminar webhooks en Alegra"**. Se borran las
+   suscripciones guardadas localmente (por su **id**) y se limpia la lista local.
+   > **Ojo:** si la lista local quedó vacía pero en Alegra hay suscripciones
+   > viejas, el botón **no las ve**. En ese caso **re-registrá primero** (paso 3)
+   > —que ahora recupera los ids de las que ya existen— y después eliminá, o
+   > borralas a mano en Alegra.
+3. **Registrá.** En la misma tarjeta, verificá que la **"URL del Webhook"** incluya
+   `?token=...` (el token se genera y persiste solo). Hacé clic en **"Registrar
+   webhooks en Alegra"**. Debe registrar los **12 eventos** (facturas, facturas de
+   compra, clientes e ítems) y mostrar algo como **"12 webhooks registrados, 0 ya
+   existían, 0 errores."**
+   - Si ya estaban registrados, el mensaje dirá **"0 webhooks registrados, 12 ya
+     existían, 0 errores."** — **eso es éxito**, no un fallo.
+4. **Verificá en Alegra.** En **Alegra → Webhooks** (o la sección de
+   integraciones), confirmá que las **12 suscripciones** apuntan a la URL **con
+   token**.
+5. **Probá con un evento real.** Cambiá algo en Alegra (por ejemplo, un ítem o un
+   cliente) y verificá que WooCommerce reacciona y que en **Alegra Connector →
+   Logs** aparece el evento procesado (`Processing webhook event`).
+6. **Troubleshooting.**
+   - **No se crea ninguna suscripción:** la URL no responde **2XX en <5s**. Probá
+     abrir la URL en el navegador (debería dar **401** sin token, y **200** con el
+     token correcto) y revisá que no haya un firewall/WAF bloqueando el POST.
+   - **Todo responde 401:** el token de la URL no coincide con el guardado.
+     Re-guardá los ajustes y re-registrá.
+   - **Los webhooks dejan de llegar solos:** revisá si Alegra borró las
+     suscripciones por **10 fallos consecutivos**. Mirá los logs del sitio por
+     errores 5xx en la ruta del webhook.
+   - **Resultado esperado:** 12 suscripciones activas apuntando a la URL con token
+     y un cambio en Alegra que llega a WooCommerce.
+   - **Riesgo: Alto (seguridad y confiabilidad).** Sin re-registrar, los webhooks
+     no llegan; con un handler que devuelve 5xx, la suscripción se borra sola.
+
+### ★.d — Verificación en vivo: ¿Alegra conserva el query string?
 
 **Estado: NO probado en vivo. Requiere prueba en vivo.**
 
-La 2.3.6 cierra el endpoint de webhooks. Alegra **no firma** sus webhooks, así
-que cualquiera podía hacer un POST al endpoint y **disparar sincronizaciones o
-completar pedidos**. Ahora la URL lleva un **token secreto** y se valida con
-`hash_equals`, con criterio **fail-closed**. Como la URL cambió, **las
-suscripciones viejas dejan de ser válidas** y hay que rehacerlas.
+La documentación oficial **no dice** si Alegra **conserva el query string**
+(`?token=...`) de la URL registrada al entregar el evento. El plugin lo asume. Si
+Alegra lo **elimina**, la entrega llegará **sin token** → el endpoint responde
+**401** (seguro, fail-closed) → y como es un no-2XX, cuenta como fallo: **tras 10
+fallos consecutivos Alegra borra la suscripción**. O sea: no habría fuga de
+seguridad, pero **los webhooks no funcionarían**.
 
-Además, la 2.3.6 corrige un bug por el que **los webhooks nunca se creaban**:
-Alegra hace un **POST con cuerpo vacío** para verificar una URL nueva y exige
-**2XX en menos de 5 segundos**; el plugin respondía **400**, así que la
-verificación fallaba. Ahora ese handshake se responde con 2XX.
+**El chequeo exacto:**
 
-1. Entrá a **Alegra Connector → Configuración → pestaña Avanzado**.
-2. En la tarjeta **"Sincronización en Tiempo Real (Webhooks)"**, mirá la
-   **"URL del Webhook"**: debe incluir `?token=...`. Si no lo incluye, guardá los
-   ajustes primero (el token se genera y persiste solo).
-3. Hacé clic en **"Registrar webhooks en Alegra"**. Debe registrar **6 eventos**
-   (creación/edición de items, clientes y facturas) y mostrar el estado.
-4. Confirmá en **Alegra → Webhooks** (o la sección de integraciones) que las 6
-   suscripciones apuntan a la URL **con token**.
-5. **Prueba de disparo:** cambiá un producto en Alegra y verificá que WooCommerce
-   reacciona y que en `Alegra Connector → Logs` aparece el evento procesado.
+1. Registrá los webhooks (★.c) y confirmá en Alegra que la URL guardada **incluye
+   `?token=...`**.
+2. En Alegra, dispará un evento real (editá un ítem o un cliente).
+3. En **Alegra Connector → Logs**, buscá la entrada del evento. **Si aparece
+   `Processing webhook event`**, Alegra **conservó** el query string → el token en
+   la URL funciona.
+4. **Si en cambio ves `Webhook rejected: missing or invalid token`** (o el log del
+   servidor muestra un **401** en `/wp-json/alegra-connector/v1/webhook`), Alegra
+   **NO** conservó el query string. En ese caso:
+   - el endpoint sigue **seguro** (401 fail-closed), pero
+   - **hay que registrar la URL con el token en el path** (o usar un header/otra
+     vía); y hay que hacerlo **antes de que se acumulen 10 fallos**, porque Alegra
+     borra la suscripción.
+5. **Prueba del endpoint (complementaria):** con el token guardado a mano, hacé un
+   POST a la URL **con** `?token=<token>` (debe dar **200**) y **sin** él (debe dar
+   **401**). Eso valida el endpoint, pero **no** responde la pregunta de si Alegra
+   conserva el query string: para eso hace falta el **evento real**.
 
-- **Resultado esperado:** 6 suscripciones activas apuntando a la URL con token y
-  un cambio en Alegra que llega a WooCommerce.
-- **Si falla:** si el botón reporta 0 registrados, revisá que la URL sea pública
-  y que el sitio responda **2XX en menos de 5 segundos**. Un POST sin token ahora
-  responde **401** (antes cualquiera pasaba).
-- **Riesgo: Alto (seguridad).** Sin re-registrar, los webhooks no llegan; con el
-  endpoint viejo abierto, cualquiera podía disparar la integración.
 
 ---
 
@@ -313,7 +386,7 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la **2.3.6**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+2. **Desplegar** e instalar la **2.3.7**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
 3. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
 4. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
    inventario (★★.c). Es lo más importante de esta versión.
@@ -339,16 +412,16 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
    exactamente qué campo rechazó.
 2. **Anotá el caso:** pedido, hora, qué hiciste y el mensaje textual. Sin eso,
    no se puede diagnosticar.
-3. **Rollback a 2.3.5** (el procedimiento completo está en
+3. **Rollback a 2.3.6** (el procedimiento completo está en
    `RELEASE_2.3.0_DEPLOY.md` §6):
    - Desactivá **"Alegra Connector"** en **Plugins**.
-   - Reemplazá la carpeta por `releases/alegra-connector-v2.3.5.zip`.
+   - Reemplazá la carpeta por `releases/alegra-connector-v2.3.6.zip`.
    - Reactivá el plugin.
    - **Ojo:** la 2.3.0 migró las columnas `alegra_id` de `BIGINT` a
      `VARCHAR(36)`; eso **no** se revierte. Con IDs numéricos, versiones previas
      siguen funcionando.
-   - **Ojo:** si re-registraste los webhooks con token, la 2.3.5 **no** entiende
-     ese token; al revertir, volvé a registrar los webhooks desde la 2.3.5.
+   - **Ojo:** si re-registraste los webhooks con token, la 2.3.6 **sí** entiende
+     ese token (lo introdujo la 2.3.6); no hace falta rehacer nada.
 4. **Estado de las facturas:** por defecto se crean como **borrador** para que
    las revises antes de emitirlas. Si querés que se creen abiertas, cambialo en
    `Alegra Connector → Configuración → Datos de facturación`.
@@ -363,12 +436,15 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.6 instalado y la versión figura como **2.3.6** en **Plugins**.
+- [ ] 2.3.7 instalado y la versión figura como **2.3.7** en **Plugins**.
 
 ### Re-registrar webhooks (obligatorio)
 - [ ] **★** La "URL del Webhook" incluye `?token=...`.
-- [ ] **★** "Registrar webhooks en Alegra" reporta **6 eventos**.
+- [ ] **★** "Registrar webhooks en Alegra" reporta **12 eventos** (o **"12 ya
+      existían"** si ya estaban: eso es éxito, no un error).
 - [ ] **★** Un cambio en Alegra dispara el webhook (visible en los logs).
+- [ ] **★.d** El evento real llega **con** el token (no aparece `Webhook
+      rejected: missing or invalid token`).
 
 ### Productos — lo nuevo de la 2.3.6
 - [ ] **★★.a** Tras importar/pull, el producto tiene **"Gestionar inventario"**
