@@ -473,8 +473,17 @@ function get_terms($args = [])
     }
     return $out;
 }
-function term_exists($term, $taxonomy = '', $parent = null) { return false; }
-function wp_insert_term($term, $taxonomy, $args = [])
+function get_the_terms($post_id, $taxonomy)
+{
+    $out = [];
+    foreach (($GLOBALS['wp_terms'] ?? []) as $term) {
+        if (($term->taxonomy ?? '') === $taxonomy) {
+            $out[] = $term;
+        }
+    }
+    return $out ?: false;
+}
+function term_exists($term, $taxonomy = '', $parent = null) { return false; }function wp_insert_term($term, $taxonomy, $args = [])
 {
     $id = (int) ($GLOBALS['alegra_next_term_id'] ?? 500);
     $GLOBALS['alegra_next_term_id'] = $id + 1;
@@ -703,6 +712,12 @@ class WC_Product
     public function get_children(): array { return (array) ($this->data['children'] ?? []); }
     public function get_parent_id(): int { return (int) ($this->data['parent_id'] ?? 0); }
     public function get_attributes(): array { return (array) ($this->data['attributes'] ?? []); }
+    /**
+     * Variation attribute selections, mirroring WC_Product::get_variation_attributes()
+     * (`['attribute_color' => 'Rojo']` for a variation; the parent returns the
+     * configured value set).
+     */
+    public function get_variation_attributes(): array { return (array) ($this->data['variation_attributes'] ?? []); }
     public function get_type(): string { return $this->type; }
     public function is_type($type): bool
     {
@@ -722,6 +737,15 @@ class WC_Product
 }
 
 class WC_Product_Simple extends WC_Product {}
+
+class WC_Product_Variation extends WC_Product
+{
+    public function __construct(int $id = 0, array $data = [])
+    {
+        $data['type'] = 'variation';
+        parent::__construct($id, $data);
+    }
+}
 
 class WC_Order
 {

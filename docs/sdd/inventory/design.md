@@ -187,9 +187,9 @@ con log; nunca propaga una excepción que corte el bucle del pull.
 
 ### 3.4 Push WC→Alegra (modificar — R2 `BLOQUEADO`)
 
-**Archivos/métodos:** `Products.php:267` (`prepare_simple_product_data`),
-`Products.php:339` (`prepare_variation_data`), `Products.php:432`
-(`apply_warehouse`).
+**Archivos/métodos:** `prepare_simple_product_data()` (simple),
+`prepare_variable_product_data()` (variable — ver NOTA VARIANT abajo) y
+`apply_warehouse()` en `includes/Sync/Products.php`.
 
 - Agregar parámetro `bool $is_create = false`.
 - Si `$is_create === false`: **omitir** `inventory.initialQuantity` (y el
@@ -223,9 +223,48 @@ con log; nunca propaga una excepción que corte el bucle del pull.
 > `inventory.unitCost` (obligatorio según la doc cuando `inventory` está
 > presente), tomado de `_wc_cog_cost`/`_cost` con fallback `0`. El mock no
 > validaba el schema, por eso el defecto era invisible. Tests: `exec-test.php`
-> T1.3/T1.4/T1.5, T-hotfix-1. El path de producto variable (`variantParent` +
-> `subitems`, variaciones `type=variant`) queda **fuera de alcance** y sigue
-> siendo un mismatch documental a resolver.
+> T1.3/T1.4/T1.5, T-hotfix-1.
+
+> **NOTA VARIANT (2026-09-17) — el push de producto variable, IMPLEMENTADO.**
+> Ya no es un gap: el path devuelve `variable_product_unsupported` **eliminado**.
+> Modelo documentado e implementado en `Products::sync_variable_product()`,
+> `prepare_variable_product_data()` y helpers:
+>
+> - **Parent:** UN item `type=variantParent` con `variantAttributes`
+>   (`[{id, options:[{id}]}]`, mín 1) + `itemVariants` (opcional, máx 100). Los
+>   `id` son de atributos/opciones **existentes** en Alegra.
+>   (`https://developer.alegra.com/reference/items__createitem.md`,
+>   `https://developer.alegra.com/reference/post_items.md`). **No** se envía
+>   `subitems` (solo `kit`) ni `inventory` a nivel padre.
+> - **Resolución de atributos:** `collect_variation_attribute_defs()` lee
+>   `_product_attributes` (el mismo store que escribe el import); por cada
+>   atributo de variación se busca el atributo Alegra por nombre normalizado
+>   (trim + minúsculas + espacios colapsados → casing/formato distinto matchea) o
+>   se crea con `POST /variant-attributes {name, options:[{value}]}`; las
+>   opciones faltantes se agregan con `PUT /variant-attributes/{id}` (las
+>   existentes conservan su `id`). El catálogo se carga **una vez por request**
+>   (`alegra_variant_attribute_index()`), no por variación.
+> - **Hijos:** NO se crean standalone. Son items `variant` que Alegra genera
+>   desde `itemVariants`; se mapean a las variaciones WC por firma de combinación
+>   (`attrId:optionId`) desde la respuesta y, si la respuesta no trae hijos, vía
+>   `GET /items?variantParent_id={id}`.
+> - **Inventario por variación:** solo si `get_manage_stock()` y **solo en
+>   create** (R3), y solo con bodega configurada (el inventario de una variante
+>   es solo `warehouses`). En update se omite por completo.
+> - **Update (`PUT /items/{id}`):** reenvía `variantAttributes` + `itemVariants`;
+>   las variaciones existentes llevan su `id` (permite agregar variantes nuevas
+>   sin `id`). `UNVERIFIED`: si Alegra interpreta `itemVariants` en el PUT como
+>   aditivo; se envía la lista completa con ids.
+> - **Decisiones de borde:** atributo no creable ⇒ falla el push completo antes
+>   de escribir (código `variant_attribute_create_failed`); valor de variación no
+>   resoluble ⇒ `variable_product_attribute_missing`; producto sin variaciones ⇒
+>   `variable_product_no_variations`; >100 variaciones ⇒
+>   `variable_product_too_many_variants` (no se trunca); variación no
+>   inventariable ⇒ sin bloque `inventory`.
+> - **Mock:** `scripts/lib/alegra-mock.php` valida `variantAttributes`/
+>   `itemVariants`, rechaza `subitems` fuera de `kit`, implementa
+>   `GET/POST/PUT /variant-attributes` y materializa los hijos. Tests:
+>   `exec-test.php` T14.1–T14.10 y T-hotfix-4/5.
 
 ### 3.5 Facturación (modificar — A6)
 

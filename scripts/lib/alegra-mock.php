@@ -29,16 +29,17 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
 
 $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
+    $GLOBALS['alegra_mock_variant_children_in_response'] = true;
 }
 
 function alegra_mock_uuid(string $prefix = 'aaaaaaaa'): string
@@ -65,6 +66,33 @@ function alegra_mock_seed_invoice(string $id, array $data = []): void
 function alegra_mock_seed_category(string $id, array $data = []): void
 {
     $GLOBALS['alegra_mock_state']['categories'][$id] = array_merge(['id' => $id], $data);
+}
+
+/**
+ * Seed a variant attribute (`GET/POST/PUT /variant-attributes`).
+ *
+ * `options` accepts either `[{value}]` / `[{id, value}]` or bare strings; a
+ * missing id is generated deterministically so tests can assert on it.
+ */
+function alegra_mock_seed_variant_attribute(string $id, array $data = []): void
+{
+    $options = [];
+    foreach (array_values((array) ($data['options'] ?? [])) as $i => $option) {
+        if (is_array($option)) {
+            $options[] = [
+                'id' => (string) ($option['id'] ?? ('opt-' . $id . '-' . ($i + 1))),
+                'value' => (string) ($option['value'] ?? ''),
+            ];
+        } else {
+            $options[] = ['id' => 'opt-' . $id . '-' . ($i + 1), 'value' => (string) $option];
+        }
+    }
+
+    $GLOBALS['alegra_mock_state']['variant_attributes'][$id] = array_merge(
+        ['id' => $id, 'name' => '', 'status' => 'active'],
+        $data,
+        ['options' => $options]
+    );
 }
 
 /**
@@ -236,6 +264,8 @@ function alegra_mock_write_validators(): array
     return [
         ['method' => 'POST', 'pattern' => '#^/items$#',        'validator' => 'alegra_mock_validate_item_create'],
         ['method' => 'PUT',  'pattern' => '#^/items/[^/]+$#',  'validator' => 'alegra_mock_validate_item_update'],
+        ['method' => 'POST', 'pattern' => '#^/variant-attributes$#',        'validator' => 'alegra_mock_validate_variant_attribute'],
+        ['method' => 'PUT',  'pattern' => '#^/variant-attributes/[^/]+$#',  'validator' => 'alegra_mock_validate_variant_attribute'],
         ['method' => 'POST', 'pattern' => '#^/contacts$#',     'validator' => 'alegra_mock_validate_contact'],
         ['method' => 'POST', 'pattern' => '#^/invoices$#',     'validator' => 'alegra_mock_validate_invoice'],
         ['method' => 'POST', 'pattern' => '#^/credit-notes$#', 'validator' => 'alegra_mock_validate_credit_note'],
@@ -343,9 +373,92 @@ function alegra_mock_validate_item(array $body, bool $is_create): ?array
         }
     }
 
+    // `subitems` is a kit-only field. Sending it with any other type (the old
+    // variantParent bug) is rejected, and a kit without subitems is invalid.
+    if (array_key_exists('subitems', $body) && ($body['type'] ?? null) !== 'kit') {
+        return alegra_mock_validation_error('El campo subitems solo aplica a type=kit');
+    }
+    if (($body['type'] ?? null) === 'kit' && empty($body['subitems'])) {
+        return alegra_mock_validation_error('El campo subitems es obligatorio para type=kit');
+    }
+
     if (($body['type'] ?? null) === 'variantParent') {
         if (empty($body['variantAttributes']) || !is_array($body['variantAttributes'])) {
             return alegra_mock_validation_error('El campo variantAttributes es obligatorio para type=variantParent (subitems solo aplica a type=kit)');
+        }
+        $attribute_error = alegra_mock_validate_variant_attribute_refs($body['variantAttributes'], 'variantAttributes');
+        if ($attribute_error !== null) {
+            return $attribute_error;
+        }
+
+        if (array_key_exists('itemVariants', $body)) {
+            if (!is_array($body['itemVariants'])) {
+                return alegra_mock_validation_error('El campo itemVariants debe ser un arreglo');
+            }
+            if (count($body['itemVariants']) > 100) {
+                return alegra_mock_validation_error('El campo itemVariants no puede superar 100 entradas');
+            }
+            foreach (array_values($body['itemVariants']) as $i => $variant) {
+                if (!is_array($variant)) {
+                    return alegra_mock_validation_error('El campo itemVariants[' . $i . '] debe ser un objeto');
+                }
+                if (!empty($variant['variantAttributes'])) {
+                    $entry_error = alegra_mock_validate_variant_attribute_refs($variant['variantAttributes'], 'itemVariants[' . $i . '].variantAttributes');
+                    if ($entry_error !== null) {
+                        return $entry_error;
+                    }
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Validate a `variantAttributes` array: `[{id, options:[{id}]}]`. The ids must
+ * reference EXISTING Alegra attribute/option ids.
+ *
+ * @return array|null Error body, or null when valid.
+ */
+function alegra_mock_validate_variant_attribute_refs(mixed $attributes, string $field): ?array
+{
+    if (!is_array($attributes) || $attributes === []) {
+        return alegra_mock_validation_error('El campo ' . $field . ' debe ser un arreglo no vacio');
+    }
+    foreach (array_values($attributes) as $i => $attribute) {
+        if (!is_array($attribute) || empty($attribute['id'])) {
+            return alegra_mock_validation_error('El campo ' . $field . '[' . $i . '].id es obligatorio');
+        }
+        if (empty($attribute['options']) || !is_array($attribute['options'])) {
+            return alegra_mock_validation_error('El campo ' . $field . '[' . $i . '].options debe ser un arreglo no vacio');
+        }
+        foreach (array_values($attribute['options']) as $j => $option) {
+            if (!is_array($option) || empty($option['id'])) {
+                return alegra_mock_validation_error('El campo ' . $field . '[' . $i . '].options[' . $j . '].id es obligatorio');
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * POST/PUT /variant-attributes. `name` and a non-empty `options` array are
+ * required; every option needs a `value` (id is optional on create and on new
+ * options added through PUT).
+ */
+function alegra_mock_validate_variant_attribute(array $body): ?array
+{
+    if (empty($body['name']) || !is_string($body['name'])) {
+        return alegra_mock_validation_error('El campo name es obligatorio');
+    }
+    if (empty($body['options']) || !is_array($body['options'])) {
+        return alegra_mock_validation_error('Las opciones de la variante son obligatorias');
+    }
+    foreach (array_values($body['options']) as $i => $option) {
+        if (!is_array($option) || !array_key_exists('value', $option) || (string) $option['value'] === '') {
+            return alegra_mock_validation_error('El campo options[' . $i . '].value es obligatorio');
         }
     }
 
@@ -484,6 +597,24 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         $cat = $GLOBALS['alegra_mock_state']['categories'][$m[1]] ?? null;
         return $cat ? alegra_mock_response(200, $cat) : alegra_mock_response(404, ['message' => 'Category not found']);
     }
+    if ($method === 'GET' && $path === '/variant-attributes') {
+        $all = array_values($GLOBALS['alegra_mock_state']['variant_attributes']);
+        if (!empty($query['name'])) {
+            $needle = strtolower((string) $query['name']);
+            $all = array_values(array_filter($all, static function ($attribute) use ($needle) {
+                return strtolower((string) ($attribute['name'] ?? '')) === $needle;
+            }));
+        }
+        $start = (int) ($query['start'] ?? 0);
+        $limit = (int) ($query['limit'] ?? 30);
+        return alegra_mock_response(200, array_slice($all, $start, $limit));
+    }
+    if ($method === 'GET' && preg_match('#^/variant-attributes/([^/]+)$#', $path, $m)) {
+        $attribute = $GLOBALS['alegra_mock_state']['variant_attributes'][$m[1]] ?? null;
+        return $attribute
+            ? alegra_mock_response(200, $attribute)
+            : alegra_mock_response(404, ['code' => 404, 'message' => 'La variante no ha sido encontrada']);
+    }
     if ($method === 'GET' && $path === '/warehouses') {
         return alegra_mock_response(200, []);
     }
@@ -532,8 +663,37 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     if ($method === 'POST' && $path === '/items') {
         $id = alegra_mock_uuid('dddddddd');
         $stored = array_merge(is_array($body) ? $body : [], ['id' => $id]);
+        if (($stored['type'] ?? null) === 'variantParent') {
+            // Alegra creates the child `variant` items from `itemVariants` and
+            // returns them (with ids) on the parent response.
+            $stored = alegra_mock_materialize_variant_children($id, $stored);
+        }
         $GLOBALS['alegra_mock_state']['items'][$id] = $stored;
         return alegra_mock_response(200, $stored);
+    }
+    if ($method === 'POST' && $path === '/variant-attributes') {
+        $id = alegra_mock_uuid('a1a1a1a1');
+        $stored = alegra_mock_store_variant_attribute($id, is_array($body) ? $body : []);
+        return alegra_mock_response(200, $stored);
+    }
+    if ($method === 'PUT' && preg_match('#^/variant-attributes/([^/]+)$#', $path, $m)) {
+        $existing = $GLOBALS['alegra_mock_state']['variant_attributes'][$m[1]] ?? null;
+        if (!$existing) {
+            return alegra_mock_response(404, ['code' => 404, 'message' => 'La variante no ha sido encontrada']);
+        }
+        $body = is_array($body) ? $body : [];
+        $merged = $existing;
+        if (array_key_exists('name', $body)) {
+            $merged['name'] = (string) $body['name'];
+        }
+        if (array_key_exists('status', $body)) {
+            $merged['status'] = (string) $body['status'];
+        }
+        if (array_key_exists('options', $body) && is_array($body['options'])) {
+            $merged['options'] = alegra_mock_build_variant_options($body['options']);
+        }
+        $GLOBALS['alegra_mock_state']['variant_attributes'][$m[1]] = $merged;
+        return alegra_mock_response(200, $merged);
     }
     if ($method === 'POST' && $path === '/invoices') {
         $id = alegra_mock_uuid('eeeeeeee');
@@ -611,7 +771,89 @@ function alegra_mock_filter_items(array $query): array
             return (string) ($i['reference'] ?? '') === $ref;
         }));
     }
+    // Documented filter: children of a variantParent
+    // (https://developer.alegra.com/reference/get_items.md).
+    if (!empty($query['variantParent_id'])) {
+        $parent_id = (string) $query['variantParent_id'];
+        $items = array_values(array_filter($items, static function ($i) use ($parent_id) {
+            return (string) ($i['variantParent']['id'] ?? '') === $parent_id;
+        }));
+    }
     return $items;
+}
+
+/**
+ * Build variant-attribute options, assigning an id to every option that does
+ * not carry one (POST create / PUT new options).
+ *
+ * @return array<int, array{id:string, value:string}>
+ */
+function alegra_mock_build_variant_options(array $options): array
+{
+    $out = [];
+    foreach (array_values($options) as $option) {
+        if (!is_array($option)) {
+            continue;
+        }
+        $id = (string) ($option['id'] ?? '');
+        if ($id === '') {
+            $id = alegra_mock_uuid('b2b2b2b2');
+        }
+        $out[] = ['id' => $id, 'value' => (string) ($option['value'] ?? '')];
+    }
+    return $out;
+}
+
+/**
+ * Store (create/replace) a variant attribute, generating option ids as needed.
+ */
+function alegra_mock_store_variant_attribute(string $id, array $body): array
+{
+    $stored = [
+        'id' => $id,
+        'name' => (string) ($body['name'] ?? ''),
+        'status' => (string) ($body['status'] ?? 'active'),
+        'options' => alegra_mock_build_variant_options((array) ($body['options'] ?? [])),
+    ];
+    $GLOBALS['alegra_mock_state']['variant_attributes'][$id] = $stored;
+    return $stored;
+}
+
+/**
+ * Materialize the child `variant` items of a variantParent from its
+ * `itemVariants` entries, and return the parent with the children (ids) attached
+ * — mirroring the documented create response.
+ */
+function alegra_mock_materialize_variant_children(string $parent_id, array $parent): array
+{
+    $children = [];
+    foreach (array_values((array) ($parent['itemVariants'] ?? [])) as $entry) {
+        if (!is_array($entry)) {
+            continue;
+        }
+        $child_id = (string) ($entry['id'] ?? '');
+        if ($child_id === '') {
+            $child_id = alegra_mock_uuid('c3c3c3c3');
+        }
+        $variant_attributes = (array) ($entry['variantAttributes'] ?? []);
+        $child = [
+            'id' => $child_id,
+            'type' => 'variant',
+            'name' => (string) ($parent['name'] ?? '') . ' / ' . $child_id,
+            'status' => (string) ($entry['status'] ?? ($parent['status'] ?? 'active')),
+            'variantParent' => ['id' => $parent_id],
+            'variantAttributes' => $variant_attributes,
+        ];
+        if (!empty($entry['inventory'])) {
+            $child['inventory'] = $entry['inventory'];
+        }
+        $GLOBALS['alegra_mock_state']['items'][$child_id] = $child;
+        $children[] = ['id' => $child_id, 'variantAttributes' => $variant_attributes];
+    }
+    // A real create response may or may not inline the children; the plugin
+    // must recover them from GET /items?variantParent_id when it does not.
+    $parent['itemVariants'] = ($GLOBALS['alegra_mock_variant_children_in_response'] ?? true) ? $children : [];
+    return $parent;
 }
 
 function alegra_mock_filter_invoices(array $query): array

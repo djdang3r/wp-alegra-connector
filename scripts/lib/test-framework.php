@@ -211,6 +211,50 @@ function alegra_make_product(int $id, array $data = []): WC_Product_Simple
     return $product;
 }
 
+function alegra_make_variation(int $id, int $parent_id, array $data = []): WC_Product_Variation
+{
+    $data['parent_id'] = $parent_id;
+    $variation = new WC_Product_Variation($id, $data);
+    $GLOBALS['wc_products'][$id] = $variation;
+    return $variation;
+}
+
+/**
+ * Build a variable WC product with custom (non-taxonomy) variation attributes.
+ *
+ * @param array<string, array{name:string, options:string[]}> $attributes  e.g. ['color' => ['name' => 'Color', 'options' => ['Rojo','Verde']]]
+ * @param array<int, array> $variations  variation id => variation data (needs
+ *        `variation_attributes` like ['attribute_color' => 'Rojo']).
+ */
+function alegra_make_variable_product(int $id, array $attributes, array $variations, array $data = []): WC_Product_Simple
+{
+    $children = [];
+    foreach ($variations as $variation_id => $variation_data) {
+        alegra_make_variation((int) $variation_id, $id, $variation_data);
+        $children[] = (int) $variation_id;
+    }
+
+    $product_attributes = [];
+    $position = 0;
+    foreach ($attributes as $key => $definition) {
+        $product_attributes[$key] = [
+            'name' => (string) ($definition['name'] ?? $key),
+            'value' => implode(' | ', (array) ($definition['options'] ?? [])),
+            'position' => $position++,
+            'is_visible' => 1,
+            'is_variation' => 1,
+            'is_taxonomy' => 0,
+        ];
+    }
+
+    $data['type'] = 'variable';
+    $data['children'] = $children;
+    $product = alegra_make_product($id, $data);
+    update_post_meta($id, '_product_attributes', $product_attributes);
+
+    return $product;
+}
+
 function alegra_make_order(int $id, array $data = []): WC_Order
 {
     $order = new WC_Order($id, $data);

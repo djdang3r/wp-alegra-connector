@@ -2,15 +2,18 @@
 /**
  * Products Sync Handler
  *
- * Bidirectional sync for simple products and for the item import (including
- * variant parents read from Alegra).
+ * Bidirectional sync for simple and variable products plus the item import.
  *
- * PUSHING a variable product is a documented gap: Alegra requires
- * `type=variantParent` + `variantAttributes` (min 1) + optional `itemVariants`,
- * and the plugin does not build `variantAttributes` yet, so variable/variation
- * pushes are refused instead of sending a schema-invalid payload.
+ * PUSHING a variable product: Alegra models it as ONE `type=variantParent`
+ * item that carries `variantAttributes` (min 1) — an array of
+ * `{id, options:[{id}]}` referencing EXISTING Alegra variant attribute/option
+ * IDs — plus an optional `itemVariants` list. The child variations are separate
+ * `type=variant` items created by Alegra from `itemVariants`; the plugin never
+ * creates them standalone. The parent is not a `kit`: `subitems` is kit-only
+ * and `variant` is not in the WRITE enum (`product|service|kit|variantParent`).
  *
- * @see self::variable_product_gap_error()
+ * @see self::sync_variable_product()
+ * @see https://developer.alegra.com/reference/items__createitem.md
  */
 
 declare(strict_types=1);
@@ -26,6 +29,14 @@ if (!defined('ABSPATH')) {
 
 class Products
 {
+    /**
+     * Documented cap: a `variantParent` accepts at most 100 explicit
+     * `itemVariants` entries (and at most 100 cartesian combinations).
+     *
+     * @see https://developer.alegra.com/reference/items__createitem.md
+     */
+    private const MAX_ITEM_VARIANTS = 100;
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -39,6 +50,16 @@ class Products
     /** @var array<string,int> */
     private array $category_name_map = [];
     private bool $category_map_loaded = false;
+
+    /**
+     * Per-request cache of the Alegra variant-attribute catalog, keyed by a
+     * normalized name. Loaded once (paged GET /variant-attributes) and reused
+     * for every variation so a variable product push never hits the API once
+     * per variation.
+     *
+     * @var array{by_name:array<string,array>,list:array<int,array>}|null
+     */
+    private ?array $variant_attribute_index = null;
 
     public function __construct(?API\Client $api, ?Logger\Logger $logger)
     {
@@ -181,77 +202,696 @@ class Products
     }
 
     /**
-     * Documented gap: variable products cannot be pushed to Alegra yet.
+     * Sync a variable product (WC parent) to Alegra as ONE `variantParent`.
      *
-     * Alegra models a variable product as a single item with
-     * `type=variantParent` that carries `variantAttributes` (min 1) — an array
-     * of `{id, options:[{id}]}` referencing EXISTING Alegra variant attribute
-     * IDs and option IDs — plus an optional `itemVariants` list. It is NOT a
-     * `kit`: `subitems` only applies to `type=kit`, and `variant` is not in the
-     * WRITE enum (`product|service|variantParent|kit`) — `variant` is a
-     * READ-only value returned by GET /items for a child.
-     *
-     * This plugin does not build `variantAttributes`: it would first have to
-     * resolve (or create, via POST /variant-attributes) the Alegra variant
-     * attributes and their option IDs from the WooCommerce variation
-     * attributes. The previous push sent `variantParent` + `subitems` (a kit
-     * field) and created each child as a standalone `type=variant` item; both
-     * are schema-invalid and Alegra rejects them with a 400. Refusing loudly is
-     * correct: it stops the plugin from sending an invalid payload.
-     *
-     * Required change (not implemented here):
-     *  1. Resolve/create the Alegra variant attributes + option IDs from the
-     *     WooCommerce variation attributes (API\Client::get_variant_attributes,
-     *     create_variant_attribute).
-     *  2. Build `variantAttributes` on the parent and an `itemVariants` entry
-     *     per WC variation (its attribute combination + per-variation
-     *     `inventory.warehouses`).
-     *  3. Map the child variant IDs returned in the parent response back to the
-     *     WC variations; drop the standalone variation create.
-     *
-     * @see https://developer.alegra.com/reference/items__createitem.md
-     */
-    private function variable_product_gap_error(): \WP_Error
-    {
-        return new \WP_Error(
-            'variable_product_unsupported',
-            __(
-                'Los productos variables todavía no se pueden enviar a Alegra: la API exige type=variantParent con variantAttributes (que el plugin aún no construye) y no acepta subitems ni el tipo variant. El producto no se sincronizó.',
-                'alegra-connector'
-            )
-        );
-    }
-
-    /**
-     * Sync variable product.
-     *
-     * Documented gap: see variable_product_gap_error(). The parent cannot be
-     * emitted as a schema-valid `variantParent` until `variantAttributes` are
-     * built, so the push is refused rather than sent invalid.
+     * The parent carries `variantAttributes` (min 1) plus one `itemVariants`
+     * entry per WC variation. The child variations are created by Alegra from
+     * `itemVariants`; the plugin does NOT create them standalone (a `variant`
+     * is a READ-only type). After the write, the returned child ids are mapped
+     * back onto the WC variations.
      */
     private function sync_variable_product(\WC_Product $product): array|\WP_Error
     {
-        $this->logger->warning('Variable product push skipped: variantAttributes not built yet', [
-            'product_id' => $product->get_id(),
-        ]);
+        $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
 
-        return $this->variable_product_gap_error();
+        // Resolve an existing Alegra item by SKU before building (prevent dupes).
+        if ($alegra_id === '') {
+            $sku = $product->get_sku();
+            if (!empty($sku)) {
+                $items = $this->api->get_items(['reference' => $sku, 'limit' => 1]);
+                if (!is_wp_error($items) && !empty($items) && isset($items[0]['id'])) {
+                    $alegra_id = (string) $items[0]['id'];
+                    update_post_meta($product->get_id(), '_alegra_item_id', $alegra_id);
+                }
+            }
+        }
+
+        $is_create = ($alegra_id === '');
+        $built = $this->prepare_variable_product_data($product, $is_create);
+        if (is_wp_error($built)) {
+            return $built;
+        }
+        $data = $built['data'];
+        $selections = $built['selections'];
+
+        if ($is_create) {
+            // AC-16: the mapped "default status" only applies on creation.
+            $data['status'] = $this->field_mapping('default_status', 'active');
+            $result = $this->api->create_item($data);
+            if (is_wp_error($result)) {
+                return $result;
+            }
+            $parent_id = (string) ($result['id'] ?? '');
+            if ($parent_id === '') {
+                return new \WP_Error(
+                    'variable_product_no_id',
+                    __('Alegra no devolvió el id del producto variable creado.', 'alegra-connector')
+                );
+            }
+            update_post_meta($product->get_id(), '_alegra_item_id', $parent_id);
+            $this->logger->info('Variable product created in Alegra', [
+                'product_id' => $product->get_id(),
+                'alegra_id' => $parent_id,
+                'variants' => count($selections),
+            ]);
+        } else {
+            $result = $this->api->update_item($alegra_id, $data);
+            if (is_wp_error($result)) {
+                return $result;
+            }
+            $parent_id = $alegra_id;
+            $this->logger->info('Variable product updated in Alegra', [
+                'product_id' => $product->get_id(),
+                'alegra_id' => $parent_id,
+                'variants' => count($selections),
+            ]);
+        }
+
+        // Map the child variant ids back to the WC variations.
+        $this->map_variant_children($parent_id, $result, $selections);
+
+        if (get_option('alegra_connector_sync_images', true)) {
+            $this->sync_product_image($product, $parent_id);
+        }
+
+        return $result;
     }
 
     /**
      * Sync a single variation.
      *
-     * Documented gap: see variable_product_gap_error(). A child variation has
-     * no standalone WRITE type — it only exists as an `itemVariants` entry on
-     * its `variantParent` — so there is nothing schema-valid to POST yet.
+     * A variation only exists in Alegra as an `itemVariants` entry on its
+     * `variantParent`; syncing it means syncing the parent (which re-emits the
+     * whole `itemVariants` list).
      */
     private function sync_variation(\WC_Product $variation): array|\WP_Error
     {
-        $this->logger->warning('Variation push skipped: variantAttributes not built yet', [
-            'variation_id' => $variation->get_id(),
-        ]);
+        $parent_id = $variation->get_parent_id();
+        $parent = $parent_id > 0 ? wc_get_product($parent_id) : false;
+        if (!$parent || !$parent->is_type('variable')) {
+            return new \WP_Error(
+                'variation_without_parent',
+                __('La variación no tiene un producto variable padre en WooCommerce.', 'alegra-connector')
+            );
+        }
 
-        return $this->variable_product_gap_error();
+        return $this->sync_variable_product($parent);
+    }
+
+    /**
+     * Build the documented `variantParent` payload for a WC variable product.
+     *
+     * @return array{data:array,selections:array<int,string>}|\WP_Error
+     *         `selections` maps each WC variation id to its canonical attribute
+     *         signature (`attrId:optionId` sorted) used to match Alegra children.
+     */
+    private function prepare_variable_product_data(\WC_Product $product, bool $is_create): array|\WP_Error
+    {
+        $variation_ids = $product->get_children();
+        if (empty($variation_ids)) {
+            return new \WP_Error(
+                'variable_product_no_variations',
+                __('El producto variable no tiene variaciones; no se puede construir el variantParent.', 'alegra-connector')
+            );
+        }
+
+        $defs = $this->collect_variation_attribute_defs($product);
+        if (empty($defs)) {
+            return new \WP_Error(
+                'variable_product_no_attributes',
+                __('El producto variable no tiene atributos de variación configurados; Alegra exige variantAttributes.', 'alegra-connector')
+            );
+        }
+
+        // Resolve each variation's canonical option value per attribute.
+        $rows = [];
+        foreach ($variation_ids as $variation_id) {
+            $variation = wc_get_product((int) $variation_id);
+            if (!$variation) {
+                continue;
+            }
+            $selection = $this->variation_selection($variation);
+            $combo = [];
+            foreach ($defs as $key => $def) {
+                $raw = (string) ($selection[$key] ?? '');
+                if ($raw === '') {
+                    return new \WP_Error(
+                        'variable_product_attribute_missing',
+                        sprintf(
+                            /* translators: 1: variation id, 2: attribute label */
+                            __('La variación #%1$d no tiene valor para el atributo "%2$s"; no se puede mapear a Alegra.', 'alegra-connector'),
+                            (int) $variation_id,
+                            $def['name']
+                        )
+                    );
+                }
+                $norm = $this->normalize_variant_token($raw);
+                if (!isset($def['options'][$norm])) {
+                    return new \WP_Error(
+                        'variable_product_attribute_missing',
+                        sprintf(
+                            /* translators: 1: option value, 2: attribute label, 3: variation id */
+                            __('La opción "%1$s" del atributo "%2$s" (variación #%3$d) no se pudo resolver en Alegra.', 'alegra-connector'),
+                            $raw,
+                            $def['name'],
+                            (int) $variation_id
+                        )
+                    );
+                }
+                $combo[$key] = $def['options'][$norm];
+            }
+            $rows[] = ['variation' => $variation, 'combo' => $combo];
+        }
+
+        if (empty($rows)) {
+            return new \WP_Error(
+                'variable_product_no_variations',
+                __('No se pudieron cargar las variaciones del producto variable.', 'alegra-connector')
+            );
+        }
+        if (count($rows) > self::MAX_ITEM_VARIANTS) {
+            return new \WP_Error(
+                'variable_product_too_many_variants',
+                sprintf(
+                    /* translators: 1: variation count, 2: documented max */
+                    __('El producto tiene %1$d variaciones; Alegra acepta como máximo %2$d.', 'alegra-connector'),
+                    count($rows),
+                    self::MAX_ITEM_VARIANTS
+                )
+            );
+        }
+
+        // Resolve (or create) the Alegra attribute + option ids. Cached per request.
+        $resolved = [];
+        foreach ($defs as $key => $def) {
+            $resolved_attr = $this->resolve_variant_attribute($def['name'], $def['options']);
+            if (is_wp_error($resolved_attr)) {
+                return $resolved_attr;
+            }
+            $resolved[$key] = $resolved_attr;
+        }
+
+        // Parent `variantAttributes`: only the options actually used by a variation
+        // (so Alegra never auto-generates a variant we did not send).
+        $variant_attributes = [];
+        foreach ($defs as $key => $def) {
+            $used = [];
+            foreach ($rows as $row) {
+                $norm = $this->normalize_variant_token($row['combo'][$key]);
+                $option_id = (string) ($resolved[$key]['options'][$norm] ?? '');
+                if ($option_id !== '') {
+                    $used[$option_id] = ['id' => $option_id];
+                }
+            }
+            if (empty($used)) {
+                continue;
+            }
+            $variant_attributes[] = ['id' => $resolved[$key]['id'], 'options' => array_values($used)];
+        }
+        if (empty($variant_attributes)) {
+            return new \WP_Error(
+                'variable_product_no_attributes',
+                __('No se pudieron resolver los atributos de variación en Alegra.', 'alegra-connector')
+            );
+        }
+
+        $warehouse = $this->resolve_warehouse_id();
+
+        // One `itemVariants` entry per WC variation.
+        $item_variants = [];
+        $selections = [];
+        foreach ($rows as $row) {
+            $variation = $row['variation'];
+            $combo_attrs = [];
+            $signature_parts = [];
+            foreach ($defs as $key => $def) {
+                $norm = $this->normalize_variant_token($row['combo'][$key]);
+                $option_id = (string) ($resolved[$key]['options'][$norm] ?? '');
+                if ($option_id === '') {
+                    return new \WP_Error(
+                        'variable_product_attribute_missing',
+                        sprintf(
+                            /* translators: 1: option value, 2: attribute label */
+                            __('No se pudo resolver la opción "%1$s" del atributo "%2$s" en Alegra.', 'alegra-connector'),
+                            $row['combo'][$key],
+                            $def['name']
+                        )
+                    );
+                }
+                $combo_attrs[] = ['id' => $resolved[$key]['id'], 'options' => [['id' => $option_id]]];
+                $signature_parts[] = $resolved[$key]['id'] . ':' . $option_id;
+            }
+            sort($signature_parts, SORT_STRING);
+            $selections[$variation->get_id()] = implode('|', $signature_parts);
+
+            $entry = ['variantAttributes' => $combo_attrs];
+
+            // On update, an existing child is referenced by its id; a new one
+            // omits the id so Alegra creates it.
+            if (!$is_create) {
+                $existing = (string) get_post_meta($variation->get_id(), '_alegra_item_id', true);
+                if ($existing !== '') {
+                    $entry['id'] = $existing;
+                }
+            }
+
+            // Per-variation inventory: only for a variation that manages stock,
+            // only on create (R3: never re-send initialQuantity on update) and
+            // only when a target warehouse is configured — a variant's inventory
+            // is warehouse-only (no unit/unitCost/initialQuantity at its level).
+            if ($is_create && $variation->get_manage_stock() && $warehouse !== '') {
+                $entry['inventory'] = ['warehouses' => [[
+                    'id' => $warehouse,
+                    'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
+                ]]];
+            }
+
+            $item_variants[] = $entry;
+        }
+
+        $data = [
+            'name' => $product->get_name(),
+            'reference' => $product->get_sku(),
+            'description' => wp_strip_all_tags($product->get_description()),
+            'type' => 'variantParent',
+            // A variable product's own `_regular_price` is normally empty; use
+            // `get_price()`, which WC_Product_Variable resolves to the lowest
+            // variation price (the old builder used get_price() too).
+            'price' => [[
+                'idPriceList' => $this->price_list_id(),
+                'price' => (float) $product->get_price(),
+            ]],
+            'variantAttributes' => $variant_attributes,
+            'itemVariants' => $item_variants,
+        ];
+
+        $tax_id = $this->map_product_tax($product);
+        if ($tax_id !== '') {
+            $data['tax'] = [['id' => $tax_id]];
+        }
+
+        $alegra_cat_id = $this->resolve_alegra_category_id($product);
+        if ($alegra_cat_id !== '') {
+            $data['category'] = ['id' => $alegra_cat_id];
+        }
+
+        return ['data' => $data, 'selections' => $selections];
+    }
+
+    /**
+     * Variation attributes (keyed by their `_product_attributes` key) that the
+     * variations actually vary on. Read from the canonical `_product_attributes`
+     * meta (the same store the import path writes) so both directions agree.
+     *
+     * @return array<string, array{name:string, options:array<string,string>, is_taxonomy:bool}>
+     *         `options` maps a normalized token (value or slug) to its display value.
+     */
+    private function collect_variation_attribute_defs(\WC_Product $product): array
+    {
+        $raw = get_post_meta($product->get_id(), '_product_attributes', true);
+        if (!is_array($raw)) {
+            return [];
+        }
+
+        $defs = [];
+        foreach ($raw as $key => $def) {
+            if (!is_array($def) || empty($def['is_variation'])) {
+                continue;
+            }
+            $key = (string) $key;
+            $label = trim((string) ($def['name'] ?? ''));
+            if ($label === '') {
+                $label = $this->humanize_attribute_key($key);
+            }
+            $is_taxonomy = !empty($def['is_taxonomy']);
+
+            $options = [];
+            if ($is_taxonomy) {
+                $terms = get_the_terms($product->get_id(), $key);
+                if (is_array($terms)) {
+                    foreach ($terms as $term) {
+                        if (!is_object($term)) {
+                            continue;
+                        }
+                        $name = (string) ($term->name ?? '');
+                        if ($name === '') {
+                            continue;
+                        }
+                        $options[$this->normalize_variant_token($name)] = $name;
+                        $slug = (string) ($term->slug ?? '');
+                        if ($slug !== '') {
+                            $options[$this->normalize_variant_token($slug)] = $name;
+                        }
+                    }
+                }
+            } else {
+                foreach (explode('|', (string) ($def['value'] ?? '')) as $option) {
+                    $option = trim($option);
+                    if ($option !== '') {
+                        $options[$this->normalize_variant_token($option)] = $option;
+                    }
+                }
+            }
+
+            if (!empty($options)) {
+                $defs[$key] = ['name' => $label, 'options' => $options, 'is_taxonomy' => $is_taxonomy];
+            }
+        }
+
+        return $defs;
+    }
+
+    /**
+     * A variation's chosen value per attribute key, from `get_variation_attributes()`
+     * (`attribute_color` → `Rojo`). Empty ("any") values are dropped.
+     *
+     * @return array<string,string>
+     */
+    private function variation_selection(\WC_Product $variation): array
+    {
+        $selection = [];
+        foreach ($variation->get_variation_attributes() as $key => $value) {
+            $key = preg_replace('/^attribute_/', '', (string) $key) ?? '';
+            if ($key === '') {
+                continue;
+            }
+            $value = is_scalar($value) ? trim((string) $value) : '';
+            if ($value === '') {
+                continue;
+            }
+            $selection[$key] = $value;
+        }
+
+        return $selection;
+    }
+
+    /**
+     * The whole Alegra variant-attribute catalog, loaded once per request and
+     * indexed by a normalized name so a push never resolves per variation.
+     *
+     * @return array{by_name:array<string,array>,list:array<int,array>}|\WP_Error
+     */
+    private function alegra_variant_attribute_index(): array|\WP_Error
+    {
+        if ($this->variant_attribute_index !== null) {
+            return $this->variant_attribute_index;
+        }
+
+        $list = [];
+        $start = 0;
+        // limit max is 30 (documented); page defensively.
+        for ($page = 0; $page < 20; $page++) {
+            $batch = $this->api->get_variant_attributes(['start' => $start, 'limit' => 30]);
+            if (is_wp_error($batch)) {
+                return $batch;
+            }
+            if (empty($batch)) {
+                break;
+            }
+            foreach ($batch as $attribute) {
+                if (is_array($attribute) && isset($attribute['id'])) {
+                    $list[] = $attribute;
+                }
+            }
+            if (count($batch) < 30) {
+                break;
+            }
+            $start += 30;
+        }
+
+        $by_name = [];
+        foreach ($list as $attribute) {
+            $by_name[$this->normalize_variant_token((string) ($attribute['name'] ?? ''))] = $attribute;
+        }
+
+        $this->variant_attribute_index = ['by_name' => $by_name, 'list' => $list];
+
+        return $this->variant_attribute_index;
+    }
+
+    /**
+     * Resolve a WC variation attribute (by name, case/whitespace-insensitive)
+     * to an Alegra variant attribute, creating the attribute and/or its missing
+     * options when needed.
+     *
+     * @param array<string,string> $options normalized token → display value
+     * @return array{id:string, options:array<string,string>}|\WP_Error
+     */
+    private function resolve_variant_attribute(string $label, array $options): array|\WP_Error
+    {
+        $index = $this->alegra_variant_attribute_index();
+        if (is_wp_error($index)) {
+            return $index;
+        }
+
+        $norm_label = $this->normalize_variant_token($label);
+        $attribute = $index['by_name'][$norm_label] ?? null;
+
+        if ($attribute === null) {
+            $created = $this->api->create_variant_attribute([
+                'name' => $label,
+                'options' => array_map(
+                    static fn ($value): array => ['value' => (string) $value],
+                    array_values($options)
+                ),
+            ]);
+            if (is_wp_error($created)) {
+                return new \WP_Error(
+                    'variant_attribute_create_failed',
+                    sprintf(
+                        /* translators: 1: attribute label, 2: API error */
+                        __('No se pudo crear el atributo de variación "%1$s" en Alegra: %2$s', 'alegra-connector'),
+                        $label,
+                        $created->get_error_message()
+                    )
+                );
+            }
+            $attribute = $created;
+            $this->variant_attribute_index['by_name'][$norm_label] = $attribute;
+            $this->variant_attribute_index['list'][] = $attribute;
+        }
+
+        // Existing options, keyed by normalized value.
+        $existing = [];
+        foreach ((array) ($attribute['options'] ?? []) as $option) {
+            if (!is_array($option)) {
+                continue;
+            }
+            $existing[$this->normalize_variant_token((string) ($option['value'] ?? ''))] = (string) ($option['id'] ?? '');
+        }
+
+        // Add any missing options. PUT resends the full list: existing options
+        // keep their id, new ones carry only `value`
+        // (https://developer.alegra.com/reference/put_variant-attributes-id).
+        $missing = [];
+        foreach ($options as $norm => $value) {
+            if (!isset($existing[$norm]) || $existing[$norm] === '') {
+                $missing[$norm] = (string) $value;
+            }
+        }
+        if (!empty($missing)) {
+            $payload_options = [];
+            foreach ((array) ($attribute['options'] ?? []) as $option) {
+                if (is_array($option) && isset($option['id'])) {
+                    $payload_options[] = [
+                        'id' => (string) $option['id'],
+                        'value' => (string) ($option['value'] ?? ''),
+                    ];
+                }
+            }
+            foreach ($missing as $value) {
+                $payload_options[] = ['value' => $value];
+            }
+
+            $updated = $this->api->update_variant_attribute((string) $attribute['id'], [
+                'name' => (string) ($attribute['name'] ?? $label),
+                'options' => $payload_options,
+            ]);
+            if (is_wp_error($updated)) {
+                return new \WP_Error(
+                    'variant_attribute_update_failed',
+                    sprintf(
+                        /* translators: 1: attribute label, 2: API error */
+                        __('No se pudieron agregar opciones al atributo de variación "%1$s" en Alegra: %2$s', 'alegra-connector'),
+                        $label,
+                        $updated->get_error_message()
+                    )
+                );
+            }
+            $attribute = $updated;
+            $this->variant_attribute_index['by_name'][$norm_label] = $attribute;
+            foreach ($this->variant_attribute_index['list'] as $i => $row) {
+                if (is_array($row) && (string) ($row['id'] ?? '') === (string) ($attribute['id'] ?? '')) {
+                    $this->variant_attribute_index['list'][$i] = $attribute;
+                }
+            }
+        }
+
+        $attribute_id = (string) ($attribute['id'] ?? '');
+        if ($attribute_id === '') {
+            return new \WP_Error(
+                'variant_attribute_no_id',
+                sprintf(
+                    /* translators: %s: attribute label */
+                    __('Alegra no devolvió el id del atributo de variación "%s".', 'alegra-connector'),
+                    $label
+                )
+            );
+        }
+
+        $option_ids = [];
+        foreach ((array) ($attribute['options'] ?? []) as $option) {
+            if (!is_array($option)) {
+                continue;
+            }
+            $option_ids[$this->normalize_variant_token((string) ($option['value'] ?? ''))] = (string) ($option['id'] ?? '');
+        }
+
+        return ['id' => $attribute_id, 'options' => $option_ids];
+    }
+
+    /**
+     * Persist `_alegra_item_id` on each WC variation from the child variants
+     * returned by the create/update response, falling back to a documented
+     * `GET /items?variantParent_id={id}` when the response carries no children.
+     *
+     * @param array<int,string> $selections variation id → attribute signature
+     */
+    private function map_variant_children(string $parent_id, array $response, array $selections): void
+    {
+        $children = [];
+        if (!empty($response['itemVariants']) && is_array($response['itemVariants'])) {
+            $children = $response['itemVariants'];
+        }
+        if (empty($children)) {
+            $children = $this->fetch_variant_children($parent_id);
+        }
+        if (empty($children)) {
+            $this->logger->warning('Variable product: no child variants returned; only the parent was mapped', [
+                'alegra_id' => $parent_id,
+            ]);
+            return;
+        }
+
+        $mapped = 0;
+        foreach ($children as $child) {
+            if (!is_array($child)) {
+                continue;
+            }
+            $child_id = (string) ($child['id'] ?? '');
+            if ($child_id === '') {
+                continue;
+            }
+            $signature = $this->variant_signature((array) ($child['variantAttributes'] ?? []));
+            if ($signature === '') {
+                continue;
+            }
+            foreach ($selections as $variation_id => $selection_signature) {
+                if ($selection_signature === $signature) {
+                    update_post_meta((int) $variation_id, '_alegra_item_id', $child_id);
+                    \Alegra\Connector\Entity_Map::map('item', $child_id, 'product', (int) $variation_id);
+                    $mapped++;
+                    break;
+                }
+            }
+        }
+
+        if ($mapped < count($selections)) {
+            $this->logger->warning('Variable product: some variations could not be mapped to Alegra child ids', [
+                'alegra_id' => $parent_id,
+                'mapped' => $mapped,
+                'expected' => count($selections),
+            ]);
+        }
+    }
+
+    /**
+     * Child variants of a variantParent, via the documented `variantParent_id`
+     * filter (limit max 30, so page defensively).
+     *
+     * @return array<int,array>
+     */
+    private function fetch_variant_children(string $parent_id): array
+    {
+        $children = [];
+        $start = 0;
+        for ($page = 0; $page < 5; $page++) {
+            $batch = $this->api->get_items([
+                'variantParent_id' => $parent_id,
+                'start' => $start,
+                'limit' => 30,
+                'mode' => 'advanced',
+            ]);
+            if (is_wp_error($batch) || empty($batch)) {
+                break;
+            }
+            foreach ($batch as $child) {
+                if (is_array($child)) {
+                    $children[] = $child;
+                }
+            }
+            if (count($batch) < 30) {
+                break;
+            }
+            $start += 30;
+        }
+
+        return $children;
+    }
+
+    /**
+     * Canonical signature of an Alegra variant's attribute combination
+     * (`attrId:optionId` sorted). Must mirror the signatures built from the WC
+     * side in prepare_variable_product_data().
+     *
+     * @param array<int,array> $variant_attributes
+     */
+    private function variant_signature(array $variant_attributes): string
+    {
+        $parts = [];
+        foreach ($variant_attributes as $attribute) {
+            if (!is_array($attribute)) {
+                continue;
+            }
+            $attribute_id = (string) ($attribute['id'] ?? '');
+            if ($attribute_id === '') {
+                continue;
+            }
+            foreach ((array) ($attribute['options'] ?? []) as $option) {
+                $option_id = '';
+                if (is_array($option)) {
+                    $option_id = (string) ($option['id'] ?? '');
+                } elseif (is_scalar($option)) {
+                    $option_id = (string) $option;
+                }
+                if ($option_id !== '') {
+                    $parts[] = $attribute_id . ':' . $option_id;
+                }
+            }
+        }
+        sort($parts, SORT_STRING);
+
+        return implode('|', $parts);
+    }
+
+    /**
+     * Normalize a token (attribute name, option value or term slug) for
+     * case/whitespace-insensitive matching against Alegra.
+     */
+    private function normalize_variant_token(string $value): string
+    {
+        $value = trim($value);
+        $value = function_exists('mb_strtolower') ? mb_strtolower($value) : strtolower($value);
+        return preg_replace('/\s+/', ' ', $value) ?? $value;
+    }
+
+    /**
+     * Turn an attribute key (`pa_color`, `color`) into a readable label.
+     */
+    private function humanize_attribute_key(string $key): string
+    {
+        $key = preg_replace('/^pa_/', '', $key) ?? $key;
+        return ucwords(str_replace(['-', '_'], ' ', $key));
     }
 
     /**

@@ -1155,25 +1155,240 @@ TestRunner::test('T10.2 AC-45 an imported variation gets its attributes and SKU'
     );
 });
 
-// AC-44 + documented gap: Alegra models a variable product as a single
-// `variantParent` carrying `variantAttributes` (min 1) and optional
-// `itemVariants`. `subitems` is a kit-only field and `variant` is not in the
-// WRITE enum. Until the plugin builds `variantAttributes`, the push must be
-// REFUSED — never sent as a schema-invalid payload (the mock now 400s those).
-TestRunner::test('T10.3 AC-44 a variable product push is refused, never sent as variantParent/kit/variant', function (): void {
+// Alegra models a variable product as ONE `variantParent` carrying
+// `variantAttributes` (min 1) + one `itemVariants` entry per variation. Children
+// are separate `variant` items created BY Alegra; `subitems` is kit-only and
+// `variant` is not in the WRITE enum. The mock validates the payload, so a
+// regression to the old variantParent+subitems / standalone type=variant shape
+// fails here.
+echo "\nT14 — Variable product push (variantParent + variantAttributes + itemVariants)\n";
+
+TestRunner::test('T14.1 a variable product push creates a variantParent with variantAttributes + itemVariants', function (): void {
     alegra_test_reset();
-    alegra_make_product(20, ['name' => 'Var', 'sku' => 'VAR-S', 'type' => 'variation', 'regular_price' => '5']);
-    alegra_make_product(21, ['name' => 'Parent', 'sku' => 'PAR', 'type' => 'variable', 'regular_price' => '10', 'children' => [20]]);
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [
+            ['id' => 'opt-rojo', 'value' => 'Rojo'],
+            ['id' => 'opt-verde', 'value' => 'Verde'],
+        ],
+    ]);
+    alegra_make_variable_product(30, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo', 'Verde']],
+    ], [
+        31 => ['name' => 'Camiseta Rojo', 'sku' => 'CAM-R', 'regular_price' => '10', 'variation_attributes' => ['attribute_color' => 'Rojo'], 'manage_stock' => true, 'stock' => 3],
+        32 => ['name' => 'Camiseta Verde', 'sku' => 'CAM-V', 'regular_price' => '10', 'variation_attributes' => ['attribute_color' => 'Verde'], 'manage_stock' => true, 'stock' => 5],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+    update_option('alegra_connector_warehouse_enabled', true);
+    update_option('alegra_connector_warehouse_id', '3');
 
-    $result = make_products()->sync_to_alegra(wc_get_product(21));
+    $result = make_products()->sync_to_alegra(wc_get_product(30));
+    TestRunner::assertFalse(is_wp_error($result), 'push must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
 
-    TestRunner::assertTrue(is_wp_error($result), 'a variable product push must be refused (documented gap)');
-    TestRunner::assertSame('variable_product_unsupported', $result->get_error_code(), 'the refusal must carry the documented-gap code');
+    $req = alegra_mock_last_request('POST', '/items');
+    TestRunner::assertTrue($req !== null, 'POST /items must be sent');
+    $body = $req['body'] ?? [];
 
-    $item_writes = array_filter($GLOBALS['alegra_mock_requests'], static function ($r) {
-        return in_array($r['method'], ['POST', 'PUT'], true) && strpos($r['path'], '/items') === 0;
-    });
-    TestRunner::assertCount(0, $item_writes, 'no item write may be sent for a variable product');
+    TestRunner::assertSame('variantParent', $body['type'] ?? null, 'type must be the WRITE enum value variantParent');
+    TestRunner::assertArrayNotHasKey('subitems', $body, 'subitems is a kit-only field and must never be sent for a variantParent');
+    TestRunner::assertCount(1, $body['variantAttributes'] ?? [], 'exactly one variantAttributes entry');
+    TestRunner::assertSame('attr-color', $body['variantAttributes'][0]['id'] ?? null, 'the attribute must reference the EXISTING Alegra attribute id');
+    $option_ids = array_map(static fn ($o) => $o['id'] ?? null, $body['variantAttributes'][0]['options'] ?? []);
+    sort($option_ids);
+    TestRunner::assertSame(['opt-rojo', 'opt-verde'], $option_ids, 'the attribute options must reference EXISTING Alegra option ids');
+
+    TestRunner::assertCount(2, $body['itemVariants'] ?? [], 'one itemVariants entry per WC variation');
+    TestRunner::assertSame('3', $body['itemVariants'][0]['inventory']['warehouses'][0]['id'] ?? null, 'create sends the configured warehouse');
+    TestRunner::assertSame(3, $body['itemVariants'][0]['inventory']['warehouses'][0]['initialQuantity'] ?? null, 'create sends the per-variation initialQuantity');
+
+    // Child ids returned by the response are mapped back onto the variations.
+    TestRunner::assertTrue((string) get_post_meta(30, '_alegra_item_id', true) !== '', 'the parent must be mapped');
+    TestRunner::assertTrue((string) get_post_meta(31, '_alegra_item_id', true) !== '', 'variation 31 must be mapped to a child id');
+    TestRunner::assertTrue((string) get_post_meta(32, '_alegra_item_id', true) !== '', 'variation 32 must be mapped to a child id');
+    TestRunner::assertNotSame(
+        (string) get_post_meta(31, '_alegra_item_id', true),
+        (string) get_post_meta(32, '_alegra_item_id', true),
+        'each variation must map to a distinct child id'
+    );
+});
+
+TestRunner::test('T14.2 the attribute catalog is fetched once and existing attributes/options are not re-created', function (): void {
+    alegra_test_reset();
+    // Alegra stores "Color" (mixed case); WC uses "COLOR" — must match, not create.
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo'], ['id' => 'opt-verde', 'value' => 'Verde']],
+    ]);
+    alegra_mock_seed_variant_attribute('attr-size', [
+        'name' => 'Talla',
+        'options' => [['id' => 'opt-xs', 'value' => 'XS'], ['id' => 'opt-m', 'value' => 'M']],
+    ]);
+    alegra_make_variable_product(40, [
+        'color' => ['name' => 'COLOR', 'options' => ['Rojo', 'Verde']],
+        'size' => ['name' => 'Talla', 'options' => ['XS', 'M']],
+    ], [
+        41 => ['variation_attributes' => ['attribute_color' => 'Rojo', 'attribute_size' => 'XS'], 'regular_price' => '10'],
+        42 => ['variation_attributes' => ['attribute_color' => 'Verde', 'attribute_size' => 'M'], 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(40));
+    TestRunner::assertFalse(is_wp_error($result), 'push must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+
+    TestRunner::assertCount(1, alegra_mock_requests('GET', '/variant-attributes'), 'the catalog must be fetched exactly once, not per variation');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/variant-attributes'), 'an existing attribute (matched case-insensitively) must not be created');
+    TestRunner::assertCount(0, alegra_mock_requests('PUT', '/variant-attributes/attr-color'), 'an existing option must not trigger an update');
+});
+
+TestRunner::test('T14.3 a missing Alegra attribute is created once and referenced by the parent', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(50, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo', 'Verde']],
+    ], [
+        51 => ['variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10'],
+        52 => ['variation_attributes' => ['attribute_color' => 'Verde'], 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(50));
+    TestRunner::assertFalse(is_wp_error($result), 'push must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+
+    $creates = alegra_mock_requests('POST', '/variant-attributes');
+    TestRunner::assertCount(1, $creates, 'the missing attribute must be created exactly once');
+    TestRunner::assertSame('Color', $creates[0]['body']['name'] ?? null, 'the created attribute carries the WC label');
+    $created_options = array_map(static fn ($o) => $o['value'] ?? null, $creates[0]['body']['options'] ?? []);
+    TestRunner::assertSame(['Rojo', 'Verde'], $created_options, 'all options are created with the attribute');
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertTrue(!empty($body['variantAttributes'][0]['id']), 'the parent must reference the newly created attribute id');
+    TestRunner::assertNotSame('', (string) ($body['variantAttributes'][0]['options'][0]['id'] ?? ''), 'the parent must reference the newly created option ids');
+});
+
+TestRunner::test('T14.4 an uncreatable variation attribute fails the whole push before any item write', function (): void {
+    alegra_test_reset();
+    alegra_mock_fail('POST', '/variant-attributes', 400, ['code' => 31002, 'message' => 'boom']);
+    alegra_make_variable_product(60, [
+        'material' => ['name' => 'Material', 'options' => ['Algodón']],
+    ], [
+        61 => ['variation_attributes' => ['attribute_material' => 'Algodón'], 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(60));
+    TestRunner::assertTrue(is_wp_error($result), 'the push must fail when a variation attribute cannot be created');
+    TestRunner::assertSame('variant_attribute_create_failed', $result->get_error_code(), 'the failure must be explicit');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/items'), 'no parent may be created after an attribute failure');
+});
+
+TestRunner::test('T14.5 a variation with an unresolvable value fails with a descriptive error', function (): void {
+    alegra_test_reset();
+    // The parent declares only Rojo/Verde, but the variation uses Azul.
+    alegra_make_variable_product(65, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo', 'Verde']],
+    ], [
+        66 => ['variation_attributes' => ['attribute_color' => 'Azul'], 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(65));
+    TestRunner::assertTrue(is_wp_error($result), 'a variation whose value is not in the attribute must fail');
+    TestRunner::assertSame('variable_product_attribute_missing', $result->get_error_code(), 'the failure must be explicit');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/items'), 'nothing is written when a variation cannot be mapped');
+});
+
+TestRunner::test('T14.6 the update path sends a valid variantParent and never re-sends inventory', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo'], ['id' => 'opt-verde', 'value' => 'Verde']],
+    ]);
+    alegra_make_variable_product(70, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo', 'Verde']],
+    ], [
+        71 => ['variation_attributes' => ['attribute_color' => 'Rojo'], 'manage_stock' => true, 'stock' => 3, 'regular_price' => '10'],
+        72 => ['variation_attributes' => ['attribute_color' => 'Verde'], 'manage_stock' => true, 'stock' => 5, 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+    update_post_meta(70, '_alegra_item_id', 'parent-1');
+    update_post_meta(71, '_alegra_item_id', 'child-1');
+    update_post_meta(72, '_alegra_item_id', 'child-2');
+    update_option('alegra_connector_warehouse_enabled', true);
+    update_option('alegra_connector_warehouse_id', '3');
+
+    $result = make_products()->sync_to_alegra(wc_get_product(70));
+    TestRunner::assertFalse(is_wp_error($result), 'update must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+
+    $req = alegra_mock_last_request('PUT', '/items/parent-1');
+    TestRunner::assertTrue($req !== null, 'PUT /items/parent-1 must be sent');
+    $body = $req['body'] ?? [];
+    TestRunner::assertSame('variantParent', $body['type'] ?? null, 'update must keep type=variantParent');
+    TestRunner::assertArrayNotHasKey('subitems', $body, 'subitems must never be sent');
+    TestRunner::assertCount(2, $body['itemVariants'] ?? [], 'update re-emits every variation');
+    TestRunner::assertSame('child-1', $body['itemVariants'][0]['id'] ?? null, 'an existing variation is referenced by its Alegra child id');
+    TestRunner::assertArrayNotHasKey('inventory', $body['itemVariants'][0] ?? [], 'update must never re-send inventory (R3 hotfix)');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/items'), 'update must not create a second parent');
+});
+
+TestRunner::test('T14.7 a variable product with no variations fails cleanly', function (): void {
+    alegra_test_reset();
+    alegra_make_product(80, ['name' => 'Empty', 'sku' => 'EMPTY', 'type' => 'variable', 'regular_price' => '10', 'children' => []]);
+    update_post_meta(80, '_product_attributes', ['color' => ['name' => 'Color', 'value' => 'Rojo', 'is_variation' => 1, 'is_taxonomy' => 0]]);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(80));
+    TestRunner::assertTrue(is_wp_error($result), 'a variable product without variations must fail');
+    TestRunner::assertSame('variable_product_no_variations', $result->get_error_code(), 'the failure must be explicit');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/items'), 'nothing is created');
+});
+
+TestRunner::test('T14.8 more than 100 variations is refused before any write', function (): void {
+    alegra_test_reset();
+    $variations = [];
+    for ($i = 0; $i < 101; $i++) {
+        $variations[1000 + $i] = ['variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10'];
+    }
+    alegra_make_variable_product(85, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], $variations, ['name' => 'Big', 'sku' => 'BIG', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(85));
+    TestRunner::assertTrue(is_wp_error($result), 'more than 100 variations must be refused');
+    TestRunner::assertSame('variable_product_too_many_variants', $result->get_error_code(), 'the failure must be explicit');
+    TestRunner::assertCount(0, alegra_mock_requests('POST', '/items'), 'nothing is created');
+});
+
+TestRunner::test('T14.9 a non-inventariable variation gets no inventory block', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo'], ['id' => 'opt-verde', 'value' => 'Verde']],
+    ]);
+    alegra_make_variable_product(90, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo', 'Verde']],
+    ], [
+        91 => ['variation_attributes' => ['attribute_color' => 'Rojo'], 'manage_stock' => false, 'regular_price' => '10'],
+        92 => ['variation_attributes' => ['attribute_color' => 'Verde'], 'manage_stock' => true, 'stock' => 7, 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+    update_option('alegra_connector_warehouse_enabled', true);
+    update_option('alegra_connector_warehouse_id', '3');
+
+    $result = make_products()->sync_to_alegra(wc_get_product(90));
+    TestRunner::assertFalse(is_wp_error($result), 'push must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('inventory', $body['itemVariants'][0] ?? [], 'a non-inventariable variation must not carry inventory');
+    TestRunner::assertArrayHasKey('inventory', $body['itemVariants'][1] ?? [], 'an inventariable variation must carry inventory');
+});
+
+TestRunner::test('T14.10 child ids are recovered via GET /items?variantParent_id when the response omits them', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_variant_children_in_response'] = false;
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo']],
+    ]);
+    alegra_make_variable_product(95, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo']],
+    ], [
+        96 => ['variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10'],
+    ], ['name' => 'Camiseta', 'sku' => 'CAM', 'regular_price' => '10']);
+
+    $result = make_products()->sync_to_alegra(wc_get_product(95));
+    TestRunner::assertFalse(is_wp_error($result), 'push must not error: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+    TestRunner::assertTrue((string) get_post_meta(96, '_alegra_item_id', true) !== '', 'the variation must be mapped from the GET fallback');
+    TestRunner::assertTrue(count(alegra_mock_requests('GET', '/items')) > 0, 'the plugin must fall back to GET /items');
+    $GLOBALS['alegra_mock_variant_children_in_response'] = true;
 });
 
 TestRunner::test('T10.4 AC-64 the CSV export paginates past 500 rows', function (): void {
@@ -1547,28 +1762,38 @@ TestRunner::test('T-hotfix-3 update still sends name, price, tax, category and u
     TestRunner::assertArrayNotHasKey('inventory', $body, 'update must omit inventory entirely (R3): a partial {unit} is undocumented');
 });
 
-// Documented gap: a variation has no standalone WRITE type — it only exists as
-// an `itemVariants` entry on its `variantParent`. The old `type=variant` create
-// was schema-invalid (400). The push must be refused instead of sent.
-TestRunner::test('T-hotfix-4 variation push is refused, never sent as type=variant', function (): void {
+// A variation has no standalone WRITE type — it only exists as an `itemVariants`
+// entry on its `variantParent`. Pushing a variation must therefore sync the
+// PARENT as a variantParent, never create a standalone `type=variant` item.
+TestRunner::test('T-hotfix-4 a variation push syncs the parent as variantParent, never a standalone type=variant', function (): void {
     alegra_test_reset();
-    alegra_make_product(50, ['name' => 'Parent', 'sku' => 'PAR-1', 'type' => 'variable', 'regular_price' => '10']);
-    alegra_make_product(51, [
-        'name' => 'Parent - Rojo', 'sku' => 'VAR-CREATE', 'type' => 'variation',
-        'parent_id' => 50, 'regular_price' => '10', 'stock' => 4, 'manage_stock' => true,
-        'attributes' => ['color' => 'Rojo'],
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-rojo', 'value' => 'Rojo']],
     ]);
+    alegra_make_variable_product(50, [
+        'color' => ['name' => 'Color', 'options' => ['Rojo']],
+    ], [
+        51 => ['name' => 'Parent - Rojo', 'sku' => 'VAR-CREATE', 'variation_attributes' => ['attribute_color' => 'Rojo'], 'regular_price' => '10', 'stock' => 4, 'manage_stock' => true],
+    ], ['name' => 'Parent', 'sku' => 'PAR-1', 'regular_price' => '10']);
 
     $result = make_products()->sync_to_alegra(wc_get_product(51));
-    TestRunner::assertTrue(is_wp_error($result), 'a variation push must be refused (documented gap)');
-    TestRunner::assertSame('variable_product_unsupported', $result->get_error_code(), 'the refusal must carry the documented-gap code');
-    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'the invalid type=variant create must never be sent');
+    TestRunner::assertFalse(is_wp_error($result), 'a variation push must sync its parent: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+
+    $writes = array_values(array_filter($GLOBALS['alegra_mock_requests'], static function ($r) {
+        return in_array($r['method'], ['POST', 'PUT'], true) && strpos($r['path'], '/items') === 0;
+    }));
+    TestRunner::assertCount(1, $writes, 'exactly one item write (the parent variantParent)');
+    TestRunner::assertSame('variantParent', $writes[0]['body']['type'] ?? null, 'the write must be a variantParent');
+    foreach ($writes as $write) {
+        TestRunner::assertNotSame('variant', $write['body']['type'] ?? null, 'type=variant must never be sent on write');
+    }
 });
 
 // R3 regression guard: the exact UPDATE payload key set must never contain
 // `inventory`. This is the assertion that fails if anyone reintroduces either
 // the old partial `{unit}` or the R2 `initialQuantity` on update.
-TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple) and variations are refused', function (): void {
+TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple) and a variation update targets the parent', function (): void {
     alegra_test_reset();
     alegra_make_product(70, [
         'name' => 'R3 simple', 'sku' => 'R3-S', 'regular_price' => '15',
@@ -1580,16 +1805,24 @@ TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple) and va
     TestRunner::assertArrayNotHasKey('inventory', $simple, 'simple UPDATE must not carry inventory');
 
     alegra_test_reset();
-    alegra_make_product(80, ['name' => 'R3 parent', 'sku' => 'R3-P', 'type' => 'variable', 'regular_price' => '10']);
-    alegra_make_product(81, [
-        'name' => 'R3 parent - Verde', 'sku' => 'R3-V', 'type' => 'variation',
-        'parent_id' => 80, 'regular_price' => '10', 'stock' => 5, 'manage_stock' => true,
-        'attributes' => ['color' => 'Verde'],
+    alegra_mock_seed_variant_attribute('attr-color', [
+        'name' => 'Color',
+        'options' => [['id' => 'opt-verde', 'value' => 'Verde']],
     ]);
-    update_post_meta(81, '_alegra_item_id', 'item-r3-v');
+    alegra_make_variable_product(80, [
+        'color' => ['name' => 'Color', 'options' => ['Verde']],
+    ], [
+        81 => ['name' => 'R3 parent - Verde', 'sku' => 'R3-V', 'variation_attributes' => ['attribute_color' => 'Verde'], 'regular_price' => '10', 'stock' => 5, 'manage_stock' => true],
+    ], ['name' => 'R3 parent', 'sku' => 'R3-P', 'regular_price' => '10']);
+    update_post_meta(80, '_alegra_item_id', 'parent-r3');
+    update_post_meta(81, '_alegra_item_id', 'child-r3');
+
     $variation_result = make_products()->sync_to_alegra(wc_get_product(81));
-    TestRunner::assertTrue(is_wp_error($variation_result), 'a variation push must be refused (documented gap)');
-    TestRunner::assertSame(0, alegra_mock_count('PUT', '/items/item-r3-v'), 'a variation update must never be sent');
+    TestRunner::assertFalse(is_wp_error($variation_result), 'a variation update must sync its parent: ' . (is_wp_error($variation_result) ? $variation_result->get_error_message() : ''));
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/items/child-r3'), 'a variation update must never be sent to the child id');
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/items/parent-r3'), 'the variation update must target the parent');
+    $parent_body = alegra_mock_last_request('PUT', '/items/parent-r3')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('inventory', $parent_body['itemVariants'][0] ?? [], 'update must not re-send per-variant inventory');
 });
 
 exit(TestRunner::summary());

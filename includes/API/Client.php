@@ -628,6 +628,11 @@ class Client
         return $this->post('/variant-attributes', $data);
     }
 
+    public function update_variant_attribute(string $id, array $data): array|\WP_Error
+    {
+        return $this->put('/variant-attributes/' . $id, $data);
+    }
+
     // Tax CRUD
     public function get_tax(string $id): array|\WP_Error
     {

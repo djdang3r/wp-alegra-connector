@@ -839,10 +839,36 @@ existente** para cada cambio. Es el contrato que consumen las tareas del SDD.
   **Pendiente/UNVERIFIED:** `warehouses` es opcional en el REST (`post_items`)
   pero la tabla del tool MCP lo lista junto a `unit`/`unitCost` como requerido
   para `product`; se mantiene el envío condicional actual (solo con bodega
-  configurada). El flujo de producto **variable** sigue usando `subitems` con
-  `type=variantParent` (el campo `subitems` es de `kit`) y crea cada variación
-  con `type=variant`, que **no** está en el enum de escritura — es un problema
-  de diseño aparte, no cubierto por este fix.
+  configurada). El flujo de producto **variable** ya **no** usa `subitems` ni
+  crea variaciones `type=variant`: se implementó el modelo documentado (ver
+  abajo).
+- **Producto variable (IMPLEMENTADO 2026-09-17).** El push de un producto
+  variable crea UN item `type=variantParent` con `variantAttributes`
+  (`[{id, options:[{id}]}]`, mín 1) + `itemVariants` (máx 100), y NO crea las
+  variaciones por separado — Alegra las genera como items `variant` hijos.
+  (`https://developer.alegra.com/reference/items__createitem.md`.)
+  - Los `id` de `variantAttributes`/`itemVariants` son atributos/opciones
+    **existentes** en Alegra. Se resuelven por nombre normalizado (trim +
+    minúsculas + espacios) o se crean con `POST /variant-attributes`
+    (`{name, options:[{value}]}`); las opciones faltantes se agregan con
+    `PUT /variant-attributes/{id}`. El catálogo se cachea por request.
+    (`https://developer.alegra.com/reference/post_variant-attributes.md`,
+    `https://developer.alegra.com/reference/put_variant-attributes-id.md`.)
+  - `itemVariants` lleva la combinación (`variantAttributes`) y, **solo en
+    create** y si la variación gestiona stock y hay bodega configurada,
+    `inventory.warehouses:[{id, initialQuantity}]`. En update se omite el
+    inventario por completo (R3). No se envía `inventory` a nivel padre.
+  - Los hijos se mapean a las variaciones WC por firma `attrId:optionId` desde
+    la respuesta; si la respuesta no trae hijos, vía
+    `GET /items?variantParent_id={id}` (UNVERIFIED que el create siempre los
+    devuelva).
+  - Errores explícitos: `variant_attribute_create_failed`,
+    `variable_product_attribute_missing`, `variable_product_no_variations`,
+    `variable_product_too_many_variants`.
+  - Código: `Products::sync_variable_product()`,
+    `prepare_variable_product_data()`, `resolve_variant_attribute()`,
+    `map_variant_children()`; mock en `scripts/lib/alegra-mock.php`; tests
+    `exec-test.php` T14.1–T14.10.
 - **Cambio de diseño (R3):** el stock **no** se cambia vía `PUT /items`; el
   camino documentado es `POST /inventory-adjustments`
   (https://developer.alegra.com/reference/post_inventory-adjustments), con
