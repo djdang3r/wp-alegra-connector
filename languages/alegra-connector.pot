@@ -2,9 +2,9 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: Alegra Connector 2.3.6\n"
+"Project-Id-Version: Alegra Connector 2.3.7\n"
 "Report-Msgid-Bugs-To: https://github.com/djdang3r/wp-alegra-connector/issues\n"
-"POT-Creation-Date: 2026-09-17 17:05+0000\n"
+"POT-Creation-Date: 2026-09-17 17:58+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -26,11 +26,7 @@ msgstr ""
 msgid "%d clientes (%d sincronizados con Alegra)"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2256
-msgid "%d errores: %s"
-msgstr ""
-
-#: admin/Admin/Admin_Dashboard.php:2340
+#: admin/Admin/Admin_Dashboard.php:2440
 msgid "%d facturas creadas, %d errores."
 msgstr ""
 
@@ -62,15 +58,15 @@ msgstr ""
 msgid "%d variaciones (%d sinc.)"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2313
+#: admin/Admin/Admin_Dashboard.php:2413
 msgid "%d webhooks eliminados."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2254
-msgid "%d webhooks registrados."
+#: admin/Admin/Admin_Dashboard.php:2269
+msgid "%d webhooks registrados, %d ya existían, %d errores."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2425
+#: admin/Admin/Admin_Dashboard.php:2525
 msgid "%d/%d facturas — %d ok, %d errores"
 msgstr ""
 
@@ -303,7 +299,7 @@ msgid "Alegra: no se pudo sincronizar el pedido con Alegra (%s). Revisá la conf
 msgstr ""
 
 #: admin/Admin/Admin_Dashboard.php:1633
-#: admin/Admin/Admin_Dashboard.php:2925
+#: admin/Admin/Admin_Dashboard.php:3025
 msgid "Another sync is in progress. Please wait."
 msgstr ""
 
@@ -319,11 +315,11 @@ msgstr ""
 msgid "Archivo"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2999
+#: admin/Admin/Admin_Dashboard.php:3099
 msgid "Archivo CSV inválido."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2985
+#: admin/Admin/Admin_Dashboard.php:3085
 msgid "Archivo CSV no encontrado."
 msgstr ""
 
@@ -602,7 +598,7 @@ msgstr ""
 msgid "Conecta con Alegra para ver tus monedas configuradas. Estas son las monedas basicas."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2911
+#: admin/Admin/Admin_Dashboard.php:3011
 msgid "Conecta primero con Alegra."
 msgstr ""
 
@@ -837,7 +833,7 @@ msgstr ""
 msgid "Desconectado"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2504
+#: admin/Admin/Admin_Dashboard.php:2604
 msgid "Desconectado de Alegra. Procesos detenidos, configuracion preservada."
 msgstr ""
 
@@ -914,7 +910,7 @@ msgstr ""
 msgid "El archivo debe tener encabezados en la primera fila. Para productos: name, reference, price, description. Para clientes: name, email, phone. Las columnas deben coincidir exactamente."
 msgstr ""
 
-#: includes/Sync/Customers.php:585
+#: includes/Sync/Customers.php:615
 msgid "El cliente no está vinculado con Alegra"
 msgstr ""
 
@@ -1001,7 +997,7 @@ msgstr ""
 msgid "El precio regular de WooCommerce se asignara a esta lista de precios en Alegra. La lista \"General\" (ID 1) es la que se usa por defecto en facturas."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2604
+#: admin/Admin/Admin_Dashboard.php:2704
 msgid "El proceso se detendra en su siguiente verificacion."
 msgstr ""
 
@@ -1134,7 +1130,7 @@ msgstr ""
 #: admin/Admin/Admin_Dashboard.php:1891
 #: admin/Admin/Admin_Dashboard.php:1893
 #: admin/Admin/Admin_Dashboard.php:1959
-#: admin/Admin/Admin_Dashboard.php:2932
+#: admin/Admin/Admin_Dashboard.php:3032
 msgid "Error de Alegra: %s"
 msgstr ""
 
@@ -1162,7 +1158,8 @@ msgstr ""
 msgid "Errores y avisos de WordPress y PHP. Util para diagnosticar problemas del servidor."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2315
+#: admin/Admin/Admin_Dashboard.php:2275
+#: admin/Admin/Admin_Dashboard.php:2415
 msgid "Errores: %s"
 msgstr ""
 
@@ -1239,7 +1236,7 @@ msgstr ""
 msgid "Este mes"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2441
+#: admin/Admin/Admin_Dashboard.php:2541
 msgid "Este pedido no tiene factura en Alegra."
 msgstr ""
 
@@ -1368,11 +1365,11 @@ msgstr ""
 msgid "Frecuencia"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2868
+#: admin/Admin/Admin_Dashboard.php:2968
 msgid "Frecuencia de \"%s\" cambiada a %d minutos."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2846
+#: admin/Admin/Admin_Dashboard.php:2946
 msgid "Frecuencia invalida. Use 5, 15, 30 o 60."
 msgstr ""
 
@@ -1416,7 +1413,7 @@ msgstr ""
 msgid "Hook"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2724
+#: admin/Admin/Admin_Dashboard.php:2824
 msgid "Hook \"%s\" ejecutado. Revisa el Monitor en unos segundos para ver el progreso."
 msgstr ""
 
@@ -1424,10 +1421,10 @@ msgstr ""
 msgid "Hook ejecutado"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2701
-#: admin/Admin/Admin_Dashboard.php:2744
-#: admin/Admin/Admin_Dashboard.php:2797
-#: admin/Admin/Admin_Dashboard.php:2838
+#: admin/Admin/Admin_Dashboard.php:2801
+#: admin/Admin/Admin_Dashboard.php:2844
+#: admin/Admin/Admin_Dashboard.php:2897
+#: admin/Admin/Admin_Dashboard.php:2938
 msgid "Hook invalido."
 msgstr ""
 
@@ -1458,7 +1455,7 @@ msgstr ""
 
 #: admin/Admin/Admin_Dashboard.php:1946
 #: admin/Admin/Admin_Dashboard.php:2086
-#: admin/Admin/Admin_Dashboard.php:2598
+#: admin/Admin/Admin_Dashboard.php:2698
 msgid "ID invalido."
 msgstr ""
 
@@ -1498,7 +1495,7 @@ msgstr ""
 msgid "Importación completada: %d items"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2939
+#: admin/Admin/Admin_Dashboard.php:3039
 msgid "Importación completada: %d nuevos, %d actualizados."
 msgstr ""
 
@@ -1757,15 +1754,15 @@ msgstr ""
 msgid "Los webhooks permiten que Alegra notifique a WooCommerce instantaneamente cuando ocurre un cambio. Sin webhooks, la sincronizacion depende del cron periodico. Se recomienda activar ambos para maxima cobertura."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:3021
+#: admin/Admin/Admin_Dashboard.php:3121
 msgid "Línea %d: error al procesar la fila."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:3034
+#: admin/Admin/Admin_Dashboard.php:3134
 msgid "Línea %d: no se pudo importar el producto."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:3011
+#: admin/Admin/Admin_Dashboard.php:3111
 msgid "Línea %d: número de columnas no coincide con el encabezado."
 msgstr ""
 
@@ -1828,7 +1825,7 @@ msgstr ""
 msgid "Modo de prueba activo: el pago NO se registró en Alegra."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2308
+#: admin/Admin/Admin_Dashboard.php:2408
 msgid "Modo de prueba activo: no se eliminó ningún webhook en Alegra."
 msgstr ""
 
@@ -1931,11 +1928,11 @@ msgstr ""
 msgid "No encontrado en Alegra"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:3111
+#: admin/Admin/Admin_Dashboard.php:3211
 msgid "No hay imagenes de Alegra para limpiar."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2392
+#: admin/Admin/Admin_Dashboard.php:2492
 msgid "No hay pedidos pendientes"
 msgstr ""
 
@@ -2007,7 +2004,7 @@ msgstr ""
 msgid "No se pudieron resolver los atributos de variación en Alegra."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2990
+#: admin/Admin/Admin_Dashboard.php:3090
 msgid "No se pudo abrir el archivo."
 msgstr ""
 
@@ -2033,7 +2030,7 @@ msgstr ""
 msgid "No se pudo inicializar el manejador de pedidos."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2447
+#: admin/Admin/Admin_Dashboard.php:2547
 msgid "No se pudo obtener el PDF de Alegra."
 msgstr ""
 
@@ -2107,14 +2104,14 @@ msgstr ""
 #: admin/Admin/Admin_Dashboard.php:2112
 #: admin/Admin/Admin_Dashboard.php:2154
 #: admin/Admin/Admin_Dashboard.php:2197
-#: admin/Admin/Admin_Dashboard.php:2270
-#: admin/Admin/Admin_Dashboard.php:2324
-#: admin/Admin/Admin_Dashboard.php:2457
-#: admin/Admin/Admin_Dashboard.php:2516
-#: admin/Admin/Admin_Dashboard.php:2878
-#: admin/Admin/Admin_Dashboard.php:2905
-#: admin/Admin/Admin_Dashboard.php:3093
-#: admin/Admin/Admin_Dashboard.php:3213
+#: admin/Admin/Admin_Dashboard.php:2370
+#: admin/Admin/Admin_Dashboard.php:2424
+#: admin/Admin/Admin_Dashboard.php:2557
+#: admin/Admin/Admin_Dashboard.php:2616
+#: admin/Admin/Admin_Dashboard.php:2978
+#: admin/Admin/Admin_Dashboard.php:3005
+#: admin/Admin/Admin_Dashboard.php:3193
+#: admin/Admin/Admin_Dashboard.php:3313
 #: admin/Admin/Admin_Dashboard.php:737
 #: admin/Admin/Admin_Dashboard.php:753
 #: admin/Admin/Admin_Dashboard.php:787
@@ -2276,8 +2273,8 @@ msgstr ""
 msgid "Pedido WooCommerce #%d"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2435
-#: admin/Admin/Admin_Dashboard.php:2438
+#: admin/Admin/Admin_Dashboard.php:2535
+#: admin/Admin/Admin_Dashboard.php:2538
 msgid "Pedido invalido."
 msgstr ""
 
@@ -2388,7 +2385,7 @@ msgstr ""
 msgid "Plugin desconectado"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2652
+#: admin/Admin/Admin_Dashboard.php:2752
 msgid "Plugin reactivado. Las operaciones volveran a funcionar."
 msgstr ""
 
@@ -2507,7 +2504,7 @@ msgstr ""
 msgid "Productos inactivos"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2777
+#: admin/Admin/Admin_Dashboard.php:2877
 msgid "Proxima ejecucion de \"%s\" movida al siguiente ciclo."
 msgstr ""
 
@@ -2647,13 +2644,13 @@ msgstr ""
 msgid "Saltar la próxima ejecución"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:3192
+#: admin/Admin/Admin_Dashboard.php:3292
 msgid "Se elimino %d imagen duplicada."
 msgid_plural "Se eliminaron %d imagenes duplicadas."
 msgstr[0] ""
 msgstr[1] ""
 
-#: admin/Admin/Admin_Dashboard.php:3260
+#: admin/Admin/Admin_Dashboard.php:3360
 msgid "Se reindexo %d imagen. Las imagenes duplicadas seran detectadas automaticamente."
 msgid_plural "Se reindexaron %d imagenes. Las imagenes duplicadas seran detectadas automaticamente."
 msgstr[0] ""
@@ -2840,13 +2837,13 @@ msgstr ""
 msgid "Solo se aceptan archivos .csv con encoding UTF-8."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2709
-#: admin/Admin/Admin_Dashboard.php:2801
-#: admin/Admin/Admin_Dashboard.php:2842
+#: admin/Admin/Admin_Dashboard.php:2809
+#: admin/Admin/Admin_Dashboard.php:2901
+#: admin/Admin/Admin_Dashboard.php:2942
 msgid "Solo se permiten hooks de Alegra."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2751
+#: admin/Admin/Admin_Dashboard.php:2851
 msgid "Solo se puede saltar la sincronización periódica."
 msgstr ""
 
@@ -2946,7 +2943,7 @@ msgstr ""
 msgid "Timestamp"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2756
+#: admin/Admin/Admin_Dashboard.php:2856
 msgid "Timestamp invalido."
 msgstr ""
 
@@ -2961,7 +2958,7 @@ msgstr ""
 msgid "Tipo de entidad desconocido."
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2916
+#: admin/Admin/Admin_Dashboard.php:3016
 msgid "Tipo de importacion invalido."
 msgstr ""
 
@@ -2993,7 +2990,7 @@ msgstr ""
 msgid "Todas las imagenes (la favorita como principal, el resto en galeria)"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2819
+#: admin/Admin/Admin_Dashboard.php:2919
 msgid "Todas las programaciones de \"%s\" eliminadas."
 msgstr ""
 
@@ -3012,7 +3009,7 @@ msgstr ""
 msgid "Todos los niveles"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2632
+#: admin/Admin/Admin_Dashboard.php:2732
 msgid "Todos los procesos han sido detenidos. El plugin quedara desconectado."
 msgstr ""
 
@@ -3303,7 +3300,7 @@ msgstr ""
 msgid "Ya se emitió una nota de crédito para este pedido."
 msgstr ""
 
-#: includes/Webhooks/Handlers.php:200
+#: includes/Webhooks/Handlers.php:205
 msgid "[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente."
 msgstr ""
 
@@ -3402,7 +3399,7 @@ msgstr ""
 msgid "pedidos totales"
 msgstr ""
 
-#: admin/Admin/Admin_Dashboard.php:2244
+#: admin/Admin/Admin_Dashboard.php:2253
 msgid "respuesta sin id de suscripción"
 msgstr ""
 
