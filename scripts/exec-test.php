@@ -1425,9 +1425,15 @@ TestRunner::test('T12.7 sync_method gates the INBOUND cron: disabled skips the r
 });
 
 // ===========================================================================
-// T13 — R2 hotfix: initialQuantity only on CREATE, never on UPDATE
+// T13 — R2/R3 hotfix: the whole `inventory` object only on CREATE
+//
+// R2: never re-send `initialQuantity` on UPDATE (it reset current stock).
+// R3: never send a PARTIAL `inventory` on UPDATE either — the docs mark
+//     unit/unitCost/initialQuantity as obligatorios when the object is
+//     present, and `PUT /items/{id}` is a partial update ("solo enviar los
+//     campos que cambiarán"), so the safe payload omits `inventory` entirely.
 // ===========================================================================
-echo "\nT13 — R2 hotfix (initialQuantity on create only)\n";
+echo "\nT13 — R2/R3 hotfix (inventory on create only)\n";
 
 TestRunner::test('T-hotfix-1 create sends inventory.initialQuantity with the WC stock', function (): void {
     alegra_test_reset();
@@ -1460,7 +1466,7 @@ TestRunner::test('T-hotfix-2 update does NOT send inventory.initialQuantity', fu
     $req = alegra_mock_last_request('PUT', '/items/item-41');
     TestRunner::assertTrue($req !== null, 'PUT /items/item-41 must have been sent');
     $body = $req['body'] ?? [];
-    TestRunner::assertArrayNotHasKey('initialQuantity', $body['inventory'] ?? [], 'update must NOT send initialQuantity');
+    TestRunner::assertArrayNotHasKey('inventory', $body, 'update must NOT send an inventory object at all (R3)');
     TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'an update must not create a new item');
 });
 
@@ -1484,11 +1490,10 @@ TestRunner::test('T-hotfix-3 update still sends name, price, tax, category and u
     TestRunner::assertEquals(44.0, $body['price'][0]['price'] ?? null, 'price must survive the update');
     TestRunner::assertSame('tax-h3', $body['tax'][0]['id'] ?? null, 'tax must survive the update');
     TestRunner::assertSame('cat-h3', $body['category']['id'] ?? null, 'category must survive the update');
-    TestRunner::assertSame('unit', $body['inventory']['unit'] ?? null, 'inventory.unit must survive the update');
-    TestRunner::assertArrayNotHasKey('initialQuantity', $body['inventory'] ?? [], 'update must still omit initialQuantity');
+    TestRunner::assertArrayNotHasKey('inventory', $body, 'update must omit inventory entirely (R3): a partial {unit} is undocumented');
 });
 
-TestRunner::test('T-hotfix-4 variation create sends initialQuantity, variation update does not', function (): void {
+TestRunner::test('T-hotfix-4 variation create sends inventory, variation update omits it', function (): void {
     alegra_test_reset();
     alegra_make_product(50, ['name' => 'Parent', 'sku' => 'PAR-1', 'type' => 'variable', 'regular_price' => '10']);
     alegra_make_product(51, [
@@ -1518,8 +1523,34 @@ TestRunner::test('T-hotfix-4 variation create sends initialQuantity, variation u
     make_products()->sync_to_alegra(wc_get_product(61));
 
     $update_body = alegra_mock_last_request('PUT', '/items/item-var-61')['body'] ?? [];
-    TestRunner::assertArrayNotHasKey('initialQuantity', $update_body['inventory'] ?? [], 'variation update must NOT send initialQuantity');
-    TestRunner::assertSame('unit', $update_body['inventory']['unit'] ?? null, 'variation update must still send inventory.unit');
+    TestRunner::assertArrayNotHasKey('inventory', $update_body, 'variation update must omit inventory entirely (R3)');
+});
+
+// R3 regression guard: the exact UPDATE payload key set must never contain
+// `inventory`. This is the assertion that fails if anyone reintroduces either
+// the old partial `{unit}` or the R2 `initialQuantity` on update.
+TestRunner::test('T-hotfix-5 UPDATE payload has no inventory key (simple + variation)', function (): void {
+    alegra_test_reset();
+    alegra_make_product(70, [
+        'name' => 'R3 simple', 'sku' => 'R3-S', 'regular_price' => '15',
+        'stock' => 11, 'manage_stock' => true,
+    ]);
+    update_post_meta(70, '_alegra_item_id', 'item-r3-s');
+    make_products()->sync_to_alegra(wc_get_product(70));
+    $simple = alegra_mock_last_request('PUT', '/items/item-r3-s')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('inventory', $simple, 'simple UPDATE must not carry inventory');
+
+    alegra_test_reset();
+    alegra_make_product(80, ['name' => 'R3 parent', 'sku' => 'R3-P', 'type' => 'variable', 'regular_price' => '10']);
+    alegra_make_product(81, [
+        'name' => 'R3 parent - Verde', 'sku' => 'R3-V', 'type' => 'variation',
+        'parent_id' => 80, 'regular_price' => '10', 'stock' => 5, 'manage_stock' => true,
+        'attributes' => ['color' => 'Verde'],
+    ]);
+    update_post_meta(81, '_alegra_item_id', 'item-r3-v');
+    make_products()->sync_to_alegra(wc_get_product(81));
+    $variation = alegra_mock_last_request('PUT', '/items/item-r3-v')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('inventory', $variation, 'variation UPDATE must not carry inventory');
 });
 
 exit(TestRunner::summary());

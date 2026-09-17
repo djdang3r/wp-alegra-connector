@@ -300,17 +300,31 @@ class Products
                     'price' => (float) $product->get_regular_price(),
                 ],
             ],
-            'inventory' => [
-                'unit' => $this->field_mapping('default_unit', 'unit'),
-            ],
         ];
 
-        // R2 hotfix: `initialQuantity` is the quantity the item was CREATED
-        // with. It is the documented way to set the initial stock on create and
-        // must NEVER be re-sent on update, or every product edit would reset
-        // the current stock.
+        // R3 hotfix: send the WHOLE `inventory` object only on CREATE.
+        //
+        // CREATE is the documented place to set the initial stock
+        // (`inventory.unit` + `inventory.initialQuantity`).
+        //
+        // On UPDATE we omit `inventory` entirely:
+        //  - Alegra documents `unit`, `unitCost` and `initialQuantity` as
+        //    obligatorios *when the object is present*, so a partial
+        //    `{unit}` payload is undocumented (400 risk) and an absent
+        //    `initialQuantity` could be read as 0 (stock corruption).
+        //  - `PUT /items/{id}` is a partial update ("solo enviar los campos que
+        //    cambiarán") and `inventory` is not required, so omitting it leaves
+        //    the inventory untouched.
+        //  - Re-sending `initialQuantity` on update is the R2 corruption bug.
+        //
+        // Stock changes must go through `POST /inventory-adjustments` (the
+        // documented stock-movement endpoint), never through `PUT /items`.
+        // Wiring that path is out of scope for this hotfix.
         if ($is_create) {
-            $data['inventory']['initialQuantity'] = (int) ($product->get_stock_quantity() ?? 0);
+            $data['inventory'] = [
+                'unit' => $this->field_mapping('default_unit', 'unit'),
+                'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
+            ];
         }
 
         $this->apply_warehouse($data, $product, $is_create);
@@ -386,15 +400,15 @@ class Products
                     'price' => (float) $variation->get_regular_price(),
                 ],
             ],
-            'inventory' => [
-                'unit' => $this->field_mapping('default_unit', 'unit'),
-            ],
         ];
 
-        // R2 hotfix: see prepare_simple_product_data(). A variation's
-        // `initialQuantity` is only sent on create, never on update.
+        // R3 hotfix: see prepare_simple_product_data(). A variation's whole
+        // `inventory` object is only sent on create, never on update.
         if ($is_create) {
-            $data['inventory']['initialQuantity'] = (int) ($variation->get_stock_quantity() ?? 0);
+            $data['inventory'] = [
+                'unit' => $this->field_mapping('default_unit', 'unit'),
+                'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
+            ];
         }
 
         $this->apply_warehouse($data, $variation, $is_create);
@@ -471,11 +485,10 @@ class Products
             return;
         }
 
-        // R2 hotfix: a warehouse `initialQuantity` is still an initial
-        // quantity — it is only meaningful on create. On update we omit the
-        // whole `warehouses` array: the Alegra docs mark `initialQuantity` as
-        // obligatorio inside a warehouse object, so sending a partial object
-        // would be undocumented (and could reset the per-warehouse stock).
+        // R3 hotfix: a warehouse `initialQuantity` is still an initial
+        // quantity — it is only meaningful on create. On update the caller no
+        // longer builds an `inventory` object at all, so this is a no-op; the
+        // guard keeps the rule explicit if the builder ever changes.
         if (!$is_create) {
             return;
         }
