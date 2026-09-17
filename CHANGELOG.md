@@ -2,6 +2,40 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.4] - 2026-09-16
+
+### 🐛 Fixed
+
+- **FIX (crítico): the item payload used `type: 'simple'`, which is the READ
+  enum** — the WRITE enum is `product|service|variantParent|kit`. Every product
+  create/update sent an invalid type. Corrected to `product`.
+- **FIX (crítico): `inventory.unitCost` was missing** from the create payload
+  (documented as required when `inventory` is present). It is now sourced from
+  the WooCommerce cost-of-goods meta with a `0` fallback.
+- **FIX (crítico): the variable-product push never worked** — the parent omitted
+  the required `variantAttributes`, used the kit-only `subitems` field, and
+  children used the non-writable type `variant`. It now resolves the attributes,
+  builds `variantAttributes` + `itemVariants`, and maps the child IDs back to the
+  WooCommerce variations.
+- **FIX (crítico): `inventory.initialQuantity` was re-sent on every product
+  update.** It is documented as the quantity at creation, so re-sending it risked
+  resetting the stock on every edit. It is now sent only on create; updates omit
+  `inventory` entirely (the API is a partial update).
+
+### ✨ Added
+
+- **ADDED: the test mock now validates write payloads** against the documented
+  schema (enums + required fields) and returns a realistic 400. This is why the
+  invalid payloads above passed CI for so long — the mock accepted anything.
+
+### ✅ Upgrade Notes
+
+- **If you push products to Alegra, this release fixes payloads that Alegra
+  would have rejected.** Re-push any products that failed silently.
+- **Products with no cost-of-goods meta will be sent with `unitCost: 0`.**
+- **Variable products can now be pushed**; each WooCommerce variation maps to an
+  Alegra variant.
+
 ## [2.3.3] - 2026-09-16
 
 ### 🐛 Fixed
@@ -201,7 +235,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.3_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.4_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 
