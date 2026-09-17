@@ -45,8 +45,9 @@ class Receiver
         // Registration handshake. Alegra's docs (descripción-general) state that
         // when a subscription is created it POSTs an EMPTY body to the URL and
         // requires a 2XX within 5s, otherwise the subscription is never created.
-        // The old code answered 400 to that empty body, so registration could
-        // never succeed. Ack it: an empty body carries no subject to process.
+        // Ack it BEFORE any auth, replay bookkeeping or handler work: an empty
+        // body carries nothing to process and the handshake must stay side-effect
+        // free and fast.
         if (trim($body) === '') {
             return new \WP_REST_Response(['received' => true, 'handshake' => true], 200);
         }
@@ -56,17 +57,16 @@ class Receiver
         // url}), so the only credential available is a secret embedded in the
         // registered URL (?token=...). Reject any request that does not carry
         // the exact token.
+        //
+        // This is the ONLY non-2XX outcome. Alegra deletes a subscription after
+        // 10 consecutive non-2XX responses, so anything else (a malformed body,
+        // an unknown subject, a handler that throws) must be ACKed and logged —
+        // the periodic sync is the safety net.
         if (!$this->authorize($request)) {
             if ($this->logger) {
                 $this->logger->warning('Webhook rejected: missing or invalid token');
             }
             return new \WP_REST_Response(['error' => 'Unauthorized'], 401);
-        }
-
-        $payload = json_decode($body, true);
-
-        if (!is_array($payload) || !isset($payload['subject'])) {
-            return new \WP_REST_Response(['error' => 'Invalid payload'], 400);
         }
 
         // Optional HMAC. Alegra does NOT send X-Alegra-Signature, so this is
@@ -80,6 +80,17 @@ class Receiver
             return new \WP_REST_Response(['error' => 'Invalid signature'], 401);
         }
 
+        $payload = json_decode($body, true);
+
+        // A body we cannot parse, or one without a string subject, is ignored
+        // with a 2XX so it never counts toward the deletion limit.
+        if (!is_array($payload) || !isset($payload['subject']) || !is_string($payload['subject'])) {
+            if ($this->logger) {
+                $this->logger->warning('Webhook ignored: missing or invalid subject');
+            }
+            return new \WP_REST_Response(['received' => true, 'ignored' => true], 200);
+        }
+
         // Replay protection (AC-32). Alegra cannot sign, so a captured request
         // can be replayed; remember the body hash and ignore duplicates inside
         // the window. Ack with 200 (not 4xx) so Alegra stops retrying and does
@@ -87,7 +98,7 @@ class Receiver
         if ($this->is_replay($body)) {
             if ($this->logger) {
                 $this->logger->warning('Webhook replay ignored (duplicate body)', [
-                    'subject' => sanitize_text_field((string) $payload['subject']),
+                    'subject' => sanitize_text_field($payload['subject']),
                 ]);
             }
             return new \WP_REST_Response(['received' => true, 'duplicate' => true], 200);
@@ -97,10 +108,13 @@ class Receiver
         $data = $payload['message'] ?? [];
 
         // AC-77: `message` must be an array. A scalar body used to raise a
-        // TypeError inside process_event(string, array) that was caught and
-        // reported as a generic 500; reject it as a bad request instead.
+        // TypeError inside process_event(string, array); ack and ignore it
+        // instead of returning a 4xx.
         if (!is_array($data)) {
-            return new \WP_REST_Response(['error' => 'Invalid payload: message must be an object'], 400);
+            if ($this->logger) {
+                $this->logger->warning('Webhook ignored: message must be an object', ['event' => $event]);
+            }
+            return new \WP_REST_Response(['received' => true, 'ignored' => true], 200);
         }
 
         if ($this->logger) {
@@ -111,13 +125,15 @@ class Receiver
             $handlers = new Handlers($this->api, $this->logger);
             $handlers->process_event($event, $data);
         } catch (\Throwable $e) {
+            // ACK anyway: the failure is logged and the periodic sync reconciles.
+            // A 5xx would push the subscription toward automatic deletion.
             if ($this->logger) {
                 $this->logger->error('Webhook processing failed', [
                     'event' => $event,
                     'error' => $e->getMessage(),
                 ]);
             }
-            return new \WP_REST_Response(['error' => 'Processing failed'], 500);
+            return new \WP_REST_Response(['received' => true, 'processed' => false], 200);
         }
 
         return new \WP_REST_Response(['received' => true], 200);

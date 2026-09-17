@@ -3077,4 +3077,274 @@ TestRunner::test('T19.9 BUG 1 a forged "paid" invoice webhook cannot complete an
     TestRunner::assertSame('completed', wc_get_order(5000)->get_status(), 'a genuinely paid invoice must complete the order');
 });
 
+// ===========================================================================
+// T20 — Webhook receiver vs the DOCUMENTED payload shapes
+//   https://developer.alegra.com/docs/descripci%C3%B3n-general.md
+//   https://developer.alegra.com/reference/post_webhooks-subscriptions.md
+// ===========================================================================
+echo "\nT20 — Webhook receiver vs documented payloads\n";
+
+/**
+ * Run $fn with PHP warnings/notices collected instead of emitted. A non-empty
+ * return means the code raised a diagnostic (e.g. "Array to string conversion")
+ * that must fail the test: a real Alegra delivery must never warn.
+ *
+ * @return string[]
+ */
+function alegra_php_diagnostics(callable $fn): array
+{
+    $diags = [];
+    set_error_handler(static function (int $no, string $str, string $file, int $line) use (&$diags): bool {
+        $diags[] = $str . ' @ ' . $file . ':' . $line;
+        return true;
+    }, E_ALL & ~E_DEPRECATED);
+    try {
+        $fn();
+    } finally {
+        restore_error_handler();
+    }
+    return $diags;
+}
+
+/** The verbatim documented `new-item` payload (nulls included). */
+function alegra_documented_item_payload(): array
+{
+    return [
+        'subject' => 'new-item',
+        'message' => [
+            'item' => [
+                'id' => '865',
+                'name' => 'Un Ítem / S',
+                'description' => 'Descripción del Item',
+                'reference' => '423424134213',
+                'itemCategory' => ['id' => '19'],
+                'price' => [['id' => '123', 'price' => 1], ['id' => '124', 'price' => 2]],
+                'inventory' => [
+                    'unit' => 'unit',
+                    'availableQuantity' => 1,
+                    'unitCost' => 1,
+                    'initialQuantity' => 1,
+                    'warehouses' => [['id' => '10']],
+                ],
+                'category' => ['id' => '234'],
+                'tax' => [],
+                'status' => 'active',
+                'customFields' => [['id' => '6'], ['id' => '5'], ['id' => '1']],
+                'type' => 'variant',
+                'variantAttributes' => null,
+                'itemVariants' => null,
+                'subitems' => null,
+            ],
+        ],
+    ];
+}
+
+/** The verbatim documented `new-client` payload (object name, array type). */
+function alegra_documented_client_payload(): array
+{
+    return [
+        'subject' => 'new-client',
+        'message' => [
+            'client' => [
+                'id' => '774',
+                'name' => [
+                    'firstName' => 'Primer Nombre',
+                    'secondName' => 'Segundo Nombre',
+                    'lastName' => 'Primer Apellido',
+                    'secondLastName' => 'Segundo Apellido',
+                ],
+                'phonePrimary' => '+432432234',
+                'phoneSecondary' => '+534234523',
+                'mobile' => '+443242323123',
+                'email' => 'uncorreo@correo.com',
+                'type' => ['client', 'provider'],
+                'fax' => 'unFax',
+                'identification' => '3211233',
+                'address' => [
+                    'zipCode' => '050013',
+                    'department' => 'Antioquia',
+                    'country' => 'Colombia',
+                    'address' => 'Una Dirección',
+                    'city' => 'Abriaquí',
+                ],
+            ],
+        ],
+    ];
+}
+
+TestRunner::test('T20.1 the handshake (empty body) is 2XX, fast, token-free and side-effect free', function (): void {
+    alegra_test_reset();
+    // No token configured on purpose: the handshake must not depend on auth.
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $start = microtime(true);
+    $res = $receiver->handle(new WP_REST_Request(''));
+    $elapsed = microtime(true) - $start;
+
+    TestRunner::assertSame(200, $res->get_status(), 'the handshake must return 2XX');
+    TestRunner::assertTrue((bool) (($res->get_data())['handshake'] ?? false), 'the handshake must be flagged');
+    TestRunner::assertTrue($elapsed < 5.0, 'the handshake must return well inside the 5s budget');
+    TestRunner::assertSame([], $GLOBALS['wp_transients'], 'the handshake must not write a replay transient');
+    TestRunner::assertSame([], alegra_mock_requests(), 'the handshake must not call the Alegra API');
+});
+
+TestRunner::test('T20.2 the documented item payload (null variants) never warns and is acked', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    alegra_mock_seed_item('865', alegra_documented_item_payload()['message']['item']);
+
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $res = null;
+    $body = json_encode(alegra_documented_item_payload());
+    $diags = alegra_php_diagnostics(function () use ($receiver, $body, &$res): void {
+        $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    });
+
+    TestRunner::assertSame([], $diags, 'the documented item payload must not raise a PHP warning/notice');
+    TestRunner::assertSame(200, $res->get_status(), 'the item delivery must be acked with 2XX');
+    // The handler re-fetches by id (never trusts the unsigned body).
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items/865'), 'the item must be re-fetched from the API');
+});
+
+TestRunner::test('T20.3 a variantParent with null variantAttributes/itemVariants/subitems imports cleanly', function (): void {
+    alegra_test_reset();
+    $item = alegra_documented_item_payload()['message']['item'];
+    $item['id'] = 'vp-1';
+    $item['type'] = 'variantParent';
+    alegra_mock_seed_item('vp-1', $item);
+
+    $logger = make_logger();
+    $products = new \Alegra\Connector\Sync\Products(new Client($logger), $logger);
+
+    $result = null;
+    $diags = alegra_php_diagnostics(function () use ($products, &$result): void {
+        $result = $products->sync_single_item_by_alegra_id('vp-1');
+    });
+
+    TestRunner::assertSame([], $diags, 'null variant lists must not raise a PHP warning/notice');
+    TestRunner::assertTrue($result === true, 'the variantParent must import (there are no children to create)');
+});
+
+TestRunner::test('T20.4 the documented client payload (object name, array type) imports cleanly', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('774', alegra_documented_client_payload()['message']['client']);
+
+    $logger = make_logger();
+    $customers = new \Alegra\Connector\Sync\Customers(new Client($logger), $logger);
+
+    $result = null;
+    $diags = alegra_php_diagnostics(function () use ($customers, &$result): void {
+        $result = $customers->sync_single_contact_by_alegra_id('774');
+    });
+
+    TestRunner::assertSame([], $diags, 'the object `name` must not raise an array-to-string warning');
+    TestRunner::assertTrue($result === true, 'the documented contact must import');
+
+    $user = get_user_by('email', 'uncorreo@correo.com');
+    TestRunner::assertTrue($user !== false, 'a WC user must be created for the documented contact');
+    if ($user !== false) {
+        $first = (string) get_user_meta($user->ID, 'billing_first_name', true);
+        TestRunner::assertStringNotContains('Array', $first, 'the first name must not degrade to the literal "Array"');
+        TestRunner::assertSame('Primer', $first, 'the first name must come from name.firstName');
+    }
+});
+
+TestRunner::test('T20.5 a client name object with only `fullname` imports cleanly', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('775', [
+        'name' => ['fullname' => 'Solo Nombre Completo'],
+        'email' => 'full@example.com',
+        'type' => ['client'],
+    ]);
+
+    $logger = make_logger();
+    $customers = new \Alegra\Connector\Sync\Customers(new Client($logger), $logger);
+
+    $result = null;
+    $diags = alegra_php_diagnostics(function () use ($customers, &$result): void {
+        $result = $customers->sync_single_contact_by_alegra_id('775');
+    });
+
+    TestRunner::assertSame([], $diags, 'the fullname shape must not raise a PHP warning/notice');
+    TestRunner::assertTrue($result === true, 'the fullname contact must import');
+    $user = get_user_by('email', 'full@example.com');
+    TestRunner::assertTrue($user !== false, 'a WC user must be created');
+    if ($user !== false) {
+        TestRunner::assertSame('Solo', (string) get_user_meta($user->ID, 'billing_first_name', true), 'the first name must come from fullname');
+    }
+});
+
+TestRunner::test('T20.6 an unknown/unsupported subject is acked with 2XX', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $body = json_encode(['subject' => 'new-bill', 'message' => ['bill' => ['id' => 'b-1']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $res->get_status(), 'an unhandled subject must be acked, never rejected');
+});
+
+TestRunner::test('T20.7 a malformed body or scalar message is acked with 2XX (never counts toward deletion)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $notJson = $receiver->handle(new WP_REST_Request('not json', [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $notJson->get_status(), 'a non-JSON body must be acked');
+
+    $noSubject = $receiver->handle(new WP_REST_Request('{"foo":"bar"}', [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $noSubject->get_status(), 'a body without subject must be acked');
+
+    $arraySubject = $receiver->handle(new WP_REST_Request('{"subject":["x"],"message":[]}', [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $arraySubject->get_status(), 'an array subject must be acked');
+
+    $scalarMessage = $receiver->handle(new WP_REST_Request('{"subject":"new-item","message":"oops"}', [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $scalarMessage->get_status(), 'a scalar message must be acked');
+});
+
+TestRunner::test('T20.8 a handler exception is acked with 2XX, not a 5xx', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    // A null API makes the item handler throw (call on null). The receiver must
+    // swallow it and ack, so Alegra does not count a failure.
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(null, $logger);
+
+    $body = json_encode(['subject' => 'new-item', 'message' => ['item' => ['id' => '865']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $res->get_status(), 'a handler exception must be acked with 2XX');
+    TestRunner::assertFalse((bool) (($res->get_data())['processed'] ?? true), 'the response must flag the failed processing');
+});
+
+TestRunner::test('T20.9 a replayed delivery is acked with 2XX', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $body = json_encode(['subject' => 'new-bill', 'message' => ['bill' => ['id' => 'b-1']]]);
+    $first = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    $second = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+
+    TestRunner::assertSame(200, $first->get_status(), 'the first delivery must be acked');
+    TestRunner::assertSame(200, $second->get_status(), 'the replay must be acked so Alegra stops retrying');
+    TestRunner::assertTrue((bool) (($second->get_data())['duplicate'] ?? false), 'the replay must be flagged');
+});
+
+TestRunner::test('T20.10 an unauthorized delivery is the ONLY non-2XX (401)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    $body = json_encode(alegra_documented_item_payload());
+    $res = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(401, $res->get_status(), 'a delivery without the token must be 401');
+});
+
 exit(TestRunner::summary());

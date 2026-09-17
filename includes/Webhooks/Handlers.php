@@ -60,6 +60,7 @@ class Handlers
     private function handle_item_event(array $data): void
     {
         $item = $data['item'] ?? $data;
+        if (!is_array($item)) return;
         $alegra_id = (string) ($item['id'] ?? '');
         if ($alegra_id === '') return;
 
@@ -76,6 +77,7 @@ class Handlers
     private function handle_delete_item(array $data): void
     {
         $item = $data['item'] ?? $data;
+        if (!is_array($item)) return;
         $alegra_id = (string) ($item['id'] ?? '');
         if ($alegra_id === '') return;
 
@@ -114,6 +116,7 @@ class Handlers
     private function handle_client_event(array $data): void
     {
         $contact = $data['client'] ?? $data;
+        if (!is_array($contact)) return;
         $alegra_id = (string) ($contact['id'] ?? '');
         if ($alegra_id === '') return;
 
@@ -136,6 +139,7 @@ class Handlers
     private function handle_delete_client(array $data): void
     {
         $contact = $data['client'] ?? $data;
+        if (!is_array($contact)) return;
         $alegra_id = (string) ($contact['id'] ?? '');
         if ($alegra_id === '') return;
 
@@ -162,6 +166,7 @@ class Handlers
     private function handle_invoice_event(array $data): void
     {
         $invoice = $data['invoice'] ?? $data;
+        if (!is_array($invoice)) return;
         $alegra_invoice_id = (string) ($invoice['id'] ?? '');
         if ($alegra_invoice_id === '') return;
 

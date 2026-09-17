@@ -331,7 +331,7 @@ class Customers
         $email = $contact['email'] ?? '';
 
         if (empty($email)) {
-            $this->logger->info('Contact without email skipped (required for WooCommerce)', ['alegra_id' => $alegra_id, 'name' => $contact['name'] ?? '']);
+            $this->logger->info('Contact without email skipped (required for WooCommerce)', ['alegra_id' => $alegra_id, 'name' => $this->contact_display_name($contact)]);
             return 'skipped';
         }
 
@@ -364,7 +364,7 @@ class Customers
                 return 'updated';
             }
 
-        $name_parts = $this->parse_name($contact['name'] ?? '');
+        $name_parts = $this->parse_name($this->contact_display_name($contact));
 
         $user_id = wp_insert_user([
             'user_email' => $email,
@@ -522,18 +522,48 @@ class Customers
     }
 
     /**
-     * Resolve a display name from an Alegra contact (`name`, else nameObject).
+     * Resolve a display name from an Alegra contact.
+     *
+     * Alegra is inconsistent across surfaces: the webhook payload documents
+     * `name` as an OBJECT ({firstName, secondName, lastName, secondLastName}
+     * or {fullname}), the contacts API historically returned a flat string
+     * `name`, and Colombia uses `nameObject`. Accept every shape so a real
+     * delivery never triggers an "Array to string conversion" warning (or a
+     * TypeError from parse_name()).
      */
     private function contact_display_name(array $contact): string
     {
-        $name = trim((string) ($contact['name'] ?? ''));
-        if ($name !== '') {
-            return $name;
+        foreach (['name', 'nameObject'] as $key) {
+            $value = $contact[$key] ?? null;
+            if (is_string($value)) {
+                $value = trim($value);
+                if ($value !== '') {
+                    return $value;
+                }
+            } elseif (is_array($value)) {
+                $flat = $this->flatten_name_object($value);
+                if ($flat !== '') {
+                    return $flat;
+                }
+            }
         }
 
-        $obj = $contact['nameObject'] ?? null;
-        if (!is_array($obj)) {
-            return '';
+        return '';
+    }
+
+    /**
+     * Flatten an Alegra name object into a single string.
+     *
+     * Prefers `fullname` when present (docs: "puede contener solamente
+     * fullname"); otherwise joins the documented name parts.
+     *
+     * @param array<string, mixed> $obj
+     */
+    private function flatten_name_object(array $obj): string
+    {
+        $full = trim((string) ($obj['fullname'] ?? ''));
+        if ($full !== '') {
+            return $full;
         }
 
         $parts = array_filter([
