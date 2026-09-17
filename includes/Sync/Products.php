@@ -293,7 +293,11 @@ class Products
             'name' => $product->get_name(),
             'reference' => $product->get_sku(),
             'description' => wp_strip_all_tags($product->get_description()),
-            'type' => 'simple',
+            // The WRITE enum for `type` is product|service|variantParent|kit
+            // (POST/PUT /items). `simple` is only the READ representation:
+            // GET /items returns `simple` for a plain product, which is what
+            // originally caused this mismatch. A plain product is `product`.
+            'type' => 'product',
             'price' => [
                 [
                     'idPriceList' => $this->price_list_id(),
@@ -305,7 +309,7 @@ class Products
         // R3 hotfix: send the WHOLE `inventory` object only on CREATE.
         //
         // CREATE is the documented place to set the initial stock
-        // (`inventory.unit` + `inventory.initialQuantity`).
+        // (`inventory.unit` + `inventory.unitCost` + `inventory.initialQuantity`).
         //
         // On UPDATE we omit `inventory` entirely:
         //  - Alegra documents `unit`, `unitCost` and `initialQuantity` as
@@ -323,6 +327,12 @@ class Products
         if ($is_create) {
             $data['inventory'] = [
                 'unit' => $this->field_mapping('default_unit', 'unit'),
+                // The docs mark `unitCost` as obligatorio whenever `inventory`
+                // is present ("unit (obligatorio) ... unitCost (obligatorio)
+                // ... initialQuantity (obligatorio)"). Omitting it was the
+                // reason a create could be rejected. Falls back to 0 when the
+                // store has no cost source.
+                'unitCost' => $this->product_unit_cost($product),
                 'initialQuantity' => (int) ($product->get_stock_quantity() ?? 0),
             ];
         }
@@ -407,6 +417,7 @@ class Products
         if ($is_create) {
             $data['inventory'] = [
                 'unit' => $this->field_mapping('default_unit', 'unit'),
+                'unitCost' => $this->product_unit_cost($variation),
                 'initialQuantity' => (int) ($variation->get_stock_quantity() ?? 0),
             ];
         }
@@ -421,6 +432,27 @@ class Products
         }
 
         return $data;
+    }
+
+    /**
+     * Unit cost for the Alegra `inventory.unitCost` field.
+     *
+     * WooCommerce core has no cost field; the value comes from the Cost of
+     * Goods Sold extension (`_wc_cog_cost`) or a common `_cost` meta key. When
+     * neither is present we fall back to 0: the docs require the field to be
+     * present and numeric but do not require it to be > 0, so 0 is the safest
+     * documented-valid default.
+     */
+    private function product_unit_cost(\WC_Product $product): float
+    {
+        foreach (['_wc_cog_cost', '_cost'] as $key) {
+            $raw = get_post_meta($product->get_id(), $key, true);
+            if ($raw !== '' && $raw !== null && is_numeric($raw)) {
+                return (float) $raw;
+            }
+        }
+
+        return 0.0;
     }
 
     /**

@@ -214,6 +214,19 @@ con log; nunca propaga una excepción que corte el bucle del pull.
 > queda para Fase 5; este hotfix solo omite `inventory` en updates. Tests:
 > `exec-test.php` T-hotfix-2/3/4/5.
 
+> **NOTA FIX (2026-09-17) — enum de escritura + `unitCost`.** El `POST /items` de
+> creación enviaba `type='simple'` (enum de **lectura** de `GET /items`) cuando
+> el enum de **escritura** es `product|service|variantParent|kit`
+> (https://developer.alegra.com/reference/post_items,
+> https://developer.alegra.com/reference/items__createitem). Corregido a
+> `product` en `prepare_simple_product_data()`. Además se agregó
+> `inventory.unitCost` (obligatorio según la doc cuando `inventory` está
+> presente), tomado de `_wc_cog_cost`/`_cost` con fallback `0`. El mock no
+> validaba el schema, por eso el defecto era invisible. Tests: `exec-test.php`
+> T1.3/T1.4/T1.5, T-hotfix-1. El path de producto variable (`variantParent` +
+> `subitems`, variaciones `type=variant`) queda **fuera de alcance** y sigue
+> siendo un mismatch documental a resolver.
+
 ### 3.5 Facturación (modificar — A6)
 
 | Elemento | Ubicación | Cambio |

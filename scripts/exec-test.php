@@ -179,11 +179,54 @@ TestRunner::test('T1.3 POST /items body matches the documented item schema', fun
 
     TestRunner::assertSame('Schema Item', $body['name'] ?? null, 'name');
     TestRunner::assertSame('SKU-3', $body['reference'] ?? null, 'reference');
-    TestRunner::assertSame('simple', $body['type'] ?? null, 'type');
+    TestRunner::assertSame('product', $body['type'] ?? null, 'type must be the WRITE enum value `product`, not the READ value `simple`');
     TestRunner::assertSame(1, $body['price'][0]['idPriceList'] ?? null, 'price[0].idPriceList');
     TestRunner::assertEquals(50.0, $body['price'][0]['price'] ?? null, 'price[0].price');
     TestRunner::assertSame('unit', $body['inventory']['unit'] ?? null, 'inventory.unit');
+    TestRunner::assertArrayHasKey('unitCost', $body['inventory'] ?? [], 'inventory.unitCost is documented obligatorio');
+    TestRunner::assertTrue(is_numeric($body['inventory']['unitCost'] ?? null), 'inventory.unitCost must be numeric');
     TestRunner::assertArrayHasKey('initialQuantity', $body['inventory'] ?? [], 'inventory.initialQuantity');
+});
+
+// The documented WRITE enum for item `type` (POST/PUT /items) is
+// product|service|variantParent|kit. `simple` is only the READ value returned
+// by GET /items — sending it on create was the original bug. This test mirrors
+// the schema so a regression back to `simple` (or any non-write value) fails.
+TestRunner::test('T1.4 POST /items payload conforms to the documented write enum', function (): void {
+    alegra_test_reset();
+    alegra_make_product(13, ['name' => 'Enum Item', 'sku' => 'SKU-4', 'regular_price' => '10', 'tax_class' => '']);
+
+    make_products()->sync_to_alegra(wc_get_product(13));
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+
+    $write_enum = ['product', 'service', 'variantParent', 'kit'];
+    TestRunner::assertTrue(
+        in_array($body['type'] ?? null, $write_enum, true),
+        'type must be one of the documented write values (' . implode(', ', $write_enum) . '), got: ' . var_export($body['type'] ?? null, true)
+    );
+    TestRunner::assertNotSame('simple', $body['type'] ?? null, '`simple` is a READ-only enum value and must never be sent on create');
+
+    foreach (['unit', 'unitCost', 'initialQuantity'] as $field) {
+        TestRunner::assertArrayHasKey($field, $body['inventory'] ?? [], 'inventory.' . $field . ' is documented obligatorio');
+    }
+});
+
+TestRunner::test('T1.5 unitCost is sourced from cost meta and falls back to 0', function (): void {
+    alegra_test_reset();
+    alegra_make_product(14, ['name' => 'Costed', 'sku' => 'SKU-5', 'regular_price' => '80', 'tax_class' => '']);
+    update_post_meta(14, '_wc_cog_cost', '12.5');
+
+    make_products()->sync_to_alegra(wc_get_product(14));
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertEquals(12.5, $body['inventory']['unitCost'] ?? null, 'unitCost must come from _wc_cog_cost');
+
+    // No cost meta → documented-valid default 0 (the docs require the field to
+    // be present and numeric, not > 0).
+    alegra_test_reset();
+    alegra_make_product(15, ['name' => 'No cost', 'sku' => 'SKU-6', 'regular_price' => '5', 'tax_class' => '']);
+    make_products()->sync_to_alegra(wc_get_product(15));
+    $fallback = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertEquals(0.0, $fallback['inventory']['unitCost'] ?? null, 'unitCost must fall back to 0 when no cost meta exists');
 });
 
 // ===========================================================================
@@ -1450,6 +1493,8 @@ TestRunner::test('T-hotfix-1 create sends inventory.initialQuantity with the WC 
     $body = $req['body'] ?? [];
     TestRunner::assertArrayHasKey('initialQuantity', $body['inventory'] ?? [], 'create must send inventory.initialQuantity');
     TestRunner::assertSame(7, $body['inventory']['initialQuantity'] ?? null, 'create must send the WC stock as initialQuantity');
+    TestRunner::assertArrayHasKey('unitCost', $body['inventory'] ?? [], 'create must send inventory.unitCost (obligatorio)');
+    TestRunner::assertSame('product', $body['type'] ?? null, 'create must use the write enum value product');
 });
 
 TestRunner::test('T-hotfix-2 update does NOT send inventory.initialQuantity', function (): void {
@@ -1509,6 +1554,7 @@ TestRunner::test('T-hotfix-4 variation create sends inventory, variation update 
     TestRunner::assertSame('variant', $create_body['type'] ?? null, 'a variation create must be type=variant');
     TestRunner::assertArrayHasKey('initialQuantity', $create_body['inventory'] ?? [], 'variation create must send initialQuantity');
     TestRunner::assertSame(4, $create_body['inventory']['initialQuantity'] ?? null, 'variation create must send the WC stock');
+    TestRunner::assertArrayHasKey('unitCost', $create_body['inventory'] ?? [], 'variation create must send inventory.unitCost (obligatorio)');
 
     // --- UPDATE ---
     alegra_test_reset();

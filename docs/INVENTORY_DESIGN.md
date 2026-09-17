@@ -815,7 +815,34 @@ existente** para cada cambio. Es el contrato que consumen las tareas del SDD.
   *"Solo enviar los campos que cambiarán"*
   (https://developer.alegra.com/reference/items__updateitem) — e `inventory` no
   es obligatorio, por lo que omitirlo deja el inventario intacto. En creación se
-  sigue enviando `inventory: {unit, initialQuantity}` (y `warehouses` si aplica).
+  sigue enviando `inventory: {unit, unitCost, initialQuantity}` (y `warehouses`
+  si aplica).
+- **Fix WRITE enum + `unitCost` (2026-09-17) — el push de productos estaba
+  roto.** Dos defectos en el `POST /items` de creación:
+  1. `type` se enviaba como `simple`. Ese es el enum de **lectura** (`GET /items`
+     devuelve `simple` para un producto sencillo —
+     https://developer.alegra.com/reference/get_items); el enum de **escritura**
+     es `product | service | variantParent | kit`
+     (https://developer.alegra.com/reference/post_items y
+     https://developer.alegra.com/reference/items__createitem). Un producto
+     sencillo debe enviarse como `product`. Corregido en
+     `prepare_simple_product_data()` (create **y** update, que comparten el
+     builder).
+  2. `inventory.unitCost` estaba ausente. La doc lo marca *obligatorio* cuando
+     `inventory` está presente (`post_items.md`: "unit (obligatorio) ... unitCost
+     (obligatorio) ... initialQuantity (obligatorio)"). Corregido: se envía el
+     costo desde `_wc_cog_cost` / `_cost` y **0** como fallback (la doc exige que
+     el campo exista y sea numérico, no que sea > 0).
+  El mock de tests (`scripts/lib/alegra-mock.php`) aceptaba cualquier body con
+  200 y **no** validaba el enum, por lo que el defecto era invisible en la
+  suite. Tests de regresión: `exec-test.php` T1.3/T1.4/T1.5 y T-hotfix-1.
+  **Pendiente/UNVERIFIED:** `warehouses` es opcional en el REST (`post_items`)
+  pero la tabla del tool MCP lo lista junto a `unit`/`unitCost` como requerido
+  para `product`; se mantiene el envío condicional actual (solo con bodega
+  configurada). El flujo de producto **variable** sigue usando `subitems` con
+  `type=variantParent` (el campo `subitems` es de `kit`) y crea cada variación
+  con `type=variant`, que **no** está en el enum de escritura — es un problema
+  de diseño aparte, no cubierto por este fix.
 - **Cambio de diseño (R3):** el stock **no** se cambia vía `PUT /items`; el
   camino documentado es `POST /inventory-adjustments`
   (https://developer.alegra.com/reference/post_inventory-adjustments), con
