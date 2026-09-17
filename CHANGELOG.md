@@ -2,6 +2,113 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.6] - 2026-09-16
+
+> **⚠️ This is a large correctness release.** Four fix batches from a
+> functional-readiness analysis. The headline: **stock never landed in
+> WooCommerce** — the merchant's original report — because the plugin never set
+> `_manage_stock`, and the commercial product category was never assigned
+> because it was sent under Alegra's *accounting* category field. Both are fixed,
+> along with the customer import lock, order totals with shipping, and an
+> unauthenticated webhook endpoint.
+
+### 🐛 Fixed
+
+**Products**
+
+- **FIX (crítico): the item payload sent the commercial category under the wrong
+  field.** The push put the item-category id under `category`, which is Alegra's
+  **accounting** category, instead of `itemCategory` (the commercial one). The
+  commercial category was therefore never assigned, and the import read the
+  accounting category, creating WooCommerce categories named after accounts.
+  Both directions now use `itemCategory`.
+- **FIX (crítico): stock never appeared in WooCommerce — the root cause of the
+  original report.** The import wrote `_stock` without ever setting
+  `_manage_stock`, and WooCommerce ignores `_stock` unless stock management is
+  enabled; `_stock_status` was never set either. The plugin now enables stock
+  management and sets the status for inventoriable items (services are left
+  untouched; variable parents are forced to `_manage_stock=no`).
+- **FIX: the import overwrote stock without checking `inventory_source`.** A
+  store configured with WooCommerce as the inventory source still had its stock
+  overwritten by the Alegra import. The write is now gated on the configured
+  source.
+- **FIX: the dedicated inventory pull existed but had no caller.** It is now
+  wired to the cron and to a manual action, gated on `inventory_source`, and
+  honours the kill switch.
+
+**Customers**
+
+- **FIX (crítico): the customer import was completely broken by a double lock.**
+  Both the cron and the manual button could not proceed. Replaced with a
+  re-entrant lock.
+- **FIX (crítico): Consumidor Final was never created.** If the Alegra account
+  did not already have it, no customer without an identification could be
+  invoiced. It is now created automatically and idempotently.
+- **FIX (crítico): a Colombia contact needs `regime` + `kindOfPerson` when the
+  account has e-invoicing.** They were missing, so the contact create failed and
+  the plugin silently fell back to Consumidor Final. They are now always sent
+  (configurable under *Datos fiscales del contacto (Colombia)*), and a failure is
+  surfaced with the real reason in an order note instead of being swallowed.
+- **FIX: skipped contacts were counted as errors** by the import. They are no
+  longer reported as failures.
+- **FIX: users are now also deduplicated by identification**, not only by email.
+- **FIX: `conflict_resolution = alegra_wins` now actually pulls the name and
+  email** from Alegra instead of keeping the WooCommerce values.
+
+**Orders**
+
+- **FIX (crítico): a partial-refund credit note sent an item with no `id`**,
+  which the API requires, so the request returned a 400. The item id is now
+  included.
+- **FIX (crítico): shipping and fees were not mapped**, so an order with shipping
+  produced an invoice smaller than the order total. They are now mapped and the
+  invoice total equals the order total.
+- **FIX: taxes were silently dropped when no tax mapping was configured.** They
+  are now derived from the WooCommerce rate, idempotently.
+- **FIX: void sent `reason` instead of the documented `cause`.**
+- **FIX: a failed payment was swallowed.** It is now logged and added as an order
+  note.
+- **FIX: "Registrar pago" on a draft invoice failed.** The invoice is now opened
+  first, then the payment is registered.
+- **FIX: automatic-mode failures were invisible.** An order note now carries the
+  real reason.
+- **FIX: the `'0'` payment-account guard is now consistent** across paths.
+
+**Orchestration**
+
+- **FIX (seguridad): the webhook endpoint had no authentication.** Alegra cannot
+  sign its webhooks, so anyone could POST to the endpoint and trigger syncs or
+  complete orders. It now requires a shared secret in the URL, enforced with
+  `hash_equals`, and fails closed.
+- **FIX (crítico): webhooks were never created.** Alegra POSTs an empty body to
+  verify a new subscription URL and requires a 2XX response in under 5 seconds;
+  the plugin returned 400, so registration never completed. The verification
+  handshake is now acknowledged.
+- **FIX: webhook registration always reported 0** because it read the wrong
+  response shape. It now reads the nested subscription id.
+- **FIX: "Run now" permanently destroyed the recurring cron.**
+  `wp_clear_scheduled_hook` removed the recurrence and nothing rescheduled it.
+  Fixed, plus a self-heal on init.
+- **FIX: "Skip next" also killed the recurrence.** It now moves the run forward
+  and keeps the schedule.
+- **FIX: the wizard redirected after headers were sent.**
+- **FIX: the per-run "Stop" button was ineffective mid-import.** It now halts the
+  products, customers and categories loops.
+
+### ✅ Upgrade Notes
+
+- **Re-register the webhooks after updating.** Existing subscriptions point at
+  the old URL without the secret token and will be rejected by the new
+  authentication. Go to **Alegra Connector → Configuración → pestaña Avanzado →
+  sección "Sincronización en Tiempo Real (Webhooks)"** and click **"Registrar
+  webhooks en Alegra"**.
+- **Products with no `manage_stock` will now have stock management enabled** when
+  the inventory source is Alegra. This is the fix (without it WooCommerce ignores
+  the stock), but it means WooCommerce will start tracking stock for those
+  products.
+- **If the merchant uses taxes, the plugin may now create the corresponding taxes
+  in Alegra** (idempotently) when no tax mapping is configured.
+
 ## [2.3.5] - 2026-09-16
 
 ### 🐛 Fixed
@@ -261,7 +368,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.5_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.6_VERIFICATION.md` for the assumptions that still require a live API test.
 
 ---
 
