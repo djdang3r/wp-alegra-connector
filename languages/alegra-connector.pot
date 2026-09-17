@@ -2,9 +2,9 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: Alegra Connector 2.3.3\n"
+"Project-Id-Version: Alegra Connector 2.3.4\n"
 "Report-Msgid-Bugs-To: https://github.com/djdang3r/wp-alegra-connector/issues\n"
-"POT-Creation-Date: 2026-09-16 23:18+0000\n"
+"POT-Creation-Date: 2026-09-17 15:09+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -250,6 +250,14 @@ msgstr ""
 
 #: templates/admin-settings.php:252
 msgid "Alegra gana (recomendado)"
+msgstr ""
+
+#: includes/Sync/Products.php:736
+msgid "Alegra no devolvió el id del atributo de variación \"%s\"."
+msgstr ""
+
+#: includes/Sync/Products.php:248
+msgid "Alegra no devolvió el id del producto variable creado."
 msgstr ""
 
 #: includes/API/Client.php:120
@@ -525,7 +533,7 @@ msgid "Completado"
 msgstr ""
 
 #: includes/Sync/Customers.php:294
-#: includes/Sync/Products.php:736
+#: includes/Sync/Products.php:1361
 msgid "Completado: %d importados, %d actualizados"
 msgstr ""
 
@@ -950,6 +958,18 @@ msgstr ""
 
 #: admin/Admin/Admin_Dashboard.php:2464
 msgid "El proceso se detendra en su siguiente verificacion."
+msgstr ""
+
+#: includes/Sync/Products.php:377
+msgid "El producto tiene %1$d variaciones; Alegra acepta como máximo %2$d."
+msgstr ""
+
+#: includes/Sync/Products.php:322
+msgid "El producto variable no tiene atributos de variación configurados; Alegra exige variantAttributes."
+msgstr ""
+
+#: includes/Sync/Products.php:314
+msgid "El producto variable no tiene variaciones; no se puede construir el variantParent."
 msgstr ""
 
 #: templates/admin-settings.php:34
@@ -1571,8 +1591,20 @@ msgstr ""
 msgid "La más específica (recomendado)"
 msgstr ""
 
+#: includes/Sync/Products.php:354
+msgid "La opción \"%1$s\" del atributo \"%2$s\" (variación #%3$d) no se pudo resolver en Alegra."
+msgstr ""
+
 #: templates/admin-settings.php:106
 msgid "La primera"
+msgstr ""
+
+#: includes/Sync/Products.php:342
+msgid "La variación #%1$d no tiene valor para el atributo \"%2$s\"; no se puede mapear a Alegra."
+msgstr ""
+
+#: includes/Sync/Products.php:294
+msgid "La variación no tiene un producto variable padre en WooCommerce."
 msgstr ""
 
 #: templates/admin-settings.php:158
@@ -1886,6 +1918,18 @@ msgstr ""
 msgid "No se encontró el archivo CSV."
 msgstr ""
 
+#: includes/Sync/Products.php:715
+msgid "No se pudieron agregar opciones al atributo de variación \"%1$s\" en Alegra: %2$s"
+msgstr ""
+
+#: includes/Sync/Products.php:369
+msgid "No se pudieron cargar las variaciones del producto variable."
+msgstr ""
+
+#: includes/Sync/Products.php:414
+msgid "No se pudieron resolver los atributos de variación en Alegra."
+msgstr ""
+
 #: admin/Admin/Admin_Dashboard.php:2837
 msgid "No se pudo abrir el archivo."
 msgstr ""
@@ -1898,6 +1942,10 @@ msgstr ""
 
 #: admin/Admin/Admin_Dashboard.php:1419
 msgid "No se pudo contactar el servidor de Alegra."
+msgstr ""
+
+#: includes/Sync/Products.php:663
+msgid "No se pudo crear el atributo de variación \"%1$s\" en Alegra: %2$s"
 msgstr ""
 
 #: admin/Admin/Admin_Dashboard.php:2009
@@ -1918,6 +1966,10 @@ msgstr ""
 
 #: includes/Sync/Orders.php:481
 msgid "No se pudo resolver el cliente para la nota de crédito."
+msgstr ""
+
+#: includes/Sync/Products.php:435
+msgid "No se pudo resolver la opción \"%1$s\" del atributo \"%2$s\" en Alegra."
 msgstr ""
 
 #: includes/Sync/Orders.php:989
@@ -2292,7 +2344,7 @@ msgstr ""
 msgid "Procesando clientes... Página %d"
 msgstr ""
 
-#: includes/Sync/Products.php:675
+#: includes/Sync/Products.php:1300
 msgid "Procesando productos... Página %d"
 msgstr ""
 
@@ -2629,7 +2681,7 @@ msgstr ""
 msgid "Sincronizados"
 msgstr ""
 
-#: includes/Sync/Products.php:487
+#: includes/Sync/Products.php:1112
 msgid "Sincronizando inventario... Página %d"
 msgstr ""
 
