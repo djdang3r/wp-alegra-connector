@@ -212,7 +212,7 @@ class Customers
         return $result;
     }
 
-    public function import_from_alegra(int $page = 1, int $per_page = 30): array|\WP_Error
+    public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
@@ -249,6 +249,12 @@ class Customers
                     break;
                 }
 
+                // Per-run stop (Monitor "Detener").
+                if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                    $this->logger->info('Customers import stopped by user');
+                    break;
+                }
+
                 // AC-83: throttle the progress write (every 5th page) and use a
                 // TTL longer than a run so the admin UI never sees it expire
                 // mid-import.
@@ -278,6 +284,10 @@ class Customers
                 if (empty($alegra_contacts)) break;
 
                 foreach ($alegra_contacts as $contact) {
+                    if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                        $this->logger->info('Customers import stopped by user mid-page');
+                        break 2;
+                    }
                     $r = $this->import_single_contact($contact);
                     if ($r === true) $result['imported']++;
                     elseif ($r === 'updated') $result['updated']++;

@@ -87,7 +87,9 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_items_count');
     delete_option('alegra_connector_contacts_count');
     delete_option('alegra_connector_webhook_secret');
+    delete_option('alegra_connector_webhook_token');
     delete_option('alegra_connector_webhook_subscriptions');
+    delete_option('alegra_connector_cron_disabled');
     delete_option('alegra_connector_schema_version');
     delete_option('alegra_connector_uuid_columns_migrated');
     delete_option('alegra_connector_products_import_cursor');

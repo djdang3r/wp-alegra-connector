@@ -76,6 +76,7 @@ $GLOBALS['wp_actions']    = [];
 $GLOBALS['wp_filters']    = [];
 $GLOBALS['wp_did_action'] = [];
 $GLOBALS['alegra_db']     = [];
+$GLOBALS['wp_cron']       = [];
 
 /**
  * Race hook used by the concurrency test (T6).
@@ -387,6 +388,27 @@ function current_time($type = 'mysql', $gmt = 0)
 }
 function home_url($path = '') { return 'https://example.test' . $path; }
 function admin_url($path = '') { return 'https://example.test/wp-admin/' . $path; }
+function rest_url($path = '', $scheme = 'rest') { return 'https://example.test/wp-json/' . ltrim((string) $path, '/'); }
+function add_query_arg(...$args)
+{
+    if (is_array($args[0] ?? null)) {
+        $query = $args[0];
+        $url = (string) ($args[1] ?? '');
+    } else {
+        $query = [(string) ($args[0] ?? '') => $args[1] ?? ''];
+        $url = (string) ($args[2] ?? '');
+    }
+
+    $parts = parse_url($url) ?: [];
+    $existing = [];
+    if (!empty($parts['query'])) {
+        parse_str((string) $parts['query'], $existing);
+    }
+    $merged = array_merge($existing, $query);
+
+    $base = ($parts['scheme'] ?? 'https') . '://' . ($parts['host'] ?? 'example.test') . ($parts['path'] ?? '');
+    return $base . '?' . http_build_query($merged);
+}
 function wp_upload_dir() { return ['basedir' => sys_get_temp_dir() . '/alegra-exec-uploads', 'path' => sys_get_temp_dir() . '/alegra-exec-uploads']; }
 function wp_mkdir_p($dir) { return is_dir($dir) || @mkdir($dir, 0777, true); }
 function wp_create_nonce($action = -1) { return 'nonce'; }
@@ -446,12 +468,163 @@ function add_settings_section(...$args) { return; }
 function register_setting(...$args) { return; }
 function add_settings_field(...$args) { return; }
 function wp_cache_delete($key, $group = '') { return true; }
-function wp_clear_scheduled_hook($hook) { return true; }
-function wp_schedule_event($timestamp, $recurrence, $hook) { return true; }
-function wp_schedule_single_event($timestamp, $hook, $args = []) { return true; }
+
+// ---------------------------------------------------------------------------
+// Cron — a faithful in-memory model of WP's cron array
+//
+// Structure mirrors WP core:
+//   [ timestamp => [ hook => [ md5(serialize(args)) => {schedule, args, interval} ] ] ]
+//
+// This is what lets the suite prove that "Run now"/"skip" do not destroy the
+// recurrence and that the init self-heal restores a missing event.
+// ---------------------------------------------------------------------------
+
+function _get_cron_array()
+{
+    return $GLOBALS['wp_cron'] ?? [];
+}
+
+function _set_cron_array($cron)
+{
+    $GLOBALS['wp_cron'] = is_array($cron) ? $cron : [];
+    return true;
+}
+
+function wp_get_schedules()
+{
+    return [
+        'hourly' => ['interval' => HOUR_IN_SECONDS, 'display' => 'Once Hourly'],
+        'daily'  => ['interval' => DAY_IN_SECONDS, 'display' => 'Once Daily'],
+    ];
+}
+
+function wp_schedule_event($timestamp, $recurrence, $hook, $args = [], $wp_error = false)
+{
+    $timestamp = (int) $timestamp;
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+
+    if (isset($GLOBALS['wp_cron'][$timestamp][$hook][$key])) {
+        return false;
+    }
+
+    $GLOBALS['wp_cron'][$timestamp][$hook][$key] = [
+        'schedule' => $recurrence,
+        'args'     => $args,
+        'interval' => 0,
+    ];
+    return true;
+}
+
+function wp_schedule_single_event($timestamp, $hook, $args = [], $wp_error = false)
+{
+    $timestamp = (int) $timestamp;
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+
+    // WP refuses a duplicate within 10 minutes.
+    $existing = wp_next_scheduled($hook, $args);
+    if ($existing !== false && abs($existing - $timestamp) < 600) {
+        return false;
+    }
+
+    $GLOBALS['wp_cron'][$timestamp][$hook][$key] = [
+        'schedule' => false,
+        'args'     => $args,
+        'interval' => 0,
+    ];
+    return true;
+}
+
+function wp_next_scheduled($hook, $args = [])
+{
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+    $next = false;
+
+    foreach (($GLOBALS['wp_cron'] ?? []) as $timestamp => $hooks) {
+        if (!isset($hooks[$hook][$key])) {
+            continue;
+        }
+        if ($next === false || (int) $timestamp < $next) {
+            $next = (int) $timestamp;
+        }
+    }
+
+    return $next;
+}
+
+function wp_get_scheduled_event($hook, $args = [], $timestamp = null)
+{
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+
+    if ($timestamp !== null) {
+        $event = $GLOBALS['wp_cron'][(int) $timestamp][$hook][$key] ?? null;
+        return $event === null
+            ? false
+            : (object) array_merge(['hook' => $hook, 'timestamp' => (int) $timestamp], $event);
+    }
+
+    $next = wp_next_scheduled($hook, $args);
+    if ($next === false) {
+        return false;
+    }
+    $event = $GLOBALS['wp_cron'][$next][$hook][$key] ?? null;
+    return $event === null
+        ? false
+        : (object) array_merge(['hook' => $hook, 'timestamp' => $next], $event);
+}
+
+function wp_unschedule_event($timestamp, $hook, $args = [], $wp_error = false)
+{
+    $timestamp = (int) $timestamp;
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+
+    if (!isset($GLOBALS['wp_cron'][$timestamp][$hook][$key])) {
+        return false;
+    }
+
+    unset($GLOBALS['wp_cron'][$timestamp][$hook][$key]);
+    if (empty($GLOBALS['wp_cron'][$timestamp][$hook])) {
+        unset($GLOBALS['wp_cron'][$timestamp][$hook]);
+    }
+    if (empty($GLOBALS['wp_cron'][$timestamp])) {
+        unset($GLOBALS['wp_cron'][$timestamp]);
+    }
+    return true;
+}
+
+function wp_clear_scheduled_hook($hook, $args = [], $wp_error = false)
+{
+    $args = is_array($args) ? $args : [];
+    $key = md5(serialize($args));
+    $cleared = 0;
+
+    foreach (array_keys($GLOBALS['wp_cron'] ?? []) as $timestamp) {
+        if (isset($GLOBALS['wp_cron'][$timestamp][$hook][$key])) {
+            unset($GLOBALS['wp_cron'][$timestamp][$hook][$key]);
+            $cleared++;
+        }
+        if (isset($GLOBALS['wp_cron'][$timestamp][$hook]) && empty($GLOBALS['wp_cron'][$timestamp][$hook])) {
+            unset($GLOBALS['wp_cron'][$timestamp][$hook]);
+        }
+        if (isset($GLOBALS['wp_cron'][$timestamp]) && empty($GLOBALS['wp_cron'][$timestamp])) {
+            unset($GLOBALS['wp_cron'][$timestamp]);
+        }
+    }
+
+    return $cleared;
+}
+
+function wp_get_schedule($hook, $args = [])
+{
+    $event = wp_get_scheduled_event($hook, $args);
+    return $event ? ($event->schedule ?: false) : false;
+}
+
 function spawn_cron($gmt_time = 0) { return true; }
-function wp_next_scheduled($hook) { return false; }
-function _get_cron_array() { return []; }
 function wc_add_notice($message, $type = 'success') { return; }
 function wc_get_notices($type = '') { return []; }
 function wc_clear_notices() { return; }
@@ -738,13 +911,16 @@ class WP_REST_Request
     private string $body = '';
     /** @var array<string,string> */
     private array $headers = [];
+    /** @var array<string,mixed> Query-string params (e.g. ?token=...). */
+    private array $params = [];
 
-    public function __construct(string $body = '', array $headers = [])
+    public function __construct(string $body = '', array $headers = [], array $params = [])
     {
         $this->body = $body;
         foreach ($headers as $name => $value) {
             $this->headers[strtolower((string) $name)] = (string) $value;
         }
+        $this->params = $params;
     }
 
     public function get_body(): string
@@ -755,6 +931,27 @@ class WP_REST_Request
     public function get_header(string $name): string
     {
         return $this->headers[strtolower($name)] ?? '';
+    }
+
+    /**
+     * Real WP merges URL query params with parsed body params. The webhook
+     * token arrives in the query string, so model both.
+     */
+    public function get_param(string $key): mixed
+    {
+        if (array_key_exists($key, $this->params)) {
+            return $this->params[$key];
+        }
+        $decoded = json_decode($this->body, true);
+        if (is_array($decoded) && array_key_exists($key, $decoded)) {
+            return $decoded[$key];
+        }
+        return null;
+    }
+
+    public function get_query_params(): array
+    {
+        return $this->params;
     }
 }
 
@@ -1013,7 +1210,44 @@ function wc_get_product($product_id)
     $product_id = (int) $product_id;
     return $GLOBALS['wc_products'][$product_id] ?? false;
 }
-function wc_get_orders($args = []) { return $GLOBALS['wc_orders'] ?? []; }
+function wc_get_orders($args = [])
+{
+    $orders = array_values($GLOBALS['wc_orders'] ?? []);
+
+    if (!empty($args['meta_key'])) {
+        $mk = (string) $args['meta_key'];
+        $mv = array_key_exists('meta_value', $args) ? (string) $args['meta_value'] : null;
+        $orders = array_values(array_filter($orders, static function ($o) use ($mk, $mv) {
+            if (!method_exists($o, 'get_meta')) { return false; }
+            $val = $o->get_meta($mk, true);
+            if ($val === '' || $val === null) { return false; }
+            return $mv === null ? true : (string) $val === $mv;
+        }));
+    }
+
+    if (!empty($args['status'])) {
+        $statuses = array_map('strval', (array) $args['status']);
+        $orders = array_values(array_filter($orders, static function ($o) use ($statuses) {
+            return in_array((string) $o->get_status(), $statuses, true);
+        }));
+    }
+
+    if (!empty($args['customer_id'])) {
+        $cid = (int) $args['customer_id'];
+        $orders = array_values(array_filter($orders, static fn ($o) => (int) $o->get_customer_id() === $cid));
+    }
+
+    if (!empty($args['limit'])) {
+        $offset = (int) ($args['offset'] ?? 0);
+        $orders = array_slice($orders, $offset, (int) $args['limit']);
+    }
+
+    if (($args['return'] ?? '') === 'ids') {
+        return array_map(static fn ($o) => $o->get_id(), $orders);
+    }
+
+    return $orders;
+}
 function wc_get_products($args = [])
 {
     $products = array_values($GLOBALS['wc_products'] ?? []);

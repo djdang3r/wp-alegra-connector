@@ -4,16 +4,11 @@ if (!defined('ABSPATH')) exit;
 // Track wizard state per user
 $user_id = get_current_user_id();
 $wizard_step = (int) get_user_meta($user_id, 'alegra_wizard_step', true);
-$wizard_done = (bool) get_user_meta($user_id, 'alegra_wizard_done', true);
 
-$is_connected = (bool) get_option('alegra_connector_connection_tested');
-
-// Skip wizard if already done or user is already connected (basic connection is set)
-if ($wizard_done || $is_connected) {
-    // Redirect to dashboard
-    wp_safe_redirect(admin_url('admin.php?page=alegra-connector'));
-    exit;
-}
+// The "already done / already connected" redirect lives on admin_init
+// (Admin_Dashboard::maybe_redirect_wizard) because by the time this template
+// renders, wp-admin has already sent the document and a redirect here would
+// trigger "headers already sent".
 
 $page_title = __('Asistente de Configuración', 'alegra-connector');
 $page_subtitle = __('Configura el plugin paso a paso', 'alegra-connector');

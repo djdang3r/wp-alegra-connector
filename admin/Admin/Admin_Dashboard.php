@@ -30,6 +30,7 @@ class Admin_Dashboard
 
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
+        add_action('admin_init', [$this, 'maybe_redirect_wizard']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_assets']);
 
         add_action('wp_ajax_alegra_test_connection', [$this, 'ajax_test_connection']);
@@ -752,6 +753,32 @@ class Admin_Dashboard
             wp_die(esc_html__('No tienes permisos.', 'alegra-connector'));
         }
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-monitor.php';
+    }
+
+    /**
+     * Redirect the wizard page before any output when it is no longer needed.
+     *
+     * The template used to call wp_safe_redirect() from inside the page
+     * callback, which runs AFTER wp-admin/admin-header.php has already sent the
+     * document — producing "headers already sent" and a broken redirect. Doing
+     * it on admin_init (before output) fixes both.
+     */
+    public function maybe_redirect_wizard(): void
+    {
+        $page = isset($_GET['page']) ? sanitize_key(wp_unslash((string) $_GET['page'])) : '';
+        if ($page !== 'alegra-connector-wizard') {
+            return;
+        }
+        if (!current_user_can('manage_woocommerce')) {
+            return;
+        }
+
+        $wizard_done = (bool) get_user_meta(get_current_user_id(), 'alegra_wizard_done', true);
+        $is_connected = (bool) get_option('alegra_connector_connection_tested');
+        if ($wizard_done || $is_connected) {
+            wp_safe_redirect(admin_url('admin.php?page=alegra-connector'));
+            exit;
+        }
     }
 
     public function render_wizard_page(): void
@@ -2181,7 +2208,10 @@ class Admin_Dashboard
 
         update_option('alegra_connector_webhook_secret', $secret);
 
-        $webhook_url = rest_url('alegra-connector/v1/webhook');
+        // Embed the shared secret in the URL: Alegra cannot sign deliveries, so
+        // this is the only credential that can authenticate a delivery. The
+        // Receiver enforces it with hash_equals().
+        $webhook_url = \Alegra\Connector\Webhooks\Receiver::registration_url();
         $events = API\Client::get_webhook_events();
         $created = [];
         $errors = [];
@@ -2190,8 +2220,28 @@ class Admin_Dashboard
             $result = $this->api->create_webhook_subscription($event, $webhook_url);
             if (is_wp_error($result)) {
                 $errors[] = $event . ': ' . $result->get_error_message();
-            } elseif (isset($result['id'])) {
-                $created[] = ['id' => $result['id'], 'event' => $event];
+                continue;
+            }
+
+            // Documented 200 shape (post_webhooks-subscriptions): the id is
+            // nested at {message, subscription:{id,event,url}}. The old code
+            // read $result['id'], so every success was counted as a failure.
+            // Tolerate the flat shape too in case the API ever inlines it.
+            $subscription = is_array($result) ? ($result['subscription'] ?? null) : null;
+            $id = '';
+            if (is_array($subscription) && !empty($subscription['id'])) {
+                $id = (string) $subscription['id'];
+            } elseif (is_array($result) && !empty($result['id'])) {
+                $id = (string) $result['id'];
+            }
+
+            if ($id !== '') {
+                $created[] = [
+                    'id' => $id,
+                    'event' => (string) ($subscription['event'] ?? $event),
+                ];
+            } else {
+                $errors[] = $event . ': ' . __('respuesta sin id de suscripción', 'alegra-connector');
             }
         }
 
@@ -2659,10 +2709,12 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Solo se permiten hooks de Alegra.', 'alegra-connector')]);
         }
 
-        // Schedule a ONE-OFF event at the current timestamp, then trigger WP's
-        // cron spawn so the next request executes it.
-        wp_clear_scheduled_hook($hook);
-        wp_schedule_single_event(time(), $hook);
+        // Queue a ONE-OFF under a DEDICATED hook, then trigger WP's cron spawn
+        // so the next request executes it. This never touches the recurring
+        // event (the old wp_clear_scheduled_hook() removed it permanently), and
+        // it dodges WP's 10-minute duplicate suppression that would otherwise
+        // swallow a single event scheduled under the recurring hook itself.
+        wp_schedule_single_event(time(), 'alegra_connector_cron_sync_now');
         spawn_cron();
 
         $this->log('info', 'Cron hook triggered manually', ['hook' => $hook]);
@@ -2692,8 +2744,11 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Hook invalido.', 'alegra-connector')]);
         }
 
-        if (strpos($hook, 'alegra') !== 0) {
-            wp_send_json_error(['message' => __('Solo se permiten hooks de Alegra.', 'alegra-connector')]);
+        // "Skip" only makes sense for the periodic sync, whose interval we know.
+        // Restricting the allowlist also stops a stray hook from being
+        // rescheduled on the wrong cadence.
+        if ($hook !== 'alegra_connector_cron_sync') {
+            wp_send_json_error(['message' => __('Solo se puede saltar la sincronización periódica.', 'alegra-connector')]);
         }
 
         $timestamp = (int) ($_POST['timestamp'] ?? 0);
@@ -2701,23 +2756,25 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Timestamp invalido.', 'alegra-connector')]);
         }
 
-        // Verify the event exists before unscheduling
-        $event = wp_get_scheduled_event($hook);
-        if (!$event) {
-            // Try with the exact timestamp and any args
-            $unscheduled = wp_unschedule_event($timestamp, $hook);
-            if (!$unscheduled) {
-                wp_send_json_error(['message' => __('No se encontro el evento programado.', 'alegra-connector')]);
-            }
-        } else {
-            wp_unschedule_event($timestamp, $hook);
+        // Move the next run forward — never delete the recurrence. WP only
+        // regenerates a recurring event when it fires, so wp_unschedule_event()
+        // on a future occurrence silently killed the periodic sync. Re-register
+        // a fresh recurring event one interval from now instead.
+        $frequency = (int) get_option('alegra_connector_sync_frequency', 15);
+        if (!in_array($frequency, [5, 15, 30, 60], true)) {
+            $frequency = 15;
         }
+        $schedule_name = 'alegra_connector_' . $frequency . 'min';
+        $next_run = time() + ($frequency * MINUTE_IN_SECONDS);
 
-        $this->log('info', 'Cron event skipped by user', ['hook' => $hook, 'timestamp' => $timestamp]);
+        wp_clear_scheduled_hook($hook);
+        wp_schedule_event($next_run, $schedule_name, $hook);
+
+        $this->log('info', 'Cron event skipped by user', ['hook' => $hook, 'timestamp' => $timestamp, 'next_run' => $next_run]);
 
         wp_send_json_success([
             'message' => sprintf(
-                __('Proxima ejecucion de "%s" saltada. Se reprogramara en el siguiente ciclo.', 'alegra-connector'),
+                __('Proxima ejecucion de "%s" movida al siguiente ciclo.', 'alegra-connector'),
                 $hook
             ),
         ]);
@@ -2747,6 +2804,12 @@ class Admin_Dashboard
         $cleared = wp_clear_scheduled_hook($hook);
         if (function_exists('as_unschedule_all_actions')) {
             as_unschedule_all_actions($hook, [], 'alegra');
+        }
+
+        // Record the user's intent so the init self-heal does not resurrect a
+        // schedule the merchant explicitly removed. schedule_cron() clears it.
+        if ($hook === 'alegra_connector_cron_sync') {
+            update_option('alegra_connector_cron_disabled', 1, false);
         }
 
         $this->log('info', 'Cron hook unscheduled by user', ['hook' => $hook, 'cleared' => $cleared]);

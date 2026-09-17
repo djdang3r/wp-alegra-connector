@@ -1083,7 +1083,7 @@ class Products
     /**
      * Sync inventory from Alegra to WooCommerce (pull)
      */
-    public function sync_inventory_from_alegra(): array
+    public function sync_inventory_from_alegra(int $run_id = 0): array
     {
         $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false];
 
@@ -1122,6 +1122,12 @@ class Products
                     break;
                 }
 
+                // Per-run stop (Monitor "Detener").
+                if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                    $this->logger->info('Inventory sync stopped by user');
+                    break;
+                }
+
                 // AC-83: throttle the progress write (every 5th page) and use a
                 // TTL longer than a run so the admin UI never sees it expire
                 // mid-import.
@@ -1155,6 +1161,10 @@ class Products
                 }
 
                 foreach ($items as $item) {
+                    if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                        $this->logger->info('Inventory sync stopped by user mid-page');
+                        break 2;
+                    }
                     if (!isset($item['inventory']['availableQuantity'])) {
                         continue;
                     }
@@ -1250,7 +1260,7 @@ class Products
         return $result;
     }
 
-    public function import_from_alegra(int $page = 1, int $per_page = 30): array|\WP_Error
+    public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
@@ -1295,6 +1305,13 @@ class Products
             // Re-check the kill switch every page so an in-flight run stops.
             if (\Alegra\Connector\Kill_Switch::is_active()) {
                 $this->logger->info('Products import stopped: kill switch active');
+                break;
+            }
+
+            // Per-run stop (Monitor "Detener"). Checked per page so a long
+            // import reacts without waiting for the whole entity to finish.
+            if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                $this->logger->info('Products import stopped by user');
                 break;
             }
 
@@ -1346,6 +1363,12 @@ class Products
             }
 
             foreach ($alegra_items as $item) {
+                // Per-item per-run stop: a single page of 30 items is short, but
+                // this keeps the loop responsive even with a slow item.
+                if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                    $this->logger->info('Products import stopped by user mid-page');
+                    break 2;
+                }
                 $r = $this->import_single_item_from_alegra($item);
                 if ($r === true) $result['imported']++;
                 elseif ($r === 'updated') $result['updated']++;

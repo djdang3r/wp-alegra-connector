@@ -88,7 +88,7 @@ class Categories
         return $result;
     }
 
-    public function import_from_alegra(): array|\WP_Error
+    public function import_from_alegra(int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
@@ -108,6 +108,12 @@ class Categories
                 break;
             }
 
+            // Per-run stop (Monitor "Detener").
+            if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                $this->logger->info('Categories import stopped by user');
+                break;
+            }
+
             $alegra_categories = $this->api->get_item_categories([
                 'start' => ($current_page - 1) * 30,
                 'limit' => 30,
@@ -121,6 +127,10 @@ class Categories
             if (empty($alegra_categories)) break;
 
             foreach ($alegra_categories as $category) {
+                if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+                    $this->logger->info('Categories import stopped by user mid-page');
+                    break 2;
+                }
                 $r = $this->import_single_category($category);
                 if ($r === true) $result['imported']++;
                 elseif ($r === 'updated') $result['updated']++;

@@ -353,11 +353,16 @@ $ac_regime_labels = [
 <?php esc_html_e('Los webhooks permiten que Alegra notifique a WooCommerce instantaneamente cuando ocurre un cambio. Sin webhooks, la sincronizacion depende del cron periodico. Se recomienda activar ambos para maxima cobertura.','alegra-connector');?>
 </div>
 
-<?php $webhook_url = rest_url('alegra-connector/v1/webhook'); ?>
+<?php
+$ac_webhook_token = (string) get_option(\Alegra\Connector\Webhooks\Receiver::token_option(), '');
+$webhook_url = $ac_webhook_token !== ''
+    ? add_query_arg('token', $ac_webhook_token, rest_url('alegra-connector/v1/webhook'))
+    : rest_url('alegra-connector/v1/webhook');
+?>
 <table class="form-table">
 <tr><th><?php esc_html_e('URL del Webhook:','alegra-connector');?></th>
 <td><code style="font-size:12px;word-break:break-all;"><?php echo esc_url($webhook_url); ?></code>
-<p class="description"><?php esc_html_e('Esta URL debe configurarse en Alegra. El plugin la registra automaticamente al hacer clic en "Registrar webhooks".','alegra-connector');?></p></td></tr>
+<p class="description"><?php esc_html_e('Esta URL (con su token secreto) debe configurarse en Alegra. El plugin la registra automaticamente al hacer clic en "Registrar webhooks".','alegra-connector');?></p></td></tr>
 
 <tr><th><?php esc_html_e('Webhook Secret:','alegra-connector');?></th>
 <td>

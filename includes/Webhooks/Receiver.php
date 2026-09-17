@@ -41,17 +41,37 @@ class Receiver
     public function handle(\WP_REST_Request $request): \WP_REST_Response
     {
         $body = $request->get_body();
+
+        // Registration handshake. Alegra's docs (descripción-general) state that
+        // when a subscription is created it POSTs an EMPTY body to the URL and
+        // requires a 2XX within 5s, otherwise the subscription is never created.
+        // The old code answered 400 to that empty body, so registration could
+        // never succeed. Ack it: an empty body carries no subject to process.
+        if (trim($body) === '') {
+            return new \WP_REST_Response(['received' => true, 'handshake' => true], 200);
+        }
+
+        // Shared-secret gate. Alegra cannot sign deliveries and publishes no
+        // source IPs (the /webhooks/subscriptions schema accepts only {event,
+        // url}), so the only credential available is a secret embedded in the
+        // registered URL (?token=...). Reject any request that does not carry
+        // the exact token.
+        if (!$this->authorize($request)) {
+            if ($this->logger) {
+                $this->logger->warning('Webhook rejected: missing or invalid token');
+            }
+            return new \WP_REST_Response(['error' => 'Unauthorized'], 401);
+        }
+
         $payload = json_decode($body, true);
 
         if (!is_array($payload) || !isset($payload['subject'])) {
             return new \WP_REST_Response(['error' => 'Invalid payload'], 400);
         }
 
-        // Alegra's /webhooks/subscriptions API accepts only {event, url}: it does
-        // NOT sign deliveries and exposes no header to configure, so
-        // X-Alegra-Signature is normally absent. When a signature IS present
-        // (e.g. a reverse proxy or an extension adds one), enforce it
-        // fail-closed; otherwise fall through to replay protection.
+        // Optional HMAC. Alegra does NOT send X-Alegra-Signature, so this is
+        // normally absent; when a reverse proxy or extension DOES inject one,
+        // enforce it fail-closed as a second factor.
         $signature = $request->get_header('X-Alegra-Signature') ?? '';
         if ($signature !== '' && !$this->verify_hmac($body, $signature)) {
             if ($this->logger) {
@@ -131,5 +151,64 @@ class Receiver
 
         $expected = hash_hmac('sha256', $body, $secret);
         return hash_equals($expected, $signature);
+    }
+
+    /**
+     * Enforce the shared secret carried in the registered URL.
+     *
+     * Fail-closed: with no token configured there can be no legitimate
+     * subscription, so reject rather than accept an unauthenticated event.
+     */
+    private function authorize(\WP_REST_Request $request): bool
+    {
+        $expected = (string) get_option(self::token_option(), '');
+        if ($expected === '') {
+            return false;
+        }
+
+        $provided = (string) ($request->get_param('token') ?? '');
+        if ($provided === '') {
+            // Secondary transport, e.g. a reverse proxy that injects a header.
+            $provided = (string) $request->get_header('X-Alegra-Webhook-Token');
+        }
+
+        return $provided !== '' && hash_equals($expected, $provided);
+    }
+
+    /**
+     * Option name holding the webhook shared secret.
+     */
+    public static function token_option(): string
+    {
+        return 'alegra_connector_webhook_token';
+    }
+
+    /**
+     * Return the existing webhook token, generating and persisting one on first
+     * use. Generated with the CSPRNG-backed wp_generate_password (no special
+     * chars, so it survives a query string untouched).
+     */
+    public static function ensure_token(): string
+    {
+        $token = (string) get_option(self::token_option(), '');
+        if ($token === '') {
+            $token = wp_generate_password(40, false, false);
+            update_option(self::token_option(), $token, false);
+        }
+        return $token;
+    }
+
+    /**
+     * Build the URL to register with Alegra: the REST route plus the shared
+     * secret. add_query_arg() keeps the plain-permalink `?rest_route=` form
+     * working (a manual '?token=' would produce a second '?').
+     */
+    public static function registration_url(): string
+    {
+        return add_query_arg(
+            'token',
+            self::ensure_token(),
+            rest_url('alegra-connector/v1/webhook')
+        );
     }
 }

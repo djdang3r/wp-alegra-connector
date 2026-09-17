@@ -821,21 +821,24 @@ TestRunner::test('T8.2 AC-30 an empty masked-secret submission keeps the stored 
 
 TestRunner::test('T8.3 AC-32 a replayed identical webhook is ignored the second time', function (): void {
     alegra_test_reset();
+    // Deliveries now require the shared secret embedded in the registered URL.
+    update_option('alegra_connector_webhook_token', 'replay-token');
     $logger = make_logger();
     $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $auth = ['token' => 'replay-token'];
 
     $body = json_encode(['subject' => 'unknown-event', 'message' => ['id' => 'x']]);
 
-    $first = $receiver->handle(new WP_REST_Request($body));
+    $first = $receiver->handle(new WP_REST_Request($body, [], $auth));
     TestRunner::assertSame(200, $first->get_status(), 'the first delivery must be accepted');
     TestRunner::assertFalse((bool) (($first->get_data())['duplicate'] ?? false), 'the first delivery must not be flagged as a duplicate');
 
-    $second = $receiver->handle(new WP_REST_Request($body));
+    $second = $receiver->handle(new WP_REST_Request($body, [], $auth));
     TestRunner::assertSame(200, $second->get_status(), 'the replay must still be acked (so Alegra stops retrying)');
     TestRunner::assertTrue((bool) (($second->get_data())['duplicate'] ?? false), 'the identical replay must be flagged as a duplicate');
 
     // A different body is not a replay.
-    $third = $receiver->handle(new WP_REST_Request(json_encode(['subject' => 'unknown-event', 'message' => ['id' => 'y']])));
+    $third = $receiver->handle(new WP_REST_Request(json_encode(['subject' => 'unknown-event', 'message' => ['id' => 'y']]), [], $auth));
     TestRunner::assertFalse((bool) (($third->get_data())['duplicate'] ?? false), 'a different body must not be treated as a replay');
 });
 
@@ -1069,10 +1072,21 @@ TestRunner::test('T9.10 the identification shape is gated on the account country
     TestRunner::assertSame('CC', $co_payload['identificationObject']['type'] ?? null, 'CO identificationObject.type');
 });
 
-TestRunner::test('T9.11 AC-52 "Run now" schedules a single event and the dead dispatcher is gone', function (): void {
+TestRunner::test('T9.11 AC-52 "Run now" queues a dedicated one-off and the dead dispatcher is gone', function (): void {
     $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
-    TestRunner::assertStringContains('wp_schedule_single_event(time(), $hook)', $admin, 'Run now must schedule a single event');
+    TestRunner::assertStringContains(
+        "wp_schedule_single_event(time(), 'alegra_connector_cron_sync_now')",
+        $admin,
+        'Run now must queue a dedicated one-off (never touch the recurring hook)'
+    );
     TestRunner::assertStringNotContains("'alegra_manual_run'", $admin, 'the unregistered recurrence must be gone');
+
+    $controller = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Sync/Controller.php');
+    TestRunner::assertStringContains(
+        "add_action('alegra_connector_cron_sync_now'",
+        $controller,
+        'the dedicated one-off hook must dispatch the same callback'
+    );
 
     $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
     TestRunner::assertStringNotContains("add_action('alegra_manual_run'", $main, 'the dead alegra_manual_run dispatcher must be removed');
@@ -2829,6 +2843,238 @@ TestRunner::test('T18.15 BUG 9 the settings text states the plugin does NOT emit
     TestRunner::assertStringContains('NO emite', $tpl, 'the settings text must state the plugin does not emit');
     TestRunner::assertStringContains('DIAN', $tpl, 'the settings text must mention the DIAN');
     TestRunner::assertStringContains('stamp.generateStamp', $tpl, 'the settings text must name the missing stamp');
+});
+
+// ===========================================================================
+// T19 — Orchestration batch 4 (webhook auth, cron recurrence, per-run stop)
+// ===========================================================================
+echo "\nT19 — Orchestration batch 4\n";
+
+/**
+ * All recurring (schedule-bearing) events for a hook, as
+ * [{timestamp, schedule}, ...].
+ */
+function alegra_recurring_events(string $hook): array
+{
+    $out = [];
+    foreach (_get_cron_array() as $timestamp => $hooks) {
+        foreach (($hooks[$hook] ?? []) as $event) {
+            if (!empty($event['schedule'])) {
+                $out[] = ['timestamp' => (int) $timestamp, 'schedule' => (string) $event['schedule']];
+            }
+        }
+    }
+    return $out;
+}
+
+/** Timestamps of the single (non-recurring) events for a hook. */
+function alegra_single_events(string $hook): array
+{
+    $out = [];
+    foreach (_get_cron_array() as $timestamp => $hooks) {
+        foreach (($hooks[$hook] ?? []) as $event) {
+            if (empty($event['schedule'])) {
+                $out[] = (int) $timestamp;
+            }
+        }
+    }
+    return $out;
+}
+
+TestRunner::test('T19.1 BUG 1 an unauthenticated webhook is rejected with 401', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'secret-abc');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = json_encode(['subject' => 'edit-item', 'message' => ['id' => 'it-1']]);
+
+    $noToken = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(401, $noToken->get_status(), 'a delivery with no token must be rejected');
+
+    $wrong = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'nope']));
+    TestRunner::assertSame(401, $wrong->get_status(), 'a wrong token must be rejected');
+
+    // Fail closed when no token is configured at all: there can be no
+    // legitimate subscription yet, so an event must not be trusted.
+    delete_option('alegra_connector_webhook_token');
+    $unconfigured = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(401, $unconfigured->get_status(), 'with no token configured the endpoint must fail closed');
+
+    // The exact token is accepted.
+    update_option('alegra_connector_webhook_token', 'secret-abc');
+    $ok = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'secret-abc']));
+    TestRunner::assertSame(200, $ok->get_status(), 'the correct token must be accepted');
+});
+
+TestRunner::test('T19.2 BUG 1 the registration handshake (empty body) is acked with 2XX', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    // Alegra POSTs an EMPTY body to verify the URL and requires a 2XX within 5s,
+    // otherwise the subscription is never created. No token is required for the
+    // handshake: an empty body carries nothing to process.
+    $handshake = $receiver->handle(new WP_REST_Request(''));
+    TestRunner::assertSame(200, $handshake->get_status(), 'the registration handshake must return 2XX');
+    TestRunner::assertTrue((bool) (($handshake->get_data())['handshake'] ?? false), 'the handshake must be flagged');
+});
+
+TestRunner::test('T19.3 BUG 2 registration counts the NESTED subscription id', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $_POST = [];
+    $response = null;
+    try {
+        $admin->ajax_register_webhooks();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $response = $e;
+    }
+    $_POST = [];
+
+    $expected = count(Client::get_webhook_events());
+    TestRunner::assertTrue($response !== null && $response->success, 'registration must succeed');
+    TestRunner::assertSame($expected, (int) ($response->payload['created'] ?? -1), 'every event must be counted as created');
+    TestRunner::assertSame($expected, count((array) get_option('alegra_connector_webhook_subscriptions', [])), 'every subscription must be stored');
+
+    // The registered URL must carry the shared secret.
+    $req = alegra_mock_last_request('POST', '/webhooks/subscriptions');
+    TestRunner::assertTrue($req !== null, 'a subscription POST must be sent');
+    $url = (string) ($req['body']['url'] ?? '');
+    TestRunner::assertStringContains('token=', $url, 'the registered URL must embed the token');
+    $token = (string) get_option('alegra_connector_webhook_token', '');
+    TestRunner::assertTrue($token !== '', 'a token must be generated');
+    TestRunner::assertStringContains($token, $url, 'the URL token must match the stored token');
+});
+
+TestRunner::test('T19.4 BUG 3 "Run now" does not destroy the recurring schedule', function (): void {
+    alegra_test_reset();
+    $hook = 'alegra_connector_cron_sync';
+    // Place the recurrence well beyond WP's 10-minute duplicate window.
+    wp_schedule_event(time() + 3600, 'alegra_connector_15min', $hook);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['hook' => $hook];
+    $response = null;
+    try {
+        $admin->ajax_run_cron_now();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $response = $e;
+    }
+    $_POST = [];
+
+    TestRunner::assertTrue($response !== null && $response->success, 'run now must succeed');
+    $recurring = alegra_recurring_events($hook);
+    TestRunner::assertSame(1, count($recurring), 'the recurring event must survive Run now');
+    TestRunner::assertSame('alegra_connector_15min', $recurring[0]['schedule'] ?? null, 'the recurrence keeps its interval');
+    TestRunner::assertSame(1, count(alegra_single_events('alegra_connector_cron_sync_now')), 'Run now must queue exactly one dedicated one-off');
+});
+
+TestRunner::test('T19.5 BUG 4 "skip" moves the run forward and keeps the recurrence', function (): void {
+    alegra_test_reset();
+    $hook = 'alegra_connector_cron_sync';
+    update_option('alegra_connector_sync_frequency', 15);
+    $scheduled = time() + 300;
+    wp_schedule_event($scheduled, 'alegra_connector_15min', $hook);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['hook' => $hook, 'timestamp' => $scheduled];
+    $response = null;
+    try {
+        $admin->ajax_skip_cron_next();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $response = $e;
+    }
+    $_POST = [];
+
+    TestRunner::assertTrue($response !== null && $response->success, 'skip must succeed');
+    $recurring = alegra_recurring_events($hook);
+    TestRunner::assertSame(1, count($recurring), 'skip must NOT delete the recurrence');
+    TestRunner::assertTrue(
+        ($recurring[0]['timestamp'] ?? 0) > $scheduled,
+        'skip must move the next run forward (was ' . $scheduled . ', now ' . ($recurring[0]['timestamp'] ?? 0) . ')'
+    );
+});
+
+TestRunner::test('T19.6 the init self-heal restores a missing schedule (and respects an explicit stop)', function (): void {
+    alegra_test_reset();
+    $hook = 'alegra_connector_cron_sync';
+    update_option('alegra_connector_sync_method', 'cron');
+    wp_clear_scheduled_hook($hook);
+    TestRunner::assertFalse(wp_next_scheduled($hook), 'precondition: no schedule');
+
+    \Alegra\Connector\Alegra_Connector::get_instance()->maybe_self_heal_cron();
+    TestRunner::assertTrue(wp_next_scheduled($hook) !== false, 'self-heal must restore the schedule');
+    TestRunner::assertSame(1, count(alegra_recurring_events($hook)), 'self-heal must create a recurring event');
+
+    // An explicit "remove all" must not be undone.
+    wp_clear_scheduled_hook($hook);
+    update_option('alegra_connector_cron_disabled', 1);
+    \Alegra\Connector\Alegra_Connector::get_instance()->maybe_self_heal_cron();
+    TestRunner::assertFalse(wp_next_scheduled($hook), 'self-heal must respect the explicit stop');
+
+    // real-time / disabled methods must never schedule a periodic pull.
+    delete_option('alegra_connector_cron_disabled');
+    update_option('alegra_connector_sync_method', 'real-time');
+    \Alegra\Connector\Alegra_Connector::get_instance()->maybe_self_heal_cron();
+    TestRunner::assertFalse(wp_next_scheduled($hook), 'real-time must not schedule a periodic pull');
+});
+
+TestRunner::test('T19.7 BUG 6 the per-run stop halts the products import loop', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-a', ['name' => 'A', 'reference' => 'A', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 10]]]);
+    alegra_mock_seed_item('it-b', ['name' => 'B', 'reference' => 'B', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 20]]]);
+
+    // Control: with no stop flag the items import.
+    $normal = make_products()->import_from_alegra(1, 30, 0);
+    TestRunner::assertTrue(($normal['imported'] + $normal['updated']) > 0, 'the control import must import items');
+
+    // With a per-run stop flag set, the loop must abort before pulling.
+    alegra_test_reset();
+    alegra_mock_seed_item('it-a', ['name' => 'A', 'reference' => 'A', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 10]]]);
+    alegra_mock_seed_item('it-b', ['name' => 'B', 'reference' => 'B', 'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 20]]]);
+    \Alegra\Connector\Runs::request_stop(77);
+    $stopped = make_products()->import_from_alegra(1, 30, 77);
+
+    TestRunner::assertSame(0, (int) $stopped['imported'] + (int) $stopped['updated'], 'a stopped run must import nothing');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'a stopped run must not even pull a page');
+});
+
+TestRunner::test('T19.8 BUG 6 the per-run stop halts the customers and categories loops', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('c-1', ['name' => 'One', 'email' => 'one@example.test']);
+    alegra_mock_seed_category('cat-1', ['name' => 'Cat 1']);
+
+    \Alegra\Connector\Runs::request_stop(88);
+    $customers = make_customers()->import_from_alegra(1, 30, 88);
+    TestRunner::assertSame(0, (int) $customers['imported'] + (int) $customers['updated'], 'a stopped customer import must import nothing');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'a stopped customer import must not pull');
+
+    $categories = new \Alegra\Connector\Sync\Categories(make_api(), make_logger());
+    $cat = $categories->import_from_alegra(88);
+    TestRunner::assertSame(0, (int) $cat['imported'] + (int) $cat['updated'], 'a stopped category import must import nothing');
+});
+
+TestRunner::test('T19.9 BUG 1 a forged "paid" invoice webhook cannot complete an order (re-fetch)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-forge', ['status' => 'open', 'balance' => 100, 'total' => 100, 'number' => 'FV-1']);
+    alegra_make_order(5000, [
+        'status' => 'processing',
+        'meta' => ['_alegra_invoice_id' => 'inv-forge'],
+    ]);
+
+    $logger = make_logger();
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+
+    // The payload claims the invoice is paid, but Alegra reports it open.
+    $handlers->process_event('new-invoice', ['invoice' => ['id' => 'inv-forge', 'status' => 'paid', 'balance' => 0]]);
+    TestRunner::assertNotSame('completed', wc_get_order(5000)->get_status(), 'a forged payload must not complete the order');
+
+    // Once Alegra really reports it paid, the same handler completes it.
+    alegra_mock_seed_invoice('inv-forge', ['status' => 'paid', 'balance' => 0, 'total' => 100, 'number' => 'FV-1']);
+    $handlers->process_event('new-invoice', ['invoice' => ['id' => 'inv-forge', 'status' => 'paid', 'balance' => 0]]);
+    TestRunner::assertSame('completed', wc_get_order(5000)->get_status(), 'a genuinely paid invoice must complete the order');
 });
 
 exit(TestRunner::summary());

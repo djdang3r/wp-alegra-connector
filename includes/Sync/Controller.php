@@ -48,6 +48,15 @@ class Controller
             add_action('alegra_connector_cron_sync', [$this, 'run_cron_sync']);
         }
 
+        // Dedicated one-off dispatcher for the Monitor's "Run now". Scheduling
+        // a single event under the SAME recurring hook is unreliable: WP's
+        // wp_schedule_single_event() suppresses a duplicate when an identical
+        // event is due within 10 minutes, which the recurring event often is.
+        // A separate hook always queues and never touches the recurrence.
+        if (!has_action('alegra_connector_cron_sync_now', [$this, 'run_cron_sync'])) {
+            add_action('alegra_connector_cron_sync_now', [$this, 'run_cron_sync']);
+        }
+
         // Documented manual trigger (docs/RELEASE_2.1.9_DEPLOY.md:359):
         //   wp eval 'do_action("alegra_sync_inventory_from_alegra");'
         // The action was documented but never registered. The pull enforces
@@ -136,7 +145,7 @@ class Controller
                 $this->logger->info('Cron sync skipped products: another sync is running');
             } else {
                 try {
-                    $products_result = $this->products->import_from_alegra();
+                    $products_result = $this->products->import_from_alegra(1, 30, $run_id);
                 } finally {
                     $this->release_sync_lock('products', $lock);
                 }
@@ -153,7 +162,7 @@ class Controller
             // itself re-checks the kill switch, the lock, the cancellation
             // transient and inventory_source.
             if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'alegra') {
-                $inventory_result = $this->products->sync_inventory_from_alegra();
+                $inventory_result = $this->products->sync_inventory_from_alegra($run_id);
                 if (!empty($inventory_result['updated'])) {
                     $result['inventory'] = (int) $inventory_result['updated'];
                 }
@@ -173,7 +182,7 @@ class Controller
                 $this->logger->info('Cron sync skipped customers: another sync is running');
             } else {
                 try {
-                    $customers_result = $this->customers->import_from_alegra();
+                    $customers_result = $this->customers->import_from_alegra(1, 30, $run_id);
                 } finally {
                     $this->release_sync_lock('customers', $lock);
                 }
@@ -201,7 +210,7 @@ class Controller
                 $this->logger->info('Cron sync skipped categories: another sync is running');
             } else {
                 try {
-                    $categories_result = $this->categories->import_from_alegra();
+                    $categories_result = $this->categories->import_from_alegra($run_id);
                 } finally {
                     $this->release_sync_lock('categories', $lock);
                 }

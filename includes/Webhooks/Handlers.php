@@ -165,8 +165,21 @@ class Handlers
         $alegra_invoice_id = (string) ($invoice['id'] ?? '');
         if ($alegra_invoice_id === '') return;
 
-        $status = $invoice['status'] ?? '';
-        $balance = (float) ($invoice['balance'] ?? 0);
+        // Never trust status/balance from the webhook body: Alegra does not sign
+        // deliveries, so a forged payload could otherwise complete an order.
+        // Re-read the invoice from the API and act on the authoritative values.
+        $fresh = $this->api ? $this->api->get_invoice($alegra_invoice_id) : null;
+        if (is_wp_error($fresh) || !is_array($fresh)) {
+            if ($this->logger) {
+                $this->logger->warning('Webhook: could not re-fetch invoice; ignoring event', [
+                    'invoice_id' => $alegra_invoice_id,
+                ]);
+            }
+            return;
+        }
+
+        $status = $fresh['status'] ?? '';
+        $balance = (float) ($fresh['balance'] ?? 0);
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
         if ($status === 'paid' && $balance <= 0 && $should_complete) {
@@ -185,7 +198,7 @@ class Handlers
                 if ($order && $order->get_status() !== 'completed') {
                     $order->add_order_note(sprintf(
                         __('[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),
-                        $invoice['number'] ?? $alegra_invoice_id
+                        $fresh['number'] ?? $alegra_invoice_id
                     ));
                     $order->update_status('completed');
                     if ($this->logger) $this->logger->info('Webhook: Order completed from paid invoice', [

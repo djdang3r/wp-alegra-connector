@@ -158,6 +158,10 @@ final class Alegra_Connector
         add_filter('cron_schedules', [$this, 'register_cron_schedules']);
         add_action('update_option_alegra_connector_sync_frequency', [$this, 'schedule_cron']);
         add_action('update_option_alegra_connector_sync_method', [$this, 'schedule_cron']);
+
+        // Self-heal the periodic schedule if it is ever missing (old "Run now"/
+        // "skip" destroyed it; a plugin conflict or manual DB edit can too).
+        add_action('init', [$this, 'maybe_self_heal_cron'], 20);
         register_activation_hook(__FILE__, [$this, 'activate']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
 
@@ -487,6 +491,10 @@ final class Alegra_Connector
         $hook = 'alegra_connector_cron_sync';
         $schedule = 'alegra_connector_' . $frequency . 'min';
 
+        // The merchant is actively (re)configuring the schedule, so lift the
+        // explicit-stop flag set by the Monitor's "remove all" action.
+        delete_option('alegra_connector_cron_disabled');
+
         // Clear any previously-scheduled events to avoid stale schedules
         wp_clear_scheduled_hook($hook);
 
@@ -501,6 +509,44 @@ final class Alegra_Connector
 
         // Keep the daily maintenance event present (AC-22).
         Maintenance::schedule();
+    }
+
+    /**
+     * Self-heal the periodic sync schedule.
+     *
+     * Restores the recurring event if it is missing while the merchant expects
+     * a periodic pull (sync_method = cron|both). Safety net for any code path
+     * that clears the hook (the old destructive "Run now"/"skip", a plugin
+     * conflict, or a manual DB edit).
+     *
+     * Cost: wp_next_scheduled() calls _get_cron_array() -> get_option('cron'),
+     * and `cron` is autoloaded, so it is already in the alloptions cache loaded
+     * on every request — no extra DB query. The schedule is only written when
+     * it is actually missing, and never after the merchant explicitly removed
+     * it from the Monitor ("remove all" sets alegra_connector_cron_disabled).
+     */
+    public function maybe_self_heal_cron(): void
+    {
+        $hook = 'alegra_connector_cron_sync';
+        if (wp_next_scheduled($hook) !== false) {
+            return;
+        }
+
+        if (get_option('alegra_connector_cron_disabled', false)) {
+            return;
+        }
+
+        $sync_method = (string) get_option('alegra_connector_sync_method', 'cron');
+        if (!in_array($sync_method, ['cron', 'both'], true)) {
+            return;
+        }
+
+        $frequency = (int) get_option('alegra_connector_sync_frequency', 15);
+        if (!in_array($frequency, [5, 15, 30, 60], true)) {
+            $frequency = 15;
+        }
+
+        wp_schedule_event(time() + 60, 'alegra_connector_' . $frequency . 'min', $hook);
     }
 
     /**

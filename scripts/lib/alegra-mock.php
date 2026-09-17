@@ -29,7 +29,7 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
 
 $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
@@ -37,7 +37,7 @@ $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
@@ -768,6 +768,37 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
             $GLOBALS['alegra_mock_state']['invoices'][$m[1]]['status'] = 'open';
         }
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'open']);
+    }
+
+    // --- Webhook subscriptions ---
+    // POST response shape is documented at
+    // https://developer.alegra.com/reference/post_webhooks-subscriptions:
+    //   {message, subscription:{id,event,url}}  (id is NESTED, not top-level)
+    if ($method === 'POST' && $path === '/webhooks/subscriptions') {
+        $event = is_array($body) ? (string) ($body['event'] ?? '') : '';
+        $url = is_array($body) ? (string) ($body['url'] ?? '') : '';
+        if ($event === '' || $url === '') {
+            return alegra_mock_response(400, ['error' => 'La URL ingresada no es válida']);
+        }
+        foreach ($GLOBALS['alegra_mock_state']['subscriptions'] as $sub) {
+            if ($sub['event'] === $event && $sub['url'] === $url) {
+                return alegra_mock_response(400, ['error' => 'Ya existe una suscripción con el mismo evento y URL']);
+            }
+        }
+        $id = alegra_mock_uuid('5u5u5u5u');
+        $subscription = ['id' => $id, 'event' => $event, 'url' => $url];
+        $GLOBALS['alegra_mock_state']['subscriptions'][$id] = $subscription;
+        return alegra_mock_response(200, [
+            'message' => 'Suscripción creada correctamente!.',
+            'subscription' => $subscription,
+        ]);
+    }
+    if ($method === 'GET' && $path === '/webhooks/subscriptions') {
+        return alegra_mock_response(200, ['subscriptions' => array_values($GLOBALS['alegra_mock_state']['subscriptions'])]);
+    }
+    if ($method === 'DELETE' && preg_match('#^/webhooks/subscriptions/([^/]+)$#', $path, $m)) {
+        unset($GLOBALS['alegra_mock_state']['subscriptions'][$m[1]]);
+        return alegra_mock_response(200, ['message' => 'Suscripción eliminada correctamente!']);
     }
 
     // --- PUT ---

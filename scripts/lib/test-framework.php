@@ -155,6 +155,7 @@ function alegra_test_reset(): void
     $GLOBALS['wp_filters']    = [];
     $GLOBALS['wp_did_action'] = [];
     $GLOBALS['alegra_db']     = [];
+    $GLOBALS['wp_cron']       = [];
     $GLOBALS['wc_orders']     = [];
     $GLOBALS['wc_products']   = [];
     $GLOBALS['wc_tax_rates']  = [];
