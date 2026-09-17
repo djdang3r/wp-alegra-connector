@@ -1009,17 +1009,20 @@ class Billing_Fields
         }
 
         $is_co = self::is_colombia_account();
+        $kind_of_person = $is_co ? self::resolve_kind_of_person() : '';
 
         $payload = [];
 
         // NEVER send both `name` and `nameObject` (Alegra error 2039).
-        if ($is_co) {
+        // Colombia: the name shape follows kindOfPerson — `nameObject` is
+        // required for a natural person, a flat `name` for a legal/other
+        // entity (post_contacts.md). Non-CO always uses the flat `name`.
+        if ($is_co && $kind_of_person === 'PERSON_ENTITY') {
             $name_object = self::build_name_object($contact);
             if (!empty($name_object)) {
                 $payload['nameObject'] = $name_object;
             }
         } else {
-            // Non-CO generic variant: a flat `name` (no nameObject).
             $display = trim((string) ($contact['display_name'] ?? ''));
             if ($display === '') {
                 $display = trim((string) ($contact['first_name'] ?? '') . ' ' . (string) ($contact['last_name'] ?? ''));
@@ -1055,7 +1058,7 @@ class Billing_Fields
             // `regime` + `kindOfPerson` (post_contacts.md). Always send them:
             // both are valid in the non-FE schema too, and there is no reliable
             // GET /company signal to detect e-invoicing.
-            $payload['kindOfPerson'] = self::resolve_kind_of_person();
+            $payload['kindOfPerson'] = $kind_of_person;
             $payload['regime'] = self::resolve_regime();
         } else {
             $payload['identification'] = (string) $values['identification'];

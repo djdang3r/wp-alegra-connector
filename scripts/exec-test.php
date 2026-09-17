@@ -2283,13 +2283,17 @@ TestRunner::test('T17.1 the CO contact payload always carries regime + kindOfPer
     TestRunner::assertFalse(is_wp_error($payload), 'the payload must build');
     TestRunner::assertSame('PERSON_ENTITY', $payload['kindOfPerson'] ?? null, 'default kindOfPerson');
     TestRunner::assertSame('SIMPLIFIED_REGIME', $payload['regime'] ?? null, 'default regime');
+    TestRunner::assertArrayHasKey('nameObject', $payload, 'a natural person sends nameObject');
 
-    // Merchant overrides are honoured (allowlisted enum values).
+    // Merchant overrides are honoured (allowlisted enum values), and the name
+    // shape follows kindOfPerson (nameObject only for PERSON_ENTITY).
     update_option(\Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON, 'LEGAL_ENTITY');
     update_option(\Alegra\Connector\Billing_Fields::OPTION_REGIME, 'COMMON_REGIME');
     $override = \Alegra\Connector\Billing_Fields::build_contact_payload($user);
     TestRunner::assertSame('LEGAL_ENTITY', $override['kindOfPerson'] ?? null, 'configured kindOfPerson');
     TestRunner::assertSame('COMMON_REGIME', $override['regime'] ?? null, 'configured regime');
+    TestRunner::assertArrayNotHasKey('nameObject', $override, 'a legal entity must NOT send nameObject');
+    TestRunner::assertArrayHasKey('name', $override, 'a legal entity sends a flat name');
 
     // Garbage never reaches Alegra.
     update_option(\Alegra\Connector\Billing_Fields::OPTION_KIND_OF_PERSON, 'NOT_A_KIND');
