@@ -78,6 +78,8 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_sync_inactive_products');
     delete_option('alegra_connector_field_mapping');
     delete_option('alegra_connector_tax_mapping');
+    delete_option('alegra_connector_resolved_tax_ids');
+    delete_option('alegra_connector_generic_item_ids');
     delete_option('alegra_connector_warehouse_mapping');
     delete_option('alegra_connector_category_mapping');
     delete_option('alegra_connector_warehouse_enabled');

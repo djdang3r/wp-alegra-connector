@@ -241,7 +241,12 @@ class Orders
         // Alegra only allows a payment on an OPEN invoice, so when a bank
         // account is configured the invoice is created open instead of the
         // configured draft status.
-        $will_record_payment = (string) get_option('alegra_connector_payment_account_id', '') !== ''
+        //
+        // BUG 9: the settings <select> stores '0' for "no account", so both ''
+        // and '0' mean UNCONFIGURED. The manual path already rejects both; the
+        // auto path must too, otherwise it POSTs bankAccount.id = '0'.
+        $payment_account = (string) get_option('alegra_connector_payment_account_id', '');
+        $will_record_payment = !in_array($payment_account, ['', '0'], true)
             && (string) $order->get_meta('_alegra_payment_id', true) === '';
 
         $invoice_result = $this->create_invoice($order, $will_record_payment ? 'open' : null);
@@ -293,7 +298,30 @@ class Orders
 
         if (!empty($payment_data)) {
             $payment_result = $this->api->create_payment($payment_data);
-            if (!is_wp_error($payment_result)) {
+            if (is_wp_error($payment_result)) {
+                // BUG 6: the failure used to be swallowed — the invoice existed
+                // but the merchant was never told the payment was not recorded.
+                if ($this->logger) {
+                    $this->logger->error('Payment recording failed after invoice creation', [
+                        'order_id'   => $order->get_id(),
+                        'invoice_id' => (string) $invoice_result['id'],
+                        'error'      => $payment_result->get_error_message(),
+                    ]);
+                }
+                $order->add_order_note(sprintf(
+                    /* translators: 1: Alegra invoice id, 2: the error Alegra returned. */
+                    __('Alegra: la factura #%1$s se creó, pero el pago NO se pudo registrar (%2$s). Registralo manualmente en Alegra o reintentá con "Registrar pago".', 'alegra-connector'),
+                    (string) $invoice_result['id'],
+                    $payment_result->get_error_message()
+                ));
+            } elseif (API\Client::is_dry_run_response($payment_result)) {
+                if ($this->logger) {
+                    $this->logger->warning('Payment recording skipped (dry run)', [
+                        'order_id'   => $order->get_id(),
+                        'invoice_id' => (string) $invoice_result['id'],
+                    ]);
+                }
+            } else {
                 $order->update_meta_data('_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
                 if (!empty($payment_result['number'])) {
                     $order->update_meta_data('_alegra_payment_number', $payment_result['number']);
@@ -318,8 +346,11 @@ class Orders
      *
      * No-op when the invoice is already open or cannot be read; failures are
      * logged so the payment attempt still surfaces Alegra's own error.
+     *
+     * Public because the manual "Registrar pago" AJAX path (BUG 7) must open a
+     * draft invoice before posting the payment, exactly like the auto path.
      */
-    private function ensure_invoice_open(string $invoice_id): void
+    public function ensure_invoice_open(string $invoice_id): void
     {
         if ($invoice_id === '') {
             return;
@@ -459,14 +490,51 @@ class Orders
                 ], static fn($v) => $v !== null);
             }
         } else {
-            // Partial refund: a single line for exactly the refunded amount, so the
-            // credit note total matches the refund (no over-crediting).
-            $items = [[
-                'name'        => __('Reembolso parcial', 'alegra-connector'),
-                'description' => $reason !== '' ? $reason : __('Reembolso parcial', 'alegra-connector'),
-                'price'       => round($amount, 2),
-                'quantity'    => 1,
-            ]];
+            // BUG 1: `items[].id` is obligatory for credit notes
+            // (https://developer.alegra.com/reference/post_credit-notes.md), so
+            // a free-text line is rejected. Resolution:
+            //  - single-line invoice whose value covers the refund -> reuse that
+            //    line's id (semantically exact: same product, partial value);
+            //  - otherwise (multi-product order, or refund larger than the one
+            //    line) -> a dedicated "Reembolso" service item, resolved
+            //    find-or-create by reference so it is created at most once.
+            $items = [];
+
+            $invoice_items = (!is_wp_error($invoice) && is_array($invoice) && isset($invoice['items']) && is_array($invoice['items']))
+                ? array_values($invoice['items'])
+                : [];
+            $single_line = count($invoice_items) === 1 ? $invoice_items[0] : null;
+
+            if (is_array($single_line) && !empty($single_line['id'])) {
+                $line_value = (float) ($single_line['price'] ?? 0) * (float) ($single_line['quantity'] ?? 0);
+                if ($line_value > 0 && $amount <= $line_value + 0.01) {
+                    $items[] = [
+                        'id'       => (string) $single_line['id'],
+                        'price'    => round($amount, 2),
+                        'quantity' => 1,
+                    ];
+                }
+            }
+
+            if ($items === []) {
+                $refund_item_id = $this->resolve_generic_item_id(
+                    'alegra-connector-refund',
+                    __('Reembolso', 'alegra-connector')
+                );
+                if ($refund_item_id === '') {
+                    return new \WP_Error(
+                        'refund_item_unlinked',
+                        __('No se pudo resolver el ítem "Reembolso" en Alegra para la nota de crédito.', 'alegra-connector')
+                    );
+                }
+                $items[] = [
+                    'id'          => $refund_item_id,
+                    'name'        => __('Reembolso parcial', 'alegra-connector'),
+                    'description' => $reason !== '' ? $reason : __('Reembolso parcial', 'alegra-connector'),
+                    'price'       => round($amount, 2),
+                    'quantity'    => 1,
+                ];
+            }
         }
 
         // Resolve the client — required by POST /credit-notes.
@@ -658,7 +726,117 @@ class Orders
             $data['warehouse'] = $warehouse;
         }
 
+        // BUG 2: Colombia's electronic-invoicing schema requires `paymentForm`
+        // (and `paymentMethod` when it is CASH). See build_colombia_payment_fields().
+        $co_payment = $this->build_colombia_payment_fields($order);
+        if ($co_payment !== []) {
+            $data = array_merge($data, $co_payment);
+        }
+
         return $data;
+    }
+
+    /**
+     * `paymentForm` / `paymentMethod` for a Colombian invoice (BUG 2).
+     *
+     * post_invoices.md (Factura de venta de Colombia): `paymentForm` admits
+     * CASH (contado) and CREDIT (crédito) and "si la compañía tiene activa la
+     * opción de facturación electrónica 2.1, este atributo se vuelve
+     * obligatorio". `paymentMethod` "sí el atributo paymentForm es CASH y la
+     * compañía tiene activa ... facturación electrónica 2.1, este atributo se
+     * vuelve obligatorio"; its values are the DIAN catalog in
+     * https://developer.alegra.com/docs/colombia.md ("Medios de pago").
+     *
+     * The plugin cannot read the FE flag, so it always sends `paymentForm` for
+     * a CO account (an extra valid field is harmless; omitting a required one
+     * is a 400) and sends `paymentMethod` only for gateways whose DIAN code is
+     * verified. An unmapped gateway omits it rather than guessing a code.
+     *
+     * @return array<string, string>
+     */
+    private function build_colombia_payment_fields(\WC_Order $order): array
+    {
+        if (!$this->is_colombia_order($order)) {
+            return [];
+        }
+
+        $paid = method_exists($order, 'is_paid') ? (bool) $order->is_paid() : false;
+        $form = $paid ? 'CASH' : 'CREDIT';
+        $fields = ['paymentForm' => $form];
+
+        if ($form === 'CASH') {
+            $method = $this->get_co_payment_method_code($order);
+            if ($method !== '') {
+                $fields['paymentMethod'] = $method;
+            } elseif ($this->logger) {
+                $this->logger->warning('No verified DIAN payment method for this gateway; paymentMethod omitted', [
+                    'order_id' => $order->get_id(),
+                    'gateway'  => $order->get_payment_method(),
+                ]);
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * Whether the connected Alegra company (or, when unknown, the order's
+     * billing country) is Colombian. paymentForm is a company-level field.
+     */
+    private function is_colombia_order(\WC_Order $order): bool
+    {
+        $company = strtoupper(trim((string) get_option('alegra_connector_company_country', '')));
+        if ($company !== '') {
+            return in_array($company, ['CO', 'COLOMBIA'], true);
+        }
+
+        return in_array(strtoupper(trim($order->get_billing_country())), ['CO', 'COLOMBIA'], true);
+    }
+
+    /**
+     * WooCommerce gateway slug → DIAN `paymentMethod` code (Colombia).
+     *
+     * Source: https://developer.alegra.com/docs/colombia.md ("Medios de pago").
+     * Only codes verified against that catalog are mapped; an unmapped gateway
+     * returns '' so the caller omits `paymentMethod` instead of guessing.
+     */
+    private function get_co_payment_method_code(\WC_Order $order): string
+    {
+        $method = strtolower($order->get_payment_method());
+
+        $map = [
+            'cod'                      => 'CASH',
+            'efecty'                   => 'CASH',
+            'baloto'                   => 'CASH',
+            'oxxo'                     => 'CASH',
+            'multicaja'                => 'CASH',
+            'bacs'                     => 'CREDIT_TRANSFER',
+            'pse'                      => 'CREDIT_TRANSFER',
+            'nequi'                    => 'CREDIT_TRANSFER',
+            'daviplata'                => 'CREDIT_TRANSFER',
+            'bancolombia'              => 'CREDIT_TRANSFER',
+            'spei'                     => 'CREDIT_TRANSFER',
+            'paypal'                   => 'CREDIT_TRANSFER',
+            'stripe'                   => 'CREDIT_CARD',
+            'mercadopago'              => 'CREDIT_CARD',
+            'woocommerce-mercado-pago' => 'CREDIT_CARD',
+            'woo-mercado-pago'         => 'CREDIT_CARD',
+            'payu'                     => 'CREDIT_CARD',
+            'epayco'                   => 'CREDIT_CARD',
+            'wompi'                    => 'CREDIT_CARD',
+            'openpay'                  => 'CREDIT_CARD',
+            'clip'                     => 'CREDIT_CARD',
+            'culqi'                    => 'CREDIT_CARD',
+            'cheque'                   => 'CHECK',
+        ];
+
+        foreach ($map as $slug => $code) {
+            if (strpos($method, $slug) !== false) {
+                return $code;
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -1066,18 +1244,211 @@ class Orders
                 $item_data['discount'] = $discount;
             }
 
-            $tax_ids = $this->map_item_taxes($item_obj);
-            if (!empty($tax_ids)) {
-                $item_data['tax'] = [];
-                foreach ($tax_ids as $tid) {
-                    $item_data['tax'][] = ['id' => $tid];
-                }
-            }
+            $this->attach_line_taxes($item_data, $item_obj);
 
             $items[] = $item_data;
         }
 
+        // BUG 4: `$order->get_items()` returns ONLY line_item rows, so shipping
+        // and fees were dropped and the invoice total was smaller than the
+        // order total. Map them as their own invoice lines.
+        $shipping_lines = $this->build_shipping_lines($order);
+        if (is_wp_error($shipping_lines)) {
+            return $shipping_lines;
+        }
+        $items = array_merge($items, $shipping_lines);
+
+        $fee_lines = $this->build_fee_lines($order);
+        if (is_wp_error($fee_lines)) {
+            return $fee_lines;
+        }
+        $items = array_merge($items, $fee_lines);
+
         return $items;
+    }
+
+    /**
+     * Append the resolved Alegra taxes of a WC order item to an invoice line.
+     *
+     * @param array<string, mixed> $line
+     */
+    private function attach_line_taxes(array &$line, \WC_Order_Item $item): void
+    {
+        $tax_ids = $this->map_item_taxes($item);
+        if ($tax_ids !== []) {
+            $line['tax'] = [];
+            foreach ($tax_ids as $tid) {
+                $line['tax'][] = ['id' => $tid];
+            }
+        }
+    }
+
+    /**
+     * Invoice lines for the order's shipping charges (BUG 4).
+     *
+     * `get_items('shipping')` returns the WC_Order_Item_Shipping rows. Because
+     * `items[].id` is obligatory (post_invoices.md), each shipping row is linked
+     * to a generic "Envío" service item resolved find-or-create by reference.
+     * The line price is pre-tax; the shipping tax is mapped like a line tax.
+     *
+     * @return array<int, array<string, mixed>>|\WP_Error
+     */
+    private function build_shipping_lines(\WC_Order $order): array|\WP_Error
+    {
+        $lines = [];
+
+        foreach ($order->get_items('shipping') as $ship_item) {
+            if (!$ship_item instanceof \WC_Order_Item) {
+                continue;
+            }
+            $total = (float) $ship_item->get_total();
+            if ($total <= 0) {
+                continue;
+            }
+
+            $item_id = $this->resolve_generic_item_id(
+                'alegra-connector-shipping',
+                __('Envío', 'alegra-connector')
+            );
+            if ($item_id === '') {
+                return new \WP_Error(
+                    'invoice_shipping_unlinked',
+                    __('No se pudo vincular el envío con un ítem de Alegra. La factura no se creó.', 'alegra-connector')
+                );
+            }
+
+            $line = [
+                'id'       => $item_id,
+                'name'     => __('Envío', 'alegra-connector'),
+                'price'    => $total,
+                'quantity' => 1,
+            ];
+            $this->attach_line_taxes($line, $ship_item);
+            $lines[] = $line;
+        }
+
+        return $lines;
+    }
+
+    /**
+     * Invoice lines for the order's fees (BUG 4).
+     *
+     * All fees share ONE generic "Recargo" service item (find-or-create); the
+     * fee's own name is carried in the line `name`/`description` so it stays
+     * readable. The line price is pre-tax and the fee tax is mapped like a line
+     * tax.
+     *
+     * @return array<int, array<string, mixed>>|\WP_Error
+     */
+    private function build_fee_lines(\WC_Order $order): array|\WP_Error
+    {
+        $lines = [];
+
+        foreach ($order->get_items('fee') as $fee_item) {
+            if (!$fee_item instanceof \WC_Order_Item) {
+                continue;
+            }
+            $total = (float) $fee_item->get_total();
+            if ($total <= 0) {
+                continue;
+            }
+
+            $name = trim((string) $fee_item->get_name());
+            if ($name === '') {
+                $name = __('Recargo', 'alegra-connector');
+            }
+
+            $item_id = $this->resolve_generic_item_id(
+                'alegra-connector-fee',
+                __('Recargo', 'alegra-connector')
+            );
+            if ($item_id === '') {
+                return new \WP_Error(
+                    'invoice_fee_unlinked',
+                    __('No se pudo vincular un recargo con un ítem de Alegra. La factura no se creó.', 'alegra-connector')
+                );
+            }
+
+            $line = [
+                'id'          => $item_id,
+                'name'        => $name,
+                'description' => $name,
+                'price'       => $total,
+                'quantity'    => 1,
+            ];
+            $this->attach_line_taxes($line, $fee_item);
+            $lines[] = $line;
+        }
+
+        return $lines;
+    }
+
+    /**
+     * Resolve (find-or-create) a generic Alegra service item by `reference`.
+     *
+     * Credit-note and invoice lines require `items[].id`
+     * (post_credit-notes.md / post_invoices.md) — a free-text line is rejected
+     * — so shipping, fees and partial refunds need a real item. The lookup is
+     * keyed by a stable `reference`, which makes it idempotent: the same
+     * reference always resolves to the same item and is never created twice.
+     *
+     * Returns '' when the item cannot be resolved.
+     */
+    private function resolve_generic_item_id(string $reference, string $name): string
+    {
+        // Dry Run blocks write verbs; return a deterministic placeholder so the
+        // rest of the payload can still be built (the invoice POST is blocked
+        // too, so the placeholder never leaves the plugin).
+        if (get_option('alegra_connector_dry_run', false)) {
+            return 'dry-run-' . $reference;
+        }
+
+        $cache = (array) get_option('alegra_connector_generic_item_ids', []);
+        if (isset($cache[$reference]) && (string) $cache[$reference] !== '') {
+            return (string) $cache[$reference];
+        }
+
+        $existing = $this->api->get_items(['reference' => $reference, 'limit' => 1]);
+        if (!is_wp_error($existing) && !empty($existing) && isset($existing[0]['id'])) {
+            $id = (string) $existing[0]['id'];
+            $this->remember_generic_item_id($reference, $id);
+            return $id;
+        }
+
+        $created = $this->api->create_item([
+            'name'      => $name,
+            'reference' => $reference,
+            'type'      => 'service',
+            'price'     => [['idPriceList' => 1, 'price' => 0]],
+        ]);
+        if (!is_wp_error($created) && isset($created['id'])) {
+            $id = (string) $created['id'];
+            $this->remember_generic_item_id($reference, $id);
+            if ($this->logger) {
+                $this->logger->warning('Created a generic Alegra item for invoice lines', [
+                    'reference' => $reference,
+                    'name'      => $name,
+                    'item_id'   => $id,
+                ]);
+            }
+            return $id;
+        }
+
+        if ($this->logger) {
+            $this->logger->error('Could not resolve a generic Alegra item', [
+                'reference' => $reference,
+                'error'     => is_wp_error($created) ? $created->get_error_message() : 'missing id',
+            ]);
+        }
+
+        return '';
+    }
+
+    private function remember_generic_item_id(string $reference, string $id): void
+    {
+        $cache = (array) get_option('alegra_connector_generic_item_ids', []);
+        $cache[$reference] = $id;
+        update_option('alegra_connector_generic_item_ids', $cache, false);
     }
 
     /**
@@ -1134,7 +1505,9 @@ class Orders
     private function prepare_payment_data(\WC_Order $order, string $invoice_id): array
     {
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
-        if ($account_id === '') {
+        // BUG 9: '' and '0' both mean UNCONFIGURED (the settings <select> stores
+        // '0' for "no account"), matching the manual path's guard.
+        if (in_array($account_id, ['', '0'], true)) {
             return [];
         }
 
@@ -1265,16 +1638,147 @@ class Orders
         $tax_mapping = (array) get_option('alegra_connector_tax_mapping', []);
         $ids = [];
 
-        foreach (array_keys($tax_data['total']) as $rate_id) {
-            if (isset($tax_mapping[$rate_id])) {
-                $mapped = (string) $tax_mapping[$rate_id];
-                if ($mapped !== '') {
-                    $ids[$mapped] = $mapped;
-                }
+        foreach ($tax_data['total'] as $rate_id => $amount) {
+            // A zero-amount tax line carries no tax.
+            if ((float) $amount <= 0) {
+                continue;
+            }
+            $resolved = $this->resolve_alegra_tax_id((string) $rate_id, $tax_mapping);
+            if ($resolved !== '') {
+                $ids[$resolved] = $resolved;
             }
         }
 
         return array_values($ids);
+    }
+
+    /**
+     * Resolve the Alegra tax id for a WooCommerce tax RATE id (BUG 5).
+     *
+     * Resolution order:
+     *  1. explicit mapping by rate id;
+     *  2. explicit mapping by tax-class slug — the key the "Mapeo de Campos" UI
+     *     writes (admin-mapping.php keys by `sanitize_title($tax_class)`), which
+     *     the old rate-id-only lookup never matched;
+     *  3. derive from the WC tax rate percentage, finding an existing Alegra tax
+     *     (or creating one, idempotently, when none exists).
+     *
+     * Returns '' when nothing can be resolved; the caller's
+     * find_or_create_alegra_tax() logs the reason at `warning`.
+     */
+    private function resolve_alegra_tax_id(string $rate_id, array $mapping): string
+    {
+        if (isset($mapping[$rate_id]) && (string) $mapping[$rate_id] !== '') {
+            return (string) $mapping[$rate_id];
+        }
+
+        $rate = class_exists('\WC_Tax') ? \WC_Tax::_get_tax_rate((int) $rate_id) : [];
+        $percentage = isset($rate['tax_rate']) ? (float) $rate['tax_rate'] : 0.0;
+        $class = isset($rate['tax_rate_class']) ? (string) $rate['tax_rate_class'] : '';
+        $slug = sanitize_title($class);
+
+        if ($slug !== '' && isset($mapping[$slug]) && (string) $mapping[$slug] !== '') {
+            return (string) $mapping[$slug];
+        }
+
+        if ($percentage <= 0) {
+            if ($this->logger) {
+                $this->logger->warning('A WooCommerce tax rate has no resolvable percentage or mapping; the invoice line will omit it', [
+                    'rate_id' => $rate_id,
+                ]);
+            }
+            return '';
+        }
+
+        return $this->find_or_create_alegra_tax($percentage);
+    }
+
+    /**
+     * Find an Alegra tax by percentage, creating it idempotently when missing.
+     *
+     * Only rates actually present on an order reach this method, so the plugin
+     * never creates unused taxes. The resolved id is cached by percentage so a
+     * rate is resolved (and at most created) once. When several Alegra taxes
+     * share the percentage, an IVA-named one is preferred.
+     */
+    private function find_or_create_alegra_tax(float $percentage): string
+    {
+        $key = rtrim(rtrim(number_format($percentage, 4, '.', ''), '0'), '.');
+        $cache = (array) get_option('alegra_connector_resolved_tax_ids', []);
+        if (isset($cache[$key]) && (string) $cache[$key] !== '') {
+            return (string) $cache[$key];
+        }
+
+        $taxes = $this->api->get_taxes(['limit' => 30]);
+        if (!is_wp_error($taxes) && is_array($taxes)) {
+            $candidates = [];
+            foreach ($taxes as $tax) {
+                if (!is_array($tax) || !isset($tax['id'])) {
+                    continue;
+                }
+                if (abs(((float) ($tax['percentage'] ?? 0)) - $percentage) < 0.0001) {
+                    $candidates[] = $tax;
+                }
+            }
+
+            if (count($candidates) === 1) {
+                $id = (string) $candidates[0]['id'];
+                $this->remember_tax_id($key, $id);
+                return $id;
+            }
+
+            if (count($candidates) > 1) {
+                foreach ($candidates as $candidate) {
+                    if (stripos((string) ($candidate['name'] ?? ''), 'IVA') !== false) {
+                        $id = (string) $candidate['id'];
+                        $this->remember_tax_id($key, $id);
+                        return $id;
+                    }
+                }
+                $id = (string) $candidates[0]['id'];
+                $this->remember_tax_id($key, $id);
+                if ($this->logger) {
+                    $this->logger->warning('Several Alegra taxes share this percentage; picked the first', [
+                        'percentage' => $percentage,
+                        'tax_id'     => $id,
+                    ]);
+                }
+                return $id;
+            }
+        }
+
+        // None found: create it, idempotently keyed by percentage.
+        $created = $this->api->create_tax([
+            'name'       => sprintf('IVA %s%%', $key),
+            'percentage' => $percentage,
+        ]);
+        if (!is_wp_error($created) && isset($created['id'])) {
+            $id = (string) $created['id'];
+            $this->remember_tax_id($key, $id);
+            if ($this->logger) {
+                $this->logger->warning('Created an Alegra tax to match a WooCommerce rate', [
+                    'percentage' => $percentage,
+                    'tax_id'     => $id,
+                ]);
+            }
+            return $id;
+        }
+
+        if ($this->logger) {
+            $this->logger->warning('Could not resolve an Alegra tax; the invoice line will omit it', [
+                'percentage' => $percentage,
+                'error'      => is_wp_error($created) ? $created->get_error_message() : 'missing id',
+            ]);
+        }
+
+        return '';
+    }
+
+    private function remember_tax_id(string $key, string $id): void
+    {
+        $cache = (array) get_option('alegra_connector_resolved_tax_ids', []);
+        $cache[$key] = $id;
+        update_option('alegra_connector_resolved_tax_ids', $cache, false);
     }
 
     /**

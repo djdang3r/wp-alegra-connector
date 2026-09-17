@@ -288,7 +288,9 @@ TestRunner::test('T3.1 CO invoice payload is complete and is created as a DRAFT'
     TestRunner::assertArrayHasKey('dueDate', $body, 'dueDate');
     TestRunner::assertArrayHasKey('numberTemplate', $body, 'numberTemplate');
     TestRunner::assertArrayNotHasKey('stamp', $body, 'invoices must NEVER request a stamp');
-    TestRunner::assertArrayNotHasKey('paymentForm', $body, 'invoices must not send the CO paymentForm');
+    // BUG 2: a CO invoice always carries paymentForm; a paid order is CASH.
+    TestRunner::assertSame('CASH', $body['paymentForm'] ?? null, 'a CO invoice must send paymentForm=CASH for a paid order');
+    TestRunner::assertSame('CREDIT_TRANSFER', $body['paymentMethod'] ?? null, 'bacs must map to the verified DIAN code CREDIT_TRANSFER');
     TestRunner::assertSame('draft', $body['status'] ?? null, 'invoices default to draft');
     TestRunner::assertSame('c0n-co', $body['client']['id'] ?? null, 'client must reference the resolved contact');
 
@@ -319,7 +321,7 @@ TestRunner::test('T3.2 an OPEN invoice status setting is honoured and no stamp i
     make_orders()->create_invoice(wc_get_order(501));
     $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
     TestRunner::assertArrayNotHasKey('stamp', $body, 'no invoice must request a stamp');
-    TestRunner::assertArrayNotHasKey('paymentForm', $body, 'no invoice must send the CO paymentForm');
+    TestRunner::assertArrayNotHasKey('paymentForm', $body, 'a non-CO (MX) invoice must NOT send the CO paymentForm');
     TestRunner::assertSame('open', $body['status'] ?? null, 'the open setting must be honoured');
 });
 
@@ -2414,6 +2416,401 @@ TestRunner::test('T17.7 the cron customer import is not self-blocked by its own 
     make_controller()->run_cron_sync();
 
     TestRunner::assertTrue(get_user_by('email', 'cron@example.test') !== false, 'the cron must actually import the customer (the inner lock must not conflict with the outer one)');
+});
+
+// ===========================================================================
+// T18 — Orders/Invoices/Payments/Credit-notes batch 3 (BUG 1-10)
+// ===========================================================================
+
+/**
+ * Concatenate the plugin's log files (written under the stubbed uploads dir).
+ */
+function alegra_read_log(): string
+{
+    $out = '';
+    foreach (glob(sys_get_temp_dir() . '/alegra-exec-uploads/alegra-logs/*.log') ?: [] as $f) {
+        $out .= (string) file_get_contents($f);
+    }
+    return $out;
+}
+
+function alegra_clear_log(): void
+{
+    foreach (glob(sys_get_temp_dir() . '/alegra-exec-uploads/alegra-logs/*.log') ?: [] as $f) {
+        @unlink($f);
+    }
+}
+
+/** Seed a WC tax rate so the invoice tax resolver can derive its percentage. */
+function alegra_seed_wc_tax_rate(int $rate_id, float $percentage, string $class = ''): void
+{
+    $GLOBALS['wc_tax_rates'][$rate_id] = [
+        'tax_rate'       => number_format($percentage, 4, '.', ''),
+        'tax_rate_class' => $class,
+    ];
+}
+
+TestRunner::test('T18.1 BUG 1 a partial refund on a MULTI-line invoice sends items[].id', function (): void {
+    alegra_test_reset();
+    $invoice_id = '1nv-b1';
+    alegra_mock_seed_invoice($invoice_id, [
+        'total' => 100.0, 'balance' => 100.0, 'status' => 'open',
+        'items' => [
+            ['id' => '1t3m-a', 'name' => 'A', 'price' => 60, 'quantity' => 1],
+            ['id' => '1t3m-b', 'name' => 'B', 'price' => 40, 'quantity' => 1],
+        ],
+    ]);
+    $refund = alegra_make_refund(1101, ['total' => 30.0]);
+    alegra_make_order(1100, [
+        'total' => 100.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id, '_billing_alegra_contact_id' => 'c0n-b1'],
+        'refunds' => [$refund],
+    ]);
+
+    register_refund_owner_hook();
+    do_action('woocommerce_order_refunded', 1100, 1101);
+
+    $body = alegra_mock_last_request('POST', '/credit-notes')['body'] ?? [];
+    TestRunner::assertTrue(!empty($body['items'][0]['id']), 'the partial-refund line MUST carry an items[].id (obligatory)');
+    TestRunner::assertTrue(
+        ($body['items'][0]['id'] ?? '') !== '1t3m-a' && ($body['items'][0]['id'] ?? '') !== '1t3m-b',
+        'a multi-line refund must NOT reuse a single invoice line id'
+    );
+    TestRunner::assertEquals(30.0, $body['items'][0]['price'] ?? null, 'the line price is the refund amount');
+    TestRunner::assertEquals(30.0, $body['invoices'][0]['amount'] ?? null, 'invoices[0].amount matches the refund');
+
+    $resolved = false;
+    foreach (alegra_mock_requests('GET', '/items') as $r) {
+        if (($r['query']['reference'] ?? '') === 'alegra-connector-refund') { $resolved = true; }
+    }
+    foreach (alegra_mock_requests('POST', '/items') as $r) {
+        if (($r['body']['reference'] ?? '') === 'alegra-connector-refund') { $resolved = true; }
+    }
+    TestRunner::assertTrue($resolved, 'the generic "Reembolso" item must be resolved by reference');
+});
+
+TestRunner::test('T18.2 BUG 1 the generic Reembolso item is find-or-created exactly once', function (): void {
+    alegra_test_reset();
+    $invoice_id = '1nv-b3';
+    alegra_mock_seed_invoice($invoice_id, [
+        'total' => 100.0, 'balance' => 100.0, 'status' => 'open',
+        'items' => [
+            ['id' => 'a', 'name' => 'A', 'price' => 60, 'quantity' => 1],
+            ['id' => 'b', 'name' => 'B', 'price' => 40, 'quantity' => 1],
+        ],
+    ]);
+    $r1 = alegra_make_refund(1201, ['total' => 30.0]);
+    $order = alegra_make_order(1200, [
+        'total' => 100.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id, '_billing_alegra_contact_id' => 'c0n-b3'],
+        'refunds' => [$r1],
+    ]);
+
+    register_refund_owner_hook();
+    do_action('woocommerce_order_refunded', 1200, 1201);
+
+    $r2 = alegra_make_refund(1202, ['total' => 30.0]);
+    $order->add_refund($r2);
+    State_Sync::handle_refund(1200, 1202);
+
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/credit-notes'), 'two credit notes');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'), 'the generic item must be created exactly once');
+    $bodies = alegra_mock_requests('POST', '/credit-notes');
+    TestRunner::assertSame(
+        $bodies[0]['body']['items'][0]['id'] ?? null,
+        $bodies[1]['body']['items'][0]['id'] ?? null,
+        'both refunds must reference the same generic item'
+    );
+});
+
+TestRunner::test('T18.3 BUG 1 a single-line partial refund reuses the invoice line id', function (): void {
+    alegra_test_reset();
+    $invoice_id = '1nv-b4';
+    alegra_mock_seed_invoice($invoice_id, [
+        'total' => 100.0, 'balance' => 100.0, 'status' => 'open',
+        'items' => [['id' => '1t3m-solo', 'name' => 'Widget', 'price' => 100, 'quantity' => 1]],
+    ]);
+    $refund = alegra_make_refund(1203, ['total' => 40.0]);
+    alegra_make_order(1204, [
+        'total' => 100.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id, '_billing_alegra_contact_id' => 'c0n-b4'],
+        'refunds' => [$refund],
+    ]);
+
+    register_refund_owner_hook();
+    do_action('woocommerce_order_refunded', 1204, 1203);
+
+    $body = alegra_mock_last_request('POST', '/credit-notes')['body'] ?? [];
+    TestRunner::assertSame('1t3m-solo', $body['items'][0]['id'] ?? null, 'a single-line refund reuses the line id');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'no generic item is needed for a single-line refund');
+    TestRunner::assertEquals(40.0, $body['items'][0]['price'] ?? null, 'the reused line carries the refund amount');
+});
+
+TestRunner::test('T18.4 BUG 1 a full refund: invoices[].amount equals the credit-note total', function (): void {
+    alegra_test_reset();
+    $invoice_id = '1nv-b2';
+    alegra_mock_seed_invoice($invoice_id, [
+        'total' => 119.0, 'balance' => 119.0, 'status' => 'open',
+        'items' => [[
+            'id' => '1t3m-b2', 'name' => 'Widget', 'price' => 100, 'quantity' => 1,
+            'tax' => [['id' => '22222222-0000-0000-0000-000000000001']],
+        ]],
+    ]);
+    $refund = alegra_make_refund(1102, ['total' => 119.0]);
+    alegra_make_order(1103, [
+        'total' => 119.0,
+        'meta' => ['_alegra_invoice_id' => $invoice_id, '_billing_alegra_contact_id' => 'c0n-b2'],
+        'refunds' => [$refund],
+    ]);
+
+    register_refund_owner_hook();
+    do_action('woocommerce_order_refunded', 1103, 1102);
+
+    $body = alegra_mock_last_request('POST', '/credit-notes')['body'] ?? [];
+    $total = 0.0;
+    foreach (($body['items'] ?? []) as $item) {
+        $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+        foreach ((array) ($item['tax'] ?? []) as $tax) {
+            $line += $line * (alegra_mock_tax_percentage((string) ($tax['id'] ?? '')) / 100);
+        }
+        $total += $line;
+    }
+    TestRunner::assertEquals(119.0, round($total, 2), 'the credit-note total must be 119 (100 + 19% IVA)');
+    TestRunner::assertEquals(
+        round($total, 2),
+        (float) ($body['invoices'][0]['amount'] ?? 0),
+        'invoices[].amount must equal the credit-note total (required when stamping)'
+    );
+});
+
+TestRunner::test('T18.5 BUG 2 an UNPAID CO order sends paymentForm=CREDIT and omits paymentMethod', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '50']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-co2');
+
+    alegra_make_order(1110, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'pending',
+        'billing' => ['country' => 'CO', 'email' => 'co@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-co2'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 50, 'total' => 50])],
+    ]);
+
+    make_orders()->create_invoice(wc_get_order(1110));
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+
+    TestRunner::assertSame('CREDIT', $body['paymentForm'] ?? null, 'an unpaid CO order is CREDIT');
+    TestRunner::assertArrayNotHasKey('paymentMethod', $body, 'paymentMethod is not required for paymentForm=CREDIT');
+});
+
+TestRunner::test('T18.6 BUG 2 an unknown gateway omits paymentMethod rather than guessing', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '50']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-co3');
+
+    alegra_make_order(1111, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'some_unknown_gateway', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'co3@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-co3'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 50, 'total' => 50])],
+    ]);
+
+    make_orders()->create_invoice(wc_get_order(1111));
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+
+    TestRunner::assertSame('CASH', $body['paymentForm'] ?? null, 'a paid CO order is CASH');
+    TestRunner::assertArrayNotHasKey('paymentMethod', $body, 'an unverified gateway must not send a guessed DIAN code');
+});
+
+TestRunner::test('T18.7 BUG 3 void_invoice sends `cause`, never `reason`', function (): void {
+    alegra_test_reset();
+    make_api()->void_invoice('1nv-void', 'motivo de prueba');
+
+    $body = alegra_mock_last_request('POST', '/invoices/1nv-void/void')['body'] ?? [];
+    TestRunner::assertSame('motivo de prueba', $body['cause'] ?? null, 'the documented void body field is `cause`');
+    TestRunner::assertArrayNotHasKey('reason', $body, '`reason` is not a documented field');
+});
+
+TestRunner::test('T18.8 BUG 4 shipping + fees are invoiced and the total matches the order', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-ship');
+
+    $order = alegra_make_order(1120, [
+        'total' => 136.85, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'ship@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-ship'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 19.0]]])],
+        'shipping_items' => [new WC_Order_Item(['name' => 'Envío', 'quantity' => 1, 'subtotal' => 10, 'total' => 10, 'taxes' => ['total' => [1 => 1.9]]])],
+        'fee_items' => [new WC_Order_Item(['name' => 'Manejo', 'quantity' => 1, 'subtotal' => 5, 'total' => 5, 'taxes' => ['total' => [1 => 0.95]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice creation must succeed');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+
+    TestRunner::assertCount(3, $body['items'] ?? [], 'product + shipping + fee = 3 lines');
+    TestRunner::assertEquals(10.0, (float) ($body['items'][1]['price'] ?? 0), 'the shipping line carries the shipping total');
+    TestRunner::assertEquals(5.0, (float) ($body['items'][2]['price'] ?? 0), 'the fee line carries the fee total');
+    TestRunner::assertTrue(!empty($body['items'][1]['id']) && !empty($body['items'][2]['id']), 'shipping/fee lines require an id');
+    TestRunner::assertEquals(136.85, (float) ($result['total'] ?? 0), 'the invoice total must equal the WC order total');
+});
+
+TestRunner::test('T18.9 BUG 5 an unmapped WC tax is derived from the Alegra catalog (not dropped)', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '119']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-tax');
+
+    $order = alegra_make_order(1130, [
+        'total' => 119.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'tax@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-tax'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 19.0]]])],
+    ]);
+
+    // No alegra_connector_tax_mapping is configured (the default).
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice creation must succeed');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+
+    TestRunner::assertSame(
+        '22222222-0000-0000-0000-000000000001',
+        $body['items'][0]['tax'][0]['id'] ?? null,
+        'the tax must be derived from the Alegra catalog, not silently dropped'
+    );
+    TestRunner::assertEquals(119.0, (float) ($result['total'] ?? 0), 'the invoice total must include the tax');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/taxes'), 'an existing tax must be reused, not created');
+});
+
+TestRunner::test('T18.10 BUG 5 a missing Alegra tax is created once and reused', function (): void {
+    alegra_test_reset();
+    // Empty catalog: no tax with this percentage exists yet.
+    $GLOBALS['alegra_mock_state']['taxes'] = [];
+    alegra_seed_wc_tax_rate(1, 5.0);
+
+    foreach ([1141, 1142] as $order_id) {
+        alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '105']);
+        update_post_meta(10, '_alegra_item_id', '1t3m-tax5');
+        $order = alegra_make_order($order_id, [
+            'total' => 105.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+            'billing' => ['country' => 'CO', 'email' => "t{$order_id}@example.test"],
+            'meta' => ['_billing_alegra_contact_id' => 'c0n-tax5'],
+            'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 5.0]]])],
+        ]);
+        make_orders()->create_invoice($order);
+    }
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/taxes'), 'the missing tax must be created exactly once');
+    $created = alegra_mock_last_request('POST', '/taxes')['body'] ?? [];
+    TestRunner::assertEquals(5.0, (float) ($created['percentage'] ?? 0), 'the created tax must match the WC rate');
+
+    $bodies = alegra_mock_requests('POST', '/invoices');
+    TestRunner::assertSame(
+        $bodies[0]['body']['items'][0]['tax'][0]['id'] ?? null,
+        $bodies[1]['body']['items'][0]['tax'][0]['id'] ?? null,
+        'both invoices must reference the same (created) tax'
+    );
+});
+
+TestRunner::test('T18.11 BUG 6 a failed payment is logged and surfaced in an order note', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_fail('POST', '/payments', 400, ['code' => 400, 'message' => 'La cuenta bancaria no existe']);
+
+    alegra_mock_seed_invoice('1nv-1140', [
+        'status' => 'open', 'total' => 50.0, 'balance' => 50.0,
+        'items' => [['id' => 'x', 'price' => 50, 'quantity' => 1]],
+    ]);
+    $order = alegra_make_order(1140, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'pay@example.test'],
+        'meta' => ['_alegra_invoice_id' => '1nv-1140', '_billing_alegra_contact_id' => 'c0n-pay'],
+    ]);
+
+    $result = make_orders()->create_invoice_with_payment($order);
+    TestRunner::assertFalse(is_wp_error($result), 'the invoice itself must succeed');
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('NO se pudo registrar', $notes, 'an order note must explain the payment failure');
+    TestRunner::assertStringContains('La cuenta bancaria no existe', $notes, 'the note must carry the real reason');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), 'no payment id may be stored on failure');
+    TestRunner::assertStringContains('Payment recording failed', alegra_read_log(), 'the failure must be logged at error level');
+});
+
+TestRunner::test('T18.12 BUG 7 ajax_record_payment opens a DRAFT invoice before paying', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('1nv-draft2', [
+        'status' => 'draft', 'total' => 20.0, 'balance' => 20.0,
+        'items' => [['id' => 'x', 'price' => 20, 'quantity' => 1]],
+    ]);
+    alegra_make_order(1150, [
+        'total' => 20.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'meta' => ['_alegra_invoice_id' => '1nv-draft2'],
+    ]);
+
+    $_POST['order_id'] = 1150;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn() => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'the payment must succeed');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/1nv-draft2/open'), 'a draft invoice must be opened before paying');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be recorded');
+});
+
+TestRunner::test('T18.13 BUG 8 an automatic order sync failure adds an order note', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '10']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-auto');
+    alegra_mock_fail('POST', '/invoices', 400, ['code' => 400, 'message' => 'Cliente inválido']);
+
+    alegra_make_order(1160, [
+        'total' => 10.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'auto@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-auto'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
+    ]);
+
+    $logger = make_logger();
+    $public = new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
+    do_action('woocommerce_new_order', 1160);
+
+    $order = wc_get_order(1160);
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('no se pudo sincronizar el pedido', $notes, 'the failure must be surfaced on the order');
+    TestRunner::assertStringContains('Cliente inválido', $notes, 'the note must carry the real reason');
+});
+
+TestRunner::test('T18.14 BUG 9 a payment account of "0" is treated as unconfigured', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '0');
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '10']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-zero');
+
+    $order = alegra_make_order(1170, [
+        'total' => 10.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'zero@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-zero'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be attempted with account "0"');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame('draft', $body['status'] ?? null, 'without a payment the configured draft status applies');
+});
+
+TestRunner::test('T18.15 BUG 10 the settings text states the plugin does NOT emit to the DIAN', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('NO emite', $tpl, 'the settings text must state the plugin does not emit');
+    TestRunner::assertStringContains('DIAN', $tpl, 'the settings text must mention the DIAN');
+    TestRunner::assertStringContains('stamp.generateStamp', $tpl, 'the settings text must name the missing stamp');
 });
 
 exit(TestRunner::summary());

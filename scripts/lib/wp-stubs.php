@@ -885,10 +885,14 @@ class WC_Order
     protected int $id;
     protected array $meta = [];
     protected array $items = [];
+    protected array $shipping_items = [];
+    protected array $fee_items = [];
     protected array $refunds = [];
     protected float $total = 0.0;
     protected float $subtotal = 0.0;
     protected float $total_refunded = 0.0;
+    protected float $shipping_total = 0.0;
+    protected float $shipping_tax = 0.0;
     protected array $billing = [];
     protected string $payment_method = '';
     protected string $currency = 'COP';
@@ -906,6 +910,8 @@ class WC_Order
         $this->total = (float) ($data['total'] ?? 0.0);
         $this->subtotal = (float) ($data['subtotal'] ?? $this->total);
         $this->total_refunded = (float) ($data['total_refunded'] ?? 0.0);
+        $this->shipping_total = (float) ($data['shipping_total'] ?? 0.0);
+        $this->shipping_tax = (float) ($data['shipping_tax'] ?? 0.0);
         $this->billing = (array) ($data['billing'] ?? []);
         $this->payment_method = (string) ($data['payment_method'] ?? '');
         $this->currency = (string) ($data['currency'] ?? 'COP');
@@ -913,6 +919,8 @@ class WC_Order
         $this->customer_id = (int) ($data['customer_id'] ?? 0);
         $this->meta = (array) ($data['meta'] ?? []);
         $this->items = (array) ($data['items'] ?? []);
+        $this->shipping_items = (array) ($data['shipping_items'] ?? []);
+        $this->fee_items = (array) ($data['fee_items'] ?? []);
         $this->refunds = (array) ($data['refunds'] ?? []);
         $this->date_created = $data['date_created'] ?? new WC_DateTime();
         $this->date_paid = $data['date_paid'] ?? null;
@@ -929,11 +937,20 @@ class WC_Order
     public function update_meta_data($key, $value) { $this->meta[$key] = $value; return $this; }
     public function delete_meta_data($key) { unset($this->meta[$key]); return $this; }
     public function save() { return $this->id; }
-    public function get_items($type = 'line_item') { return $this->items; }
+    public function get_items($type = 'line_item')
+    {
+        if ($type === 'shipping') { return $this->shipping_items; }
+        if ($type === 'fee') { return $this->fee_items; }
+        return $this->items;
+    }
     public function get_total(): float { return $this->total; }
     public function get_subtotal(): float { return $this->subtotal; }
     public function get_total_refunded(): float { return $this->total_refunded; }
+    public function get_shipping_total(): float { return $this->shipping_total; }
+    public function get_shipping_tax(): float { return $this->shipping_tax; }
+    public function is_paid(): bool { return in_array($this->status, ['processing', 'completed'], true); }
     public function get_refunds(): array { return $this->refunds; }
+
     public function get_billing_country(): string { return (string) ($this->billing['country'] ?? ''); }
     public function get_billing_email(): string { return (string) ($this->billing['email'] ?? ''); }
     public function get_billing_first_name(): string { return (string) ($this->billing['first_name'] ?? ''); }
@@ -968,6 +985,20 @@ class WC_Order_Refund extends WC_Order
     {
         parent::__construct($id, $data);
         $this->total = (float) ($data['total'] ?? 0.0);
+    }
+}
+
+/**
+ * Minimal WC_Tax stub. `_get_tax_rate($rate_id)` returns the seeded rate array
+ * (`['tax_rate' => '19.0000', 'tax_rate_class' => '']`) so the invoice tax
+ * resolver can derive a percentage from a WC rate id.
+ */
+class WC_Tax
+{
+    public static function _get_tax_rate($rate_id, $output = 'ARRAY_A'): array
+    {
+        $rates = $GLOBALS['wc_tax_rates'] ?? [];
+        return $rates[(int) $rate_id] ?? [];
     }
 }
 

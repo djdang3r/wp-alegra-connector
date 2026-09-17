@@ -157,6 +157,7 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_db']     = [];
     $GLOBALS['wc_orders']     = [];
     $GLOBALS['wc_products']   = [];
+    $GLOBALS['wc_tax_rates']  = [];
     $GLOBALS['alegra_race']   = null;
     $GLOBALS['alegra_next_post_id'] = 1000;
     $GLOBALS['alegra_next_term_id'] = 500;

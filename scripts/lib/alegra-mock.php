@@ -29,7 +29,7 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
 
 $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
@@ -37,11 +37,13 @@ $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
     $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
+    // Default Alegra tax catalog: one IVA 19% tax, as a CO account has.
+    alegra_mock_seed_tax('22222222-0000-0000-0000-000000000001', ['name' => 'IVA 19%', 'percentage' => 19]);
 }
 
 /**
@@ -78,6 +80,11 @@ function alegra_mock_seed_invoice(string $id, array $data = []): void
 function alegra_mock_seed_category(string $id, array $data = []): void
 {
     $GLOBALS['alegra_mock_state']['categories'][$id] = array_merge(['id' => $id], $data);
+}
+
+function alegra_mock_seed_tax(string $id, array $data = []): void
+{
+    $GLOBALS['alegra_mock_state']['taxes'][$id] = array_merge(['id' => $id], $data);
 }
 
 /**
@@ -544,9 +551,9 @@ function alegra_mock_validate_invoice(array $body): ?array
 }
 
 /**
- * POST /credit-notes. Required: date, client, items (non-empty). When
- * `invoices` is present every entry must carry `{id, amount}`
- * (post_credit-notes.md).
+ * POST /credit-notes. Required: date, client, items (non-empty, every line with
+ * an `id` — a free-text line is rejected). When `invoices` is present every
+ * entry must carry `{id, amount}` (post_credit-notes.md).
  */
 function alegra_mock_validate_credit_note(array $body): ?array
 {
@@ -555,6 +562,11 @@ function alegra_mock_validate_credit_note(array $body): ?array
     }
     if (empty($body['items']) || !is_array($body['items'])) {
         return alegra_mock_validation_error('El campo items es obligatorio y no puede estar vacio');
+    }
+    foreach (array_values($body['items']) as $i => $item) {
+        if (!is_array($item) || empty($item['id'])) {
+            return alegra_mock_validation_error('El campo items[' . $i . '].id es obligatorio');
+        }
     }
     if (empty($body['date']) || !is_string($body['date'])) {
         return alegra_mock_validation_error('El campo date es obligatorio');
@@ -603,11 +615,7 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         ]]);
     }
     if ($method === 'GET' && $path === '/taxes') {
-        return alegra_mock_response(200, [[
-            'id' => '22222222-0000-0000-0000-000000000001',
-            'name' => 'IVA 19%',
-            'percentage' => 19,
-        ]]);
+        return alegra_mock_response(200, array_values($GLOBALS['alegra_mock_state']['taxes']));
     }
     if ($method === 'GET' && $path === '/item-categories') {
         $all = array_values($GLOBALS['alegra_mock_state']['categories']);
@@ -691,6 +699,15 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
             $stored = alegra_mock_materialize_variant_children($id, $stored);
         }
         $GLOBALS['alegra_mock_state']['items'][$id] = $stored;
+        return alegra_mock_response(200, $stored);
+    }
+    if ($method === 'POST' && $path === '/taxes') {
+        if (!is_array($body) || empty($body['name']) || !isset($body['percentage'])) {
+            return alegra_mock_response(400, ['code' => 400, 'message' => 'La información enviada es inválida']);
+        }
+        $id = alegra_mock_uuid('abababab');
+        $stored = array_merge($body, ['id' => $id, 'status' => 'active']);
+        $GLOBALS['alegra_mock_state']['taxes'][$id] = $stored;
         return alegra_mock_response(200, $stored);
     }
     if ($method === 'POST' && $path === '/variant-attributes') {
@@ -895,14 +912,25 @@ function alegra_mock_body_total(mixed $body): float
     if (!is_array($body)) { return 0.0; }
     $total = 0.0;
     foreach (($body['items'] ?? []) as $item) {
-        if (is_array($item)) {
-            $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
-            // `discount` is a percentage (post_invoices.md).
-            if (isset($item['discount'])) {
-                $line *= (1 - ((float) $item['discount'] / 100));
-            }
-            $total += $line;
+        if (!is_array($item)) { continue; }
+        $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
+        // `discount` is a percentage (post_invoices.md).
+        if (isset($item['discount'])) {
+            $line *= (1 - ((float) $item['discount'] / 100));
         }
+        // `items[].tax` is a list of {id}; resolve each percentage from the
+        // seeded tax catalog so the invoice total reflects the taxes.
+        foreach ((array) ($item['tax'] ?? []) as $tax) {
+            $tax_id = is_array($tax) ? (string) ($tax['id'] ?? '') : (string) $tax;
+            $line += $line * (alegra_mock_tax_percentage($tax_id) / 100);
+        }
+        $total += $line;
     }
     return round($total, 2);
+}
+
+function alegra_mock_tax_percentage(string $tax_id): float
+{
+    $tax = $GLOBALS['alegra_mock_state']['taxes'][$tax_id] ?? null;
+    return is_array($tax) ? (float) ($tax['percentage'] ?? 0) : 0.0;
 }

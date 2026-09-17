@@ -212,6 +212,7 @@ $ac_resolution_mode = get_option('alegra_connector_customer_resolution_mode','au
 <option value="open" <?php selected(get_option('alegra_connector_invoice_status','draft'),'open');?>><?php esc_html_e('Abierta','alegra-connector');?></option>
 </select>
 <p class="description"><?php esc_html_e('Las facturas se crean en Alegra como borrador para que puedas revisarlas antes de emitirlas. Si eliges "Abierta" se crean directamente como facturas abiertas.','alegra-connector');?></p>
+<div class="ac-notice warning" style="margin-top:8px;"><strong><?php esc_html_e('Importante (Colombia / DIAN):','alegra-connector');?></strong> <?php esc_html_e('El plugin NO emite las facturas ante la DIAN: nunca envía el timbrado electrónico (stamp.generateStamp). Aunque elijas "Abierta", la factura queda sin emitir electrónicamente en Alegra y debés emitirla/timbrarla manualmente desde Alegra.','alegra-connector');?></div>
 </td></tr>
 
 <!-- 1c. Dry run toggle -->

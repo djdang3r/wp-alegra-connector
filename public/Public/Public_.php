@@ -310,7 +310,28 @@ class Public_
 
         try {
             $sync_controller = new Sync\Controller($this->api, $this->logger);
-            $sync_controller->sync_entity($type, $id, $action);
+            $result = $sync_controller->sync_entity($type, $id, $action);
+
+            // BUG 8: the auto path used to discard the result, so a failed order
+            // push was only logged. Surface the real reason on the order. No
+            // note on success (avoids noise on every order event).
+            if (is_wp_error($result) && $type === 'order') {
+                $order = wc_get_order($id);
+                if ($order instanceof \WC_Order) {
+                    $order->add_order_note(sprintf(
+                        /* translators: %s: the error Alegra returned. */
+                        __('Alegra: no se pudo sincronizar el pedido con Alegra (%s). Revisá la configuración y volvé a intentarlo desde el panel.', 'alegra-connector'),
+                        $result->get_error_message()
+                    ));
+                }
+                if ($this->logger) {
+                    $this->logger->error('Automatic order sync failed', [
+                        'order_id' => $id,
+                        'action'   => $action,
+                        'error'    => $result->get_error_message(),
+                    ]);
+                }
+            }
         } finally {
             self::$is_syncing = false;
             Sync\Controller::release_lock($lock_key, $token);

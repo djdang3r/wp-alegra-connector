@@ -419,7 +419,9 @@ class Client
     {
         $data = [];
         if (!empty($reason)) {
-            $data['reason'] = sanitize_text_field($reason);
+            // BUG 3: the documented body field is `cause`, not `reason`
+            // (https://developer.alegra.com/reference/post_invoices-id-void.md).
+            $data['cause'] = sanitize_text_field($reason);
         }
         return $this->post('/invoices/' . $id . '/void', $data);
     }

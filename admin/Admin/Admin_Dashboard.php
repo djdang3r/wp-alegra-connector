@@ -1839,6 +1839,11 @@ class Admin_Dashboard
         }
 
         $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+
+        // BUG 7: a payment requires an OPEN invoice. The invoice may be a draft
+        // (the default), so open it first — exactly like the auto path does.
+        $orders_sync->ensure_invoice_open($alegra_invoice_id);
+
         $payment_data = [
             'date' => $order->get_date_paid() ? $order->get_date_paid()->date('Y-m-d') : date('Y-m-d'),
             'bankAccount' => ['id' => $account_id],
