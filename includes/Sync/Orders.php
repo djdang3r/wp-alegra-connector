@@ -154,11 +154,40 @@ class Orders
             $invoice_number = (string) $invoice['number'];
         }
         $order->update_meta_data('_alegra_invoice_number', $invoice_number);
+
+        // Cache the invoice status (draft/open/paid/void) so the orders list can
+        // show it without one API call per row.
+        $invoice_status = (string) ($invoice['status'] ?? '');
+        if ($invoice_status !== '') {
+            $order->update_meta_data('_alegra_invoice_status', $invoice_status);
+        }
+
         $order->save();
 
         // AC-07: write the indexed mapping so a later lookup never scans
         // wp_postmeta.meta_value (O(N²) on a large catalog).
         \Alegra\Connector\Entity_Map::map('invoice', $invoice_id, 'order', (int) $order->get_id());
+    }
+
+    /**
+     * Cache the Alegra invoice status on the order (saved only when it changes).
+     *
+     * Used after opening a draft and after the status poll so the admin list can
+     * render a truthful badge without a per-row API call.
+     *
+     * @param array<string, mixed> $invoice
+     */
+    public function persist_invoice_status(\WC_Order $order, array $invoice): void
+    {
+        $status = (string) ($invoice['status'] ?? '');
+        if ($status === '') {
+            return;
+        }
+        if ((string) $order->get_meta('_alegra_invoice_status', true) === $status) {
+            return;
+        }
+        $order->update_meta_data('_alegra_invoice_status', $status);
+        $order->save();
     }
 
     /**
@@ -283,7 +312,10 @@ class Orders
         // was created earlier as a draft (the default, e.g. by the
         // `woocommerce_new_order` hook) open it before applying the payment.
         if ($will_record_payment && !empty($invoice_result['already_exists'])) {
-            $this->ensure_invoice_open((string) $invoice_result['id']);
+            $opened = $this->ensure_invoice_open((string) $invoice_result['id']);
+            if (!is_wp_error($opened)) {
+                $this->persist_invoice_status($order, $opened);
+            }
         }
 
         // AC-14: recover a payment Alegra committed but whose response was lost.
@@ -354,35 +386,50 @@ class Orders
     }
 
     /**
-     * Open a draft invoice so a payment can be applied to it.
+     * Open a draft invoice in Alegra and return its resulting state.
      *
-     * No-op when the invoice is already open or cannot be read; failures are
-     * logged so the payment attempt still surfaces Alegra's own error.
+     * No-op when the invoice is already open (returns it unchanged). Used by
+     * the payment paths (a payment requires an OPEN invoice) and by the manual
+     * "Abrir factura" action on the order detail page.
      *
      * Public because the manual "Registrar pago" AJAX path (BUG 6) must open a
      * draft invoice before posting the payment, exactly like the auto path.
+     *
+     * @return array|\WP_Error The invoice after opening, or the API error.
      */
-    public function ensure_invoice_open(string $invoice_id): void
+    public function ensure_invoice_open(string $invoice_id): array|\WP_Error
     {
         if ($invoice_id === '') {
-            return;
+            return new \WP_Error('missing_invoice', __('No hay una factura de Alegra vinculada.', 'alegra-connector'));
         }
 
         $invoice = $this->api->get_invoice($invoice_id);
-        if (is_wp_error($invoice) || !is_array($invoice)) {
-            return;
+        if (is_wp_error($invoice)) {
+            return $invoice;
+        }
+        if (!is_array($invoice)) {
+            return new \WP_Error('invoice_not_found', __('No se pudo leer la factura en Alegra.', 'alegra-connector'));
         }
         if ((string) ($invoice['status'] ?? '') !== 'draft') {
-            return;
+            // Already open (or any non-draft state): nothing to do.
+            return $invoice;
         }
 
         $opened = $this->api->open_invoice($invoice_id);
-        if (is_wp_error($opened) && $this->logger) {
-            $this->logger->warning('Could not open a draft invoice before recording a payment', [
-                'invoice_id' => $invoice_id,
-                'error'      => $opened->get_error_message(),
-            ]);
+        if (is_wp_error($opened)) {
+            if ($this->logger) {
+                $this->logger->warning('Could not open a draft invoice', [
+                    'invoice_id' => $invoice_id,
+                    'error'      => $opened->get_error_message(),
+                ]);
+            }
+            return $opened;
         }
+
+        // Re-read so the caller gets the final status (the open response may not
+        // carry every field the order detail shows).
+        $fresh = $this->api->get_invoice($invoice_id);
+        return is_wp_error($fresh) ? $opened : $fresh;
     }
 
     /**
@@ -1771,6 +1818,9 @@ class Orders
                     $result['errors']++;
                     continue;
                 }
+
+                // Keep the cached status fresh for the orders list.
+                $this->persist_invoice_status($order, $invoice);
 
                 $status = $invoice['status'] ?? '';
                 $balance = (float) ($invoice['balance'] ?? 0);

@@ -2,6 +2,35 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.10] - 2026-09-18
+
+> **Draft-invoice visibility.** When invoices are created as drafts, the order
+> detail already shows the Alegra status; this release adds a button to open an
+> existing draft from the plugin.
+
+### Added
+
+- **"Abrir factura (borrador)" button** on the order detail page. It appears only
+  when the linked Alegra invoice is in `draft`; it opens it in Alegra
+  (`POST /invoices/{id}/open`) so it stops being a draft and gets accounted.
+  No-op (and hidden) when the invoice is already open.
+- **The orders list now shows the real invoice status** (Pendiente / Borrador /
+  Abierta / Pagada) instead of a generic "Facturado", and offers an **Abrir**
+  button for drafts. The status is cached on the order (`_alegra_invoice_status`)
+  when the invoice is created, opened or polled, so the list needs no per-row
+  API call.
+- The order's Alegra panel already displayed `Estado` (draft/open/paid); the
+  button complements it.
+
+### Notes for the merchant
+
+- New invoices follow **Ajustes → Sincronización → "Estado de la factura"**
+  (`draft` = borrador, `open` = abierta). This affects only new invoices.
+- To stop using drafts: set that option to "Abierta". Existing drafts can be
+  opened one by one from the order detail (or in Alegra).
+- Recording a payment still opens a draft automatically, because Alegra only
+  accepts payments on open invoices.
+
 ## [2.3.9] - 2026-09-18
 
 > **Field-preservation release.** When Alegra is the source of truth, a

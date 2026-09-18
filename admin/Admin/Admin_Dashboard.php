@@ -41,6 +41,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_save_mapping', [$this, 'ajax_save_mapping']);
         add_action('wp_ajax_alegra_sync_single', [$this, 'ajax_sync_single']);
         add_action('wp_ajax_alegra_record_payment', [$this, 'ajax_record_payment']);
+        add_action('wp_ajax_alegra_open_invoice', [$this, 'ajax_open_invoice']);
         add_action('wp_ajax_alegra_import_from_api', [$this, 'ajax_import_from_api']);
         add_action('wp_ajax_alegra_sync_inventory', [$this, 'ajax_sync_inventory']);
         add_action('wp_ajax_alegra_export_csv', [$this, 'ajax_export_csv']);
@@ -615,6 +616,8 @@ class Admin_Dashboard
             'cleanupImages'         => __('Limpiar imágenes duplicadas', 'alegra-connector'),
             'imagesDeleted'         => __('Imágenes duplicadas eliminadas', 'alegra-connector'),
             'confirmRecordPayment'  => __('¿Registrar pago en Alegra?', 'alegra-connector'),
+            'confirmOpenInvoice'    => __('¿Abrir esta factura en Alegra? Dejará de estar en borrador y quedará contabilizada.', 'alegra-connector'),
+            'invoiceOpened'         => __('Factura abierta en Alegra', 'alegra-connector'),
             'selectOneItem'         => __('Selecciona al menos un elemento', 'alegra-connector'),
             'sending'               => __('Enviando...', 'alegra-connector'),
             'fetching'              => __('Trayendo...', 'alegra-connector'),
@@ -2036,6 +2039,57 @@ class Admin_Dashboard
         wp_send_json_success(['message' => __('Mapeo guardado.', 'alegra-connector')]);
     }
 
+    /**
+     * AJAX: open a draft invoice in Alegra from the order detail page.
+     *
+     * Used when the merchant configured invoices as `draft` and now wants an
+     * existing one to become an open/issued invoice (without recording a
+     * payment). No-op when the invoice is already open.
+     */
+    public function ajax_open_invoice(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $order_id = (int) ($_POST['order_id'] ?? 0);
+        $order = $order_id > 0 ? wc_get_order($order_id) : false;
+        if (!$order) {
+            wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
+        }
+
+        $alegra_invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        if ($alegra_invoice_id === '') {
+            wp_send_json_error(['message' => __('El pedido no tiene una factura de Alegra vinculada.', 'alegra-connector')]);
+        }
+
+        $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+        $result = $orders_sync->ensure_invoice_open($alegra_invoice_id);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+        }
+
+        $status = (string) ($result['status'] ?? 'open');
+        if ($status === 'draft') {
+            // Alegra accepted the call but the invoice is still a draft.
+            wp_send_json_error(['message' => __('Alegra no abrió la factura; sigue en borrador.', 'alegra-connector')]);
+        }
+
+        $orders_sync->persist_invoice_status($order, $result);
+
+        $order->add_order_note(sprintf(
+            /* translators: %s: Alegra invoice number or id */
+            __('[Alegra] Factura #%s abierta (ya no es borrador).', 'alegra-connector'),
+            (string) $order->get_meta('_alegra_invoice_number', true) ?: $alegra_invoice_id
+        ));
+
+        wp_send_json_success([
+            'message' => __('Factura abierta en Alegra.', 'alegra-connector'),
+            'status'  => $status,
+        ]);
+    }
+
     public function ajax_record_payment(): void
     {
         check_ajax_referer('alegra_connector_nonce');
@@ -2074,7 +2128,10 @@ class Admin_Dashboard
 
         // BUG 6: a payment requires an OPEN invoice. The invoice may be a draft
         // (the default), so open it first — exactly like the auto path does.
-        $orders_sync->ensure_invoice_open($alegra_invoice_id);
+        $opened = $orders_sync->ensure_invoice_open($alegra_invoice_id);
+        if (!is_wp_error($opened)) {
+            $orders_sync->persist_invoice_status($order, $opened);
+        }
 
         $payment_data = [
             'date' => $order->get_date_paid() ? $order->get_date_paid()->date('Y-m-d') : date('Y-m-d'),

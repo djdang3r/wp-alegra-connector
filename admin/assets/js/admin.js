@@ -51,6 +51,7 @@
             this.initWebhookManagement();
             this.initSingleSync();
             this.initRecordPayment();
+            this.initOpenInvoice();
             this.initCleanupDuplicateImages();
         },
 
@@ -545,6 +546,28 @@
                     data: { action: 'alegra_record_payment', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
                     success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).text(S.retry); } },
                     error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
+                });
+            });
+        },
+
+        initOpenInvoice: function() {
+            $('.alegra-open-invoice').on('click', function() {
+                var $btn = $(this);
+                if (!confirm(S.confirmOpenInvoice)) return;
+                $btn.prop('disabled', true);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_open_invoice', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, S.invoiceOpened), 'success');
+                            setTimeout(function(){ location.reload(); }, 1200);
+                        } else {
+                            showNotice(safeMsg(r, S.error), 'error');
+                            $btn.prop('disabled', false);
+                        }
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false); }
                 });
             });
         },

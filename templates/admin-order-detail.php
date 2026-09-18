@@ -45,6 +45,12 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
     <?php if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null && !$payment_synced): ?>
         <button class="ac-btn ac-btn-primary ac-btn-sm alegra-record-payment" data-order-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Registrar pago en Alegra', 'alegra-connector'); ?></button>
     <?php endif; ?>
+    <?php if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null && (($alegra_data['status'] ?? '') === 'draft')): ?>
+        <button class="ac-btn ac-btn-sm alegra-open-invoice" data-order-id="<?php echo esc_attr($order->get_id()); ?>" title="<?php esc_attr_e('La factura está en borrador en Alegra. Ábrela para emitirla/contabilizarla.', 'alegra-connector'); ?>">
+            <span class="dashicons dashicons-unlock" style="font-size:14px;width:14px;height:14px;"></span>
+            <?php esc_html_e('Abrir factura (borrador)', 'alegra-connector'); ?>
+        </button>
+    <?php endif; ?>
     <?php if (!$alegra_invoice_id): ?>
         <button class="ac-btn ac-btn-primary ac-btn-sm alegra-sync-single" data-type="order" data-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Crear factura', 'alegra-connector'); ?></button>
     <?php endif; ?>

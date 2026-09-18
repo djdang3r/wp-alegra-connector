@@ -3646,4 +3646,63 @@ TestRunner::test('T23.2 a guest order with billing data on the order creates a c
     TestRunner::assertSame('1020304050', (string) ($body['identificationObject']['number'] ?? ''), 'the guest identification must reach Alegra');
 });
 
+// ===========================================================================
+// T24 — Open a draft invoice
+// ===========================================================================
+echo "\nT24 — Open a draft invoice\n";
+
+TestRunner::test('T24.1 ensure_invoice_open opens a draft and returns the open invoice', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-draft', ['status' => 'draft', 'balance' => 100]);
+
+    $result = make_orders()->ensure_invoice_open('inv-draft');
+
+    TestRunner::assertFalse(is_wp_error($result), 'opening must not error');
+    TestRunner::assertSame('open', (string) ($result['status'] ?? ''), 'the returned invoice must be open');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft/open'), 'exactly one open call');
+});
+
+TestRunner::test('T24.2 ensure_invoice_open is a no-op when the invoice is already open', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-open', ['status' => 'open', 'balance' => 100]);
+
+    $result = make_orders()->ensure_invoice_open('inv-open');
+
+    TestRunner::assertFalse(is_wp_error($result), 'a no-op must not error');
+    TestRunner::assertSame('open', (string) ($result['status'] ?? ''), 'the invoice stays open');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open/open'), 'no open call for an already-open invoice');
+});
+
+TestRunner::test('T24.3 ajax_open_invoice opens the order draft invoice', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-draft2', ['status' => 'draft', 'balance' => 50]);
+    alegra_make_order(800, ['meta' => ['_alegra_invoice_id' => 'inv-draft2', '_alegra_invoice_number' => 'v1']]);
+
+    $_POST['order_id'] = 800;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_open_invoice());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'the handler must succeed');
+    TestRunner::assertSame('open', (string) ($resp->payload['status'] ?? ''), 'the payload must report open');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft2/open'), 'the open call must be sent');
+    TestRunner::assertSame('open', (string) wc_get_order(800)->get_meta('_alegra_invoice_status', true), 'the cached status must be updated');
+});
+
+TestRunner::test('T24.4 persist_invoice_status caches the status and skips redundant saves', function (): void {
+    alegra_test_reset();
+    $order = alegra_make_order(810, []);
+    $orders = make_orders();
+
+    $orders->persist_invoice_status($order, ['status' => 'draft']);
+    TestRunner::assertSame('draft', (string) $order->get_meta('_alegra_invoice_status', true), 'draft must be cached');
+
+    $orders->persist_invoice_status($order, ['status' => 'open']);
+    TestRunner::assertSame('open', (string) $order->get_meta('_alegra_invoice_status', true), 'open must replace draft');
+
+    // An empty status must not clobber the cached value.
+    $orders->persist_invoice_status($order, []);
+    TestRunner::assertSame('open', (string) $order->get_meta('_alegra_invoice_status', true), 'an empty status is ignored');
+});
+
 exit(TestRunner::summary());
