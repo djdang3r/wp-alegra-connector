@@ -308,6 +308,26 @@ $ac_regime_labels = [
 <input type="number" name="alegra_connector_import_max_pages" value="<?php echo esc_attr(get_option('alegra_connector_import_max_pages',0));?>" class="small-text" min="0">
 <p class="description"><?php esc_html_e('Limite de paginas por corrida. 0 = sin limite (recomendado: la importacion reanuda desde el cursor).','alegra-connector');?></p></td></tr>
 
+<!-- Preserve WooCommerce fields on update -->
+<tr><th><?php esc_html_e('Al actualizar productos, conservar de WooCommerce:','alegra-connector');?></th><td><fieldset>
+<?php
+$ac_preserve = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_preserve_fields(get_option('alegra_connector_import_preserve_fields', []));
+$ac_preserve_fields = [
+    'description' => __('Descripcion', 'alegra-connector'),
+    'name'        => __('Nombre', 'alegra-connector'),
+    'price'       => __('Precio', 'alegra-connector'),
+    'images'      => __('Imagenes', 'alegra-connector'),
+    'inventory'   => __('Inventario / stock', 'alegra-connector'),
+    'sku'         => __('SKU / referencia', 'alegra-connector'),
+];
+?>
+<input type="hidden" name="alegra_connector_import_preserve_fields[]" value="">
+<?php foreach ($ac_preserve_fields as $ac_key => $ac_label): ?>
+<label style="display:block;margin:2px 0;"><input type="checkbox" name="alegra_connector_import_preserve_fields[]" value="<?php echo esc_attr($ac_key); ?>" <?php checked(in_array($ac_key, $ac_preserve, true)); ?>> <?php echo esc_html($ac_label); ?></label>
+<?php endforeach; ?>
+<p class="description"><?php esc_html_e('Los campos marcados NO se sobrescriben cuando se actualiza un producto que ya existe en WooCommerce. Aplica a la sincronizacion automatica (cron y webhooks) y a la importacion manual. En el modal "Traer desde Alegra" (pagina Productos) puedes cambiarlo solo para esa corrida. Los productos nuevos siempre se crean con todos los datos.','alegra-connector');?></p>
+</fieldset></td></tr>
+
 <!-- Orders poll batch -->
 <tr><th><?php esc_html_e('Pedidos por revision de estado:','alegra-connector');?></th><td>
 <input type="number" name="alegra_connector_orders_poll_batch" value="<?php echo esc_attr(get_option('alegra_connector_orders_poll_batch',20));?>" class="small-text" min="1" max="100">

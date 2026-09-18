@@ -762,7 +762,15 @@ class Orders
     private function ensure_customer_synced(\WC_Order $order): string
     {
         $order_id = (int) $order->get_id();
+
+        // WC_Order::get_user() returns WP_User|false (false for a guest order
+        // with customer_id 0). Normalize to ?WP_User so the typed helpers below
+        // (persist_contact_id, collect_billing_values, ...) accept it; every
+        // falsy branch already means "guest", so behavior is unchanged.
         $customer = $order->get_user();
+        if (!$customer instanceof \WP_User) {
+            $customer = null;
+        }
 
         // Customer resolution mode: auto (default) | always_generic | require_data.
         // `require_data` is enforced at checkout and disables the Consumidor

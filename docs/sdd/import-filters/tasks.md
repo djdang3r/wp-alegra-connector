@@ -226,6 +226,43 @@ comportamiento idéntico.
 
 ---
 
+## Fase 6 — Exclusión de campos al actualizar
+
+**Objetivo de la fase:** que el comerciante conserve campos editados en WC
+(descripción, nombre, precio, imágenes, inventario, SKU) al reimportar, con una
+**única fuente de verdad** en Ajustes.
+**DoD de la fase:** T22.x verdes.
+
+- [x] **T6.1 — Backend: exclusión solo en actualizaciones**
+  - **Objetivo:** REQ-FILTER-13/14.
+  - **Descripción técnica:** `resolve_preserve_fields()` lee el ajuste;
+    `update_product_from_alegra($product, $item, bool $is_new = false)` ignora la
+    lista cuando `$is_new=true`.
+  - **Desarrollo técnico:** guardas por campo; `assign_variation_sku` respeta
+    `sku`; sin plomería por corrida.
+  - **Resultado esperado:** los campos configurados no se sobrescriben al
+    actualizar; los productos nuevos se crean completos.
+  - **DoD:** T22.1–T22.4.
+
+- [x] **T6.2 — Ajuste persistente + UI**
+  - **Objetivo:** REQ-FILTER-13.
+  - **Descripción técnica:** `register_setting` de
+    `alegra_connector_import_preserve_fields` + UI en Ajustes → Sincronización.
+  - **Resultado esperado:** configuración única que aplica a manual, Importar,
+    botón "Traer", cron y webhooks.
+  - **DoD:** UI funcional + limpieza en `uninstall.php`.
+
+- [x] **T6.3 — Sanitización**
+  - **Objetivo:** REQ-FILTER-15.
+  - **Descripción técnica:** `sanitize_preserve_fields()` como callback de
+    `register_setting`.
+  - **DoD:** T22.5.
+
+> **Nota:** se descartó el override por corrida en el modal para evitar
+> ambigüedad (decisión del 2026-09-18). El modal enlaza a Ajustes → Sincronización.
+
+---
+
 ## Resumen de dependencias
 
 ```

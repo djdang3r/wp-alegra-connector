@@ -1167,7 +1167,10 @@ class WC_Order
     public function set_refunds(array $refunds) { $this->refunds = $refunds; return $this; }
     public function add_refund(WC_Order_Refund $refund) { $this->refunds[] = $refund; return $this; }
     public function get_customer_id(): int { return $this->customer_id; }
-    public function get_user(): ?WP_User { return $this->user; }
+    // Mirrors WC_Order::get_user(): a WP_User for a registered customer and
+    // `false` for a guest (customer_id 0). Returning null hid a production
+    // TypeError where `false` was passed to a `?WP_User` parameter.
+    public function get_user() { return $this->user ?? false; }
     public function get_payment_tokens(): array { return $this->payment_tokens; }
     public function add_order_note($note, $is_customer_note = 0, $added_by_user = false)
     {

@@ -104,6 +104,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_push_category_strategy');
     delete_option('alegra_connector_push_category_id');
     delete_option('alegra_connector_import_category_parent');
+    delete_option('alegra_connector_import_preserve_fields');
     delete_option('alegra_connector_consumidor_final_contact_id');
     delete_option('alegra_connector_consumidor_final_manual_override');
     delete_option('alegra_connector_consumidor_final_manual_id');

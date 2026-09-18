@@ -3522,4 +3522,128 @@ TestRunner::test('T21.7 the categories endpoint caps at 10 pages and flags more'
     TestRunner::assertTrue((bool) ($resp->payload['has_more'] ?? false), 'more pages must be flagged');
 });
 
+// ===========================================================================
+// T22 — Preserve WooCommerce fields on import (import-filters)
+// ===========================================================================
+echo "\nT22 — Preserve WooCommerce fields on import\n";
+
+TestRunner::test('T22.1 the setting preserves the WooCommerce description on update', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_import_preserve_fields', ['description']);
+    alegra_make_product(80, ['name' => 'WC N', 'description' => 'WC D', 'regular_price' => '10', 'sku' => 'P-80']);
+    update_post_meta(80, '_alegra_item_id', 'item-80');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-80', 'name' => 'Alegra N', 'description' => 'Alegra D', 'reference' => 'P-80',
+        'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 10]],
+    ]);
+
+    $product = wc_get_product(80);
+    TestRunner::assertSame('WC D', $product->get_description(), 'the WC description must be preserved');
+    TestRunner::assertSame('Alegra N', $product->get_name(), 'a non-listed field must still update');
+});
+
+TestRunner::test('T22.2 the setting preserves name, price and sku', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_import_preserve_fields', ['name', 'price', 'sku']);
+    alegra_make_product(81, ['name' => 'WC N', 'regular_price' => '10', 'sku' => 'P-81']);
+    update_post_meta(81, '_alegra_item_id', 'item-81');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-81', 'name' => 'Alegra N', 'reference' => 'ALG-81',
+        'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 99]],
+    ]);
+
+    $product = wc_get_product(81);
+    TestRunner::assertSame('WC N', $product->get_name(), 'the WC name must be preserved');
+    TestRunner::assertSame('10', $product->get_regular_price(), 'the WC price must be preserved');
+    TestRunner::assertSame('P-81', $product->get_sku(), 'the WC sku must be preserved');
+});
+
+TestRunner::test('T22.3 with no setting the import overwrites everything (default)', function (): void {
+    alegra_test_reset();
+    alegra_make_product(82, ['name' => 'WC N', 'description' => 'WC D', 'regular_price' => '10', 'sku' => 'P-82']);
+    update_post_meta(82, '_alegra_item_id', 'item-82');
+
+    make_products()->import_single_item_public([
+        'id' => 'item-82', 'name' => 'Alegra N', 'description' => 'Alegra D', 'reference' => 'ALG-82',
+        'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 99]],
+    ]);
+
+    $product = wc_get_product(82);
+    TestRunner::assertSame('Alegra D', $product->get_description(), 'without a setting the description is overwritten');
+    TestRunner::assertSame('Alegra N', $product->get_name(), 'without a setting the name is overwritten');
+    TestRunner::assertSame('99', $product->get_regular_price(), 'without a setting the price is overwritten');
+});
+
+TestRunner::test('T22.4 a new product ignores the setting and gets all Alegra data', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_import_preserve_fields', ['description', 'name', 'price', 'sku']);
+    $product = alegra_make_product(90, ['name' => 'WC N', 'description' => 'WC D', 'regular_price' => '10', 'sku' => 'P-90']);
+
+    alegra_call_private(make_products(), 'update_product_from_alegra', $product, [
+        'id' => 'item-90', 'name' => 'Alegra N', 'description' => 'Alegra D', 'reference' => 'ALG-90',
+        'status' => 'active', 'price' => [['idPriceList' => 1, 'price' => 99]],
+    ], true);
+
+    TestRunner::assertSame('Alegra N', $product->get_name(), 'a new product gets the Alegra name');
+    TestRunner::assertSame('Alegra D', $product->get_description(), 'a new product gets the Alegra description');
+    TestRunner::assertSame('99', $product->get_regular_price(), 'a new product gets the Alegra price');
+    TestRunner::assertSame('ALG-90', $product->get_sku(), 'a new product gets the Alegra sku');
+});
+
+TestRunner::test('T22.5 sanitize_preserve_fields whitelists keys', function (): void {
+    alegra_test_reset();
+    $clean = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_preserve_fields(
+        ['description', 'bogus', '<script>', 'name', 'name']
+    );
+    TestRunner::assertSame(['description', 'name'], $clean, 'only whitelisted unique keys survive');
+    TestRunner::assertSame([], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_preserve_fields('nope'), 'a non-array yields []');
+});
+
+// ===========================================================================
+// T23 — Guest order customer resolution (no WP_User)
+// ===========================================================================
+echo "\nT23 — Guest order customer resolution\n";
+
+TestRunner::test('T23.1 a guest order (get_user() === false) does not fatal and falls back to Consumidor Final', function (): void {
+    alegra_test_reset();
+    $cf = seed_consumidor_final();
+    // customer_id 0: WC_Order::get_user() returns false (not WP_User), which is
+    // what used to be passed to the ?WP_User parameters and fataled.
+    $order = make_invoice_order(700, 0, 'guest@example.test');
+
+    $result = make_orders()->create_invoice($order);
+
+    TestRunner::assertFalse(is_wp_error($result), 'a guest order must be invoiced without a TypeError');
+    $invoice = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame($cf, $invoice['client']['id'] ?? null, 'the guest order must use Consumidor Final');
+});
+
+TestRunner::test('T23.2 a guest order with billing data on the order creates a contact', function (): void {
+    alegra_test_reset();
+    seed_consumidor_final();
+    // The catalog fields are opt-in; enable the two required ones.
+    update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, ['idtype' => 1, 'identification' => 1]);
+
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '10']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-5');
+    $order = alegra_make_order(701, [
+        'total' => 10.0, 'currency' => 'COP',
+        'billing' => ['country' => 'CO', 'email' => 'guest2@example.test', 'first_name' => 'Juan', 'last_name' => 'Perez'],
+        'customer_id' => 0,
+        // Guest fiscal data lives on the ORDER meta (prefixed with _).
+        'meta' => [
+            '_billing_alegra_idtype'         => 'CC',
+            '_billing_alegra_identification' => '1020304050',
+        ],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
+    ]);
+
+    make_orders()->create_invoice($order);
+
+    $body = alegra_mock_last_request('POST', '/contacts')['body'] ?? [];
+    TestRunner::assertSame('1020304050', (string) ($body['identificationObject']['number'] ?? ''), 'the guest identification must reach Alegra');
+});
+
 exit(TestRunner::summary());

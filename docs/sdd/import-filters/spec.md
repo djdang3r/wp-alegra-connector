@@ -186,6 +186,55 @@ Se elimina `#alegra-sync-modal` y sus handlers; no rompe ningún flujo.
 
 ---
 
+## D. Exclusión de campos al actualizar
+
+> **Decisión de diseño:** la exclusión se configura **una sola vez** en
+> Ajustes → Sincronización (`alegra_connector_import_preserve_fields`) y la
+> respetan **todas** las rutas de importación. No hay opción en el modal manual:
+> una única fuente de verdad, sin ambigüedad.
+
+### REQ-FILTER-13 — Configuración persistente `ACTIVO`
+
+El ajuste lista campos de WooCommerce que **no** deben sobrescribirse al
+actualizar productos existentes: `description`, `name`, `price`, `images`,
+`inventory`, `sku`. Aplica a la importación manual (Productos), la página
+Importar, el botón "Traer" por producto, el cron y los webhooks.
+
+```gherkin
+Escenario: La descripción editada en WC sobrevive a la reimportación
+  Dado alegra_connector_import_preserve_fields=["description"]
+  Y un producto WC con _alegra_item_id y descripción "editada"
+  Y el item de Alegra tiene descripción "de Alegra"
+  Cuando se importa (manual o cron)
+  Entonces la descripción del producto WC sigue siendo "editada"
+  Y los campos no listados (nombre) sí se actualizan
+```
+
+### REQ-FILTER-14 — Solo aplica a actualizaciones `ACTIVO`
+
+La exclusión solo aplica a productos/variaciones que **ya existen** en WC. Un
+producto nuevo se crea con todos los datos de Alegra.
+
+```gherkin
+Escenario: Producto nuevo no queda vacío
+  Dado alegra_connector_import_preserve_fields=["description","name","price","sku"]
+  Y un item de Alegra que no existe en WC
+  Cuando se importa
+  Entonces el producto nuevo recibe nombre, descripción, precio y SKU de Alegra
+```
+
+### REQ-FILTER-15 — Sanitización `ACTIVO`
+
+`Admin_Dashboard::sanitize_preserve_fields()` acepta solo las claves permitidas y
+elimina duplicados; cualquier otro valor se descarta.
+
+```gherkin
+Escenario: Claves inválidas se descartan
+  Dado ["description","bogus","<script>","name","name"]
+  Cuando se sanitiza
+  Entonces el resultado es ["description","name"]
+```
+
 ## Matriz de trazabilidad
 
 | Requerimiento | Estado | Tarea |
@@ -202,3 +251,6 @@ Se elimina `#alegra-sync-modal` y sus handlers; no rompe ningún flujo.
 | REQ-FILTER-10 | ACTIVO | T1.2, T1.3, T3.2 |
 | REQ-FILTER-11 | ACTIVO | T1.1, T2.1, T2.2 |
 | REQ-FILTER-12 | ACTIVO | T5.1, T5.2 |
+| REQ-FILTER-13 | ACTIVO | T6.1, T6.3, T22.1–T22.3 |
+| REQ-FILTER-14 | ACTIVO | T6.1, T22.4 |
+| REQ-FILTER-15 | ACTIVO | T6.4, T22.5 |

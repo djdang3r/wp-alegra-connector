@@ -317,6 +317,16 @@ if ($total_pages > 1) {
             </label>
         </div>
 
+        <p style="font-size:11px;color:var(--ac-text-muted);margin-top:12px;line-height:1.5;">
+            <?php
+            printf(
+                /* translators: %s: link to the Synchronization settings tab */
+                esc_html__('Al actualizar productos que ya existen, los campos que marques en %s se conservan de WooCommerce. Los productos nuevos se crean con todos los datos de Alegra.', 'alegra-connector'),
+                '<a href="' . esc_url(admin_url('admin.php?page=alegra-connector-settings&tab=sync')) . '" target="_blank" rel="noopener">' . esc_html__('Ajustes → Sincronización', 'alegra-connector') . '</a>'
+            );
+            ?>
+        </p>
+
         <p id="ac-filter-variant-note" style="display:none;margin-top:12px;font-size:12px;color:var(--ac-warning);background:var(--ac-warning-bg);padding:8px 10px;border-radius:6px;">
             <?php esc_html_e('Con variantes: se recorre todo el catálogo; el total mostrado es aproximado.', 'alegra-connector'); ?>
         </p>

@@ -413,6 +413,13 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_push_category_id', ['sanitize_callback' => 'intval']);
         // Parent term for categories imported from Alegra (read by Categories/Products).
         register_setting('alegra_connector_settings', 'alegra_connector_import_category_parent', ['sanitize_callback' => 'intval']);
+        // WooCommerce fields to preserve when updating existing products from
+        // Alegra. Read by Products::resolve_preserve_fields(); the Products
+        // modal can override it per run.
+        register_setting('alegra_connector_settings', 'alegra_connector_import_preserve_fields', [
+            'sanitize_callback' => [self::class, 'sanitize_preserve_fields'],
+            'default' => [],
+        ]);
         // AC-19/AC-18 performance knobs. These were read with hardcoded defaults
         // but never written (dead config); register them so the Avanzado tab can
         // actually set them. Clamped so a bad value cannot break an import.
@@ -1613,6 +1620,33 @@ class Admin_Dashboard
     }
 
     /**
+     * Whitelist the WooCommerce fields that must NOT be overwritten on import.
+     *
+     * Used as the `sanitize_callback` of `alegra_connector_import_preserve_fields`
+     * (Ajustes → Sincronización) and for the per-run value from the modal.
+     *
+     * @param mixed $value
+     * @return array<int,string> Subset of description|name|price|images|inventory|sku
+     */
+    public static function sanitize_preserve_fields($value): array
+    {
+        $allowed = ['description', 'name', 'price', 'images', 'inventory', 'sku'];
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($value as $field) {
+            $field = sanitize_key((string) $field);
+            if (in_array($field, $allowed, true)) {
+                $out[] = $field;
+            }
+        }
+
+        return array_values(array_unique($out));
+    }
+
+    /**
      * Translate sanitized filters into Alegra `GET /items` query params.
      *
      * The implicit `status=active` (driven by sync_inactive_products) is only
@@ -1765,7 +1799,8 @@ class Admin_Dashboard
                 }
 
                 // Use Products class for proper import (handles variable, images, etc.)
-                // Already-linked products will be updated, new ones created
+                // Already-linked products will be updated, new ones created. The
+                // field exclusion (Ajustes) applies only to existing products.
                 $r = $products_sync->import_single_item_public($item);
                 if ($r === true) { $state['imported']++; }
                 elseif ($r === 'updated') { $state['updated']++; }

@@ -1512,7 +1512,9 @@ class Products
                 wp_set_object_terms($product_id, 'variable', 'product_type');
                 $product = wc_get_product($product_id);
             }
-            $this->update_product_from_alegra($product, $item);
+            // New product: nothing to preserve, so the field exclusion is
+            // ignored ($is_new=true).
+            $this->update_product_from_alegra($product, $item, true);
         }
 
         // Import variant children. Alegra returns `itemVariants` for a
@@ -1688,7 +1690,12 @@ class Products
             if ($variation) {
                 $this->update_product_from_alegra($variation, $item);
                 $this->assign_variation_attributes((int) $variation_id, $item);
-                $this->assign_variation_sku((int) $variation_id, $item);
+                // assign_variation_sku() writes _sku directly, so it must honour
+                // the SKU exclusion too (update_product_from_alegra already skips
+                // set_sku).
+                if (!in_array('sku', $this->resolve_preserve_fields(), true)) {
+                    $this->assign_variation_sku((int) $variation_id, $item);
+                }
                 if (!empty($item['itemCategory'])) {
                     $this->assign_product_category((int) $variation_id, $item);
                 }
@@ -1713,7 +1720,8 @@ class Products
 
         $variation = wc_get_product($variation_id);
         if ($variation) {
-            $this->update_product_from_alegra($variation, $item);
+            // New variation: nothing to preserve ($is_new=true).
+            $this->update_product_from_alegra($variation, $item, true);
         }
 
         // AC-45: attributes + SKU make the variation selectable in WooCommerce.
@@ -1825,10 +1833,30 @@ class Products
         }
     }
 
-    private function update_product_from_alegra(\WC_Product $product, array $item): void
+    /**
+     * WooCommerce fields the merchant asked NOT to overwrite on an update.
+     *
+     * Configured once in Ajustes → Sincronización
+     * (`alegra_connector_import_preserve_fields`); the same setting is honoured
+     * by every import path (cron, webhooks, Importar page and the manual
+     * Products import), so there is a single source of truth.
+     *
+     * @return array<int,string> Field keys: description|name|price|images|inventory|sku
+     */
+    private function resolve_preserve_fields(): array
+    {
+        $saved = get_option('alegra_connector_import_preserve_fields', []);
+        return is_array($saved) ? array_values($saved) : [];
+    }
+
+    private function update_product_from_alegra(\WC_Product $product, array $item, bool $is_new = false): void
     {
         $product_id = (int) $product->get_id();
         $guard_key = 'alegra_updating_product_' . $product_id;
+
+        // The exclusion applies only to EXISTING products: on create there is
+        // nothing to preserve, so a new product is always fully populated.
+        $preserve = $is_new ? [] : $this->resolve_preserve_fields();
 
         // Anti-loop guard: when we save a product, WC fires `woocommerce_update_product`
         // which can trigger a recursive sync. The guard prevents re-entry.
@@ -1852,18 +1880,20 @@ class Products
                 $price = (float) $item['price'];
             }
 
-            // AC-46: never overwrite a WooCommerce price with 0. A missing/zero
-            // Alegra price list used to wipe the merchant's price.
-            if ($price > 0) {
-                $product->set_regular_price($price);
-            } else {
-                $this->logger->warning('Skipping price update: no usable Alegra price', [
-                    'product_id' => $product_id,
-                    'alegra_id'  => (string) ($item['id'] ?? ''),
-                ]);
+            if (!in_array('price', $preserve, true)) {
+                // AC-46: never overwrite a WooCommerce price with 0. A missing/zero
+                // Alegra price list used to wipe the merchant's price.
+                if ($price > 0) {
+                    $product->set_regular_price($price);
+                } else {
+                    $this->logger->warning('Skipping price update: no usable Alegra price', [
+                        'product_id' => $product_id,
+                        'alegra_id'  => (string) ($item['id'] ?? ''),
+                    ]);
+                }
             }
 
-            if (!empty($item['name'])) {
+            if (!empty($item['name']) && !in_array('name', $preserve, true)) {
                 $product->set_name($item['name']);
             }
 
@@ -1873,7 +1903,7 @@ class Products
             $product->set_status($alegra_status === 'inactive' ? 'draft' : 'publish');
             $product->set_catalog_visibility($alegra_status === 'inactive' ? 'hidden' : 'visible');
 
-            if (!empty($item['description'])) {
+            if (!empty($item['description']) && !in_array('description', $preserve, true)) {
                 $product->set_description($item['description']);
             }
 
@@ -1882,18 +1912,19 @@ class Products
             // every import. When WooCommerce owns inventory the plugin must not
             // touch stock at all. A variable PARENT never manages stock in WC
             // (its variations do), so it is skipped too.
-            if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') {
+            if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce'
+                && !in_array('inventory', $preserve, true)) {
                 $this->apply_inventory_to_product($product, $item);
             }
 
-            if (!empty($item['reference'])) {
+            if (!empty($item['reference']) && !in_array('sku', $preserve, true)) {
                 $product->set_sku($item['reference']);
             }
 
             $product->save();
 
             // Import product images from Alegra
-            if (get_option('alegra_connector_sync_images', true)) {
+            if (get_option('alegra_connector_sync_images', true) && !in_array('images', $preserve, true)) {
                 $mode = get_option('alegra_connector_sync_images_mode', 'favorite');
                 $this->import_product_images($product_id, $item['images'] ?? [], $mode);
             }

@@ -166,6 +166,19 @@ primario `#ac-filter-apply` y enlace `#ac-filter-all`.
 `$connected = (bool) get_option('alegra_connector_connection_tested');` antes de
 incluir el template.
 
+### 3.10 Exclusión de campos al actualizar
+
+- **Configuración única:** `alegra_connector_import_preserve_fields` (Ajustes →
+  Sincronización). No hay override en el modal manual; así no hay ambigüedad.
+- `Products::resolve_preserve_fields()` lee el ajuste.
+- `update_product_from_alegra($product, $item, bool $is_new = false)`: con
+  `$is_new=true` la lista se ignora (un producto nuevo se crea completo).
+- Guardas por campo: `price`, `name`, `description`, `inventory`, `sku`, `images`.
+  `assign_variation_sku()` respeta `sku` porque escribe `_sku` directamente.
+- Claves válidas: `description|name|price|images|inventory|sku`.
+- Aplica a todas las rutas: manual (Productos), Importar, botón "Traer", cron y
+  webhooks.
+
 ## 4. Compatibilidad
 
 | Elemento | Cambio |

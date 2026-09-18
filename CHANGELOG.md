@@ -2,6 +2,46 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.9] - 2026-09-18
+
+> **Field-preservation release.** When Alegra is the source of truth, a
+> re-import used to overwrite everything, including a description the merchant
+> had extended in WooCommerce. You can now choose which fields to keep, from a
+> single, unambiguous place: the plugin settings. This release also fixes a
+> fatal when invoicing an order placed by a guest.
+
+### Fixed
+
+- **FATAL (crítico): invoicing a guest order threw a `TypeError`.**
+  `WC_Order::get_user()` returns `WP_User|false` (`false` for a guest with
+  `customer_id = 0`), and that `false` was passed to the `?WP_User` parameters
+  of `collect_billing_values()`, `persist_contact_id()` and
+  `add_consumidor_final_fallback_note()`. PHP 8 raised
+  `Argument #2 ($customer) must be of type ?WP_User, bool given` and the
+  invoice was never created. The customer is now normalized to `?WP_User`, so a
+  guest order resolves to Consumidor Final (mode `auto`) as designed.
+
+### Added
+
+- **Preserve WooCommerce fields on update.** Mark any of: Descripción, Nombre,
+  Precio, Imágenes, Inventario/stock, SKU/referencia. A marked field is never
+  overwritten on an existing product.
+- **Ajustes → Sincronización → "Al actualizar productos, conservar de
+  WooCommerce"** (`alegra_connector_import_preserve_fields`). This single
+  setting applies to every import path: manual (Productos), the "Importar"
+  page, the per-product "Traer" button, the cron and the webhooks.
+- The "Traer desde Alegra" modal links to that setting so the configuration is
+  easy to find.
+
+### Notes for the merchant
+
+- The exclusion applies **only to products that already exist** in WooCommerce.
+  New products are always created with all the data from Alegra.
+- With no field marked, the behavior is identical to before (Alegra overwrites
+  everything).
+- If Alegra is your inventory source and you preserve "Inventario/stock", stock
+  will stop syncing; that is intentional and shown in the setting description.
+
 ## [2.3.8] - 2026-09-18
 
 > **Import filters release.** You can now choose *which* products to bring
