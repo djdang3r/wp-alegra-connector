@@ -51,6 +51,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_sync_progress', [$this, 'ajax_sync_progress']);
         add_action('wp_ajax_alegra_sync_start', [$this, 'ajax_sync_start']);
         add_action('wp_ajax_alegra_sync_page', [$this, 'ajax_sync_page']);
+        add_action('wp_ajax_alegra_get_item_categories', [$this, 'ajax_get_item_categories']);
         add_action('wp_ajax_alegra_import_single', [$this, 'ajax_import_single']);
         add_action('wp_ajax_alegra_bulk_import', [$this, 'ajax_bulk_import']);
         add_action('wp_ajax_alegra_cleanup_placeholders', [$this, 'ajax_cleanup_placeholders']);
@@ -687,6 +688,13 @@ class Admin_Dashboard
             'chartPending'          => __('Pendiente', 'alegra-connector'),
             'chartCancelled'        => __('Cancelado', 'alegra-connector'),
             'chartRefunded'         => __('Reembolsado', 'alegra-connector'),
+
+            // Product import filters (modal in the Products page). Only the
+            // strings consumed by admin.js live here; the modal labels are
+            // rendered server-side in templates/admin-products.php.
+            'importFilterLoading'   => __('Cargando categorías...', 'alegra-connector'),
+            'importFilterNoCats'    => __('No se encontraron categorías en Alegra.', 'alegra-connector'),
+            'importFilterCatError'  => __('No se pudieron cargar las categorías.', 'alegra-connector'),
         ];
     }
 
@@ -1254,6 +1262,7 @@ class Admin_Dashboard
         );
 
         $header_color = 'green';
+        $connected = (bool) get_option('alegra_connector_connection_tested');
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-products.php';
     }
@@ -1573,6 +1582,82 @@ class Admin_Dashboard
     }
 
     /**
+     * Sanitize the product-import filters posted from the Products modal.
+     *
+     * Invalid input degrades to "all" and never throws. Shape:
+     *   [idItemCategory => string, status => default|active|inactive,
+     *    inventariable => bool, query => string, type => ''|simple|kit|variantParent]
+     *
+     * @param array<string,mixed> $raw
+     * @return array{idItemCategory:string,status:string,inventariable:bool,query:string,type:string}
+     */
+    private function sanitize_item_filters(array $raw): array
+    {
+        $status = isset($raw['status']) ? sanitize_text_field((string) $raw['status']) : 'default';
+        if (!in_array($status, ['default', 'active', 'inactive'], true)) {
+            $status = 'default';
+        }
+
+        $type = isset($raw['type']) ? sanitize_text_field((string) $raw['type']) : '';
+        if (!in_array($type, ['', 'simple', 'kit', 'variantParent'], true)) {
+            $type = '';
+        }
+
+        return [
+            'idItemCategory' => isset($raw['idItemCategory']) ? sanitize_text_field((string) $raw['idItemCategory']) : '',
+            'status'         => $status,
+            'inventariable'  => filter_var($raw['inventariable'] ?? false, FILTER_VALIDATE_BOOLEAN),
+            'query'          => isset($raw['query']) ? sanitize_text_field((string) $raw['query']) : '',
+            'type'           => $type,
+        ];
+    }
+
+    /**
+     * Translate sanitized filters into Alegra `GET /items` query params.
+     *
+     * The implicit `status=active` (driven by sync_inactive_products) is only
+     * added when $include_default_status is true. The metadata call in
+     * ajax_sync_start passes false so that, with no filters, the total is
+     * byte-for-byte the same as before this feature.
+     *
+     * @param array{idItemCategory?:string,status?:string,inventariable?:bool,query?:string,type?:string} $f
+     * @return array<string,string>
+     */
+    private function build_item_filter_params(array $f, bool $include_default_status = true): array
+    {
+        $p = [];
+
+        if (($f['idItemCategory'] ?? '') !== '') {
+            $p['idItemCategory'] = (string) $f['idItemCategory'];
+        }
+
+        if (in_array($f['status'] ?? 'default', ['active', 'inactive'], true)) {
+            $p['status'] = (string) $f['status'];
+        } elseif ($include_default_status && !get_option('alegra_connector_sync_inactive_products', false)) {
+            // Preserves the pre-existing behaviour on the page loop.
+            $p['status'] = 'active';
+        }
+
+        if (!empty($f['inventariable'])) {
+            // The API documents a boolean; send the literal "true" (a PHP bool
+            // would serialize to "1" through http_build_query()).
+            $p['inventariable'] = 'true';
+        }
+
+        if (($f['query'] ?? '') !== '') {
+            $p['query'] = (string) $f['query'];
+        }
+
+        // `simple` and `kit` are the documented `type` filter values.
+        // `variantParent` is handled client-side in ajax_sync_page.
+        if (in_array($f['type'] ?? '', ['simple', 'kit'], true)) {
+            $p['type'] = (string) $f['type'];
+        }
+
+        return $p;
+    }
+
+    /**
      * AJAX: Start chunked sync - get EXACT total via metadata=true
      */
     public function ajax_sync_start(): void
@@ -1583,6 +1668,17 @@ class Admin_Dashboard
         $type = sanitize_text_field($_POST['sync_type'] ?? 'products');
         $this->api->reload_credentials();
 
+        // Product-import filters (empty for the other entity types / legacy calls).
+        $raw_filters = $_POST['filters'] ?? '';
+        if (is_string($raw_filters) && $raw_filters !== '') {
+            $decoded = json_decode(wp_unslash($raw_filters), true);
+        } elseif (is_array($raw_filters)) {
+            $decoded = $raw_filters;
+        } else {
+            $decoded = [];
+        }
+        $filters = $this->sanitize_item_filters(is_array($decoded) ? $decoded : []);
+
         // Get exact total via metadata=true (single API call!)
         $total = 0;
         if ($type === 'customers') {
@@ -1591,7 +1687,10 @@ class Admin_Dashboard
                 $total = (int) $resp['metadata']['total'];
             }
         } else {
-            $resp = $this->api->get('/items', ['metadata' => 'true', 'limit' => 1]);
+            // The metadata total must reflect the explicit filters, but NOT the
+            // implicit default status, to preserve the historical total.
+            $params = ['metadata' => 'true', 'limit' => 1] + $this->build_item_filter_params($filters, false);
+            $resp = $this->api->get('/items', $params);
             if (!is_wp_error($resp) && isset($resp['metadata']['total'])) {
                 $total = (int) $resp['metadata']['total'];
             }
@@ -1604,6 +1703,7 @@ class Admin_Dashboard
             'type' => $type, 'page' => 0, 'per_page' => $per_page,
             'total_pages' => $total_pages, 'total_items' => $total,
             'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+            'filters' => $filters,
         ];
         set_transient('alegra_batch_state', $state, 600);
 
@@ -1639,11 +1739,11 @@ class Admin_Dashboard
 
         if ($type === 'products') {
             $start = ($page - 1) * $per_page;
-            // Build API params. Filter by status if user only wants active products.
-            $api_params = ['start' => $start, 'limit' => $per_page, 'mode' => 'advanced'];
-            if (!get_option('alegra_connector_sync_inactive_products', false)) {
-                $api_params['status'] = 'active';
-            }
+            $filters = is_array($state['filters'] ?? null) ? $state['filters'] : [];
+            // Build API params. With no filters this is exactly the historical
+            // ['start','limit','mode'] + implicit status=active.
+            $api_params = ['start' => $start, 'limit' => $per_page, 'mode' => 'advanced']
+                + $this->build_item_filter_params($filters, true);
             $items = $this->api->get('/items', $api_params);
             if (is_wp_error($items)) { wp_send_json_error(['message' => $items->get_error_message()]); }
 
@@ -1655,6 +1755,14 @@ class Admin_Dashboard
 
                 // Skip variants - imported with their parent
                 if ($item_type === 'variant') { continue; }
+
+                // Client-side `variantParent` filter: the API does not document
+                // this value for the `type` query param, so the whole catalog is
+                // walked and non-variantParent items are discarded here.
+                if (($filters['type'] ?? '') === 'variantParent' && $item_type !== 'variantParent') {
+                    $state['skipped'] = ($state['skipped'] ?? 0) + 1;
+                    continue;
+                }
 
                 // Use Products class for proper import (handles variable, images, etc.)
                 // Already-linked products will be updated, new ones created
@@ -1746,6 +1854,68 @@ class Admin_Dashboard
             \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
         }
     }
+
+    /**
+     * List Alegra item categories for the product-import filter modal.
+     *
+     * Paginated with `start`/`limit` (max 30 per the documented endpoint,
+     * https://developer.alegra.com/reference/get_item-categories). Walks up to
+     * 10 pages and reports whether more remain.
+     */
+    public function ajax_get_item_categories(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        if (!get_option('alegra_connector_connection_tested')) {
+            wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
+        }
+
+        $this->api->reload_credentials();
+
+        $categories = [];
+        $start = 0;
+        $per_page = 30;
+        $has_more = false;
+
+        for ($page = 0; $page < 10; $page++) {
+            $batch = $this->api->get_item_categories(['start' => $start, 'limit' => $per_page]);
+            if (is_wp_error($batch)) {
+                if ($page === 0) {
+                    wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $batch->get_error_message())]);
+                }
+                break;
+            }
+            if (empty($batch)) {
+                break;
+            }
+            foreach ($batch as $category) {
+                if (!is_array($category) || empty($category['id'])) {
+                    continue;
+                }
+                $categories[] = [
+                    'id'   => (string) $category['id'],
+                    'name' => (string) ($category['name'] ?? ''),
+                ];
+            }
+            if (count($batch) < $per_page) {
+                break;
+            }
+            $start += $per_page;
+            // A full page on the last allowed iteration means more remain.
+            if ($page === 9) {
+                $has_more = true;
+            }
+        }
+
+        wp_send_json_success([
+            'categories' => $categories,
+            'has_more'   => $has_more,
+        ]);
+    }
+
     public function ajax_import_csv(): void
     {
         check_ajax_referer('alegra_connector_nonce');

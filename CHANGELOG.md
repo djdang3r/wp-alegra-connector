@@ -2,6 +2,52 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.8] - 2026-09-18
+
+> **Import filters release.** You can now choose *which* products to bring
+> from Alegra instead of always pulling the whole catalog. The "Traer desde
+> Alegra" button in the Products page opens a filter modal (category, type,
+> status, inventory, text search); without filters the behavior is identical
+> to before. This release also removes the dead "Traer desde Alegra" modal
+> that was never reachable from the dashboard.
+
+### Added
+
+**Products import filters**
+
+- **New filter modal in the Products page.** The "Traer desde Alegra" button
+  opens a modal with: category (`idItemCategory`, single), type
+  (sencillos/combos/con variantes), status (default/activos/inactivos),
+  inventory (solo con inventario) and free-text search (name or reference).
+  Two actions: **Aplicar y traer** (applies the filters) and **Traer todo sin
+  filtros** (the previous behavior).
+- **Backend plumbing** (`Admin_Dashboard::ajax_sync_start` /
+  `ajax_sync_page`): a single helper translates filters into the documented
+  Alegra `GET /items` query params. The metadata total reflects the explicit
+  filters, so the progress bar matches what is actually imported.
+- **New endpoint** `alegra_get_item_categories` to populate the category
+  selector (paginated with `start`/`limit`, up to 10 pages).
+- **`variantParent` filter** is applied client-side: the Alegra API only
+  documents `type=simple|kit`, so "Con variantes" walks the catalog and
+  discards non-variant items. The modal warns that the total is approximate.
+
+### Changed
+
+- The Products page button label is now "Traer desde Alegra" (it opens the
+  filter modal). The dashboard quick-sync buttons are untouched.
+
+### Removed
+
+- The dead `#alegra-sync-modal` markup and its JS handlers. Nothing opened
+  it; the dashboard "Traer productos" flow already used the progress modal.
+
+### Notes for the merchant
+
+- With no filters selected, the import sends exactly the same parameters as
+  before this release (verified by test T21.1).
+- Cron, webhooks and the "Importar" page are unaffected: filters apply only
+  to the manual import from the Products page.
+
 ## [2.3.7] - 2026-09-16
 
 > **⚠️ Webhook reliability release.** A `new-client` webhook crashed the

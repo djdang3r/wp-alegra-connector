@@ -19,7 +19,7 @@ $root = dirname(__DIR__);
 $out  = $argv[1] ?? ($root . '/languages/alegra-connector.pot');
 
 $text_domain = 'alegra-connector';
-$version      = '2.3.7';
+$version      = '2.3.8';
 $package      = 'Alegra Connector';
 
 $php_functions = [
@@ -198,7 +198,9 @@ function collect_files(string $dir, array $skip_dirs, string $root): array
     foreach ($it as $file) {
         /** @var SplFileInfo $file */
         $path = $file->getPathname();
-        $rel = ltrim(str_replace($root, '', $path), '/');
+        // Normalize Windows separators so the .pot references are canonical
+        // (forward slashes) regardless of the build host.
+        $rel = ltrim(str_replace('\\', '/', str_replace($root, '', $path)), '/');
         foreach ($skip_dirs as $skip) {
             if (strpos('/' . $rel, $skip . '/') !== false) {
                 continue 2;

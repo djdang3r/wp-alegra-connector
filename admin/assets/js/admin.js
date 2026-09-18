@@ -37,10 +37,15 @@
     }
 
     var AlegraConnector = {
+        // Filters chosen in the Products import modal. Read by initSyncNow when
+        // it calls alegra_sync_start. Empty = import everything.
+        pendingFilters: {},
+
         init: function() {
             this.initTabs();
             this.initConnectionTest();
             this.initSyncNow();
+            this.initImportFilters();
             this.initLogManagement();
             this.initTokenVisibility();
             this.initWebhookManagement();
@@ -116,6 +121,15 @@
 
         initSyncNow: function() {
             $('#alegra-sync-now-btn, .alegra-quick-sync').on('click', function() {
+                // The Products-page button opens the filter modal first. Once the
+                // modal applies, it re-triggers this click with filter-confirmed
+                // set, so the sync proceeds through the normal path.
+                if ($(this).data('requires-filter') && !$(this).data('filter-confirmed')) {
+                    AlegraConnector.openImportFilterModal($(this));
+                    return;
+                }
+                $(this).removeData('filter-confirmed');
+
                 var types = $(this).data('type') || 'all';
                 var $btn = $(this).prop('disabled', true);
 
@@ -195,7 +209,10 @@
 
                 currentRequest = $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_sync_start', _ajax_nonce: alegraConnector.nonce, sync_type: types },
+                    data: {
+                        action: 'alegra_sync_start', _ajax_nonce: alegraConnector.nonce, sync_type: types,
+                        filters: JSON.stringify(AlegraConnector.pendingFilters || {})
+                    },
                     success: function(r) {
                         currentRequest = null;
                         if (!r.success || cancelled) { cleanup(); return; }
@@ -263,23 +280,103 @@
                 };
                 } // end doSync
             });
-            $('#alegra-sync-start').on('click', function() {
-                var syncTypes = [];
-                $('input[name="sync_products"]:checked').length && syncTypes.push('products');
-                $('input[name="sync_customers"]:checked').length && syncTypes.push('customers');
-                $('input[name="sync_orders"]:checked').length && syncTypes.push('orders');
-                $('input[name="sync_categories"]:checked').length && syncTypes.push('categories');
-                if (!syncTypes.length) { showNotice(S.selectOneType,'warning'); return; }
-                var $modal = $('#alegra-sync-modal');
-                var $status = $modal.find('.alegra-sync-status').text(S.syncing);
-                $.ajax({
-                    url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_sync_now', _ajax_nonce: alegraConnector.nonce, sync_type: syncTypes.join(',') },
-                    success: function(r) { if(r.success){$status.text(safeMsg(r, S.completed));setTimeout(function(){location.reload();},1500);} else {showNotice(safeMsg(r, S.error),'error');} },
-                    error: function() { showNotice(S.connectionError,'error'); }
-                });
+        },
+
+        // -------------------------------------------------------------------
+        // Product import filters (Products page modal)
+        // -------------------------------------------------------------------
+
+        /** Remembered button that opened the modal (re-triggered on apply). */
+        filterTriggerBtn: null,
+
+        openImportFilterModal: function($btn) {
+            // A fresh open always starts from "no filters".
+            AlegraConnector.pendingFilters = {};
+            AlegraConnector.filterTriggerBtn = $btn || null;
+            $('#ac-filter-type').val('');
+            $('#ac-filter-status').val('default');
+            $('#ac-filter-inventariable').val('');
+            $('#ac-filter-query').val('');
+            $('#ac-filter-variant-note').hide();
+            $('#alegra-import-filter-modal').show();
+            $('body').addClass('ac-modal-open');
+            AlegraConnector.loadFilterCategories();
+        },
+
+        loadFilterCategories: function() {
+            var $sel = $('#ac-filter-category');
+            var $note = $('#ac-filter-category-note');
+            $sel.prop('disabled', true);
+            $note.text(S.importFilterLoading || '...');
+            $.ajax({
+                url: alegraConnector.ajaxUrl, type: 'POST',
+                data: { action: 'alegra_get_item_categories', _ajax_nonce: alegraConnector.nonce },
+                success: function(r) {
+                    $sel.prop('disabled', false);
+                    $sel.find('option:not(:first)').remove();
+                    if (r && r.success && r.data && r.data.categories && r.data.categories.length) {
+                        var cats = r.data.categories;
+                        for (var i = 0; i < cats.length; i++) {
+                            $sel.append($('<option>').val(cats[i].id).text(cats[i].name));
+                        }
+                        $note.text('');
+                    } else {
+                        $note.text(S.importFilterNoCats || '');
+                    }
+                },
+                error: function() {
+                    $sel.prop('disabled', false);
+                    $note.text(S.importFilterCatError || '');
+                }
             });
-            $('#alegra-sync-cancel').on('click', function() { $('#alegra-sync-modal').hide(); });
+        },
+
+        initImportFilters: function() {
+            var $modal = $('#alegra-import-filter-modal');
+            if (!$modal.length) { return; }
+
+            function closeModal() {
+                $modal.hide();
+                $('body').removeClass('ac-modal-open');
+            }
+
+            function run($btn, filters) {
+                AlegraConnector.pendingFilters = filters || {};
+                closeModal();
+                if ($btn && $btn.length) {
+                    $btn.data('filter-confirmed', true).trigger('click');
+                }
+            }
+
+            function collectFilters() {
+                var f = {};
+                var cat = $('#ac-filter-category').val();
+                if (cat) { f.idItemCategory = cat; }
+                var type = $('#ac-filter-type').val();
+                if (type) { f.type = type; }
+                var status = $('#ac-filter-status').val();
+                if (status && status !== 'default') { f.status = status; }
+                if ($('#ac-filter-inventariable').val()) { f.inventariable = true; }
+                var q = $.trim($('#ac-filter-query').val());
+                if (q) { f.query = q; }
+                return f;
+            }
+
+            $('#ac-filter-type').on('change', function() {
+                $('#ac-filter-variant-note').toggle($(this).val() === 'variantParent');
+            });
+
+            $('#ac-filter-cancel').on('click', closeModal);
+            $modal.on('click', function(e) { if (e.target === this) { closeModal(); } });
+
+            $('#ac-filter-apply').on('click', function() {
+                run(AlegraConnector.filterTriggerBtn, collectFilters());
+            });
+
+            $('#ac-filter-all').on('click', function(e) {
+                e.preventDefault();
+                run(AlegraConnector.filterTriggerBtn, {});
+            });
         },
 
         initLogManagement: function() {

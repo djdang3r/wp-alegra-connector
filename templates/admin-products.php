@@ -8,6 +8,7 @@ $variable_count    = $variable_count ?? 0;
 $variation_count   = $variation_count ?? 0;
 $synced_variations = $synced_variations ?? 0;
 $total             = $total ?? 0;
+$connected         = $connected ?? false;
 
 $page_subtitle = sprintf(__('%d productos (%d sincronizados con Alegra)', 'alegra-connector'), $total, $synced_count);
 
@@ -88,9 +89,9 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
 <div class="ac-card" style="margin-bottom:14px;padding:12px 20px;">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
         <span class="ac-selected-count" style="font-size:12px;color:var(--ac-text-muted);"></span>
-        <button type="button" class="ac-btn ac-btn-primary ac-btn-sm alegra-quick-sync" data-type="products">
+        <button type="button" class="ac-btn ac-btn-primary ac-btn-sm alegra-quick-sync" data-type="products" data-requires-filter="1" <?php echo !$connected ? 'disabled' : ''; ?>>
             <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
-            <?php esc_html_e('Traer todo desde Alegra', 'alegra-connector'); ?>
+            <?php esc_html_e('Traer desde Alegra', 'alegra-connector'); ?>
         </button>
         <?php if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') : ?>
         <button type="button" class="ac-btn ac-btn-sm alegra-sync-inventory" title="<?php esc_attr_e('Trae las existencias desde Alegra y actualiza el stock de WooCommerce.', 'alegra-connector'); ?>">
@@ -265,6 +266,68 @@ if ($total_pages > 1) {
     echo alegra_pagination($page, $total_pages, $base, $total, 20);
 }
 ?>
+
+<!-- Product import filter modal -->
+<div id="alegra-import-filter-modal" class="ac-modal-overlay" style="display:none;">
+    <div class="ac-modal">
+        <h2><?php esc_html_e('Traer productos desde Alegra', 'alegra-connector'); ?></h2>
+        <p style="margin-bottom:14px;color:var(--ac-text-secondary);font-size:13px;">
+            <?php esc_html_e('Elige qué productos traer. Sin filtros se trae todo el catálogo.', 'alegra-connector'); ?>
+        </p>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;">
+            <label style="display:block;font-size:13px;">
+                <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Categoría', 'alegra-connector'); ?></span>
+                <select id="ac-filter-category" style="width:100%;">
+                    <option value=""><?php esc_html_e('Todas', 'alegra-connector'); ?></option>
+                </select>
+                <span id="ac-filter-category-note" style="display:block;font-size:11px;color:var(--ac-text-muted);margin-top:3px;"></span>
+            </label>
+
+            <label style="display:block;font-size:13px;">
+                <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Tipo', 'alegra-connector'); ?></span>
+                <select id="ac-filter-type" style="width:100%;">
+                    <option value=""><?php esc_html_e('Todos', 'alegra-connector'); ?></option>
+                    <option value="simple"><?php esc_html_e('Sencillos', 'alegra-connector'); ?></option>
+                    <option value="kit"><?php esc_html_e('Combos', 'alegra-connector'); ?></option>
+                    <option value="variantParent"><?php esc_html_e('Con variantes', 'alegra-connector'); ?></option>
+                </select>
+            </label>
+
+            <label style="display:block;font-size:13px;">
+                <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Estado', 'alegra-connector'); ?></span>
+                <select id="ac-filter-status" style="width:100%;">
+                    <option value="default"><?php esc_html_e('Por defecto (según Ajustes)', 'alegra-connector'); ?></option>
+                    <option value="active"><?php esc_html_e('Activos', 'alegra-connector'); ?></option>
+                    <option value="inactive"><?php esc_html_e('Inactivos', 'alegra-connector'); ?></option>
+                </select>
+            </label>
+
+            <label style="display:block;font-size:13px;">
+                <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Inventario', 'alegra-connector'); ?></span>
+                <select id="ac-filter-inventariable" style="width:100%;">
+                    <option value=""><?php esc_html_e('Todos', 'alegra-connector'); ?></option>
+                    <option value="1"><?php esc_html_e('Solo con inventario', 'alegra-connector'); ?></option>
+                </select>
+            </label>
+
+            <label style="display:block;font-size:13px;grid-column:1 / -1;">
+                <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Buscar (nombre o referencia)', 'alegra-connector'); ?></span>
+                <input type="text" id="ac-filter-query" style="width:100%;" placeholder="<?php esc_attr_e('Ej: camisa', 'alegra-connector'); ?>">
+            </label>
+        </div>
+
+        <p id="ac-filter-variant-note" style="display:none;margin-top:12px;font-size:12px;color:var(--ac-warning);background:var(--ac-warning-bg);padding:8px 10px;border-radius:6px;">
+            <?php esc_html_e('Con variantes: se recorre todo el catálogo; el total mostrado es aproximado.', 'alegra-connector'); ?>
+        </p>
+
+        <div class="ac-modal-actions" style="margin-top:16px;display:flex;gap:10px;align-items:center;justify-content:flex-end;">
+            <a href="#" id="ac-filter-all" style="margin-right:auto;font-size:12px;"><?php esc_html_e('Traer todo sin filtros', 'alegra-connector'); ?></a>
+            <button type="button" class="ac-btn" id="ac-filter-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
+            <button type="button" class="ac-btn ac-btn-primary" id="ac-filter-apply"><?php esc_html_e('Aplicar y traer', 'alegra-connector'); ?></button>
+        </div>
+    </div>
+</div>
 
 <?php include __DIR__ . '/footer.php'; ?>
 </div>

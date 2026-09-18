@@ -420,6 +420,7 @@ function wp_get_current_user() { return new WP_User(1, ['user_login' => 'tester'
 function get_current_user_id() { return 1; }
 function current_user_can($cap) { return true; }
 function wp_die($message = '', $title = '', $args = []) { return; }
+function wp_raise_memory_limit($context = 'admin') { return ''; }
 
 /**
  * Thrown by the wp_send_json_* stubs to emulate WordPress's wp_die() exit.

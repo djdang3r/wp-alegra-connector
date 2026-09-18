@@ -3397,4 +3397,129 @@ TestRunner::test('T20.10 an unauthorized delivery is the ONLY non-2XX (401)', fu
     TestRunner::assertSame(401, $res->get_status(), 'a delivery without the token must be 401');
 });
 
+// ===========================================================================
+// T21 — Product import filters (docs/sdd/import-filters)
+// ===========================================================================
+echo "\nT21 — Product import filters\n";
+
+TestRunner::test('T21.1 no filters keeps the historical page params', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $params = alegra_call_private($admin, 'build_item_filter_params', [], true);
+    TestRunner::assertSame(['status' => 'active'], $params, 'no filters on the page must yield only the implicit status=active');
+
+    $metadata_params = alegra_call_private($admin, 'build_item_filter_params', [], false);
+    TestRunner::assertSame([], $metadata_params, 'the metadata call must not add the implicit status');
+
+    update_option('alegra_connector_sync_inactive_products', true);
+    TestRunner::assertSame([], alegra_call_private($admin, 'build_item_filter_params', [], true), 'with inactive products enabled the implicit status is dropped');
+});
+
+TestRunner::test('T21.2 each filter maps to its documented Alegra query param', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $f = alegra_call_private($admin, 'sanitize_item_filters', [
+        'idItemCategory' => 'cat-9',
+        'status'         => 'inactive',
+        'inventariable'  => '1',
+        'query'          => 'camisa',
+        'type'           => 'kit',
+    ]);
+    $params = alegra_call_private($admin, 'build_item_filter_params', $f, true);
+    TestRunner::assertSame('cat-9', $params['idItemCategory'] ?? null, 'category maps to idItemCategory');
+    TestRunner::assertSame('inactive', $params['status'] ?? null, 'an explicit status wins over the default');
+    TestRunner::assertSame('true', $params['inventariable'] ?? null, 'inventariable must be the string true');
+    TestRunner::assertSame('camisa', $params['query'] ?? null, 'query maps to query');
+    TestRunner::assertSame('kit', $params['type'] ?? null, 'kit maps to type');
+
+    // variantParent is not a documented `type` filter value: never sent.
+    $vp = alegra_call_private($admin, 'build_item_filter_params', ['type' => 'variantParent'], true);
+    TestRunner::assertArrayNotHasKey('type', $vp, 'variantParent must not be sent to the API');
+});
+
+TestRunner::test('T21.3 invalid filter input degrades to defaults', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $f = alegra_call_private($admin, 'sanitize_item_filters', [
+        'status'        => 'hack',
+        'type'          => '<script>',
+        'inventariable' => 'x',
+    ]);
+    TestRunner::assertSame('default', $f['status'], 'invalid status degrades to default');
+    TestRunner::assertSame('', $f['type'], 'invalid type degrades to empty');
+    TestRunner::assertFalse($f['inventariable'], 'invalid inventariable degrades to false');
+});
+
+TestRunner::test('T21.4 ajax_sync_start totals only the filtered category', function (): void {
+    alegra_test_reset();
+    $cat = ['id' => 'cat-9', 'name' => 'Ropa'];
+    for ($i = 1; $i <= 5; $i++) {
+        alegra_mock_seed_item('in-' . $i, ['name' => 'In ' . $i, 'itemCategory' => $cat, 'status' => 'active']);
+    }
+    for ($i = 1; $i <= 3; $i++) {
+        alegra_mock_seed_item('out-' . $i, ['name' => 'Out ' . $i, 'itemCategory' => ['id' => 'cat-1', 'name' => 'Otros'], 'status' => 'active']);
+    }
+
+    $_POST['sync_type'] = 'products';
+    $_POST['filters'] = json_encode(['idItemCategory' => 'cat-9']);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_sync_start());
+    unset($_POST['sync_type'], $_POST['filters']);
+
+    TestRunner::assertTrue($resp->success, 'the response must be a success envelope');
+    TestRunner::assertSame(5, (int) ($resp->payload['total_items'] ?? 0), 'the total must count only the filtered category');
+});
+
+TestRunner::test('T21.5 ajax_sync_page discards non-variantParent items for the variant filter', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('simple-1', ['name' => 'Simple', 'type' => 'simple', 'status' => 'active']);
+    alegra_mock_seed_item('parent-1', ['name' => 'Parent', 'type' => 'variantParent', 'status' => 'active', 'variantAttributes' => [], 'itemVariants' => []]);
+
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'page' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 2,
+        'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'filters' => ['type' => 'variantParent'],
+    ], 600);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_sync_page());
+
+    TestRunner::assertTrue($resp->success, 'the page must respond successfully');
+    TestRunner::assertSame(1, (int) ($resp->payload['skipped'] ?? 0), 'the simple item must be skipped');
+    TestRunner::assertSame(1, (int) ($resp->payload['imported'] ?? 0), 'the variantParent must be imported');
+});
+
+TestRunner::test('T21.6 the categories endpoint paginates across pages', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    for ($i = 1; $i <= 35; $i++) {
+        alegra_mock_seed_category('cat-' . $i, ['name' => 'Cat ' . $i]);
+    }
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_get_item_categories());
+
+    TestRunner::assertTrue($resp->success, 'the endpoint must succeed');
+    TestRunner::assertSame(35, count($resp->payload['categories'] ?? []), 'all 35 categories must be returned');
+    TestRunner::assertFalse((bool) ($resp->payload['has_more'] ?? true), 'no more pages remain');
+});
+
+TestRunner::test('T21.7 the categories endpoint caps at 10 pages and flags more', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    for ($i = 1; $i <= 305; $i++) {
+        alegra_mock_seed_category('cat-' . $i, ['name' => 'Cat ' . $i]);
+    }
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_get_item_categories());
+
+    TestRunner::assertSame(300, count($resp->payload['categories'] ?? []), 'the endpoint caps at 300 categories');
+    TestRunner::assertTrue((bool) ($resp->payload['has_more'] ?? false), 'more pages must be flagged');
+});
+
 exit(TestRunner::summary());

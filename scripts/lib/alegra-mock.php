@@ -652,7 +652,18 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         return alegra_mock_response(200, alegra_mock_filter_contacts($query));
     }
     if ($method === 'GET' && $path === '/items') {
-        return alegra_mock_response(200, alegra_mock_filter_items($query));
+        $filtered = alegra_mock_filter_items($query);
+        // `metadata=true` wraps the list as {metadata:{total}, data:[]}, as the
+        // documented endpoint does. Used by ajax_sync_start for the exact total.
+        if (filter_var($query['metadata'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
+            $start = (int) ($query['start'] ?? 0);
+            $limit = (int) ($query['limit'] ?? 30);
+            return alegra_mock_response(200, [
+                'metadata' => ['total' => count($filtered)],
+                'data'     => array_slice($filtered, $start, $limit),
+            ]);
+        }
+        return alegra_mock_response(200, $filtered);
     }
     if ($method === 'GET' && $path === '/invoices') {
         return alegra_mock_response(200, alegra_mock_filter_invoices($query));
@@ -847,6 +858,43 @@ function alegra_mock_filter_items(array $query): array
         $parent_id = (string) $query['variantParent_id'];
         $items = array_values(array_filter($items, static function ($i) use ($parent_id) {
             return (string) ($i['variantParent']['id'] ?? '') === $parent_id;
+        }));
+    }
+    // Documented filter: item category.
+    if (!empty($query['idItemCategory'])) {
+        $cat_id = (string) $query['idItemCategory'];
+        $items = array_values(array_filter($items, static function ($i) use ($cat_id) {
+            return (string) ($i['itemCategory']['id'] ?? '') === $cat_id;
+        }));
+    }
+    // Documented filter: active|inactive. Items without a status default to
+    // active, matching Alegra.
+    if (!empty($query['status'])) {
+        $status = (string) $query['status'];
+        $items = array_values(array_filter($items, static function ($i) use ($status) {
+            return (string) ($i['status'] ?? 'active') === $status;
+        }));
+    }
+    // Documented filter: inventariable=true keeps only items with inventory.
+    if (filter_var($query['inventariable'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
+        $items = array_values(array_filter($items, static function ($i) {
+            return array_key_exists('inventory', $i);
+        }));
+    }
+    // Documented filter: free text over name or reference.
+    if (!empty($query['query'])) {
+        $needle = mb_strtolower((string) $query['query']);
+        $items = array_values(array_filter($items, static function ($i) use ($needle) {
+            $name = mb_strtolower((string) ($i['name'] ?? ''));
+            $ref = mb_strtolower((string) ($i['reference'] ?? ''));
+            return strpos($name, $needle) !== false || strpos($ref, $needle) !== false;
+        }));
+    }
+    // Documented filter: simple|kit. Items without a type default to simple.
+    if (!empty($query['type'])) {
+        $type = (string) $query['type'];
+        $items = array_values(array_filter($items, static function ($i) use ($type) {
+            return (string) ($i['type'] ?? 'simple') === $type;
         }));
     }
     return $items;

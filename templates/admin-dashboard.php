@@ -309,20 +309,3 @@ include __DIR__ . '/header.php';
 <?php include __DIR__ . '/footer.php'; ?>
 </div>
 
-<!-- Sync modal (kept here for backward compat) -->
-<div id="alegra-sync-modal" class="ac-modal-overlay" style="display:none;">
-    <div class="ac-modal">
-        <h2><?php esc_html_e('Traer desde Alegra', 'alegra-connector'); ?></h2>
-        <p style="margin-bottom:12px;"><?php esc_html_e('Seleccióna que datos traer a WooCommerce:', 'alegra-connector'); ?></p>
-        <div style="margin-bottom:16px;">
-            <label style="display:block;margin:4px 0;"><input type="checkbox" name="sync_products" checked> <?php esc_html_e('Productos', 'alegra-connector'); ?></label>
-            <label style="display:block;margin:4px 0;"><input type="checkbox" name="sync_customers"> <?php esc_html_e('Clientes', 'alegra-connector'); ?></label>
-            <label style="display:block;margin:4px 0;"><input type="checkbox" name="sync_orders"> <?php esc_html_e('Pedidos (estado)', 'alegra-connector'); ?></label>
-            <label style="display:block;margin:4px 0;"><input type="checkbox" name="sync_categories" checked> <?php esc_html_e('Categorías', 'alegra-connector'); ?></label>
-        </div>
-        <div class="ac-modal-actions">
-            <button type="button" class="ac-btn" id="alegra-sync-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
-            <button type="button" class="ac-btn ac-btn-primary" id="alegra-sync-start"><?php esc_html_e('Iniciar', 'alegra-connector'); ?></button>
-        </div>
-    </div>
-</div>
