@@ -5254,4 +5254,235 @@ TestRunner::test('T-RB-11 the public webhook receiver ACKs but processes nothing
     TestRunner::assertSame(0, count(alegra_mock_requests()), 'no handler work may hit Alegra');
 });
 
+// ===========================================================================
+// T-CN — Phase 5: the manual credit-note action (Task A)
+//
+// Phase 3 correctly gated the AUTOMATIC refund in manual mode. Without an
+// explicit action the merchant could not emit a credit note at all, so this is
+// the button that runs inside Write_Gate::run_explicit().
+// ===========================================================================
+echo "\nT-CN — manual credit-note action (REQ-ENF-2 / REQ-HYG-1)\n";
+
+TestRunner::test('T-CN-1 manual mode: the automatic refund stays gated while the button emits exactly one (REQ-ENF-2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    build_refund_world(100.0, 100.0, 9800, 9801);
+    register_refund_owner_hook();
+
+    // 1) The automatic hook must NOT emit in manual mode.
+    do_action('woocommerce_order_refunded', 9800, 9801);
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'the automatic refund must stay gated in manual mode');
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+
+    // 2) The explicit button emits it.
+    $_POST['order_id'] = 9800;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'the button must succeed');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/credit-notes'), 'the button must emit exactly one credit note');
+
+    // 3) A second click must not duplicate (per-refund idempotency).
+    $_POST['order_id'] = 9800;
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp2->success, 'the second click must be a clean no-op');
+    TestRunner::assertSame(true, $resp2->payload['already_exists'] ?? null, 'the second click must report already_exists');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/credit-notes'), 'the second click must not duplicate the credit note');
+});
+
+TestRunner::test('T-CN-2 no linked invoice: the button errors clearly and posts nothing', function (): void {
+    alegra_test_reset();
+    $refund = alegra_make_refund(9811, ['total' => 10.0]);
+    alegra_make_order(9810, ['total' => 100.0, 'refunds' => [$refund]]);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $_POST['order_id'] = 9810;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertFalse($resp->success, 'no invoice => error envelope');
+    TestRunner::assertStringContains('factura', strtolower((string) ($resp->payload['message'] ?? '')), 'the message must explain the missing invoice');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'nothing may be posted without an invoice');
+});
+
+TestRunner::test('T-CN-3 draft invoice: the button asks to open it first and posts nothing', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('1nv-9820', [
+        'total' => 100.0, 'balance' => 100.0, 'status' => 'draft',
+        'items' => [['id' => '1t3m-9820', 'name' => 'Widget', 'price' => 100, 'quantity' => 1]],
+    ]);
+    $refund = alegra_make_refund(9821, ['total' => 100.0]);
+    alegra_make_order(9820, [
+        'total' => 100.0,
+        'meta' => ['_alegra_invoice_id' => '1nv-9820', '_billing_alegra_contact_id' => 'c0n-9820'],
+        'refunds' => [$refund],
+    ]);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $_POST['order_id'] = 9820;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertFalse($resp->success, 'a draft invoice must be refused');
+    TestRunner::assertStringContains('borrador', strtolower((string) ($resp->payload['message'] ?? '')), 'the message must mention the draft');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'nothing may be posted for a draft invoice');
+});
+
+TestRunner::test('T-CN-4 dry run: the button reports no write and posts nothing', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    update_option('alegra_connector_push_orders_enabled', false);
+    build_refund_world(100.0, 100.0, 9830, 9831);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $_POST['order_id'] = 9830;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertTrue($resp->success, 'dry run is not an error');
+    TestRunner::assertSame(true, $resp->payload['dry_run'] ?? null, 'the payload must be flagged dry_run');
+    TestRunner::assertStringContains('NO se envió', (string) ($resp->payload['message'] ?? ''), 'the message must say nothing was sent');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'dry run must not post');
+});
+
+TestRunner::test('T-CN-5 kill switch: the button reports the block and posts nothing', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    build_refund_world(100.0, 100.0, 9840, 9841);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $_POST['order_id'] = 9840;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertFalse($resp->success, 'the kill switch must block the button');
+    TestRunner::assertSame('kill_switch', $resp->payload['reason'] ?? null, 'the reason must be kill_switch');
+    TestRunner::assertStringContains('desconectado', (string) ($resp->payload['message'] ?? ''), 'the message must explain the kill switch');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'nothing may be posted');
+});
+
+TestRunner::test('T-CN-6 a real API error surfaces a clear message and writes no refund meta', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    [$order] = build_refund_world(100.0, 100.0, 9850, 9851);
+    alegra_mock_fail('POST', '/credit-notes', 422, ['code' => 422, 'message' => 'Factura inválida']);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $_POST['order_id'] = 9850;
+    $resp = alegra_capture_json(fn () => $admin->ajax_emit_credit_note());
+    unset($_POST['order_id']);
+
+    TestRunner::assertFalse($resp->success, 'a 422 must be an error envelope');
+    TestRunner::assertStringContains('Error de Alegra', (string) ($resp->payload['message'] ?? ''), 'the message must surface the API error');
+    TestRunner::assertSame('', (string) $order->get_meta(sprintf(\Alegra\Connector\State_Sync::REFUND_META_FMT, 9851), true), 'no refund meta may be written on failure');
+});
+
+TestRunner::test('T-CN-7 the button is wired end to end (hook + template + JS)', function (): void {
+    $admin_src = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    $tpl_src   = cfg2_source('templates/admin-order-detail.php');
+    $js_src    = cfg2_source('admin/assets/js/admin.js');
+
+    TestRunner::assertStringContains("add_action('wp_ajax_alegra_emit_credit_note'", $admin_src, 'the AJAX action must be registered');
+    TestRunner::assertStringContains('Write_Gate::run_explicit', $admin_src, 'the handler must run in explicit context');
+    TestRunner::assertStringContains('alegra-emit-credit-note', $tpl_src, 'the order detail must render the button');
+    TestRunner::assertStringContains("action: 'alegra_emit_credit_note'", $js_src, 'admin.js must call the action');
+});
+
+// ===========================================================================
+// T-HYG — Phase 5 hygiene (REQ-HYG-1, REQ-HYG-2)
+// ===========================================================================
+echo "\nT-HYG — hygiene (REQ-HYG-1)\n";
+
+TestRunner::test('T-HYG-1 the dead option writes are gone and their legacy cleanup remains (REQ-HYG-1)', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains("update_option('alegra_connector_items_count'", $admin, 'the items_count write must be removed');
+    TestRunner::assertStringNotContains("update_option('alegra_connector_contacts_count'", $admin, 'the contacts_count write must be removed');
+    TestRunner::assertStringNotContains("update_option('alegra_connector_disconnected_at'", $admin, 'the disconnected_at write must be removed');
+
+    $uninstall = cfg2_source('uninstall.php');
+    TestRunner::assertStringContains("delete_option('alegra_connector_items_count')", $uninstall, 'uninstall must still clean the legacy items_count');
+    TestRunner::assertStringContains("delete_option('alegra_connector_contacts_count')", $uninstall, 'uninstall must still clean the legacy contacts_count');
+    TestRunner::assertStringContains("delete_option('alegra_connector_disconnected_at')", $uninstall, 'uninstall must still clean the legacy disconnected_at');
+});
+
+TestRunner::test('T-HYG-2 the 14 uncalled Client methods are kept and marked @deprecated (branch B)', function (): void {
+    $client = cfg2_source('includes/API/Client.php');
+    $methods = [
+        'delete_item_category', 'void_credit_note', 'update_credit_note', 'delete_credit_note',
+        'update_payment', 'delete_payment', 'void_payment', 'open_payment',
+        'create_price_list', 'update_price_list', 'delete_price_list',
+        'create_inventory_adjustment', 'create_estimate', 'update_invoice_retentions',
+    ];
+    foreach ($methods as $m) {
+        TestRunner::assertStringContains('function ' . $m . '(', $client, "$m must still exist (public API)");
+    }
+    TestRunner::assertSame(14, substr_count($client, '@deprecated 2.4.0'), 'all 14 uncalled methods must be marked @deprecated 2.4.0');
+
+    // The two methods that ARE called must NOT be deprecated.
+    foreach (['delete_contact', 'update_item_category'] as $called) {
+        $pos = strpos($client, 'function ' . $called . '(');
+        TestRunner::assertTrue($pos !== false, "$called must still exist");
+        $before = substr($client, max(0, $pos - 260), 260);
+        TestRunner::assertStringNotContains('@deprecated', $before, "$called IS called in production and must NOT be deprecated");
+    }
+});
+
+TestRunner::test('T-HYG-3 the dead sync_all() methods are gone (REQ-HYG-1)', function (): void {
+    foreach (['Products', 'Customers', 'Categories'] as $class) {
+        $src = cfg2_source('includes/Sync/' . $class . '.php');
+        TestRunner::assertStringNotContains('function sync_all(', $src, "$class::sync_all() must be removed");
+    }
+});
+
+TestRunner::test('T-HYG-4 uninstall.php deletes every option the plugin reads or writes (REQ-HYG-1)', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $options = [];
+    $rii = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($root));
+    foreach ($rii as $file) {
+        if (!$file->isFile() || $file->getExtension() !== 'php') {
+            continue;
+        }
+        $path = str_replace('\\', '/', $file->getPathname());
+        if (str_contains($path, '/scripts/') || str_contains($path, '/languages/') || str_contains($path, '/releases/')) {
+            continue;
+        }
+        $src = (string) file_get_contents($path);
+        if (preg_match_all("/(?:get_option|update_option|add_option)\(\s*'([a-z_]+)'/", $src, $m)) {
+            foreach ($m[1] as $opt) {
+                $options[$opt] = true;
+            }
+        }
+    }
+
+    $uninstall = cfg2_source('uninstall.php');
+    $missing = [];
+    foreach (array_keys($options) as $opt) {
+        if (!str_contains($uninstall, "delete_option('$opt')")) {
+            $missing[] = $opt;
+        }
+    }
+    sort($missing);
+    TestRunner::assertSame([], $missing, 'every plugin option must be deleted by uninstall.php (missing: ' . implode(', ', $missing) . ')');
+});
+
+TestRunner::test('T-HYG-5 no decorative settings sections and no do_settings_sections (REQ-HYG-2)', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains('add_settings_section(', $admin, 'the dead settings sections must stay removed');
+
+    $root = $GLOBALS['alegra_plugin_root'];
+    foreach (['admin/Admin/Admin_Dashboard.php', 'templates/admin-settings.php'] as $rel) {
+        $src = cfg2_source($rel);
+        TestRunner::assertStringNotContains('do_settings_sections(', $src, "$rel must not call do_settings_sections() without registered fields");
+    }
+});
+
 exit(TestRunner::summary());

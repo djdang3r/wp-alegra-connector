@@ -255,19 +255,16 @@ check(
     '— the webhook handler must use Tombstone_Manager::create() (regression guard)'
 );
 
-// ---- Assertion 9: customers pagination regression (2.2.0) ----
-echo "\n[9] Regression check: Customers::sync_all() must NOT use 'number' => -1\n";
-$customers_src = file_source($plugin_root . 'includes/Sync/Customers.php');
-$customers_stripped = strip_php_comments($customers_src);
-$has_unbounded_fetch = (bool) preg_match(
-    "/sync_all\s*\([^)]*\)\s*:[^{]*\{[^}]*'number'\s*=>\s*-1/s",
-    $customers_stripped
-);
-check(
-    'Customers::sync_all() paginates instead of fetching all customers',
-    !$has_unbounded_fetch,
-    '— must use number + paged to avoid OOM on large stores (regression guard)'
-);
+// ---- Assertion 9: dead sync_all() removed (REQ-HYG-1) ----
+echo "\n[9] Hygiene: the dead Sync::sync_all() methods are gone\n";
+foreach (['Products', 'Customers', 'Categories'] as $sync_class) {
+    $sync_src = file_source($plugin_root . 'includes/Sync/' . $sync_class . '.php');
+    check(
+        $sync_class . '::sync_all() no longer exists (0 production callers)',
+        !str_contains($sync_src, 'function sync_all('),
+        '— dead surface removed (REQ-HYG-1)'
+    );
+}
 
 // ---- Assertion 10: LOCK_NB regression (2.2.0) ----
 echo "\n[10] Regression check: LOCK_NB must NOT be used in Logger::write()\n";

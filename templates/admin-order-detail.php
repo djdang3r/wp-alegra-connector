@@ -54,6 +54,9 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
     <?php if (!$alegra_invoice_id): ?>
         <button class="ac-btn ac-btn-primary ac-btn-sm alegra-sync-single" data-type="order" data-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Crear factura', 'alegra-connector'); ?></button>
     <?php endif; ?>
+    <?php if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null && (float) $order->get_total_refunded() > 0): ?>
+        <button class="ac-btn ac-btn-sm alegra-emit-credit-note" data-order-id="<?php echo esc_attr($order->get_id()); ?>"><?php esc_html_e('Emitir nota de crédito', 'alegra-connector'); ?></button>
+    <?php endif; ?>
 </div>
 
 <div class="ac-detail-grid">

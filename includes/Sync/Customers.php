@@ -177,49 +177,6 @@ class Customers
         return null;
     }
 
-    public function sync_all(): array|\WP_Error
-    {
-        $result = ['synced' => 0, 'errors' => 0, 'pages' => 0];
-        $page = 1;
-        $per_page = 100;
-
-        while (true) {
-            $args = [
-                'role' => 'customer',
-                'orderby' => 'ID',
-                'order' => 'ASC',
-                'number' => $per_page,
-                'paged' => $page,
-            ];
-
-            $customers = get_users($args);
-
-            if (empty($customers)) break;
-
-            foreach ($customers as $customer) {
-                $sync_result = $this->sync_to_alegra($customer);
-                if (is_wp_error($sync_result)) {
-                    $result['errors']++;
-                    $this->logger->error('Failed to sync customer', [
-                        'customer_id' => $customer->ID,
-                        'error' => $sync_result->get_error_message(),
-                    ]);
-                } else {
-                    $result['synced']++;
-                }
-            }
-
-            $result['pages'] = $page;
-
-            if (count($customers) < $per_page) break;
-            $page++;
-        }
-
-        $this->logger->info('Customers sync completed', $result);
-
-        return $result;
-    }
-
     public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard

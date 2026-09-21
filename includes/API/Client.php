@@ -504,6 +504,10 @@ class Client
         return $this->put('/item-categories/' . $id, $data);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function delete_item_category(string $id): array|\WP_Error
     {
         return $this->delete('/item-categories/' . $id);
@@ -619,16 +623,28 @@ class Client
         return $this->get('/credit-notes/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function update_credit_note(string $id, array $data): array|\WP_Error
     {
         return $this->put('/credit-notes/' . $id, $data);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function delete_credit_note(string $id): array|\WP_Error
     {
         return $this->delete('/credit-notes/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function void_credit_note(string $id): array|\WP_Error
     {
         return $this->post('/credit-notes/' . $id . '/void', []);
@@ -640,32 +656,56 @@ class Client
         return $this->get('/payments/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function update_payment(string $id, array $data): array|\WP_Error
     {
         return $this->put('/payments/' . $id, $data);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function delete_payment(string $id): array|\WP_Error
     {
         return $this->delete('/payments/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function void_payment(string $id): array|\WP_Error
     {
         return $this->post('/payments/' . $id . '/void', []);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function open_payment(string $id): array|\WP_Error
     {
         return $this->post('/payments/' . $id . '/open', []);
     }
 
     // Price Lists CRUD
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function create_price_list(array $data): array|\WP_Error
     {
         return $this->post('/price-lists', $data);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function update_price_list(string $id, array $data): array|\WP_Error
     {
         return $this->put('/price-lists/' . $id, $data);
@@ -676,6 +716,10 @@ class Client
         return $this->get('/price-lists/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function delete_price_list(string $id): array|\WP_Error
     {
         return $this->delete('/price-lists/' . $id);
@@ -719,6 +763,10 @@ class Client
         return $this->get('/inventory-adjustments', $params);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function create_inventory_adjustment(array $data): array|\WP_Error
     {
         return $this->post('/inventory-adjustments', $data);
@@ -735,6 +783,10 @@ class Client
         return $this->get('/estimates/' . $id);
     }
 
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function create_estimate(array $data): array|\WP_Error
     {
         return $this->post('/estimates', $data);
@@ -747,6 +799,10 @@ class Client
     }
 
     // Retentions on invoices
+    /**
+     * @deprecated 2.4.0 No production caller; kept as public API of the
+     *             distributed plugin for backward compatibility.
+     */
     public function update_invoice_retentions(string $id, array $retentions): array|\WP_Error
     {
         return $this->put('/invoices/' . $id . '/retentions-applied', $retentions);

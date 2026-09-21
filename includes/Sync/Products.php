@@ -1231,44 +1231,6 @@ class Products
         }
     }
 
-    public function sync_all(): array|\WP_Error
-    {
-        $result = ['synced' => 0, 'errors' => 0];
-        $page = 1;
-        $per_page = 30;
-
-        while (true) {
-            $products = wc_get_products([
-                'limit' => $per_page,
-                'page' => $page,
-                'status' => 'publish',
-                'type' => ['simple', 'variable'],
-            ]);
-
-            if (empty($products)) break;
-
-            foreach ($products as $product) {
-                $sync_result = $this->sync_to_alegra($product);
-                if (is_wp_error($sync_result)) {
-                    $result['errors']++;
-                    $this->logger->error('Failed to sync product', [
-                        'product_id' => $product->get_id(),
-                        'error' => $sync_result->get_error_message(),
-                    ]);
-                } else {
-                    $result['synced']++;
-                }
-            }
-
-            if (count($products) < $per_page) break;
-            $page++;
-        }
-
-        $this->logger->info('Products sync completed', $result);
-
-        return $result;
-    }
-
     public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard

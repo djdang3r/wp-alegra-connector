@@ -578,8 +578,8 @@ final class Alegra_Connector
      * that clears the hook (the old destructive "Run now"/"skip", a plugin
      * conflict, or a manual DB edit).
      *
-     * Cost: wp_next_scheduled() calls _get_cron_array() -> get_option('cron'),
-     * and `cron` is autoloaded, so it is already in the alloptions cache loaded
+     * Cost: wp_next_scheduled() calls _get_cron_array() -> the core `cron`
+     * option, and `cron` is autoloaded, so it is already in the alloptions cache loaded
      * on every request — no extra DB query. The schedule is only written when
      * it is actually missing, and never after the merchant explicitly removed
      * it from the Monitor ("remove all" sets alegra_connector_cron_disabled).

@@ -71,7 +71,6 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_sync_customers');
     delete_option('alegra_connector_sync_orders');
     delete_option('alegra_connector_sync_categories');
-    delete_option('alegra_connector_sync_taxes');
     delete_option('alegra_connector_inventory_source');
     delete_option('alegra_connector_warehouse_id');
     delete_option('alegra_connector_payment_account_id');

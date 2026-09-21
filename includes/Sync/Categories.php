@@ -60,37 +60,6 @@ class Categories
         return $result;
     }
 
-    public function sync_all(): array|\WP_Error
-    {
-        $result = ['synced' => 0, 'errors' => 0];
-
-        $categories = get_terms([
-            'taxonomy' => 'product_cat',
-            'hide_empty' => false,
-        ]);
-
-        if (is_wp_error($categories)) {
-            return $categories;
-        }
-
-        foreach ($categories as $category) {
-            $sync_result = $this->sync_to_alegra($category);
-            if (is_wp_error($sync_result)) {
-                $result['errors']++;
-                $this->logger->error('Failed to sync category', [
-                    'term_id' => $category->term_id,
-                    'error' => $sync_result->get_error_message(),
-                ]);
-            } else {
-                $result['synced']++;
-            }
-        }
-
-        $this->logger->info('Categories sync completed', $result);
-
-        return $result;
-    }
-
     public function import_from_alegra(int $run_id = 0): array|\WP_Error
     {
         // Kill switch guard

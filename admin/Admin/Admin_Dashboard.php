@@ -41,6 +41,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_save_mapping', [$this, 'ajax_save_mapping']);
         add_action('wp_ajax_alegra_sync_single', [$this, 'ajax_sync_single']);
         add_action('wp_ajax_alegra_record_payment', [$this, 'ajax_record_payment']);
+        add_action('wp_ajax_alegra_emit_credit_note', [$this, 'ajax_emit_credit_note']);
         add_action('wp_ajax_alegra_open_invoice', [$this, 'ajax_open_invoice']);
         add_action('wp_ajax_alegra_import_from_api', [$this, 'ajax_import_from_api']);
         add_action('wp_ajax_alegra_sync_inventory', [$this, 'ajax_sync_inventory']);
@@ -581,9 +582,9 @@ class Admin_Dashboard
             'sanitize_callback' => [self::class, 'sanitize_tax_mapping'],
         ]);
 
-        // The six settings sections were removed: do_settings_sections() is
-        // never called and the templates render their own tables, so the
-        // sections were pure dead code (REQ-HYG-2).
+        // The six settings sections were removed: the sections API is never
+        // invoked and the templates render their own tables, so the sections
+        // were pure dead code (REQ-HYG-2).
     }
 
     public function enqueue_assets(string $hook): void
@@ -710,6 +711,9 @@ class Admin_Dashboard
             'confirmRecordPayment'  => __('¿Registrar pago en Alegra?', 'alegra-connector'),
             'confirmOpenInvoice'    => __('¿Abrir esta factura en Alegra? Dejará de estar en borrador y quedará contabilizada.', 'alegra-connector'),
             'invoiceOpened'         => __('Factura abierta en Alegra', 'alegra-connector'),
+            'confirmEmitCreditNote' => __('¿Emitir una nota de crédito en Alegra por el reembolso de este pedido?', 'alegra-connector'),
+            'emittingCreditNote'    => __('Emitiendo...', 'alegra-connector'),
+            'creditNoteEmitted'     => __('Nota de crédito emitida en Alegra', 'alegra-connector'),
             'selectOneItem'         => __('Selecciona al menos un elemento', 'alegra-connector'),
             'sending'               => __('Enviando...', 'alegra-connector'),
             'fetching'              => __('Trayendo...', 'alegra-connector'),
@@ -1610,12 +1614,9 @@ class Admin_Dashboard
         if (isset($result['email'])) {
             update_option('alegra_connector_company_email', sanitize_text_field($result['email']));
         }
-        if (isset($result['items_count'])) {
-            update_option('alegra_connector_items_count', (int) $result['items_count']);
-        }
-        if (isset($result['contacts_count'])) {
-            update_option('alegra_connector_contacts_count', (int) $result['contacts_count']);
-        }
+        // REQ-HYG-1: the `alegra_connector_items_count` / `_contacts_count`
+        // options were written here and never read anywhere. Removed. The counts
+        // are still returned in the JSON payload below (derived from $result).
         update_option('alegra_connector_connection_tested', true);
 
         $diagnostics = $result['diagnostics'] ?? [];
@@ -2441,6 +2442,142 @@ class Admin_Dashboard
         ]);
     }
 
+    /**
+     * AJAX: emit a credit note for a refund from the order detail page.
+     *
+     * Phase 3 made `push_orders_enabled=false` (manual mode) block the
+     * AUTOMATIC credit note on `woocommerce_order_refunded`. That is correct,
+     * but without this action a merchant in manual mode had no way to emit the
+     * credit note at all. This is the explicit path: the merchant asks for it,
+     * so it runs inside Write_Gate::run_explicit() and the entity gate lets the
+     * write through (the kill switch still blocks it).
+     *
+     * Idempotent: it reuses State_Sync::handle_refund() and its per-refund
+     * `_alegra_credit_note_id_for_<refund>` marker, so a second click does not
+     * duplicate the credit note.
+     */
+    public function ajax_emit_credit_note(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_emit_credit_note_impl());
+    }
+
+    private function ajax_emit_credit_note_impl(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $order_id = (int) ($_POST['order_id'] ?? 0);
+        if ($order_id <= 0) {
+            wp_send_json_error(['message' => __('ID de pedido inválido.', 'alegra-connector')]);
+        }
+
+        $order = wc_get_order($order_id);
+        if (!$order instanceof \WC_Order) {
+            wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
+        }
+
+        $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        if ($invoice_id === '') {
+            wp_send_json_error(['message' => __('El pedido no tiene una factura de Alegra vinculada. Primero crea la factura.', 'alegra-connector')]);
+        }
+
+        // A credit note requires an ISSUED invoice. Alegra rejects (or the
+        // credit note is meaningless against) a draft, so tell the merchant to
+        // open it first instead of failing with a raw API error.
+        if ($this->api) {
+            $invoice = $this->api->get_invoice($invoice_id);
+            if (!is_wp_error($invoice) && is_array($invoice) && (string) ($invoice['status'] ?? '') === 'draft') {
+                wp_send_json_error(['message' => __('La factura está en borrador. Ábrela en Alegra antes de emitir la nota de crédito.', 'alegra-connector')]);
+            }
+        }
+
+        // Resolve the refund to credit: an explicit id, else the first refund
+        // that has not been credited yet (per-refund idempotency marker).
+        $refund_id = (int) ($_POST['refund_id'] ?? 0);
+        $refunds = $order->get_refunds();
+        if ($refund_id <= 0) {
+            foreach ($refunds as $refund) {
+                if (!$refund instanceof \WC_Order_Refund) {
+                    continue;
+                }
+                $candidate = (int) $refund->get_id();
+                if ($candidate > 0 && (string) $order->get_meta(sprintf(\Alegra\Connector\State_Sync::REFUND_META_FMT, $candidate), true) === '') {
+                    $refund_id = $candidate;
+                    break;
+                }
+            }
+        }
+
+        if ($refund_id <= 0 && $refunds !== []) {
+            // Every refund already carries a credit note: idempotent no-op.
+            wp_send_json_success([
+                'message' => __('Ya se emitió una nota de crédito para este reembolso; no se duplicó.', 'alegra-connector'),
+                'already_exists' => true,
+            ]);
+        }
+
+        if ($refund_id > 0) {
+            $result = \Alegra\Connector\State_Sync::handle_refund($order_id, $refund_id);
+        } else {
+            // No WC refund object (e.g. the amount was credited manually): credit
+            // whatever remains uncredited on the order.
+            $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+            $result = $orders_sync->create_credit_note($order);
+        }
+
+        if (is_wp_error($result)) {
+            $this->logger->error('Credit note emission failed', [
+                'order_id'  => $order_id,
+                'refund_id' => $refund_id,
+                'error'     => $result->get_error_message(),
+            ]);
+            wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+        }
+
+        // Idempotency: handle_refund() short-circuits when the refund was
+        // already credited. Report it as a success (nothing was duplicated).
+        if (!empty($result['already_exists'])) {
+            wp_send_json_success([
+                'message' => __('La nota de crédito ya estaba emitida; no se duplicó.', 'alegra-connector'),
+                'already_exists' => true,
+                'credit_note_id' => (string) ($result['id'] ?? ''),
+            ]);
+        }
+
+        if (API\Client::is_dry_run_response($result)) {
+            $this->logger->warning('Credit note emission skipped (dry run)', [
+                'order_id'  => $order_id,
+                'refund_id' => $refund_id,
+            ]);
+            wp_send_json_success([
+                'dry_run' => true,
+                'message' => __('Modo de prueba activo: la nota de crédito NO se envió a Alegra.', 'alegra-connector'),
+            ]);
+        }
+
+        if (API\Client::is_gate_blocked_response($result)) {
+            $this->logger->warning('Credit note emission blocked by write gate', [
+                'order_id'  => $order_id,
+                'refund_id' => $refund_id,
+                'reason'    => $result['reason'] ?? 'unknown',
+            ]);
+            wp_send_json_error([
+                'message' => self::blocked_message($result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'unknown'),
+            ]);
+        }
+
+        $credit_note_id = (string) ($result['id'] ?? '');
+        wp_send_json_success([
+            'message' => __('Nota de crédito emitida en Alegra.', 'alegra-connector'),
+            'credit_note_id' => $credit_note_id,
+        ]);
+    }
+
     public function ajax_sync_single(): void
     {
         \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_sync_single_impl());
@@ -3247,7 +3384,9 @@ class Admin_Dashboard
         update_option('alegra_connector_company_name', '');
         update_option('alegra_connector_company_country', '');
         update_option('alegra_connector_company_email', '');
-        update_option('alegra_connector_disconnected_at', current_time('mysql'));
+        // REQ-HYG-1: `alegra_connector_disconnected_at` was written here and
+        // never read; the disconnection state is carried by Kill_Switch::reason()
+        // / `alegra_connector_disconnected_reason`. Removed.
 
         $this->log('info', 'Disconnected from Alegra (kill switch active, all resources cleaned)', [
             'webhooks_deleted'   => $deleted,

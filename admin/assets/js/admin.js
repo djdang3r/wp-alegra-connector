@@ -52,6 +52,7 @@
             this.initSingleSync();
             this.initRecordPayment();
             this.initOpenInvoice();
+            this.initEmitCreditNote();
             this.initCleanupDuplicateImages();
         },
 
@@ -568,6 +569,28 @@
                         }
                     },
                     error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false); }
+                });
+            });
+        },
+
+        initEmitCreditNote: function() {
+            $('.alegra-emit-credit-note').on('click', function() {
+                var $btn = $(this);
+                if (!confirm(S.confirmEmitCreditNote)) return;
+                $btn.prop('disabled', true).text(S.emittingCreditNote);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_emit_credit_note', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, S.creditNoteEmitted), 'success');
+                            setTimeout(function(){ location.reload(); }, 1500);
+                        } else {
+                            showNotice(safeMsg(r, S.error), 'error');
+                            $btn.prop('disabled', false).text(S.creditNoteEmitted);
+                        }
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false).text(S.creditNoteEmitted); }
                 });
             });
         },
