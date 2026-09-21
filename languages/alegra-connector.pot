@@ -2,9 +2,9 @@
 # This file is distributed under the GPL v2 or later.
 msgid ""
 msgstr ""
-"Project-Id-Version: Alegra Connector 2.3.10\n"
+"Project-Id-Version: Alegra Connector 2.3.11\n"
 "Report-Msgid-Bugs-To: https://github.com/djdang3r/wp-alegra-connector/issues\n"
-"POT-Creation-Date: 2026-09-21 00:20+0000\n"
+"POT-Creation-Date: 2026-09-21 00:26+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -266,15 +266,15 @@ msgstr ""
 msgid "Alegra Connector"
 msgstr ""
 
-#: alegra-connector.php:261
+#: alegra-connector.php:291
 msgid "Alegra Connector requiere WooCommerce activo. La sincronización está desactivada hasta que actives WooCommerce."
 msgstr ""
 
-#: alegra-connector.php:366
+#: alegra-connector.php:396
 msgid "Alegra Connector requiere WooCommerce instalado y activo."
 msgstr ""
 
-#: alegra-connector.php:209
+#: alegra-connector.php:239
 msgid "Alegra Connector: no se pudo cargar la clase Logger. El directorio logger/ parece estar incompleto en esta instalación. El plugin no puede registrar eventos hasta que reinstales el plugin completo o contactes al soporte."
 msgstr ""
 
@@ -1203,7 +1203,7 @@ msgstr ""
 msgid "Error al subir archivo."
 msgstr ""
 
-#: alegra-connector.php:367
+#: alegra-connector.php:397
 msgid "Error de Activacion"
 msgstr ""
 
@@ -1351,7 +1351,7 @@ msgstr ""
 msgid "Estos valores se usan como predeterminados al crear productos en Alegra. Si un producto en WooCommerce no tiene un valor especifico para estos campos, se usara el valor que definas aqui."
 msgstr ""
 
-#: alegra-connector.php:231
+#: alegra-connector.php:261
 msgid "Every %d minutes (Alegra Connector)"
 msgstr ""
 
