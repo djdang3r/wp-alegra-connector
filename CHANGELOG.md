@@ -2,6 +2,74 @@
 
 All notable changes to Alegra Connector.
 
+## [2.3.11] - 2026-09-16
+
+> **Payments reliability release.** The "Facturar" button on the order detail
+> never registered a payment: it called the invoice-only path, so an already-paid
+> order's invoice stayed **"Por Cobrar"** in Alegra. This release fixes that root
+> cause, takes every payment datum from WooCommerce, and adds automatic
+> reconciliation (event hooks + an hourly sweep) so a payment that arrives after
+> the invoice is attached without the merchant clicking anything.
+
+### Fixed
+
+- **CRITICAL (crítico): "Facturar" never registered a payment.** The order-detail
+  action mapped to `create_invoice()` — a code path with no payment logic — so
+  the invoice was created and left **"Por Cobrar"** even when the order was
+  already paid. "Facturar", bulk "Facturar seleccionados" and "Facturar
+  pendientes" now reach `create_invoice_with_payment()`, which registers the
+  payment from WooCommerce **when the order `is_paid()`**. An unpaid order still
+  gets its invoice, with no payment and an explanatory order note.
+- **Payment data now comes from WooCommerce, not the server date.** The `date`
+  is `$order->get_date_paid()` (with a logged fallback to today when it is null),
+  the `amount` is `get_total()`, and the `observations` carry the gateway title. A
+  mismatch between the order total and the invoice balance is reported (note +
+  log), never silently adjusted. The gateway→`paymentMethod` mapping is now a
+  single resolver with one safe fallback (`transfer`), validated against the
+  official Alegra enum; Mercado Pago maps to `credit-card`.
+- **Reconciliation: a later payment now reaches an already-created invoice.**
+  The reconcile hooks (`payment_complete`, `processing`, `completed`) are
+  registered **outside** the `push_orders_enabled` gate (manual mode included),
+  and an **hourly sweep** covers missed events. They never create an invoice;
+  they only attach the payment through the same idempotent path (meta guard +
+  pre-search + lock).
+- **The payment-account `<select>` could silently overwrite a saved account with
+  "Sin cuenta".** When the stored id was absent from `/bank-accounts`, no option
+  was selected and the browser submitted `0`. The select now always renders the
+  stored value (injecting a synthetic "Cuenta guardada (no sincronizada)" option
+  when needed), so a stored value can no longer be lost.
+- **The sanitizer no longer drops an invalid value in silence.** It keeps the
+  previous value and registers a visible `settings_error`; the "Configuración
+  guardada correctamente" banner is suppressed when a rejection occurred.
+- **The checkout document-type select pre-selected "Registro Civil".** The
+  classic and Blocks selects now start with a **"Seleccione…"** placeholder.
+- **`ALEGRA_CONNECTOR_VERSION` was stuck at 2.3.7 while the header said 2.3.10**,
+  so every upgrade served cached JS/CSS and new features never loaded. The
+  constant now derives from the plugin header, so the two can never drift again.
+- **The option label "Cuenta bancaria" was misleading** (Alegra's
+  `/bank-accounts` returns **cajas** as well as banks). It is now **"Cuenta de
+  destino para pagos (banco o caja)"**.
+
+### Changed
+
+- The release process is now consistent and reproducible:
+  `scripts/build-release.sh` refuses to build when the header, README and
+  `make-pot.php` versions disagree (exit 9), and a pushed `v*` tag publishes a
+  GitHub Release with the ZIP and its SHA256 (`.github/workflows/release.yml`).
+  The README points at the GitHub Releases page instead of the lexicographically
+  sorted `releases/` folder, where `2.3.10` sorts after `2.3.1` and `2.3.9` is
+  last.
+
+### Notes for the merchant
+
+- **Upgrade note:** if the payment-account select ever showed "Sin cuenta",
+  re-save it (Ajustes → Avanzado). The select can no longer lose the value, but
+  it cannot guess a value that was already overwritten.
+- `Schema::SCHEMA_VERSION` is unchanged (`2.3.1`): this release has **no schema
+  change**.
+- The release process now tags and (when `gh` is available) publishes a Release;
+  `v2.3.8`, `v2.3.9` and `v2.3.10` are back-filled as tags.
+
 ## [2.3.10] - 2026-09-18
 
 > **Draft-invoice visibility.** When invoices are created as drafts, the order
@@ -533,7 +601,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.7_VERIFICATION.md` for the assumptions that still require a live API test.
+- See `docs/RELEASE_2.3.11_VERIFICATION.md` for the assumptions that still require a live API test (this guide was renamed from `RELEASE_2.3.7_VERIFICATION.md`).
 
 ---
 

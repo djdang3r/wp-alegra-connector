@@ -1,26 +1,17 @@
-# Verificación en Producción — Alegra Connector 2.3.7
+# Verificación en Producción — Alegra Connector 2.3.11
 
-Esta guía es la **lista de validación** de la versión **2.3.7**. La 2.3.7 es una
-**versión de confiabilidad de webhooks**: un webhook `new-client` **crasheaba con
-un fatal (HTTP 500)** —Alegra manda `name` como **objeto**, no como string— y
-**cada entrega contaba como fallo**. Eso importa porque **Alegra elimina una
-suscripción tras 10 fallos consecutivos**: los webhooks de clientes se habrían
-borrado solos. Además, **re-registrar** los webhooks (la acción esperada después
-de actualizar) reportaba **"12 errores"** aunque todo estuviera ya registrado.
+Esta guía es la **lista de validación** de la versión **2.3.11**. La 2.3.11 es una
+**versión de confiabilidad de pagos**: el botón **"Facturar"** creaba la factura
+pero **nunca registraba el pago**, así que un pedido ya pagado quedaba con la
+factura **"Por Cobrar"** en Alegra. Ahora "Facturar" registra el pago desde
+WooCommerce cuando el pedido `is_paid()`, los datos del pago salen de WC (fecha,
+monto, pasarela) y la reconciliación (hooks siempre activos + barrido horario)
+adjunta un pago posterior a una factura ya creada.
 
-La 2.3.7 **conserva** las verificaciones de la 2.3.6 (stock, categoría comercial,
-clientes, pedidos y orquestación): siguen siendo válidas y están más abajo. Lo
-**nuevo** es la sección de webhooks (★), que ahora incluye los **hechos
-confirmados** en la documentación oficial, el **paso a paso de configuración** y
-la **verificación en vivo del token en la URL**.
-
-> **⚠️ ANTES QUE NADA: re-registrá los webhooks.** Las suscripciones viejas
-> apuntan a la URL **sin el token secreto** y el endpoint nuevo **las rechaza**.
-> Hacelo en **Alegra Connector → Configuración → pestaña Avanzado → sección
-> "Sincronización en Tiempo Real (Webhooks)" → "Registrar webhooks en Alegra"**.
-> Si no lo hacés, los webhooks quedan mudos (el cron periódico sigue como
-> respaldo, pero perdés el tiempo real). **Re-registrar es seguro e idempotente**:
-> si ya existen, el mensaje dirá cuántos **ya existían**, no "errores".
+La 2.3.11 **conserva** las verificaciones de la 2.3.7 (webhooks), de la 2.3.6
+(stock, categoría comercial, clientes, pedidos y orquestación) y de las versiones
+anteriores: siguen siendo válidas y están más abajo. Lo **nuevo** es la sección
+de **pagos (★★★)**, que es el bug reportado.
 
 **Guía complementaria:** este documento **no** repite cómo instalar ni cómo
 revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
@@ -41,6 +32,58 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 | **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, se factura sin querer, el stock queda desalineado, o los webhooks se **borran solos**. **Bloquea** el uso real hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
+
+---
+
+## ★★★ Pagos — lo nuevo de la 2.3.11 (el bug reportado)
+
+### ★★★.a — "Facturar" un pedido pagado registra el pago
+
+1. Tomá un pedido **pagado** (`processing`/`completed`) **sin** factura en Alegra
+   y con la **cuenta de destino** configurada.
+2. En el detalle del pedido, apretá **"Facturar"**.
+3. **Resultado esperado:** se crea **1 factura** y **1 pago** en Alegra; la
+   factura deja de estar **"Por Cobrar"**. En el pedido, `_alegra_payment_id`
+   queda seteado y la nota del pedido lo confirma.
+4. **Si falla:** revisá `Alegra Connector → Logs`; el error real de Alegra queda
+   ahí y en una nota del pedido. Verificá también que la **fecha del pago** sea
+   la del pedido (`get_date_paid()`), no la del servidor.
+
+### ★★★.b — "Facturar" un pedido impago crea la factura y NO paga
+
+1. Tomá un pedido **on-hold/pending** (no pagado) con la cuenta configurada.
+2. Apretá **"Facturar"**.
+3. **Resultado esperado:** se crea la **factura** pero **no** se registra pago
+   (0 pagos). Queda una **nota** explicando que el pedido no figura pagado en
+   WooCommerce.
+4. **Caso sin cuenta:** sin cuenta configurada, un pedido pagado con factura y
+   sin pago **no** postea pago, pero deja **nota + warning** (no falla en
+   silencio).
+
+### ★★★.c — Reconciliación: el pago posterior se adjunta solo
+
+1. Con un pedido **ya facturado** (factura vinculada) y **sin pago**, pasalo a
+   **`processing`** (o completá el pago).
+2. **Resultado esperado:** el plugin registra el pago automáticamente por el
+   hook, aunque el modo push de pedidos esté **apagado** (modo manual). Si el
+   evento se pierde, el **barrido horario** lo reintenta (hasta 20 por corrida).
+3. **No duplica:** disparar el hook y el barrido juntos produce **un solo**
+   `POST /payments` (guard de meta + pre-búsqueda + lock).
+4. **Nunca crea factura:** en modo manual, la reconciliación solo adjunta el pago
+   a una factura existente.
+
+### ★★★.d — Cuenta de destino y placeholder del checkout
+
+1. En **Ajustes → Avanzado**, el label es **"Cuenta de destino para pagos
+   (banco o caja)"** y, si había un id guardado, **sigue seleccionado** aunque
+   `/bank-accounts` falle o no incluya ese id.
+2. Si la cuenta había quedado en **"Sin cuenta"**, **re-elegila y guardá** (el
+   select ya no puede perder el valor, pero no puede adivinar el que se pisó).
+3. En el checkout (clásico y Blocks), el select de **tipo de documento** arranca
+   en **"Seleccione…"**; ya no viene preseleccionado "Registro Civil".
+
+- **Riesgo: Alto.** Era el bug reportado: sin esto, la factura queda "Por Cobrar"
+  y la contabilidad no refleja el cobro.
 
 ---
 
@@ -436,7 +479,17 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.7 instalado y la versión figura como **2.3.7** en **Plugins**.
+- [ ] 2.3.11 instalado y la versión figura como **2.3.11** en **Plugins**.
+
+### Pagos — lo nuevo de la 2.3.11
+- [ ] **★★★.a** "Facturar" un pedido **pagado** → **1 pago** en Alegra y la
+      factura deja de estar "Por Cobrar"; `_alegra_payment_id` seteado.
+- [ ] **★★★.b** "Facturar" un pedido **impago** → factura sí, **0 pagos**, con
+      nota explicativa.
+- [ ] **★★★.c** Pago posterior a una factura ya creada → se adjunta **solo**
+      (hook y/o barrido), sin duplicar.
+- [ ] **★★★.d** Cuenta de destino con label "banco o caja" y valor guardado
+      seleccionado; checkout con "Seleccione…" en tipo de documento.
 
 ### Re-registrar webhooks (obligatorio)
 - [ ] **★** La "URL del Webhook" incluye `?token=...`.

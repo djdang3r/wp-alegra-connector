@@ -38,6 +38,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Preflight (REQ-REL-2): the plugin header is the single source of truth for
+# the version (ALEGRA_CONNECTOR_VERSION is derived from it). Refuse to build a
+# release when the argument, the header, the README and make-pot.php disagree,
+# so a version can never drift again (the 2.3.10-header/2.3.7-constant bug that
+# left every upgrade serving cached JS/CSS).
+HEADER_VERSION="$(sed -n 's/^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*\([0-9A-Za-z.\-]*\).*/\1/p' alegra-connector.php | head -1)"
+if [[ "$HEADER_VERSION" != "$VERSION" ]]; then
+    echo "error: version mismatch — header='$HEADER_VERSION' argument='$VERSION'" >&2
+    echo "  bump 'Version:' in alegra-connector.php (ALEGRA_CONNECTOR_VERSION derives from it)" >&2
+    exit 9
+fi
+
+README_VERSION="$(sed -n 's/^Version:[[:space:]]*\([0-9A-Za-z.\-]*\).*/\1/p' README.md | head -1)"
+if [[ "$README_VERSION" != "$VERSION" ]]; then
+    echo "error: version mismatch — README='$README_VERSION' argument='$VERSION'" >&2
+    exit 9
+fi
+
+POT_VERSION="$(sed -n "s/^[[:space:]]*\$version[[:space:]]*=[[:space:]]*'\([0-9A-Za-z.\-]*\)'.*/\1/p" scripts/make-pot.php | head -1)"
+if [[ "$POT_VERSION" != "$VERSION" ]]; then
+    echo "error: version mismatch — make-pot.php='$POT_VERSION' argument='$VERSION'" >&2
+    exit 9
+fi
+
+echo "Version consistency OK: header == README == make-pot.php == $VERSION"
+
 # Preflight: required binaries
 for bin in git zip; do
     if ! command -v "$bin" >/dev/null 2>&1; then
@@ -224,8 +250,56 @@ echo "Files:   $STAGED (staged from git ls-files minus .distignore)"
 echo "ZIP:     $ZIP_PATH  ($ZIP_SIZE bytes)"
 echo "SHA256:  $SHA_VALUE"
 echo "============================================"
+
+# ---------------------------------------------------------------------------
+# Release tagging + publishing (opt-in)
+# ---------------------------------------------------------------------------
+# Canonical flow:
+#   git commit (version bump) -> build -> git commit (artifacts) -> git tag -> push
+# so tagging is NOT automatic: the artifacts commit must exist first. Pass
+# `--tag` to create the annotated tag for the current HEAD, and `--publish` to
+# also create the GitHub Release (needs `gh`; otherwise the exact command is
+# printed). Pushing the tag triggers .github/workflows/release.yml.
+PUBLISH=0
+CREATE_TAG=0
+for arg in "${@:2}"; do
+    case "$arg" in
+        --tag)     CREATE_TAG=1 ;;
+        --publish) CREATE_TAG=1; PUBLISH=1 ;;
+    esac
+done
+
+TAG_NAME="v${VERSION}"
+
+if [[ "$CREATE_TAG" == "1" ]]; then
+    if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+        echo "Tag $TAG_NAME already exists ($(git rev-list -n1 "$TAG_NAME" | cut -c1-10)); leaving it untouched."
+    else
+        git tag -a "$TAG_NAME" -m "Alegra Connector $VERSION"
+        echo "Created annotated tag $TAG_NAME -> $(git rev-parse --short HEAD)"
+    fi
+fi
+
+if [[ "$PUBLISH" == "1" ]]; then
+    if command -v gh >/dev/null 2>&1; then
+        echo "--- Publishing GitHub Release $TAG_NAME ---"
+        gh release create "$TAG_NAME" \
+            --title "Alegra Connector $VERSION" \
+            --notes "Alegra Connector $VERSION" \
+            "$ZIP_PATH" "$SHA_PATH" \
+            && echo "GitHub Release $TAG_NAME published." \
+            || echo "warning: gh release create failed; create it manually." >&2
+    else
+        echo "gh not available — publish the GitHub Release with:"
+        echo "  gh release create $TAG_NAME --title \"Alegra Connector $VERSION\" --notes \"Alegra Connector $VERSION\" \"$ZIP_PATH\" \"$SHA_PATH\""
+    fi
+fi
+
 echo
 echo "Next steps:"
 echo "  1. Extract and smoke-test:    bash scripts/smoke-test-zip.sh $ZIP_PATH"
 echo "  2. Upload to test server and activate"
 echo "  3. Monitor wp-content/debug.log for 5 minutes for new fatals"
+echo "  4. Tag the release:           git tag -a $TAG_NAME -m \"Alegra Connector $VERSION\""
+echo "  5. Push:                      git push origin main && git push origin $TAG_NAME"
+echo "  6. Publish a GitHub Release:  gh release create $TAG_NAME --title \"Alegra Connector $VERSION\" --notes \"Alegra Connector $VERSION\" $ZIP_PATH $SHA_PATH"

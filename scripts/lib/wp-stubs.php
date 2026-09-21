@@ -462,6 +462,29 @@ function load_plugin_textdomain($domain, $deprecated = false, $path = false) { r
 function plugin_dir_path($file) { return rtrim(dirname($file), '/\\') . '/'; }
 function plugin_dir_url($file) { return 'https://example.test/wp-content/plugins/alegra-connector/'; }
 function plugin_basename($file) { return 'alegra-connector/' . basename($file); }
+
+/**
+ * get_file_data() — minimal WP core-compatible header parser.
+ *
+ * WP core reads the plugin/theme file headers from disk. The plugin derives
+ * ALEGRA_CONNECTOR_VERSION from its `Version:` header, so the harness needs a
+ * faithful stub (the real function is defined in wp-includes/functions.php and
+ * is always present when WordPress boots the plugin).
+ */
+function get_file_data($file, $default_headers = [], $context = '')
+{
+    $contents = is_file($file) ? (string) @file_get_contents($file) : '';
+    $data = [];
+    foreach ((array) $default_headers as $field => $regex) {
+        $pattern = '/^[ \t\/*#@]*' . preg_quote((string) $regex, '/') . ':(.*)$/mi';
+        if (preg_match($pattern, $contents, $m)) {
+            $data[$field] = trim(preg_replace('/\s*(?:\*\/|\?>).*/', '', $m[1]));
+        } else {
+            $data[$field] = '';
+        }
+    }
+    return $data;
+}
 function register_activation_hook($file, $callback) { return; }
 function register_deactivation_hook($file, $callback) { return; }
 function register_rest_route($ns, $route, $args = []) { return true; }

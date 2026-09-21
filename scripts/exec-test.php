@@ -4472,4 +4472,109 @@ TestRunner::test('T-CHK-2b Blocks requires idtype only in require_data mode', fu
     TestRunner::assertTrue((bool) $args['required'], 'require_data must mark the Blocks idtype required');
 });
 
+// ===========================================================================
+// T28 — Version + release integrity (Fase 7: REQ-REL-1..4)
+//
+// Spec:   docs/sdd/payments/spec.md   (REQ-REL-1..4)
+// Design: docs/sdd/payments/design.md (§8 versión y release)
+// ===========================================================================
+echo "\nT28 — Version + release integrity (Fase 7)\n";
+
+function alegra_read_plugin_header_version(string $file): string
+{
+    $src = (string) file_get_contents($file);
+    if (preg_match('/^[ \t\/*#@]*Version:\s*(.+?)\s*$/mi', $src, $m)) {
+        return trim($m[1]);
+    }
+    return '';
+}
+
+TestRunner::test('T-REL-1a the plugin header and ALEGRA_CONNECTOR_VERSION are identical', function (): void {
+    $file = $GLOBALS['alegra_plugin_root'] . 'alegra-connector.php';
+    $header = alegra_read_plugin_header_version($file);
+
+    TestRunner::assertTrue($header !== '', 'the plugin header must carry a Version');
+    TestRunner::assertTrue(defined('ALEGRA_CONNECTOR_VERSION'), 'ALEGRA_CONNECTOR_VERSION must be defined');
+    TestRunner::assertSame($header, ALEGRA_CONNECTOR_VERSION, 'header and constant must match (anti-drift)');
+});
+
+TestRunner::test('T-REL-1b the constant is derived from the header, not hardcoded', function (): void {
+    $file = $GLOBALS['alegra_plugin_root'] . 'alegra-connector.php';
+    $src = (string) file_get_contents($file);
+
+    TestRunner::assertStringContains(
+        "define('ALEGRA_CONNECTOR_VERSION', alegra_connector_plugin_version(__FILE__)",
+        $src,
+        'the constant must derive from the header'
+    );
+    TestRunner::assertStringNotContains(
+        "define('ALEGRA_CONNECTOR_VERSION', '2.",
+        $src,
+        'no hardcoded version literal may remain'
+    );
+
+    // The derivation reads the header: a file with a different header yields
+    // that version, so a stale constant can no longer survive a release.
+    $tmp = tempnam(sys_get_temp_dir(), 'alegra-ver-');
+    file_put_contents($tmp, "<?php\n/**\n * Plugin Name: X\n * Version: 9.9.9\n */\n");
+    $derived = \Alegra\Connector\alegra_connector_plugin_version($tmp);
+    @unlink($tmp);
+    TestRunner::assertSame('9.9.9', $derived, 'the derivation must read the header value');
+});
+
+TestRunner::test('T-REL-1c the asset cache-buster uses ALEGRA_CONNECTOR_VERSION', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $admin = (string) file_get_contents($root . 'admin/Admin/Admin_Dashboard.php');
+    $checkout = (string) file_get_contents($root . 'includes/Checkout_Integration.php');
+
+    TestRunner::assertStringContains(
+        "admin/assets/js/admin.js', ['jquery'], ALEGRA_CONNECTOR_VERSION",
+        $admin,
+        'admin.js must be versioned with the plugin version'
+    );
+    TestRunner::assertStringContains('alegra-checkout-conditions.js', $checkout, 'the checkout enqueue must exist');
+    TestRunner::assertStringContains('ALEGRA_CONNECTOR_VERSION', $checkout, 'checkout-conditions.js must be versioned with the plugin version');
+});
+
+TestRunner::test('T-REL-2 the release build refuses a version mismatch', function (): void {
+    $script = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'scripts/build-release.sh');
+
+    TestRunner::assertStringContains('HEADER_VERSION', $script, 'the build must read the plugin header');
+    TestRunner::assertStringContains(
+        "header='\$HEADER_VERSION' argument='\$VERSION'",
+        $script,
+        'the build must report the header/argument divergence'
+    );
+    TestRunner::assertStringContains('exit 9', $script, 'a divergence must abort the build');
+    TestRunner::assertStringContains('README_VERSION', $script, 'the build must verify the README version');
+    TestRunner::assertStringContains('make-pot.php', $script, 'the build must verify make-pot.php too');
+});
+
+TestRunner::test('T-REL-3 a v* tag workflow runs the gates and publishes the ZIP', function (): void {
+    $workflow = $GLOBALS['alegra_plugin_root'] . '.github/workflows/release.yml';
+    TestRunner::assertTrue(is_file($workflow), 'the release workflow must exist');
+    $yaml = (string) file_get_contents($workflow);
+
+    TestRunner::assertStringContains("tags: ['v*']", $yaml, 'it must trigger on v* tags');
+    TestRunner::assertStringContains('bash scripts/smoke-test.sh', $yaml, 'smoke-test must be a gate');
+    TestRunner::assertStringContains('bash scripts/exec-test.sh', $yaml, 'exec-test must be a gate');
+    TestRunner::assertStringContains('action-gh-release', $yaml, 'it must publish a GitHub Release');
+    TestRunner::assertStringContains('.sha256', $yaml, 'the SHA256 must be attached');
+});
+
+TestRunner::test('T-REL-4 the README points at the GitHub Releases page, not the releases folder', function (): void {
+    $readme = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'README.md');
+
+    TestRunner::assertStringContains(
+        'https://github.com/djdang3r/wp-alegra-connector/releases/latest',
+        $readme,
+        'it must point at the latest release'
+    );
+    TestRunner::assertStringNotContains(
+        'latest release from the `releases` folder',
+        $readme,
+        'the lexicographically-sorted releases folder trap must be gone'
+    );
+});
+
 exit(TestRunner::summary());

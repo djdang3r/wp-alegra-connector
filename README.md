@@ -6,7 +6,7 @@
 
 Developed by [Script Develop](https://scriptdevelop.com.co)
 
-Version: 2.3.7 | PHP 8.0+ | WP 5.8+ | WC 6.0+
+Version: 2.3.11 | PHP 8.0+ | WP 5.8+ | WC 6.0+
 
 ## Description
 
@@ -26,7 +26,7 @@ Alegra Connector allows you to synchronize your WooCommerce store with the Alegr
 
 ## Installation
 
-1. Download the latest release from the `releases` folder
+1. Download the latest release from https://github.com/djdang3r/wp-alegra-connector/releases/latest
 2. Upload the plugin to your WordPress site via Plugins > Add New > Upload Plugin
 3. Activate the plugin
 4. Go to Alegra Connector > Settings to configure

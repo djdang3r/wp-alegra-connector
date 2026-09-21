@@ -1,0 +1,56 @@
+name: Release
+
+# A pushed v* tag publishes the release: gates, build, then a GitHub Release
+# with the ZIP and its SHA256 attached (REQ-REL-3).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (X.Y.Z). Defaults to the ref name without the leading v.'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [[ -z "$VERSION" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Gates (smoke + execution tests)
+        run: |
+          bash scripts/smoke-test.sh
+          bash scripts/exec-test.sh
+
+      - name: Build release ZIP
+        run: bash scripts/build-release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Alegra Connector ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            releases/alegra-connector-v${{ steps.version.outputs.version }}.zip
+            releases/alegra-connector-v${{ steps.version.outputs.version }}.zip.sha256

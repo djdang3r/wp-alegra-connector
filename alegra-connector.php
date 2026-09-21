@@ -3,7 +3,7 @@
  * Plugin Name: Alegra Connector
  * Plugin URI: https://github.com/djdang3r/wp-alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
- * Version: 2.3.10
+ * Version: 2.3.11
  * Author: Script Develop
  * Author URI: https://scriptdevelop.com.co
  * License: GPL v2 or later
@@ -25,8 +25,38 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+/**
+ * Read the plugin's `Version` header.
+ *
+ * Single source of truth for the plugin version: the constant below is derived
+ * from this header so the two can never drift again. The stale constant
+ * (header 2.3.10 vs constant 2.3.7) made every upgrade serve cached JS/CSS, so
+ * new features never loaded until the cache was busted by hand.
+ *
+ * @param string $file Absolute path to the main plugin file.
+ * @return string Version string, or '' when the header cannot be read.
+ */
+function alegra_connector_plugin_version(string $file): string
+{
+    if (function_exists('get_file_data')) {
+        $data = get_file_data($file, ['Version' => 'Version']);
+        $version = trim((string) ($data['Version'] ?? ''));
+        if ($version !== '') {
+            return $version;
+        }
+    }
+
+    // Safe fallback: parse the header directly when get_file_data() is absent
+    // (e.g. the dependency-free execution-test harness).
+    if (preg_match('/^[ \t\/*#@]*Version:\s*(.+?)\s*$/mi', (string) @file_get_contents($file), $m)) {
+        return trim($m[1]);
+    }
+
+    return '';
+}
+
 // Plugin constants
-define('ALEGRA_CONNECTOR_VERSION', '2.3.7');
+define('ALEGRA_CONNECTOR_VERSION', alegra_connector_plugin_version(__FILE__) ?: '0.0.0');
 define('ALEGRA_CONNECTOR_PATH', plugin_dir_path(__FILE__));
 define('ALEGRA_CONNECTOR_URL', plugin_dir_url(__FILE__));
 define('ALEGRA_CONNECTOR_BASENAME', plugin_basename(__FILE__));
