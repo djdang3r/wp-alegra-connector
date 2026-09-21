@@ -77,6 +77,11 @@ function alegra_mock_seed_invoice(string $id, array $data = []): void
     $GLOBALS['alegra_mock_state']['invoices'][$id] = array_merge(['id' => $id], $data);
 }
 
+function alegra_mock_seed_payment(string $id, array $data = []): void
+{
+    $GLOBALS['alegra_mock_state']['payments'][$id] = array_merge(['id' => $id], $data);
+}
+
 function alegra_mock_seed_category(string $id, array $data = []): void
 {
     $GLOBALS['alegra_mock_state']['categories'][$id] = array_merge(['id' => $id], $data);

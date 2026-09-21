@@ -2213,7 +2213,10 @@ class Admin_Dashboard
         switch ($entity_type) {
             case 'product': $result = $sync_controller->sync_entity('product', $entity_id, 'update'); break;
             case 'customer': $result = $sync_controller->sync_entity('customer', $entity_id, 'update'); break;
-            case 'order': $result = $sync_controller->sync_entity('order', $entity_id, 'create'); break;
+            // REQ-MAN-1: "Facturar" uses the payment-capable path. Whether a
+            // payment is posted is decided by $order->is_paid() inside
+            // create_invoice_with_payment(), not by this action.
+            case 'order': $result = $sync_controller->sync_entity('order', $entity_id, 'complete'); break;
             default: wp_send_json_error(['message' => __('Tipo de entidad desconocido.', 'alegra-connector')]);
         }
 
@@ -2329,7 +2332,9 @@ class Admin_Dashboard
         $synced = 0; $errors = 0;
 
         foreach ($ids as $id) {
-            $action = $type === 'order' ? 'create' : 'update';
+            // REQ-MAN-2: bulk "Facturar seleccionados" must also register the
+            // payment of each paid order, so it uses the complete path too.
+            $action = $type === 'order' ? 'complete' : 'update';
             $r = $sync_controller->sync_entity($type, $id, $action);
             is_wp_error($r) ? $errors++ : $synced++;
         }

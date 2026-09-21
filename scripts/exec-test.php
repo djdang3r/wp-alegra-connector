@@ -3705,4 +3705,337 @@ TestRunner::test('T24.4 persist_invoice_status caches the status and skips redun
     TestRunner::assertSame('open', (string) $order->get_meta('_alegra_invoice_status', true), 'an empty status is ignored');
 });
 
+// ===========================================================================
+// T25 — Payments: "Facturar" registers the payment (Fase 1 + Fase 2)
+//
+// Spec:   docs/sdd/payments/spec.md   (REQ-MAN-1..4, REQ-PAY-1..2)
+// Design: docs/sdd/payments/design.md (§1 causa raíz, §2 fuente de datos)
+// ===========================================================================
+echo "\nT25 — Facturar registra el pago (Fase 1+2)\n";
+
+/**
+ * A user create_invoice() can resolve to an Alegra contact.
+ */
+function make_payable_user(int $id = 1, string $email = 'pay@example.test'): void
+{
+    alegra_make_user($id, ['user_email' => $email, 'display_name' => 'Pay SA'], [
+        'billing_alegra_idtype'         => 'NIT',
+        'billing_alegra_identification' => '900123456',
+        'billing_alegra_dv'             => '1',
+        'billing_first_name'            => 'Pay',
+        'billing_last_name'             => 'SA',
+    ]);
+}
+
+/**
+ * An order create_invoice() can process. `$total` drives both the order total
+ * and the single line item so the mock invoice balance matches.
+ */
+function make_payable_order(int $order_id, int $user_id, string $email, float $total = 10.0, array $data = []): WC_Order
+{
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => (string) $total]);
+    update_post_meta(10, '_alegra_item_id', '1t3m-5');
+    return alegra_make_order($order_id, array_merge([
+        'total' => $total,
+        'currency' => 'COP',
+        'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => $email],
+        'customer_id' => $user_id,
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => $total, 'total' => $total])],
+    ], $data));
+}
+
+/**
+ * Click the order-detail "Facturar" button: the real AJAX handler, so reverting
+ * Admin_Dashboard.php:2216 to 'create' breaks these tests.
+ */
+function click_facturar(int $order_id): Alegra_Test_JSON_Response
+{
+    $_POST['entity_type'] = 'order';
+    $_POST['entity_id'] = $order_id;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    try {
+        return alegra_capture_json(fn() => $admin->ajax_sync_single());
+    } finally {
+        unset($_POST['entity_type'], $_POST['entity_id']);
+    }
+}
+
+function click_bulk_facturar(array $ids): Alegra_Test_JSON_Response
+{
+    $_POST['entity_type'] = 'order';
+    $_POST['ids'] = $ids;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    try {
+        return alegra_capture_json(fn() => $admin->ajax_bulk_sync());
+    } finally {
+        unset($_POST['entity_type'], $_POST['ids']);
+    }
+}
+
+TestRunner::test('T-MAN-1a "Facturar" on a PAID order posts exactly ONE payment with WC data', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(2001, 1, 'pay@example.test', 150.0, [
+        'payment_method' => 'mercadopago',
+        'payment_method_title' => 'Mercado Pago',
+        'date_paid' => new \DateTime('2026-09-20'),
+    ]);
+
+    $resp = click_facturar(2001);
+
+    TestRunner::assertTrue($resp->success, 'the manual action must succeed');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'the invoice must be created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'exactly one payment must be posted');
+
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertSame('5', (string) ($payment['bankAccount']['id'] ?? ''), 'the configured account id must be sent');
+    TestRunner::assertSame(150.0, (float) ($payment['invoices'][0]['amount'] ?? 0), 'the amount must be the WC order total');
+    TestRunner::assertSame('2026-09-20', (string) ($payment['date'] ?? ''), 'the date must be the WC date_paid');
+    TestRunner::assertSame('credit-card', (string) ($payment['paymentMethod'] ?? ''), 'Mercado Pago must map to credit-card');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_payment_id', true) !== '', '_alegra_payment_id must be stored');
+});
+
+TestRunner::test('T-MAN-1b "Facturar" on an UNPAID order creates the invoice, posts NO payment and warns', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(2002, 1, 'pay@example.test', 50.0, [
+        'status' => 'on-hold',
+        'payment_method' => 'bacs',
+    ]);
+
+    $resp = click_facturar(2002);
+
+    TestRunner::assertTrue($resp->success, 'the manual action must succeed');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'the invoice must still be created');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'an unpaid order must not post a payment');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), 'no payment id may be stored');
+    TestRunner::assertStringContains('no figura pagado', implode("\n", $order->get_notes()), 'a note must explain why no payment was posted');
+});
+
+TestRunner::test('T-MAN-1c "Facturar" twice on an invoiced+paid order posts no duplicate payment', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    $order = alegra_make_order(2003, [
+        'total' => 50.0,
+        'status' => 'processing',
+        'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-1', '_alegra_payment_id' => 'pay-1'],
+    ]);
+
+    $resp = click_facturar(2003);
+
+    TestRunner::assertTrue($resp->success, 'the action must succeed');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no invoice may be re-created');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be re-posted');
+    TestRunner::assertSame('pay-1', (string) $order->get_meta('_alegra_payment_id', true), 'the existing payment id must be kept');
+});
+
+TestRunner::test('T-MAN-2a bulk "Facturar seleccionados" posts one payment per paid order', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    make_payable_order(3001, 1, 'pay@example.test', 10.0, ['payment_method' => 'mercadopago']);
+    make_payable_order(3002, 1, 'pay@example.test', 20.0, ['payment_method' => 'mercadopago']);
+
+    $resp = click_bulk_facturar([3001, 3002]);
+
+    TestRunner::assertTrue($resp->success, 'the bulk action must succeed');
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/invoices'), 'one invoice per order');
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/payments'), 'one payment per paid order');
+    TestRunner::assertTrue((string) wc_get_order(3001)->get_meta('_alegra_payment_id', true) !== '', 'order 3001 must store its payment id');
+    TestRunner::assertTrue((string) wc_get_order(3002)->get_meta('_alegra_payment_id', true) !== '', 'order 3002 must store its payment id');
+});
+
+TestRunner::test('T-MAN-2b bulk with one paid and one unpaid order posts a single payment', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    make_payable_order(3011, 1, 'pay@example.test', 10.0, ['payment_method' => 'mercadopago']);
+    make_payable_order(3012, 1, 'pay@example.test', 10.0, ['status' => 'on-hold', 'payment_method' => 'bacs']);
+
+    click_bulk_facturar([3011, 3012]);
+
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/invoices'), 'both invoices must be created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'only the paid order must post a payment');
+});
+
+TestRunner::test('T-MAN-3 "Facturar pendientes" (sync_recent) posts a payment for each paid order', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    make_payable_order(3021, 1, 'pay@example.test', 10.0, ['payment_method' => 'mercadopago']);
+    make_payable_order(3022, 1, 'pay@example.test', 20.0, ['payment_method' => 'mercadopago']);
+    make_payable_order(3023, 1, 'pay@example.test', 30.0, ['payment_method' => 'mercadopago']);
+
+    $result = make_orders()->sync_recent(30);
+
+    TestRunner::assertFalse(is_wp_error($result), 'sync_recent must not error');
+    TestRunner::assertSame(3, alegra_mock_count('POST', '/invoices'), 'one invoice per order');
+    TestRunner::assertSame(3, alegra_mock_count('POST', '/payments'), 'one payment per paid order');
+});
+
+TestRunner::test('T-MAN-4a a payment already recorded is never re-posted', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-4a', ['status' => 'open', 'balance' => 10.0, 'total' => 10.0]);
+    $order = alegra_make_order(4001, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-4a', '_alegra_payment_id' => 'pay-1'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be re-posted');
+    TestRunner::assertSame('pay-1', (string) $order->get_meta('_alegra_payment_id', true), 'the existing id must be kept');
+});
+
+TestRunner::test('T-MAN-4b a pre-existing Alegra payment is recovered without re-posting', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-4b', ['status' => 'open', 'balance' => 100.0, 'total' => 100.0]);
+    alegra_mock_seed_payment('pay-existing', [
+        'number' => 'P-EXISTING',
+        'invoices' => [['id' => 'inv-4b', 'amount' => 100.0]],
+    ]);
+    $order = alegra_make_order(4002, [
+        'total' => 100.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-4b', '_billing_alegra_contact_id' => 'c0n-4b'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no new payment may be posted');
+    TestRunner::assertSame('pay-existing', (string) $order->get_meta('_alegra_payment_id', true), 'the found payment id must be stored');
+});
+
+TestRunner::test('T-PAY-1a a paid order with a NULL date_paid falls back to today with a warning', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(5001, 1, 'pay@example.test', 30.0, [
+        'payment_method' => 'mercadopago',
+        // date_paid intentionally omitted → null
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertSame(date('Y-m-d'), (string) ($payment['date'] ?? ''), 'a missing paid date must fall back to today');
+    TestRunner::assertStringContains('Payment date missing', alegra_read_log(), 'the fallback must be logged as a warning');
+});
+
+TestRunner::test('T-PAY-1b an order total different from the invoice balance is reported, not silently adjusted', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-100', ['status' => 'open', 'total' => 100.0, 'balance' => 80.0]);
+    $order = alegra_make_order(5002, [
+        'total' => 100.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-100', '_billing_alegra_contact_id' => 'c0n-100'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertSame(100.0, (float) ($payment['invoices'][0]['amount'] ?? 0), 'the payment must use the WC total, not the balance');
+    TestRunner::assertStringContains('no coincide', implode("\n", $order->get_notes()), 'the discrepancy must be surfaced in a note');
+    TestRunner::assertStringContains('differs from invoice balance', alegra_read_log(), 'the discrepancy must be logged');
+});
+
+TestRunner::test('T-PAY-1c the payment carries the gateway title in observations', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(5003, 1, 'pay@example.test', 10.0, [
+        'payment_method' => 'mercadopago',
+        'payment_method_title' => 'Mercado Pago',
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertStringContains('Mercado Pago', (string) ($payment['observations'] ?? ''), 'observations must mention the gateway title');
+});
+
+TestRunner::test('T-PAY-2a both method resolvers agree and every value is a valid Alegra enum', function (): void {
+    alegra_test_reset();
+    $orders = make_orders();
+    $enum = ['cash', 'check', 'transfer', 'deposit', 'credit-card', 'debit-card'];
+
+    $mp_order = alegra_make_order(6001, ['payment_method' => 'mercadopago']);
+    $private_mp = alegra_call_private($orders, 'get_payment_method_code', $mp_order);
+    $public_mp = $orders->getPaymentMethodForGateway('mercadopago');
+    TestRunner::assertSame('credit-card', $private_mp, 'Mercado Pago must map to credit-card');
+    TestRunner::assertSame('credit-card', $public_mp, 'the public resolver must agree');
+    TestRunner::assertTrue(in_array($private_mp, $enum, true), 'credit-card must be in the Alegra enum');
+
+    $unknown_order = alegra_make_order(6002, ['payment_method' => 'gateway-desconocido']);
+    $private_unknown = alegra_call_private($orders, 'get_payment_method_code', $unknown_order);
+    $public_unknown = $orders->getPaymentMethodForGateway('gateway-desconocido');
+    TestRunner::assertSame('transfer', $private_unknown, 'an unknown gateway must fall back to transfer');
+    TestRunner::assertSame($private_unknown, $public_unknown, 'both resolvers must return the SAME fallback');
+    TestRunner::assertTrue(in_array($private_unknown, $enum, true), 'transfer must be in the Alegra enum');
+});
+
+TestRunner::test('T-PAY-2b an unknown gateway still posts the payment with the transfer fallback', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(6003, 1, 'pay@example.test', 10.0, [
+        'payment_method' => 'pasarela-inventada-xyz',
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'an unknown gateway must not block the payment');
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertSame('transfer', (string) ($payment['paymentMethod'] ?? ''), 'the fallback must be transfer');
+    TestRunner::assertStringContains('Unknown payment gateway', alegra_read_log(), 'the unmapped gateway must be logged');
+});
+
+TestRunner::test('T-DRAFT-1a a draft invoice is opened before the payment is posted', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-draft-pay', ['status' => 'draft', 'total' => 10.0, 'balance' => 10.0]);
+    $order = alegra_make_order(7001, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-draft-pay', '_billing_alegra_contact_id' => 'c0n-draft'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft-pay/open'), 'the draft must be opened before paying');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be posted');
+
+    $open_pos = null;
+    $pay_pos = null;
+    foreach (alegra_mock_requests() as $i => $req) {
+        if ($req['method'] === 'POST' && $req['path'] === '/invoices/inv-draft-pay/open') { $open_pos = $i; }
+        if ($req['method'] === 'POST' && $req['path'] === '/payments') { $pay_pos = $i; }
+    }
+    TestRunner::assertTrue($open_pos !== null && $pay_pos !== null && $open_pos < $pay_pos, 'the invoice must be opened before the payment POST');
+});
+
+TestRunner::test('T-DRAFT-1b an already-open invoice is not re-opened before paying', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-open-pay', ['status' => 'open', 'total' => 10.0, 'balance' => 10.0]);
+    $order = alegra_make_order(7002, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-open-pay', '_billing_alegra_contact_id' => 'c0n-open'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open-pay/open'), 'an open invoice must not be re-opened');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must still be posted');
+});
+
 exit(TestRunner::summary());

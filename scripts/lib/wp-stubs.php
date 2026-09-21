@@ -1093,6 +1093,7 @@ class WC_Order
     protected float $shipping_tax = 0.0;
     protected array $billing = [];
     protected string $payment_method = '';
+    protected string $payment_method_title = '';
     protected string $currency = 'COP';
     protected string $status = 'processing';
     protected ?\DateTime $date_created = null;
@@ -1112,6 +1113,7 @@ class WC_Order
         $this->shipping_tax = (float) ($data['shipping_tax'] ?? 0.0);
         $this->billing = (array) ($data['billing'] ?? []);
         $this->payment_method = (string) ($data['payment_method'] ?? '');
+        $this->payment_method_title = (string) ($data['payment_method_title'] ?? '');
         $this->currency = (string) ($data['currency'] ?? 'COP');
         $this->status = (string) ($data['status'] ?? 'processing');
         $this->customer_id = (int) ($data['customer_id'] ?? 0);
@@ -1159,6 +1161,7 @@ class WC_Order
     public function get_billing_state(): string { return (string) ($this->billing['state'] ?? ''); }
     public function get_billing_postcode(): string { return (string) ($this->billing['postcode'] ?? ''); }
     public function get_payment_method(): string { return $this->payment_method; }
+    public function get_payment_method_title(): string { return $this->payment_method_title; }
     public function get_currency(): string { return $this->currency; }
     public function get_status(): string { return $this->status; }
     public function update_status($status) { $this->status = (string) $status; return true; }

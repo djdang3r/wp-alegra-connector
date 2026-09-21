@@ -35,6 +35,16 @@ class Orders
      */
     private const GENERIC_ITEM_REFERENCE = 'alegra-connector-adjustment';
 
+    /**
+     * Valid Alegra `paymentMethod` enum values for POST /payments.
+     *
+     * Any mapped value outside this list is a configuration bug; the resolver
+     * falls back to 'transfer' rather than sending an invalid method.
+     *
+     * @see https://developer.alegra.com/reference/post_payments-1.md
+     */
+    private const ALEGRA_PAYMENT_METHOD_ENUM = ['cash', 'check', 'transfer', 'deposit', 'credit-card', 'debit-card'];
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -287,8 +297,12 @@ class Orders
         // and '0' mean UNCONFIGURED. The manual path already rejects both; the
         // auto path must too, otherwise it POSTs bankAccount.id = '0'.
         $payment_account = (string) get_option('alegra_connector_payment_account_id', '');
+        // REQ-MAN-1: WooCommerce is the source of truth for whether the order
+        // was paid. A payment is recorded only when an account is configured,
+        // no payment was recorded before, AND $order->is_paid() is true.
         $will_record_payment = !in_array($payment_account, ['', '0'], true)
-            && (string) $order->get_meta('_alegra_payment_id', true) === '';
+            && (string) $order->get_meta('_alegra_payment_id', true) === ''
+            && $order->is_paid();
 
         $invoice_result = $this->create_invoice($order, $will_record_payment ? 'open' : null);
 
@@ -303,24 +317,59 @@ class Orders
             return $invoice_result;
         }
 
+        if ($will_record_payment) {
+            $this->record_payment_for_invoice($order, (string) $invoice_result['id']);
+        } elseif (!in_array($payment_account, ['', '0'], true)
+            && (string) $order->get_meta('_alegra_payment_id', true) === '') {
+            // REQ-MAN-1: an account is configured and no payment exists, but the
+            // order is not marked paid in WooCommerce, so no payment is posted.
+            // Tell the merchant why instead of leaving the invoice silently
+            // "Por Cobrar".
+            $order->add_order_note(__(
+                '[Alegra] El pedido no figura pagado en WooCommerce; se creó la factura pero no se registró pago.',
+                'alegra-connector'
+            ));
+        }
+
+        return $invoice_result;
+    }
+
+    /**
+     * Record a payment against an invoice that ALREADY exists in Alegra.
+     *
+     * Does NOT create invoices. Idempotent by construction:
+     *   1. `_alegra_payment_id` meta guard (already recorded → bail).
+     *   2. ensure_invoice_open() — Alegra only accepts payments on OPEN invoices.
+     *   3. find_existing_payment() pre-search — recover a committed-but-lost response.
+     *   4. prepare_payment_data() + POST /payments.
+     *
+     * Used by the manual ("Facturar") and automatic payment paths (design §5.3).
+     *
+     * @return array|\WP_Error The payment payload, or a WP_Error when the POST failed.
+     */
+    private function record_payment_for_invoice(\WC_Order $order, string $invoice_id): array|\WP_Error
+    {
+        if ($invoice_id === '') {
+            return new \WP_Error('missing_invoice', __('No hay una factura de Alegra vinculada.', 'alegra-connector'));
+        }
+
+        // 1. Meta guard: never post a second payment for the same order.
         $existing_payment_id = (string) $order->get_meta('_alegra_payment_id', true);
         if ($existing_payment_id !== '') {
-            return $invoice_result;
+            return ['id' => $existing_payment_id, 'already_exists' => true];
         }
 
-        // Alegra only accepts a payment on an OPEN invoice. When the invoice
-        // was created earlier as a draft (the default, e.g. by the
-        // `woocommerce_new_order` hook) open it before applying the payment.
-        if ($will_record_payment && !empty($invoice_result['already_exists'])) {
-            $opened = $this->ensure_invoice_open((string) $invoice_result['id']);
-            if (!is_wp_error($opened)) {
-                $this->persist_invoice_status($order, $opened);
-            }
+        // 2. Alegra only accepts a payment on an OPEN invoice. A draft invoice
+        //    created earlier (the default, e.g. by the `woocommerce_new_order`
+        //    hook) must be opened before applying the payment.
+        $opened = $this->ensure_invoice_open($invoice_id);
+        if (!is_wp_error($opened)) {
+            $this->persist_invoice_status($order, $opened);
         }
 
-        // AC-14: recover a payment Alegra committed but whose response was lost.
+        // 3. AC-14: recover a payment Alegra committed but whose response was lost.
         $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
-        $existing_payment = $this->find_existing_payment((string) $invoice_result['id'], $client_id);
+        $existing_payment = $this->find_existing_payment($invoice_id, $client_id);
         if ($existing_payment !== null) {
             $order->update_meta_data('_alegra_payment_id', (string) ($existing_payment['id'] ?? ''));
             if (!empty($existing_payment['number'])) {
@@ -335,54 +384,60 @@ class Orders
                 'order_id'   => $order->get_id(),
                 'payment_id' => $existing_payment['id'] ?? 'unknown',
             ]);
-            return $invoice_result;
+            return $existing_payment;
         }
 
-        $payment_data = $this->prepare_payment_data($order, (string) $invoice_result['id']);
+        // 4. Build the payment from WooCommerce and POST it.
+        $payment_data = $this->prepare_payment_data($order, $invoice_id);
+        if (empty($payment_data)) {
+            return ['skipped' => true, 'reason' => 'no_account'];
+        }
 
-        if (!empty($payment_data)) {
-            $payment_result = $this->api->create_payment($payment_data);
-            if (is_wp_error($payment_result)) {
-                // BUG 5: the failure used to be swallowed — the invoice existed
-                // but the merchant was never told the payment was not recorded.
-                if ($this->logger) {
-                    $this->logger->error('Payment recording failed after invoice creation', [
-                        'order_id'   => $order->get_id(),
-                        'invoice_id' => (string) $invoice_result['id'],
-                        'error'      => $payment_result->get_error_message(),
-                    ]);
-                }
-                $order->add_order_note(sprintf(
-                    /* translators: 1: Alegra invoice id, 2: the error Alegra returned. */
-                    __('Alegra: la factura #%1$s se creó, pero el pago NO se pudo registrar (%2$s). Registralo manualmente en Alegra o reintentá con "Registrar pago".', 'alegra-connector'),
-                    (string) $invoice_result['id'],
-                    $payment_result->get_error_message()
-                ));
-            } elseif (API\Client::is_dry_run_response($payment_result)) {
-                if ($this->logger) {
-                    $this->logger->warning('Payment recording skipped (dry run)', [
-                        'order_id'   => $order->get_id(),
-                        'invoice_id' => (string) $invoice_result['id'],
-                    ]);
-                }
-            } else {
-                $order->update_meta_data('_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
-                if (!empty($payment_result['number'])) {
-                    $order->update_meta_data('_alegra_payment_number', $payment_result['number']);
-                }
-                $order->save();
-                $order->add_order_note(sprintf(
-                    __('Pago Alegra #%s registrado.', 'alegra-connector'),
-                    $payment_result['number'] ?? $payment_result['id'] ?? ''
-                ));
-                $this->logger->info('Payment recorded in Alegra', [
-                    'order_id' => $order->get_id(),
-                    'payment_id' => $payment_result['id'] ?? 'unknown',
+        $payment_result = $this->api->create_payment($payment_data);
+        if (is_wp_error($payment_result)) {
+            // BUG 5: the failure used to be swallowed — the invoice existed
+            // but the merchant was never told the payment was not recorded.
+            if ($this->logger) {
+                $this->logger->error('Payment recording failed after invoice creation', [
+                    'order_id'   => $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                    'error'      => $payment_result->get_error_message(),
                 ]);
             }
+            $order->add_order_note(sprintf(
+                /* translators: 1: Alegra invoice id, 2: the error Alegra returned. */
+                __('Alegra: la factura #%1$s se creó, pero el pago NO se pudo registrar (%2$s). Registralo manualmente en Alegra o reintentá con "Registrar pago".', 'alegra-connector'),
+                $invoice_id,
+                $payment_result->get_error_message()
+            ));
+            return $payment_result;
         }
 
-        return $invoice_result;
+        if (API\Client::is_dry_run_response($payment_result)) {
+            if ($this->logger) {
+                $this->logger->warning('Payment recording skipped (dry run)', [
+                    'order_id'   => $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                ]);
+            }
+            return $payment_result;
+        }
+
+        $order->update_meta_data('_alegra_payment_id', (string) ($payment_result['id'] ?? ''));
+        if (!empty($payment_result['number'])) {
+            $order->update_meta_data('_alegra_payment_number', $payment_result['number']);
+        }
+        $order->save();
+        $order->add_order_note(sprintf(
+            __('Pago Alegra #%s registrado.', 'alegra-connector'),
+            $payment_result['number'] ?? $payment_result['id'] ?? ''
+        ));
+        $this->logger->info('Payment recorded in Alegra', [
+            'order_id' => $order->get_id(),
+            'payment_id' => $payment_result['id'] ?? 'unknown',
+        ]);
+
+        return $payment_result;
     }
 
     /**
@@ -717,7 +772,10 @@ class Orders
                 continue;
             }
 
-            $sync_result = $this->create_invoice($order);
+            // REQ-MAN-3: "Facturar pendientes" must register the payment of
+            // paid orders, so it goes through the payment-capable path. The
+            // is_paid() guard inside decides whether a payment is posted.
+            $sync_result = $this->create_invoice_with_payment($order);
             if (is_wp_error($sync_result)) {
                 $result['errors']++;
             } else {
@@ -1464,6 +1522,15 @@ class Orders
         return '';
     }
 
+    /**
+     * Build the `POST /payments` payload from WooCommerce data (REQ-PAY-1).
+     *
+     * The amount is $order->get_total() and the date is $order->get_date_paid();
+     * the method is the single gateway→Alegra mapping (REQ-PAY-2). Values are
+     * never invented and never read from the gateway's own panel.
+     *
+     * @return array<string,mixed> Empty array when no destination account is configured.
+     */
     private function prepare_payment_data(\WC_Order $order, string $invoice_id): array
     {
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
@@ -1473,17 +1540,98 @@ class Orders
             return [];
         }
 
-        return [
-            'date' => date('Y-m-d'),
+        $amount = (float) $order->get_total();
+
+        // REQ-PAY-1: this is a full payment against the invoice balance. If the
+        // balance Alegra reports differs, surface the discrepancy (note + log)
+        // instead of silently adjusting the amount.
+        $this->assert_full_payment_matches_balance($order, $invoice_id, $amount);
+
+        $method_title = trim((string) $order->get_payment_method_title());
+        $observations = $method_title !== ''
+            ? sprintf(
+                /* translators: 1: WooCommerce order id, 2: payment gateway title. */
+                __('Pedido #%1$d — %2$s', 'alegra-connector'),
+                (int) $order->get_id(),
+                $method_title
+            )
+            : '';
+
+        $data = [
+            'date' => $this->payment_date($order),
             'bankAccount' => ['id' => $account_id],
             'invoices' => [
                 [
                     'id' => $invoice_id,
-                    'amount' => (float) $order->get_total(),
+                    'amount' => $amount,
                 ],
             ],
             'paymentMethod' => $this->get_payment_method_code($order),
         ];
+
+        if ($observations !== '') {
+            $data['observations'] = $observations;
+        }
+
+        return $data;
+    }
+
+    /**
+     * The payment date, taken from WooCommerce (REQ-PAY-1).
+     *
+     * Uses $order->get_date_paid() formatted as `Y-m-d`. A paid order with no
+     * paid date falls back to today WITH a warning — the date is never silently
+     * invented.
+     */
+    private function payment_date(\WC_Order $order): string
+    {
+        $paid = $order->get_date_paid();
+        if ($paid instanceof \DateTimeInterface) {
+            return $paid->format('Y-m-d');
+        }
+
+        if ($this->logger) {
+            $this->logger->warning('Payment date missing on a paid order; using today', [
+                'order_id' => $order->get_id(),
+            ]);
+        }
+
+        return date('Y-m-d');
+    }
+
+    /**
+     * Report (do NOT silently fix) when the WC order total differs from the
+     * invoice balance returned by Alegra (REQ-PAY-1).
+     */
+    private function assert_full_payment_matches_balance(\WC_Order $order, string $invoice_id, float $amount): void
+    {
+        $invoice = $this->api->get_invoice($invoice_id);
+        if (is_wp_error($invoice) || !is_array($invoice)) {
+            // Not being able to read the balance must not block the payment.
+            return;
+        }
+
+        $balance = isset($invoice['balance']) ? (float) $invoice['balance'] : null;
+        if ($balance === null || abs($balance - $amount) <= 0.01) {
+            return;
+        }
+
+        $order->add_order_note(sprintf(
+            /* translators: 1: order total, 2: invoice id, 3: invoice balance. */
+            __('[Alegra] Aviso: el total del pedido (%1$s) no coincide con el saldo de la factura #%2$s (%3$s). Se registró el pago por el total del pedido; revisá la factura.', 'alegra-connector'),
+            number_format($amount, 2, '.', ''),
+            $invoice_id,
+            number_format($balance, 2, '.', '')
+        ));
+
+        if ($this->logger) {
+            $this->logger->warning('Payment amount differs from invoice balance', [
+                'order_id'   => $order->get_id(),
+                'invoice_id' => $invoice_id,
+                'amount'     => $amount,
+                'balance'    => $balance,
+            ]);
+        }
     }
 
     private function get_preferred_number_template(): ?string
@@ -1515,18 +1663,50 @@ class Orders
         return (string) get_option('alegra_connector_payment_term_id', '');
     }
 
-    private function get_payment_method_code(\WC_Order $order): string
+    /**
+     * Map a WooCommerce payment gateway slug to an Alegra `paymentMethod`.
+     *
+     * SINGLE resolver: both get_payment_method_code() and
+     * getPaymentMethodForGateway() delegate here, so one unknown gateway can
+     * never produce two different methods. The fallback is UNIQUE and
+     * documented: 'transfer'.
+     *
+     * Valid Alegra enum (verified): cash | check | transfer | deposit |
+     * credit-card | debit-card.
+     *
+     * @see https://developer.alegra.com/reference/post_payments-1.md
+     */
+    public function resolve_alegra_payment_method(string $gateway_slug): string
     {
-        $method = $order->get_payment_method();
-        $mappings = $this->get_payment_gateway_code_mappings();
-
-        foreach ($mappings as $slug => $code) {
-            if (strpos($method, $slug) !== false) {
-                return $code;
+        foreach ($this->get_payment_gateway_code_mappings() as $slug => $code) {
+            if ($slug !== '' && strpos($gateway_slug, $slug) !== false) {
+                if (in_array($code, self::ALEGRA_PAYMENT_METHOD_ENUM, true)) {
+                    return $code;
+                }
+                // A value outside the official enum is a config bug, not a
+                // network error: fall back instead of sending an invalid method.
+                if ($this->logger) {
+                    $this->logger->warning('Payment gateway maps outside the Alegra enum; falling back to transfer', [
+                        'gateway' => $gateway_slug,
+                        'code'    => $code,
+                    ]);
+                }
+                return 'transfer';
             }
         }
 
+        if ($this->logger) {
+            $this->logger->warning('Unknown payment gateway; falling back to transfer', [
+                'gateway' => $gateway_slug,
+            ]);
+        }
+
         return 'transfer';
+    }
+
+    private function get_payment_method_code(\WC_Order $order): string
+    {
+        return $this->resolve_alegra_payment_method($order->get_payment_method());
     }
 
     /**
@@ -1535,15 +1715,7 @@ class Orders
      */
     public function getPaymentMethodForGateway(string $gateway_slug): string
     {
-        $codes = $this->get_payment_gateway_code_mappings();
-
-        foreach ($codes as $slug => $code) {
-            if (strpos($gateway_slug, $slug) !== false) {
-                return $code;
-            }
-        }
-
-        return 'cash';
+        return $this->resolve_alegra_payment_method($gateway_slug);
     }
 
     /**
