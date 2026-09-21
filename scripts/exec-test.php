@@ -1645,13 +1645,13 @@ function build_public_for_orders(bool $auto_upload, int $order_id, string $sync_
 
 TestRunner::test('T12.1 manual is the default and Public_ registers no order hooks when the option is absent', function (): void {
     alegra_test_reset();
+    // A fresh install has no row: the option defaults to false (manual).
+    unset($GLOBALS['wp_options']['alegra_connector_push_orders_enabled']);
     TestRunner::assertFalse(
         (bool) get_option('alegra_connector_push_orders_enabled', false),
         'push_orders_enabled must default to false (manual)'
     );
 
-    // Simulate a fresh install where the option was never stored.
-    unset($GLOBALS['wp_options']['alegra_connector_push_orders_enabled']);
     $logger = make_logger();
     $public = new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
 
@@ -1683,8 +1683,11 @@ TestRunner::test('T12.3 auto ON: firing the WC order hooks creates EXACTLY ONE i
 TestRunner::test('T12.4 auto OFF: the manual path still creates one invoice', function (): void {
     [$order_id] = build_public_for_orders(false, 702);
 
-    // Exactly what Admin_Dashboard::ajax_sync_single() does for an order.
-    $result = make_controller()->sync_entity('order', $order_id, 'create');
+    // Exactly what Admin_Dashboard::ajax_sync_single() does for an order:
+    // an explicit merchant action, so it runs inside the explicit write context.
+    $result = \Alegra\Connector\Write_Gate::run_explicit(
+        fn () => make_controller()->sync_entity('order', $order_id, 'create')
+    );
 
     TestRunner::assertFalse(is_wp_error($result), 'the manual invoice must succeed');
     TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'manual invoicing must work with auto off');
@@ -4575,6 +4578,184 @@ TestRunner::test('T-REL-4 the README points at the GitHub Releases page, not the
         $readme,
         'the lexicographically-sorted releases folder trap must be gone'
     );
+});
+
+// ===========================================================================
+// T-GATE — Phase 1: central write enforcement (kill switch + entity gate)
+//
+// Every outbound write funnels through Client::request(). These tests prove the
+// single choke point blocks a write (marker, zero HTTP) when the kill switch is
+// active or the owning entity is disabled, still allows an enabled write, and
+// keeps dry-run composing exactly as before.
+// ===========================================================================
+echo "\nT-GATE — Write Gate (kill switch + per-entity enablement)\n";
+
+TestRunner::test('T-GATE-1 the entity taxonomy maps every write endpoint', function (): void {
+    $ef = [\Alegra\Connector\Write_Gate::class, 'entity_for'];
+
+    TestRunner::assertSame('invoice', $ef('POST', '/invoices'), 'POST /invoices is an invoice');
+    TestRunner::assertSame('invoice', $ef('POST', '/invoices/abc/open'), 'POST /invoices/{id}/open is an invoice');
+    TestRunner::assertSame('credit_note', $ef('POST', '/credit-notes'), 'POST /credit-notes is a credit_note');
+    TestRunner::assertSame('payment', $ef('POST', '/payments'), 'POST /payments is a payment');
+    TestRunner::assertSame('contact', $ef('POST', '/contacts'), 'POST /contacts is a contact');
+    TestRunner::assertSame('item', $ef('POST', '/items'), 'POST /items is an item');
+    TestRunner::assertSame('item', $ef('PUT', '/items/abc'), 'PUT /items/{id} is an item');
+    TestRunner::assertSame('category', $ef('POST', '/item-categories'), 'POST /item-categories is a category');
+    TestRunner::assertSame('webhook', $ef('POST', '/webhooks/subscriptions'), 'POST /webhooks/subscriptions is a webhook');
+    TestRunner::assertSame('other', $ef('POST', '/price-lists'), 'POST /price-lists is other');
+    TestRunner::assertSame('invoice', $ef('GET', '/invoices?limit=1'), 'the query string is stripped before matching');
+});
+
+TestRunner::test('T-GATE-2 kill switch ON blocks EVERY write path with zero HTTP', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $api = make_api();
+
+    $results = [
+        'invoice'     => $api->create_invoice(['client' => ['id' => 'c1'], 'items' => [['id' => 'i1']], 'date' => '2026-01-01', 'dueDate' => '2026-01-01']),
+        'payment'     => $api->create_payment(['bankAccount' => ['id' => 'b1'], 'invoices' => [['id' => 'inv1', 'amount' => 10]]]),
+        'credit_note' => $api->create_credit_note(['client' => ['id' => 'c1'], 'items' => [['id' => 'i1']], 'date' => '2026-01-01']),
+        'contact'     => $api->create_contact(['name' => 'Blocked Co']),
+        'item'        => $api->create_item(['name' => 'Blocked', 'price' => [['idPriceList' => 1, 'price' => 10]]]),
+        'category'    => $api->create_item_category(['name' => 'Blocked']),
+        'webhook'     => $api->create_webhook_subscription('new-invoice', 'https://example.test/hook'),
+    ];
+
+    TestRunner::assertSame(0, count(alegra_mock_requests()), 'the kill switch must block all HTTP');
+    foreach ($results as $entity => $r) {
+        TestRunner::assertTrue(\Alegra\Connector\API\Client::is_gate_blocked_response($r), "$entity must return the gate marker");
+        TestRunner::assertSame('kill_switch', $r['reason'] ?? null, "$entity must report kill_switch");
+        TestRunner::assertSame($entity, $r['entity'] ?? null, "$entity marker must carry its entity");
+        TestRunner::assertSame('POST', substr((string) ($r['blocked'] ?? ''), 0, 4), "$entity marker must carry the verb");
+        TestRunner::assertFalse(is_wp_error($r), "$entity must not be a WP_Error");
+        TestRunner::assertFalse(\Alegra\Connector\API\Client::is_dry_run_response($r), "$entity must not be a dry-run marker");
+        TestRunner::assertTrue(\Alegra\Connector\API\Client::write_was_blocked($r), "$entity must be flagged write_was_blocked");
+    }
+});
+
+TestRunner::test('T-GATE-3 kill switch OFF + entity enabled reaches Alegra (no regression)', function (): void {
+    alegra_test_reset();
+    $api = make_api();
+
+    $contact = $api->create_contact(['name' => 'Enabled Co']);
+    $item = $api->create_item(['name' => 'Enabled', 'price' => [['idPriceList' => 1, 'price' => 10]]]);
+    $invoice = $api->create_invoice(['client' => ['id' => 'c1'], 'items' => [['id' => 'i1']], 'date' => '2026-01-01', 'dueDate' => '2026-01-01']);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'an enabled contact write must reach Alegra');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'), 'an enabled item write must reach Alegra');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'an enabled invoice write must reach Alegra');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($contact), 'contact must not be blocked');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($item), 'item must not be blocked');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($invoice), 'invoice must not be blocked');
+});
+
+TestRunner::test('T-GATE-4 kill switch OFF + entity DISABLED blocks automatic writes', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_push_products_enabled', false);
+    update_option('alegra_connector_push_customers_enabled', false);
+    $api = make_api();
+
+    $invoice = $api->create_invoice(['client' => ['id' => 'c1'], 'items' => [['id' => 'i1']], 'date' => '2026-01-01', 'dueDate' => '2026-01-01']);
+    $item = $api->create_item(['name' => 'Disabled', 'price' => [['idPriceList' => 1, 'price' => 10]]]);
+    $contact = $api->create_contact(['name' => 'Disabled Co']);
+
+    TestRunner::assertSame('entity_disabled', $invoice['reason'] ?? null, 'invoice must be blocked by entity_disabled');
+    TestRunner::assertSame('invoice', $invoice['entity'] ?? null, 'invoice marker must carry entity invoice');
+    TestRunner::assertSame('entity_disabled', $item['reason'] ?? null, 'item must be blocked by entity_disabled');
+    TestRunner::assertSame('entity_disabled', $contact['reason'] ?? null, 'contact must be blocked by entity_disabled');
+    TestRunner::assertSame(0, count(alegra_mock_requests()), 'a disabled entity must send zero HTTP');
+});
+
+TestRunner::test('T-GATE-5 explicit context bypasses the entity gate (kill switch off)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    $api = make_api();
+    $payload = ['client' => ['id' => 'c1'], 'items' => [['id' => 'i1']], 'date' => '2026-01-01', 'dueDate' => '2026-01-01'];
+
+    $r = \Alegra\Connector\Write_Gate::run_explicit(fn () => $api->create_invoice($payload));
+
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($r), 'an explicit invoice must not be blocked');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'the explicit invoice must reach Alegra');
+    TestRunner::assertFalse(\Alegra\Connector\Write_Gate::is_explicit(), 'the explicit context must reset after run_explicit');
+});
+
+TestRunner::test('T-GATE-6 the gate marker is distinguishable from a real WP_Error', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $api = make_api();
+    $blocked = $api->post('/invoices', ['client' => ['id' => 'c1']]);
+
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::is_gate_blocked_response($blocked), 'blocked result must be the gate marker');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::is_dry_run_response($blocked), 'blocked result must not be a dry-run marker');
+    TestRunner::assertFalse(is_wp_error($blocked), 'blocked result must not be a WP_Error');
+    TestRunner::assertSame('kill_switch', $blocked['reason'] ?? null, 'the marker must carry the reason');
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::write_was_blocked($blocked), 'write_was_blocked must be true');
+
+    // A real HTTP error is still a WP_Error and is NOT a block.
+    alegra_test_reset();
+    alegra_mock_fail('POST', '/invoices', 422, ['message' => 'payload inválido']);
+    $error = make_api()->post('/invoices', ['client' => ['id' => 'c1']]);
+    TestRunner::assertTrue(is_wp_error($error), 'a real HTTP error must stay a WP_Error');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($error), 'a WP_Error is not a block marker');
+});
+
+TestRunner::test('T-GATE-7 dry_run and the gate compose (dry_run wins, GET passes)', function (): void {
+    // dry_run ON + kill switch ON -> the dry-run marker wins, byte-identical.
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $api = make_api();
+    $r = $api->post('/invoices', ['client' => ['id' => 'c1']]);
+
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::is_dry_run_response($r), 'dry-run must win over the gate');
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::is_gate_blocked_response($r), 'the gate marker must not be returned when dry-run is on');
+    TestRunner::assertSame(['dry_run' => true, 'blocked' => 'POST /invoices'], $r, 'the dry-run marker must be unchanged');
+    TestRunner::assertSame(0, count(alegra_mock_requests()), 'no HTTP in dry-run');
+
+    // GET always passes, even with the kill switch active.
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', false);
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $get = make_api()->get('/invoices');
+    TestRunner::assertFalse(is_wp_error($get), 'GET must not be blocked');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/invoices'), 'GET must reach the mock');
+});
+
+TestRunner::test('T-GATE-8 ajax_record_payment reports the kill switch instead of silence', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $order = alegra_make_order(9700, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'meta' => ['_alegra_invoice_id' => '1nv-9700'],
+    ]);
+
+    $_POST['order_id'] = 9700;
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+
+    TestRunner::assertFalse($resp->success, 'the response must be an error envelope, not a fake success');
+    TestRunner::assertStringContains('desconectado', (string) ($resp->payload['message'] ?? ''), 'the message must explain the kill switch');
+    TestRunner::assertSame(true, $resp->payload['blocked'] ?? null, 'the payload must be flagged blocked');
+    TestRunner::assertSame('kill_switch', $resp->payload['reason'] ?? null, 'the reason must be kill_switch');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may reach Alegra');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), '_alegra_payment_id must not be written');
+});
+
+TestRunner::test('T-GATE-9 kill switch ON: an automatic refund writes zero credit notes', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    [$order] = build_refund_world(100.0, 100.0, 9701, 9702);
+    register_refund_owner_hook();
+
+    $result = \Alegra\Connector\State_Sync::handle_refund(9701, 9702);
+
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::write_was_blocked($result), 'the refund must be blocked');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'no credit note may be POSTed');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_credited_amount', true), '_alegra_credited_amount must not be written');
 });
 
 exit(TestRunner::summary());

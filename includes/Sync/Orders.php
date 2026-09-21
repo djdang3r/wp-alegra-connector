@@ -413,11 +413,12 @@ class Orders
             return $payment_result;
         }
 
-        if (API\Client::is_dry_run_response($payment_result)) {
+        if (API\Client::write_was_blocked($payment_result)) {
             if ($this->logger) {
-                $this->logger->warning('Payment recording skipped (dry run)', [
+                $this->logger->warning('Payment recording skipped (write blocked)', [
                     'order_id'   => $order->get_id(),
                     'invoice_id' => $invoice_id,
+                    'reason'     => $payment_result['reason'] ?? 'dry_run',
                 ]);
             }
             return $payment_result;
@@ -803,15 +804,17 @@ class Orders
             return $result;
         }
 
-        // Dry Run: the credit note was NOT created. Do not mark the refund as
-        // credited, do not store a refund meta id, and do not claim success.
-        if (API\Client::is_dry_run_response($result)) {
+        // Dry Run / Write Gate: the credit note was NOT created. Do not mark the
+        // refund as credited, do not store a refund meta id, and do not claim
+        // success.
+        if (API\Client::write_was_blocked($result)) {
             $order->add_order_note(__('Alegra (modo de prueba): no se creó la nota de crédito. Desactiva el modo de prueba para facturar de verdad.', 'alegra-connector'));
             if ($this->logger) {
-                $this->logger->warning('Credit note for refund skipped (dry run)', [
+                $this->logger->warning('Credit note for refund skipped (write blocked)', [
                     'order_id'  => $order_id,
                     'refund_id' => $refund_id,
                     'amount'    => $amount,
+                    'reason'    => $result['reason'] ?? 'dry_run',
                 ]);
             }
             return $result;
@@ -1133,8 +1136,10 @@ class Orders
                                 'order_id' => $order_id,
                                 'error'    => $contact_create_error,
                             ]);
-                        } elseif (API\Client::is_dry_run_response($result)) {
-                            $contact_create_error = __('modo de prueba (dry run) activo', 'alegra-connector');
+                        } elseif (API\Client::write_was_blocked($result)) {
+                            $contact_create_error = ($result['reason'] ?? 'dry_run') === 'kill_switch'
+                                ? __('el plugin está desconectado (kill switch activo)', 'alegra-connector')
+                                : __('modo de prueba (dry run) activo', 'alegra-connector');
                         }
                     }
                 }

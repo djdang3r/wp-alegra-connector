@@ -172,6 +172,11 @@ class Products
 
         if (!$is_create) {
             $result = $this->api->update_item($alegra_id, $data);
+            // Write Gate: nothing reached Alegra. Return the marker without
+            // logging a false success.
+            if (API\Client::write_was_blocked($result)) {
+                return $result;
+            }
             if ($linked_by_sku) {
                 $this->logger->info('Product linked to existing Alegra item by SKU', [
                     'product_id' => $product->get_id(),
@@ -241,9 +246,10 @@ class Products
             if (is_wp_error($result)) {
                 return $result;
             }
-            // Dry Run: no item was created. Return the marker (consistent with
-            // the simple-product path) instead of a misleading "no id" error.
-            if (API\Client::is_dry_run_response($result)) {
+            // Dry Run / Write Gate: no item was created. Return the marker
+            // (consistent with the simple-product path) instead of a misleading
+            // "no id" error.
+            if (API\Client::write_was_blocked($result)) {
                 return $result;
             }
             $parent_id = (string) ($result['id'] ?? '');
@@ -262,6 +268,9 @@ class Products
         } else {
             $result = $this->api->update_item($alegra_id, $data);
             if (is_wp_error($result)) {
+                return $result;
+            }
+            if (API\Client::write_was_blocked($result)) {
                 return $result;
             }
             $parent_id = $alegra_id;
@@ -2423,7 +2432,9 @@ class Products
         }
 
         $result = $this->api->delete_item($alegra_id);
-        if (!is_wp_error($result)) {
+        // Write Gate: the item was NOT deleted in Alegra, so the local link and
+        // mapping must survive.
+        if (!is_wp_error($result) && !API\Client::write_was_blocked($result)) {
             delete_post_meta($product_id, '_alegra_item_id');
             // AC-60: drop the indexed mapping so it cannot point at a ghost id.
             \Alegra\Connector\Entity_Map::remove('item', $alegra_id, 'product');

@@ -38,6 +38,9 @@ class Categories
 
         if (!empty($alegra_id)) {
             $result = $this->api->update_item_category((string) $alegra_id, $data);
+            if (API\Client::write_was_blocked($result)) {
+                return $result;
+            }
             $this->logger->info('Category updated in Alegra', [
                 'term_id' => $category->term_id,
                 'alegra_id' => $alegra_id,

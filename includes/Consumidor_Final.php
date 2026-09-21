@@ -213,9 +213,9 @@ class Consumidor_Final
     {
         $result = $client->create_contact(self::build_create_payload());
 
-        // Dry run: the contact was NOT created. Never cache a fake id.
-        if (Client::is_dry_run_response($result)) {
-            self::log_error('Consumidor Final: no se creó el contacto (modo de prueba activo)');
+        // Dry run / Write Gate: the contact was NOT created. Never cache a fake id.
+        if (Client::write_was_blocked($result)) {
+            self::log_error('Consumidor Final: no se creó el contacto (escritura bloqueada por configuración)');
             return false;
         }
 

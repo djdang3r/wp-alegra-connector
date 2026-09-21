@@ -177,10 +177,19 @@ function alegra_test_reset(): void
     $GLOBALS['wp_options']['alegra_connector_token'] = 'harness-token';
     $GLOBALS['wp_options']['alegra_connector_invoice_status'] = 'draft';
     $GLOBALS['wp_options']['alegra_connector_sync_method'] = 'cron';
-    $GLOBALS['wp_options']['alegra_connector_push_orders_enabled'] = false;
-    $GLOBALS['wp_options']['alegra_connector_push_products_enabled'] = false;
+    // Configured store: the write-gate entities are enabled, so an existing
+    // test that performs a direct write (representing an enabled merchant
+    // action) keeps reaching Alegra. A gate test disables the option it probes.
+    $GLOBALS['wp_options']['alegra_connector_push_orders_enabled'] = true;
+    $GLOBALS['wp_options']['alegra_connector_push_products_enabled'] = true;
+    $GLOBALS['wp_options']['alegra_connector_push_customers_enabled'] = true;
+    $GLOBALS['wp_options']['alegra_connector_payment_reconcile_enabled'] = true;
     $GLOBALS['wp_options']['alegra_connector_customer_resolution_mode'] = 'auto';
     $GLOBALS['wp_options']['alegra_connector_dry_run'] = false;
+
+    // Explicit write context must never leak between tests (run_explicit's
+    // finally normally clears it; this is belt-and-braces isolation).
+    \Alegra\Connector\Write_Gate::reset_explicit();
     $GLOBALS['wp_options']['alegra_connector_auto_complete_order'] = true;
     $GLOBALS['wp_options']['alegra_connector_sync_images'] = false;
 

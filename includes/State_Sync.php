@@ -152,10 +152,10 @@ class State_Sync
                 return $result;
             }
 
-            // Dry Run: create_credit_note_for_refund() already added the honest
-            // note. Do not log a false "synced" success.
-            if (API\Client::is_dry_run_response($result)) {
-                self::log('warning', 'Refund sync skipped (dry run)', [
+            // Dry Run / Write Gate: create_credit_note_for_refund() already
+            // added the honest note. Do not log a false "synced" success.
+            if (API\Client::write_was_blocked($result)) {
+                self::log('warning', 'Refund sync skipped (write blocked)', [
                     'order_id'  => $order_id,
                     'refund_id' => $refund_id,
                     'amount'    => $amount,
@@ -301,10 +301,10 @@ class State_Sync
             return;
         }
 
-        // Dry Run: the invoice was NOT updated. Do not claim it happened.
-        if (API\Client::is_dry_run_response($result)) {
+        // Dry Run / Write Gate: the invoice was NOT updated. Do not claim it.
+        if (API\Client::write_was_blocked($result)) {
             $order->add_order_note(__('Alegra (modo de prueba): el método de pago NO se actualizó. Desactiva el modo de prueba para sincronizar de verdad.', 'alegra-connector'));
-            self::log('warning', 'Payment method update skipped (dry run)', [
+            self::log('warning', 'Payment method update skipped (write blocked)', [
                 'order_id' => $order_id,
                 'payment_method' => $payment_method,
             ]);

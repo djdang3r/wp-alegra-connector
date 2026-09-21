@@ -2123,7 +2123,29 @@ class Admin_Dashboard
      * existing one to become an open/issued invoice (without recording a
      * payment). No-op when the invoice is already open.
      */
+    /**
+     * Human message for a write blocked by dry-run or the write gate. Callers
+     * use it so the merchant learns WHY nothing reached Alegra.
+     *
+     * @param array<string, mixed> $result A Client write result.
+     */
+    private static function blocked_message(array $result): string
+    {
+        if (($result['reason'] ?? '') === 'kill_switch') {
+            return __('El plugin está desconectado (kill switch activo): la operación NO se envió a Alegra.', 'alegra-connector');
+        }
+        if (API\Client::is_dry_run_response($result)) {
+            return __('Modo de prueba activo: la operación NO se envió a Alegra.', 'alegra-connector');
+        }
+        return __('La configuración actual bloqueó la operación; no se envió a Alegra.', 'alegra-connector');
+    }
+
     public function ajax_open_invoice(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_open_invoice_impl());
+    }
+
+    private function ajax_open_invoice_impl(): void
     {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) {
@@ -2147,6 +2169,14 @@ class Admin_Dashboard
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
         }
 
+        if (API\Client::write_was_blocked($result)) {
+            wp_send_json_error([
+                'message' => self::blocked_message($result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'dry_run'),
+            ]);
+        }
+
         $status = (string) ($result['status'] ?? 'open');
         if ($status === 'draft') {
             // Alegra accepted the call but the invoice is still a draft.
@@ -2168,6 +2198,11 @@ class Admin_Dashboard
     }
 
     public function ajax_record_payment(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_record_payment_impl());
+    }
+
+    private function ajax_record_payment_impl(): void
     {
         check_ajax_referer('alegra_connector_nonce');
 
@@ -2245,6 +2280,21 @@ class Admin_Dashboard
             ]);
         }
 
+        // Write Gate (kill switch / entity disabled): the payment was NOT
+        // recorded. Report the real reason instead of a fake success.
+        if (API\Client::is_gate_blocked_response($result)) {
+            $this->logger->warning('Payment recording blocked by write gate', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+                'reason'     => $result['reason'] ?? 'unknown',
+            ]);
+            wp_send_json_error([
+                'message' => self::blocked_message($result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'unknown'),
+            ]);
+        }
+
         // Alegra payment ids are UUID strings.
         $payment_id = (string) ($result['id'] ?? '');
         $order->update_meta_data('_alegra_payment_id', $payment_id);
@@ -2271,6 +2321,11 @@ class Admin_Dashboard
     }
 
     public function ajax_sync_single(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_sync_single_impl());
+    }
+
+    private function ajax_sync_single_impl(): void
     {
         check_ajax_referer('alegra_connector_nonce');
 
@@ -2299,6 +2354,14 @@ class Admin_Dashboard
 
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+        }
+
+        if (API\Client::write_was_blocked($result)) {
+            wp_send_json_error([
+                'message' => self::blocked_message($result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'dry_run'),
+            ]);
         }
 
         wp_send_json_success(['message' => __('Sincronización completada.', 'alegra-connector'), 'data' => $result]);
@@ -2398,6 +2461,11 @@ class Admin_Dashboard
 
     public function ajax_bulk_sync(): void
     {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_bulk_sync_impl());
+    }
+
+    private function ajax_bulk_sync_impl(): void
+    {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
 
@@ -2406,14 +2474,29 @@ class Admin_Dashboard
         if (empty($ids)) wp_send_json_error(['message' => __('Seleccióna al menos un elemento.', 'alegra-connector')]);
 
         $sync_controller = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
-        $synced = 0; $errors = 0;
+        $synced = 0; $errors = 0; $blocked = 0;
 
         foreach ($ids as $id) {
             // REQ-MAN-2: bulk "Facturar seleccionados" must also register the
             // payment of each paid order, so it uses the complete path too.
             $action = $type === 'order' ? 'complete' : 'update';
             $r = $sync_controller->sync_entity($type, $id, $action);
-            is_wp_error($r) ? $errors++ : $synced++;
+            if (is_wp_error($r)) {
+                $errors++;
+            } elseif (API\Client::write_was_blocked($r)) {
+                $blocked++;
+            } else {
+                $synced++;
+            }
+        }
+
+        if ($blocked > 0) {
+            wp_send_json_error([
+                'message' => __('La configuración bloqueó la sincronización; no se envió nada a Alegra.', 'alegra-connector'),
+                'blocked' => $blocked,
+                'synced'  => $synced,
+                'errors'  => $errors,
+            ]);
         }
 
         wp_send_json_success(['message' => sprintf(__('%d sincronizados, %d errores.', 'alegra-connector'), $synced, $errors)]);
@@ -2536,6 +2619,11 @@ class Admin_Dashboard
 
     public function ajax_register_webhooks(): void
     {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_register_webhooks_impl());
+    }
+
+    private function ajax_register_webhooks_impl(): void
+    {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) {
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
@@ -2560,9 +2648,15 @@ class Admin_Dashboard
         $created = [];
         $already = [];
         $errors = [];
+        $blocked = 0;
 
         foreach ($events as $event) {
             $result = $this->api->create_webhook_subscription($event, $webhook_url);
+            if (API\Client::write_was_blocked($result)) {
+                // Kill switch / dry-run: nothing reached Alegra.
+                $blocked++;
+                continue;
+            }
             if (is_wp_error($result)) {
                 if (self::is_webhook_already_registered($result)) {
                     // Alegra answers 400 "Ya existe una suscripción con el
@@ -2609,6 +2703,14 @@ class Admin_Dashboard
             update_option('alegra_connector_webhook_subscriptions', $subscriptions, false);
         }
 
+        if ($blocked > 0 && count($created) === 0) {
+            wp_send_json_error([
+                'message' => __('La configuración bloqueó el registro de webhooks; no se envió nada a Alegra.', 'alegra-connector'),
+                'blocked' => $blocked,
+                'errores' => count($errors),
+            ]);
+        }
+
         $message = sprintf(
             __('%d webhooks registrados, %d ya existían, %d errores.', 'alegra-connector'),
             count($created),
@@ -2624,6 +2726,7 @@ class Admin_Dashboard
             'creados' => count($created),
             'ya_existian' => count($already),
             'errores' => count($errors),
+            'blocked' => $blocked,
         ]);
     }
 
@@ -2709,6 +2812,11 @@ class Admin_Dashboard
 
     public function ajax_delete_webhooks(): void
     {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_delete_webhooks_impl());
+    }
+
+    private function ajax_delete_webhooks_impl(): void
+    {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) {
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
@@ -2719,6 +2827,7 @@ class Admin_Dashboard
         $errors = [];
         $remaining = [];
         $dry_run_skipped = 0;
+        $gate_blocked = 0;
 
         foreach ($subscriptions as $sub) {
             $id = $sub['id'] ?? '';
@@ -2730,6 +2839,10 @@ class Admin_Dashboard
             if (is_wp_error($result)) {
                 $errors[] = $sub['event'] . ': ' . $result->get_error_message();
                 $remaining[] = $sub;
+            } elseif (API\Client::is_gate_blocked_response($result)) {
+                // Write Gate: nothing was deleted in Alegra; keep it locally.
+                $gate_blocked++;
+                $remaining[] = $sub;
             } elseif (API\Client::is_dry_run_response($result)) {
                 // Dry Run: nothing was deleted in Alegra; keep it locally.
                 $dry_run_skipped++;
@@ -2737,6 +2850,15 @@ class Admin_Dashboard
             } else {
                 $deleted++;
             }
+        }
+
+        if ($gate_blocked > 0 && $deleted === 0) {
+            wp_send_json_error([
+                'message' => __('La configuración bloqueó la eliminación de webhooks; no se envió nada a Alegra.', 'alegra-connector'),
+                'blocked' => true,
+                'reason'  => 'kill_switch',
+                'deleted' => $deleted,
+            ]);
         }
 
         // Only drop the subscriptions that were ACTUALLY deleted.
@@ -2763,6 +2885,11 @@ class Admin_Dashboard
     }
 
     public function ajax_sync_pending_orders(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_sync_pending_orders_impl());
+    }
+
+    private function ajax_sync_pending_orders_impl(): void
     {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
@@ -2824,6 +2951,11 @@ class Admin_Dashboard
 
     public function ajax_sync_pending_page(): void
     {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_sync_pending_page_impl());
+    }
+
+    private function ajax_sync_pending_page_impl(): void
+    {
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
@@ -2839,16 +2971,28 @@ class Admin_Dashboard
         $orders_sync = new Sync\Orders($this->api, $this->logger);
         $batch = array_splice($state['order_ids'], 0, 10);
 
+        $blocked = 0;
         foreach ($batch as $oid) {
             $order = wc_get_order($oid);
             if (!$order) { $state['errors']++; continue; }
             $result = $orders_sync->create_invoice_with_payment($order);
             if (is_wp_error($result)) {
                 $state['errors']++;
+            } elseif (API\Client::write_was_blocked($result)) {
+                $blocked++;
             } else {
                 $state['synced']++;
             }
             $state['processed']++;
+        }
+
+        if ($blocked > 0 && $state['synced'] === 0) {
+            delete_transient('alegra_pending_invoice_batch');
+            wp_send_json_error([
+                'message' => __('La configuración bloqueó la facturación; no se envió nada a Alegra.', 'alegra-connector'),
+                'blocked' => true,
+                'reason'  => 'kill_switch',
+            ]);
         }
 
         $done = empty($state['order_ids']);
@@ -2895,6 +3039,11 @@ class Admin_Dashboard
     }
 
     public function ajax_disconnect(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_disconnect_impl());
+    }
+
+    private function ajax_disconnect_impl(): void
     {
         check_ajax_referer('alegra_connector_nonce');
         // Clears the whole integration config: admin-level (AC-33).

@@ -35,6 +35,11 @@ class Customers
 
         if (!empty($alegra_id)) {
             $result = $this->api->update_contact((string) $alegra_id, $data);
+            // Write Gate: nothing reached Alegra. Return the marker without a
+            // false "updated" log.
+            if (API\Client::write_was_blocked($result)) {
+                return $result;
+            }
             $this->logger->info('Customer updated in Alegra', [
                 'customer_id' => $customer->ID,
                 'alegra_id' => $alegra_id,
@@ -72,6 +77,9 @@ class Customers
 
         if ($conflict_resolution === 'woocommerce_wins') {
             $result = $this->api->update_contact($alegra_id, $data);
+            if (API\Client::write_was_blocked($result)) {
+                return $result;
+            }
             $this->logger->info('Duplicate customer: WC data overwrote Alegra', [
                 'customer_id' => $customer->ID,
                 'alegra_id' => $alegra_id,
@@ -617,7 +625,9 @@ class Customers
 
         $result = $this->api->delete_contact((string) $alegra_id);
 
-        if (!is_wp_error($result)) {
+        // Write Gate: the contact was NOT deleted in Alegra, so the local link
+        // and mapping must survive.
+        if (!is_wp_error($result) && !API\Client::write_was_blocked($result)) {
             delete_user_meta($customer_id, 'alegra_contact_id');
             // AC-60: drop the indexed mapping.
             \Alegra\Connector\Entity_Map::remove('contact', (string) $alegra_id, 'customer');

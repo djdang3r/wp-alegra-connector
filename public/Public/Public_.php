@@ -103,6 +103,11 @@ class Public_
      */
     public function handle_sync_request(\WP_REST_Request $request): \WP_REST_Response
     {
+        return \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->handle_sync_request_impl($request));
+    }
+
+    private function handle_sync_request_impl(\WP_REST_Request $request): \WP_REST_Response
+    {
         $params = $request->get_json_params();
 
         if (!isset($params['action'])) {

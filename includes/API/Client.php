@@ -100,14 +100,36 @@ class Client
 
     public function request(string $method, string $endpoint, array $data = [], array $args = []): array|\WP_Error
     {
-        // Dry Run: block all write verbs (POST/PUT/PATCH/DELETE) at the single
-        // choke point before any network call. GETs always pass through.
+        // Write choke point. Order is fixed: dry-run -> write gate -> throttle
+        // -> network. Both gates return a plain ARRAY marker (never a
+        // WP_Error); GETs always pass through.
         $verb = strtoupper($method);
-        if ($verb !== 'GET' && get_option('alegra_connector_dry_run', false)) {
-            if ($this->logger) {
-                $this->logger->warning('[DRY RUN] Blocked ' . $verb . ' ' . $endpoint, ['payload' => $data]);
+        if ($verb !== 'GET') {
+            // 1) Dry-run first: current behaviour, marker unchanged.
+            if (get_option('alegra_connector_dry_run', false)) {
+                if ($this->logger) {
+                    $this->logger->warning('[DRY RUN] Blocked ' . $verb . ' ' . $endpoint, ['payload' => $data]);
+                }
+                return ['dry_run' => true, 'blocked' => $verb . ' ' . $endpoint];
             }
-            return ['dry_run' => true, 'blocked' => $verb . ' ' . $endpoint];
+
+            // 2) Write gate: kill switch (hard) + per-entity enablement.
+            $entity = \Alegra\Connector\Write_Gate::entity_for($verb, $endpoint);
+            $reason = \Alegra\Connector\Write_Gate::block_reason($entity);
+            if ($reason !== null) {
+                if ($this->logger) {
+                    $this->logger->warning('[WRITE GATE] Blocked ' . $verb . ' ' . $endpoint, [
+                        'entity' => $entity,
+                        'reason' => $reason,
+                    ]);
+                }
+                return [
+                    'blocked_by_gate' => true,
+                    'reason'          => $reason,
+                    'entity'          => $entity,
+                    'blocked'         => $verb . ' ' . $endpoint,
+                ];
+            }
         }
 
         // Throttle: wait if we're at the rate limit
@@ -249,6 +271,35 @@ class Client
     public static function is_dry_run_response(mixed $result): bool
     {
         return is_array($result) && ($result['dry_run'] ?? false) === true;
+    }
+
+    /**
+     * Whether a request() result is the Write Gate marker.
+     *
+     * A gate block (kill switch active, entity disabled, or automatic write to
+     * an entity with no switch) returns ['blocked_by_gate' => true, ...]
+     * instead of performing the call. Like the dry-run marker it is a plain
+     * ARRAY, so is_wp_error() alone would treat it as success.
+     *
+     * @param mixed $result A value returned by a Client write method.
+     */
+    public static function is_gate_blocked_response(mixed $result): bool
+    {
+        return is_array($result) && !empty($result['blocked_by_gate']);
+    }
+
+    /**
+     * Whether a write was blocked by config (dry-run OR write gate).
+     *
+     * Every write call site that must not persist fake state should use this
+     * instead of is_dry_run_response(), so a kill-switch/entity block is
+     * handled exactly like a dry-run block.
+     *
+     * @param mixed $result A value returned by a Client write method.
+     */
+    public static function write_was_blocked(mixed $result): bool
+    {
+        return self::is_dry_run_response($result) || self::is_gate_blocked_response($result);
     }
 
     /**
