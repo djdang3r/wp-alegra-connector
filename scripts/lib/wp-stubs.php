@@ -360,7 +360,7 @@ function wp_parse_url($url) { return parse_url((string) $url); }
 function number_format_i18n($number, $decimals = 0) { return number_format((float) $number, (int) $decimals); }
 function size_format($bytes, $decimals = 0) { return (string) $bytes; }
 function human_time_diff($from, $to = 0) { return '1 min'; }
-function selected($a, $b, $echo = true) { $r = ((string) $a === (string) $b) ? " selected='selected'" : ''; if ($echo) { echo $r; } return $r; }
+function selected($a, $b = true, $echo = true) { $r = ((string) $a === (string) $b) ? " selected='selected'" : ''; if ($echo) { echo $r; } return $r; }
 function absint($n) { return abs((int) $n); }
 function wp_parse_args($args, $defaults = [])
 {
@@ -468,6 +468,40 @@ function register_rest_route($ns, $route, $args = []) { return true; }
 function add_settings_section(...$args) { return; }
 function register_setting(...$args) { return; }
 function add_settings_field(...$args) { return; }
+
+/**
+ * Settings errors — a faithful in-memory model. WordPress persists them in a
+ * transient and `settings_errors()` consumes (clears) it after rendering.
+ */
+function add_settings_error($setting, $code, $message, $type = 'error')
+{
+    $GLOBALS['wp_settings_errors'][] = [
+        'setting' => (string) $setting,
+        'code'    => (string) $code,
+        'message' => (string) $message,
+        'type'    => (string) $type,
+    ];
+}
+
+function get_settings_errors($setting = '', $sanitize = false)
+{
+    $all = $GLOBALS['wp_settings_errors'] ?? [];
+    if ($setting === '') {
+        return $all;
+    }
+    return array_values(array_filter(
+        $all,
+        static fn($error) => ($error['setting'] ?? '') === (string) $setting
+    ));
+}
+
+function settings_errors($setting = '', $hide_on_update = false)
+{
+    foreach (get_settings_errors($setting) as $error) {
+        echo $error['message'];
+    }
+    $GLOBALS['wp_settings_errors'] = [];
+}
 function wp_cache_delete($key, $group = '') { return true; }
 
 // ---------------------------------------------------------------------------
@@ -626,9 +660,19 @@ function wp_get_schedule($hook, $args = [])
 }
 
 function spawn_cron($gmt_time = 0) { return true; }
-function wc_add_notice($message, $type = 'success') { return; }
-function wc_get_notices($type = '') { return []; }
-function wc_clear_notices() { return; }
+function wc_add_notice($message, $type = 'success')
+{
+    $GLOBALS['wc_notices'][] = ['message' => (string) $message, 'type' => (string) $type];
+}
+function wc_get_notices($type = '')
+{
+    $notices = $GLOBALS['wc_notices'] ?? [];
+    if ($type === '') {
+        return $notices;
+    }
+    return array_values(array_filter($notices, static fn($n) => ($n['type'] ?? '') === (string) $type));
+}
+function wc_clear_notices() { $GLOBALS['wc_notices'] = []; }
 function get_post($post_id) { return $GLOBALS['wp_posts'][(int) $post_id] ?? null; }
 function wp_is_post_revision($post_id) { return false; }
 function get_post_type($post_id) { return $GLOBALS['wp_posts'][(int) $post_id]->post_type ?? ''; }
@@ -1076,6 +1120,12 @@ class WC_Product_Variation extends WC_Product
         $data['type'] = 'variation';
         parent::__construct($id, $data);
     }
+}
+
+// Marker class so `class_exists('WooCommerce')` is true in the harness (the
+// activation defaults are only written when WooCommerce is active).
+if (!class_exists('WooCommerce')) {
+    class WooCommerce {}
 }
 
 class WC_Order

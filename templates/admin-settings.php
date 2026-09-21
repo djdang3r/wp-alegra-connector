@@ -6,7 +6,8 @@
 <span><?php esc_html_e('El plugin NO envía nada a Alegra: no se crean facturas, clientes ni productos. Desactívalo antes de facturar de verdad.','alegra-connector');?></span>
 </div>
 <?php endif;?>
-<?php if(isset($_GET['settings-updated']) && $_GET['settings-updated']):?>
+<?php settings_errors('alegra_connector_settings');?>
+<?php if(isset($_GET['settings-updated']) && $_GET['settings-updated'] && empty(get_settings_errors('alegra_connector_settings'))):?>
 <div class="ac-notice success" style="margin-bottom:16px;"><?php esc_html_e('Configuración guardada correctamente.','alegra-connector');?></div>
 <?php endif;?>
 <form method="post" action="options.php"><?php settings_fields('alegra_connector_settings');?>
@@ -334,18 +335,18 @@ $ac_preserve_fields = [
 <p class="description"><?php esc_html_e('Cuantos pedidos revisa cada corrida del cron al consultar el estado de sus facturas en Alegra.','alegra-connector');?></p></td></tr>
 
 <!-- Bank Account -->
-<tr><th><?php esc_html_e('Cuenta bancaria para pagos:','alegra-connector');?></th><td>
-<?php if(!empty($alegra_bank_accounts)):?>
+<tr><th><?php esc_html_e('Cuenta de destino para pagos (banco o caja):','alegra-connector');?></th><td>
+<?php $ac_payment_account=(string)get_option('alegra_connector_payment_account_id','');?>
+<?php if(!empty($alegra_bank_accounts) || !in_array($ac_payment_account,['','0'],true)):?>
 <select name="alegra_connector_payment_account_id">
-    <option value="0"><?php esc_html_e('-- Sin cuenta (no se registraran pagos) --','alegra-connector');?></option>
-    <?php foreach($alegra_bank_accounts as $ba): $id=(string)($ba['id']??'');?>
-    <option value="<?php echo esc_attr($id);?>" <?php selected((string)get_option('alegra_connector_payment_account_id',''),$id);?>><?php echo esc_html(($ba['name']??'Banco').' (ID: '.$id.')');?></option>
+    <?php foreach(\Alegra\Connector\Admin\Admin_Dashboard::bank_account_select_options($alegra_bank_accounts,$ac_payment_account) as $opt):?>
+    <option value="<?php echo esc_attr($opt['value']);?>" <?php selected($opt['selected']);?>><?php echo esc_html($opt['label']);?></option>
     <?php endforeach;?>
 </select>
-<p class="description"><?php esc_html_e('Sincronizado desde Alegra. Sin una cuenta seleccionada NO se registraran pagos automaticos en Alegra al completar pedidos.','alegra-connector');?></p>
+<p class="description"><?php esc_html_e('Sincronizado desde Alegra (bancos y cajas). Sin una cuenta seleccionada NO se registraran pagos automaticos en Alegra al completar pedidos.','alegra-connector');?></p>
 <?php else:?>
-<input type="text" name="alegra_connector_payment_account_id" value="<?php echo esc_attr(get_option('alegra_connector_payment_account_id',''));?>" class="small-text" placeholder="ID o UUID en Alegra">
-<p class="description"><?php esc_html_e('ID de la cuenta bancaria en Alegra donde se registraran los pagos. Conecta con Alegra para ver tus cuentas o ingresa el ID manualmente.','alegra-connector');?></p>
+<input type="text" name="alegra_connector_payment_account_id" value="<?php echo esc_attr($ac_payment_account);?>" class="small-text" placeholder="ID o UUID en Alegra">
+<p class="description"><?php esc_html_e('ID de la cuenta de destino (banco o caja) en Alegra donde se registraran los pagos. Conecta con Alegra para ver tus cuentas o ingresa el ID manualmente.','alegra-connector');?></p>
 <?php endif;?>
 </td></tr>
 

@@ -497,7 +497,10 @@ class Billing_Fields
             ];
 
             if ($wc_type === 'select') {
-                $entry['options'] = self::options_for($key, $field);
+                // Prepend an explicit empty option so the browser never
+                // pre-selects the first entry (RC = Registro civil). The `+`
+                // operator preserves the catalog keys; '' cannot collide.
+                $entry['options'] = ['' => __('Seleccione…', 'alegra-connector')] + self::options_for($key, $field);
             }
 
             $fields['billing']['billing_alegra_' . $key] = $entry;

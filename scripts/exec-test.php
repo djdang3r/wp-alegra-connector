@@ -4232,4 +4232,244 @@ TestRunner::test('T-REC-4e the sweep ignores paid orders without an invoice', fu
     TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no invoice means no payment');
 });
 
+// ===========================================================================
+// T26 — Payments settings hardening (Fase 5: REQ-CFG-1/2/3/5)
+//
+// Spec:   docs/sdd/payments/spec.md   (REQ-CFG-1..5)
+// Design: docs/sdd/payments/design.md (§4 endurecimiento del select + label)
+// ===========================================================================
+echo "\nT26 — Payments settings hardening (Fase 5)\n";
+
+/**
+ * Find an option entry by value, or null.
+ *
+ * @param array<int,array{value:string,label:string,selected:bool}> $options
+ * @return array{value:string,label:string,selected:bool}|null
+ */
+function alegra_find_option(array $options, string $value): ?array
+{
+    foreach ($options as $option) {
+        if ((string) ($option['value'] ?? '') === $value) {
+            return $option;
+        }
+    }
+    return null;
+}
+
+TestRunner::test('T-CFG-0 register_settings() wires every Alegra id option without errors', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $admin->register_settings();
+    TestRunner::assertTrue(true, 'register_settings() must run without a fatal or undefined variable');
+});
+
+TestRunner::test('T-CFG-1a a stored id present in the list is selected; "Sin cuenta" is not', function (): void {
+    alegra_test_reset();
+    $options = \Alegra\Connector\Admin\Admin_Dashboard::bank_account_select_options(
+        [['id' => 5, 'name' => 'Caja Pagina Web'], ['id' => 4, 'name' => 'Banco X']],
+        '5'
+    );
+
+    $stored = alegra_find_option($options, '5');
+    TestRunner::assertTrue($stored !== null, 'the stored id must be rendered as an option');
+    TestRunner::assertTrue((bool) $stored['selected'], 'the stored id must be selected');
+    TestRunner::assertSame('Caja Pagina Web (ID: 5)', (string) $stored['label'], 'the option label shows name + id');
+
+    $zero = alegra_find_option($options, '0');
+    TestRunner::assertFalse((bool) $zero['selected'], '"Sin cuenta" must NOT be selected');
+
+    $selected = array_filter($options, static fn($o) => !empty($o['selected']));
+    TestRunner::assertCount(1, $selected, 'exactly one option may be selected');
+});
+
+TestRunner::test('T-CFG-1b a stored id ABSENT from the list is injected and selected (anti-clobber)', function (): void {
+    alegra_test_reset();
+    $options = \Alegra\Connector\Admin\Admin_Dashboard::bank_account_select_options(
+        [['id' => 4, 'name' => 'Banco X']],
+        '5'
+    );
+
+    $stored = alegra_find_option($options, '5');
+    TestRunner::assertTrue($stored !== null, 'a synthetic option for the stored id must be injected');
+    TestRunner::assertTrue((bool) $stored['selected'], 'the synthetic option must be selected');
+    TestRunner::assertStringContains('no sincronizada', (string) $stored['label'], 'the synthetic option must say it is not synced');
+
+    $zero = alegra_find_option($options, '0');
+    TestRunner::assertFalse((bool) $zero['selected'], '"Sin cuenta" must NOT be selected');
+
+    // A browser resolves a <select> to its first selected option; assert the
+    // stored id is the ONLY selected option, so it can never fall back to '0'.
+    $selected = array_values(array_filter($options, static fn($o) => !empty($o['selected'])));
+    TestRunner::assertCount(1, $selected, 'exactly one option may be selected');
+    TestRunner::assertSame('5', (string) $selected[0]['value'], 'the selected option must be the stored id');
+});
+
+TestRunner::test('T-CFG-1c an empty/"0" stored value selects "Sin cuenta"', function (): void {
+    alegra_test_reset();
+    foreach (['', '0'] as $stored) {
+        $options = \Alegra\Connector\Admin\Admin_Dashboard::bank_account_select_options([], $stored);
+        $zero = alegra_find_option($options, '0');
+        TestRunner::assertTrue((bool) $zero['selected'], "'$stored' must select Sin cuenta");
+        TestRunner::assertCount(1, array_filter($options, static fn($o) => !empty($o['selected'])), 'only one selected option');
+    }
+});
+
+TestRunner::test('T-CFG-2a an invalid id keeps the previous value AND registers a settings error', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+
+    $result = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_alegra_id('no-es-un-id', 'alegra_connector_payment_account_id');
+
+    TestRunner::assertSame('5', $result, 'an invalid input must preserve the previous value');
+    $errors = get_settings_errors('alegra_connector_settings');
+    TestRunner::assertTrue(count($errors) >= 1, 'a settings error must be registered');
+    TestRunner::assertStringContains('se conservó el valor anterior', (string) $errors[0]['message'], 'the error must explain the value was kept');
+});
+
+TestRunner::test('T-CFG-2b valid ids (numeric / UUID) and empty are accepted with no error', function (): void {
+    alegra_test_reset();
+    $uuid = '12345678-1234-1234-1234-1234567890ab';
+
+    TestRunner::assertSame('5', \Alegra\Connector\Admin\Admin_Dashboard::sanitize_alegra_id('5', 'alegra_connector_payment_account_id'), 'numeric id');
+    TestRunner::assertSame($uuid, \Alegra\Connector\Admin\Admin_Dashboard::sanitize_alegra_id($uuid, 'alegra_connector_payment_account_id'), 'legacy UUID');
+    TestRunner::assertSame('', \Alegra\Connector\Admin\Admin_Dashboard::sanitize_alegra_id('', 'alegra_connector_payment_account_id'), 'empty is allowed');
+    TestRunner::assertCount(0, get_settings_errors('alegra_connector_settings'), 'valid values must not register errors');
+});
+
+TestRunner::test('T-CFG-2c the success banner is suppressed when a rejection was registered', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains("settings_errors('alegra_connector_settings')", $tpl, 'the template must render the settings errors');
+    TestRunner::assertStringContains("empty(get_settings_errors('alegra_connector_settings'))", $tpl, 'the success banner must be gated on no errors');
+});
+
+TestRunner::test('T-CFG-3a activation leaves an explicit empty default for the payment account', function (): void {
+    alegra_test_reset();
+    unset($GLOBALS['wp_options']['alegra_connector_payment_account_id']);
+
+    \Alegra\Connector\Alegra_Connector::get_instance()->activate();
+
+    TestRunner::assertTrue(array_key_exists('alegra_connector_payment_account_id', $GLOBALS['wp_options']), 'activation must create the option');
+    TestRunner::assertSame('', get_option('alegra_connector_payment_account_id'), 'the default must be the empty string');
+});
+
+TestRunner::test('T-CFG-3b a failed /bank-accounts list with a stored id still renders the select', function (): void {
+    alegra_test_reset();
+    // Empty list (a WP_Error fetch degrades to []) + stored id: synthetic option.
+    $options = \Alegra\Connector\Admin\Admin_Dashboard::bank_account_select_options([], '5');
+    $stored = alegra_find_option($options, '5');
+    TestRunner::assertTrue($stored !== null, 'the stored id must survive an empty list');
+    TestRunner::assertTrue((bool) $stored['selected'], 'it must stay selected');
+
+    // The template renders the <select> when the list is empty but an id is stored.
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('!in_array($ac_payment_account', $tpl, 'the select must render for a stored id even with an empty list');
+});
+
+TestRunner::test('T-CFG-5 the label says "banco o caja" and no longer "Cuenta bancaria"', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('Cuenta de destino para pagos (banco o caja)', $tpl, 'the label must mention banco/caja');
+    TestRunner::assertStringContains('banco o caja', $tpl, 'the label must contain "banco o caja"');
+    TestRunner::assertStringNotContains('Cuenta bancaria para pagos', $tpl, 'the old "Cuenta bancaria" label must be gone');
+});
+
+// ===========================================================================
+// T27 — Checkout placeholders (Fase 6: REQ-CHK-1/2)
+//
+// Spec:   docs/sdd/payments/spec.md   (REQ-CHK-1..2)
+// Design: docs/sdd/payments/design.md (§7 placeholder del checkout)
+// ===========================================================================
+echo "\nT27 — Checkout placeholders (Fase 6)\n";
+
+function alegra_catalog_field(string $key): array
+{
+    return \Alegra\Connector\Billing_Fields::CATALOG[$key];
+}
+
+TestRunner::test('T-CHK-1a the classic idtype select starts with an empty option, RC is not default', function (): void {
+    alegra_test_reset();
+    $fields = alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'render_checkout_fields', []);
+    $options = $fields['billing']['billing_alegra_idtype']['options'] ?? [];
+
+    $keys = array_keys($options);
+    TestRunner::assertSame('', (string) $keys[0], 'the empty option must come first');
+    TestRunner::assertSame('Seleccione…', (string) ($options[''] ?? ''), 'the placeholder text must be Seleccione…');
+    TestRunner::assertTrue(isset($options['RC']), 'RC must remain selectable');
+});
+
+TestRunner::test('T-CHK-1b the registration placeholder still works (no regression)', function (): void {
+    alegra_test_reset();
+
+    ob_start();
+    alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'render_registration_fields');
+    $html = (string) ob_get_clean();
+
+    TestRunner::assertStringContains('<option value="">Seleccione…</option>', $html, 'the registration select must keep its placeholder');
+    TestRunner::assertStringContains('name="billing_alegra_idtype"', $html, 'the idtype field must be rendered');
+});
+
+TestRunner::test('T-CHK-1c an empty idtype is rejected in require_data but allowed in auto', function (): void {
+    alegra_test_reset();
+
+    // auto: the WC field is optional → '' is allowed.
+    $fields = alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'render_checkout_fields', []);
+    TestRunner::assertFalse((bool) $fields['billing']['billing_alegra_idtype']['required'], 'auto mode must not require idtype');
+
+    // require_data: the WC field is required → '' is rejected by WC core.
+    update_option('alegra_connector_customer_resolution_mode', 'require_data');
+    $fields = alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'render_checkout_fields', []);
+    TestRunner::assertTrue((bool) $fields['billing']['billing_alegra_idtype']['required'], 'require_data must require idtype');
+
+    // The clear Spanish notice fires on woocommerce_checkout_process.
+    wc_clear_notices();
+    $_POST = ['billing_alegra_idtype' => '', 'billing_alegra_identification' => ''];
+    alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'on_checkout_process');
+    $_POST = [];
+    $notices = wc_get_notices('error');
+    TestRunner::assertTrue(count($notices) >= 1, 'an empty idtype in require_data must add an error notice');
+    TestRunner::assertStringContains('tipo y número de documento', implode("\n", array_column($notices, 'message')), 'the notice must be clear');
+
+    // auto: no error notice.
+    update_option('alegra_connector_customer_resolution_mode', 'auto');
+    wc_clear_notices();
+    $_POST = ['billing_alegra_idtype' => '', 'billing_alegra_identification' => ''];
+    alegra_call_private_static(\Alegra\Connector\Billing_Fields::class, 'on_checkout_process');
+    $_POST = [];
+    TestRunner::assertCount(0, wc_get_notices('error'), 'auto mode must not block an empty idtype');
+});
+
+TestRunner::test('T-CHK-2a the Blocks idtype options start with an empty option (Rama A)', function (): void {
+    alegra_test_reset();
+    $options = alegra_call_private_static(
+        \Alegra\Connector\Checkout_Integration::class,
+        'block_options',
+        'idtype',
+        alegra_catalog_field('idtype')
+    );
+
+    TestRunner::assertSame('', (string) ($options[0]['value'] ?? 'x'), 'the first Blocks option must be empty');
+    TestRunner::assertSame('Seleccione…', (string) ($options[0]['label'] ?? ''), 'the Blocks placeholder text');
+    TestRunner::assertSame('RC', (string) ($options[1]['value'] ?? ''), 'RC must remain, just not first');
+});
+
+TestRunner::test('T-CHK-2b Blocks requires idtype only in require_data mode', function (): void {
+    alegra_test_reset();
+    $args = alegra_call_private_static(
+        \Alegra\Connector\Checkout_Integration::class,
+        'block_field_args',
+        'idtype',
+        alegra_catalog_field('idtype')
+    );
+    TestRunner::assertFalse((bool) $args['required'], 'auto mode must leave the Blocks idtype optional');
+
+    update_option('alegra_connector_customer_resolution_mode', 'require_data');
+    $args = alegra_call_private_static(
+        \Alegra\Connector\Checkout_Integration::class,
+        'block_field_args',
+        'idtype',
+        alegra_catalog_field('idtype')
+    );
+    TestRunner::assertTrue((bool) $args['required'], 'require_data must mark the Blocks idtype required');
+});
+
 exit(TestRunner::summary());

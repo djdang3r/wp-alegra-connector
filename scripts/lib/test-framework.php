@@ -166,6 +166,8 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_postmeta_scans'] = 0;
     $GLOBALS['alegra_category_lookups'] = 0;
     $GLOBALS['alegra_dbdelta_calls'] = 0;
+    $GLOBALS['wp_settings_errors'] = [];
+    $GLOBALS['wc_notices'] = [];
 
     alegra_mock_reset();
 
@@ -276,6 +278,16 @@ function alegra_call_private(object $object, string $method, mixed ...$args): mi
     $ref = new ReflectionMethod($object, $method);
     $ref->setAccessible(true);
     return $ref->invokeArgs($object, $args);
+}
+
+/**
+ * Invoke a private/public STATIC method (no instance required).
+ */
+function alegra_call_private_static(string $class, string $method, mixed ...$args): mixed
+{
+    $ref = new ReflectionMethod($class, $method);
+    $ref->setAccessible(true);
+    return $ref->invokeArgs(null, $args);
 }
 
 /**

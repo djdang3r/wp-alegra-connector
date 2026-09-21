@@ -389,6 +389,7 @@ final class Alegra_Connector
             'alegra_connector_inventory_source' => 'alegra',
             'alegra_connector_customer_resolution_mode' => 'auto',
             'alegra_connector_invoice_status' => 'draft',
+            'alegra_connector_payment_account_id' => '',
             'alegra_connector_dry_run' => false,
         ];
 

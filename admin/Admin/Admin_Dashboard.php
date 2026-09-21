@@ -285,24 +285,100 @@ class Admin_Dashboard
         return preg_match('/^[=+\-@\t\r]/', $value) === 1 ? "'" . $value : $value;
     }
 
+    /**
+     * Build the <select> options for the destination payment account.
+     *
+     * Guarantees the stored value is ALWAYS present and selected. When the
+     * stored id is absent from the fetched list (a partial/failed
+     * /bank-accounts call, a renamed or deleted account), a synthetic selected
+     * option is injected so the browser can never fall back to the first option
+     * ("Sin cuenta", value "0") and silently clobber the saved id.
+     *
+     * @param array<int,array<string,mixed>> $accounts Accounts from /bank-accounts.
+     * @param string                         $stored   Current option value (e.g. '5').
+     * @return array<int,array{value:string,label:string,selected:bool}>
+     */
+    public static function bank_account_select_options(array $accounts, string $stored): array
+    {
+        $stored = trim($stored);
+        $none_selected = in_array($stored, ['', '0'], true);
+
+        $options = [[
+            'value'    => '0',
+            'label'    => __('-- Sin cuenta (no se registraran pagos) --', 'alegra-connector'),
+            'selected' => $none_selected,
+        ]];
+
+        $ids = [];
+        foreach ($accounts as $account) {
+            $id = (string) ($account['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            $ids[] = $id;
+            $name = (string) ($account['name'] ?? 'Cuenta');
+            $options[] = [
+                'value'    => $id,
+                'label'    => $name . ' (ID: ' . $id . ')',
+                'selected' => ($stored === $id),
+            ];
+        }
+
+        // The stored id did not come back in the list: keep it selectable.
+        if (!$none_selected && !in_array($stored, $ids, true)) {
+            $options[] = [
+                'value'    => $stored,
+                'label'    => sprintf(
+                    __('Cuenta guardada (no sincronizada) — ID: %s', 'alegra-connector'),
+                    $stored
+                ),
+                'selected' => true,
+            ];
+        }
+
+        return $options;
+    }
+
+    /**
+     * Sanitize an Alegra id option (numeric id or legacy UUID).
+     *
+     * Alegra migrated all IDs to UUID (VARCHAR(36)) on 2025-01-06; intval()
+     * truncates a UUID to 0 on save, silently breaking config. This accepts a
+     * UUID or a legacy numeric id and, on invalid input, preserves the previous
+     * value AND registers a settings error, so the admin sees why the value was
+     * not saved instead of a misleading "guardado correctamente" banner.
+     */
+    public static function sanitize_alegra_id($value, string $option_name): string
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return '';
+        }
+
+        $is_uuid = (bool) preg_match(
+            '/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/',
+            $value
+        );
+        if ($is_uuid || ctype_digit($value)) {
+            return $value;
+        }
+
+        add_settings_error(
+            'alegra_connector_settings',
+            $option_name . '_invalid',
+            sprintf(
+                __('El valor de %1$s ("%2$s") no es un ID válido; se conservó el valor anterior.', 'alegra-connector'),
+                $option_name,
+                $value
+            ),
+            'error'
+        );
+
+        return (string) get_option($option_name, '');
+    }
+
     public function register_settings(): void
     {
-        // Alegra migrated all IDs to UUID (VARCHAR(36)) on 2025-01-06.
-        // intval() truncates a UUID to 0 on save, silently breaking config.
-        // This sanitizer accepts a UUID or a legacy numeric id and preserves the
-        // previous value when the input is neither (rejecting garbage).
-        $alegra_id_sanitizer = function ($value, $option_name) {
-            $value = trim((string) $value);
-            if ($value === '') {
-                return '';
-            }
-            $is_uuid = (bool) preg_match('/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/', $value);
-            if ($is_uuid || ctype_digit($value)) {
-                return $value;
-            }
-            return (string) get_option($option_name, '');
-        };
-
         register_setting('alegra_connector_settings', 'alegra_connector_email', ['sanitize_callback' => 'sanitize_email']);
         // The token is masked in the UI (never echoed). An empty submission means
         // "keep the stored token", not "clear it" — otherwise re-saving any other
@@ -357,14 +433,15 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_sync_categories', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_inventory_source', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_warehouse_id', [
-            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_warehouse_id'),
+            'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_warehouse_id'),
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_warehouse_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_payment_account_id', [
-            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_payment_account_id'),
+            'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_payment_account_id'),
+            'default' => '',
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_payment_term_id', [
-            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_payment_term_id'),
+            'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_payment_term_id'),
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_auto_complete_order', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images', ['sanitize_callback' => 'rest_sanitize_boolean']);
@@ -442,7 +519,7 @@ class Admin_Dashboard
             'default' => false,
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_consumidor_final_manual_id', [
-            'sanitize_callback' => fn($v) => $alegra_id_sanitizer($v, 'alegra_connector_consumidor_final_manual_id'),
+            'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_consumidor_final_manual_id'),
         ]);
 
         // Per-field billing toggles. Group A (identification) is force-enabled

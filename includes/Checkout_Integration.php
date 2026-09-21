@@ -194,6 +194,15 @@ class Checkout_Integration
         }
 
         $options = [];
+
+        // Rama A (Fase 0.5): an explicit empty option so Blocks does not
+        // default to the first type (RC = Registro civil). If the Blocks API
+        // turns out to reject an empty `value`, remove this block and validate
+        // '' in the save path instead (Rama B, design §7.2).
+        if ($key === 'idtype') {
+            $options[] = ['value' => '', 'label' => __('Seleccione…', 'alegra-connector')];
+        }
+
         foreach ($map as $value => $label) {
             $options[] = ['value' => (string) $value, 'label' => (string) $label];
         }
