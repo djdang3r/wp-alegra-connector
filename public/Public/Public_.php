@@ -58,6 +58,14 @@ class Public_
             add_action('woocommerce_order_status_failed', [$this, 'on_order_failed'], 10, 1);
         }
 
+        // Payment reconciliation: ALWAYS active, independent of push_orders_enabled.
+        // It never creates invoices; it only records the payment on an invoice that
+        // was already linked. `on_order_paid_reconcile` is deliberately a distinct
+        // method from `on_payment_complete`, which stays inside the gate (T12.1).
+        add_action('woocommerce_payment_complete', [$this, 'on_order_paid_reconcile'], 10, 1);
+        add_action('woocommerce_order_status_processing', [$this, 'on_order_paid_reconcile'], 10, 1);
+        add_action('woocommerce_order_status_completed', [$this, 'on_order_paid_reconcile'], 10, 1);
+
         // Products and Customers hooks: DISABLED by default.
         // These can only push data when the user explicitly enables this option,
         // AND should still be triggered manually from the dashboard for safety.
@@ -256,6 +264,53 @@ class Public_
     {
         $this->logger->info('WooCommerce: Order failed', ['order_id' => $order_id]);
         $this->trigger_sync('order', $order_id, 'cancel');
+    }
+
+    /**
+     * Always-active payment reconciliation (REQ-REC-1..3, REQ-REC-5).
+     *
+     * Fires when WooCommerce marks an order as paid (`payment_complete`, or the
+     * processing/completed status). When the invoice was uploaded earlier but the
+     * payment was not final yet, this attaches the payment to the EXISTING
+     * invoice. It never creates an invoice: with no linked invoice it does
+     * nothing, so manual mode keeps creating invoices only by hand.
+     */
+    public function on_order_paid_reconcile(int $order_id): void
+    {
+        if (self::$is_syncing) {
+            return;
+        }
+
+        $order = wc_get_order($order_id);
+        if (!$order instanceof \WC_Order) {
+            return;
+        }
+
+        $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        $payment_id = (string) $order->get_meta('_alegra_payment_id', true);
+
+        // Guard exacto (REQ-REC-2): factura vinculada Y sin pago Y pagado.
+        if ($invoice_id === '' || $payment_id !== '' || !$order->is_paid()) {
+            return;
+        }
+
+        $account = (string) get_option('alegra_connector_payment_account_id', '');
+        if (in_array($account, ['', '0'], true)) {
+            $order->add_order_note(__(
+                '[Alegra] El pedido está pagado y tiene factura, pero no hay cuenta de destino configurada; el pago NO se registró. Configurala en Ajustes > Avanzado.',
+                'alegra-connector'
+            ));
+            if ($this->logger) {
+                $this->logger->warning('Payment reconciliation skipped: no payment account configured', [
+                    'order_id'   => $order_id,
+                    'invoice_id' => $invoice_id,
+                ]);
+            }
+            return;
+        }
+
+        $orders = new Sync\Orders($this->api, $this->logger);
+        $orders->reconcile_payment_only($order);
     }
 
     public function on_new_customer(int $customer_id): void

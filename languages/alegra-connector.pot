@@ -4,7 +4,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Alegra Connector 2.3.10\n"
 "Report-Msgid-Bugs-To: https://github.com/djdang3r/wp-alegra-connector/issues\n"
-"POT-Creation-Date: 2026-09-21 00:06+0000\n"
+"POT-Creation-Date: 2026-09-21 00:12+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -218,9 +218,9 @@ msgstr ""
 msgid "Ajusta la conexion y el comportamiento del plugin"
 msgstr ""
 
-#: includes/Sync/Orders.php:1330
-#: includes/Sync/Orders.php:1383
-#: includes/Sync/Orders.php:636
+#: includes/Sync/Orders.php:1446
+#: includes/Sync/Orders.php:1499
+#: includes/Sync/Orders.php:752
 msgid "Ajuste"
 msgstr ""
 
@@ -252,7 +252,7 @@ msgstr ""
 msgid "Alegra (modo de prueba): el método de pago NO se actualizó. Desactiva el modo de prueba para sincronizar de verdad."
 msgstr ""
 
-#: includes/Sync/Orders.php:693
+#: includes/Sync/Orders.php:809
 msgid "Alegra (modo de prueba): no se creó la nota de crédito. Desactiva el modo de prueba para facturar de verdad."
 msgstr ""
 
@@ -266,15 +266,15 @@ msgstr ""
 msgid "Alegra Connector"
 msgstr ""
 
-#: alegra-connector.php:259
+#: alegra-connector.php:261
 msgid "Alegra Connector requiere WooCommerce activo. La sincronización está desactivada hasta que actives WooCommerce."
 msgstr ""
 
-#: alegra-connector.php:364
+#: alegra-connector.php:366
 msgid "Alegra Connector requiere WooCommerce instalado y activo."
 msgstr ""
 
-#: alegra-connector.php:207
+#: alegra-connector.php:209
 msgid "Alegra Connector: no se pudo cargar la clase Logger. El directorio logger/ parece estar incompleto en esta instalación. El plugin no puede registrar eventos hasta que reinstales el plugin completo o contactes al soporte."
 msgstr ""
 
@@ -311,19 +311,19 @@ msgstr ""
 msgid "Alegra: la factura #%1$s se creó, pero el pago NO se pudo registrar (%2$s). Registralo manualmente en Alegra o reintentá con \"Registrar pago\"."
 msgstr ""
 
-#: includes/Sync/Orders.php:1087
+#: includes/Sync/Orders.php:1203
 msgid "Alegra: la factura se emitirá a nombre del Consumidor Final porque el cliente no tiene %s registrado. Si necesitas la factura a nombre del cliente, agrega su cédula/NIT y vuelve a facturar."
 msgstr ""
 
-#: includes/Sync/Orders.php:1097
+#: includes/Sync/Orders.php:1213
 msgid "Alegra: la factura se emitirá a nombre del Consumidor Final porque otra sincronización estaba en curso y no se pudo crear el contacto del cliente. Volvé a facturar en unos segundos para emitirla a nombre del cliente."
 msgstr ""
 
-#: includes/Sync/Orders.php:1076
+#: includes/Sync/Orders.php:1192
 msgid "Alegra: no se pudo crear el contacto del cliente en Alegra (%s). La factura se emitirá a nombre del Consumidor Final. Corregí el dato o la conexión y volvé a facturar para emitirla a nombre del cliente."
 msgstr ""
 
-#: public/Public/Public_.php:323
+#: public/Public/Public_.php:378
 msgid "Alegra: no se pudo sincronizar el pedido con Alegra (%s). Revisá la configuración y volvé a intentarlo desde el panel."
 msgstr ""
 
@@ -482,7 +482,7 @@ msgstr ""
 msgid "Campos de facturación"
 msgstr ""
 
-#: includes/Sync/Orders.php:740
+#: includes/Sync/Orders.php:856
 msgid "Cancelada desde WooCommerce - Pedido #%d"
 msgstr ""
 
@@ -519,7 +519,7 @@ msgstr ""
 msgid "Categoría a enviar a Alegra:"
 msgstr ""
 
-#: includes/Sync/Controller.php:327
+#: includes/Sync/Controller.php:363
 msgid "Categoría no encontrada"
 msgstr ""
 
@@ -566,7 +566,7 @@ msgstr ""
 msgid "Cliente"
 msgstr ""
 
-#: includes/Sync/Controller.php:288
+#: includes/Sync/Controller.php:324
 msgid "Cliente no encontrado"
 msgstr ""
 
@@ -621,7 +621,7 @@ msgstr ""
 msgid "Completado: %d importados, %d actualizados, %d omitidos, %d errores"
 msgstr ""
 
-#: includes/Sync/Controller.php:240
+#: includes/Sync/Controller.php:276
 msgid "Completado: %d productos, %d clientes, %d ordenes, %d categorias"
 msgstr ""
 
@@ -1007,11 +1007,11 @@ msgstr ""
 msgid "El mismo email con el que inicias sesion en Alegra."
 msgstr ""
 
-#: includes/Sync/Orders.php:583
+#: includes/Sync/Orders.php:699
 msgid "El monto acumulado de reembolsos supera el total de la factura."
 msgstr ""
 
-#: includes/Sync/Orders.php:547
+#: includes/Sync/Orders.php:663
 msgid "El monto del reembolso debe ser mayor a cero."
 msgstr ""
 
@@ -1041,9 +1041,9 @@ msgid "El pago ya está registrado en Alegra."
 msgstr ""
 
 #: includes/State_Sync.php:110
-#: includes/Sync/Orders.php:507
-#: includes/Sync/Orders.php:558
-#: includes/Sync/Orders.php:735
+#: includes/Sync/Orders.php:623
+#: includes/Sync/Orders.php:674
+#: includes/Sync/Orders.php:851
 msgid "El pedido no tiene una factura de Alegra vinculada"
 msgstr ""
 
@@ -1174,7 +1174,7 @@ msgstr ""
 msgid "Enviar seleccionados"
 msgstr ""
 
-#: includes/Sync/Orders.php:1341
+#: includes/Sync/Orders.php:1457
 msgid "Envío"
 msgstr ""
 
@@ -1195,7 +1195,7 @@ msgstr ""
 msgid "Error al subir archivo."
 msgstr ""
 
-#: alegra-connector.php:365
+#: alegra-connector.php:367
 msgid "Error de Activacion"
 msgstr ""
 
@@ -1343,7 +1343,7 @@ msgstr ""
 msgid "Estos valores se usan como predeterminados al crear productos en Alegra. Si un producto en WooCommerce no tiene un valor especifico para estos campos, se usara el valor que definas aqui."
 msgstr ""
 
-#: alegra-connector.php:229
+#: alegra-connector.php:231
 msgid "Every %d minutes (Alegra Connector)"
 msgstr ""
 
@@ -1364,7 +1364,7 @@ msgstr ""
 msgid "Factura Alegra"
 msgstr ""
 
-#: includes/Sync/Orders.php:745
+#: includes/Sync/Orders.php:861
 msgid "Factura Alegra #%s anulada."
 msgstr ""
 
@@ -1602,15 +1602,15 @@ msgstr ""
 msgid "Importando %s..."
 msgstr ""
 
-#: includes/Sync/Controller.php:202
+#: includes/Sync/Controller.php:238
 msgid "Importando categorias desde Alegra..."
 msgstr ""
 
-#: includes/Sync/Controller.php:174
+#: includes/Sync/Controller.php:210
 msgid "Importando clientes desde Alegra..."
 msgstr ""
 
-#: includes/Sync/Controller.php:137
+#: includes/Sync/Controller.php:173
 msgid "Importando productos desde Alegra..."
 msgstr ""
 
@@ -2061,7 +2061,7 @@ msgid "No hay un proceso de sincronización en curso."
 msgstr ""
 
 #: includes/Sync/Orders.php:353
-#: includes/Sync/Orders.php:458
+#: includes/Sync/Orders.php:574
 msgid "No hay una factura de Alegra vinculada."
 msgstr ""
 
@@ -2147,7 +2147,7 @@ msgstr ""
 msgid "No se pudo inicializar el manejador de pedidos."
 msgstr ""
 
-#: includes/Sync/Orders.php:466
+#: includes/Sync/Orders.php:582
 msgid "No se pudo leer la factura en Alegra."
 msgstr ""
 
@@ -2155,15 +2155,15 @@ msgstr ""
 msgid "No se pudo obtener el PDF de Alegra."
 msgstr ""
 
-#: includes/Sync/Orders.php:798
+#: includes/Sync/Orders.php:914
 msgid "No se pudo resolver el cliente en Alegra ni usar el Consumidor Final. La factura no se creó."
 msgstr ""
 
-#: includes/Sync/Orders.php:663
+#: includes/Sync/Orders.php:779
 msgid "No se pudo resolver el cliente para la nota de crédito."
 msgstr ""
 
-#: includes/Sync/Orders.php:641
+#: includes/Sync/Orders.php:757
 msgid "No se pudo resolver el ítem \"Ajuste\" en Alegra para la nota de crédito."
 msgstr ""
 
@@ -2171,15 +2171,15 @@ msgstr ""
 msgid "No se pudo resolver la opción \"%1$s\" del atributo \"%2$s\" en Alegra."
 msgstr ""
 
-#: includes/Sync/Orders.php:1335
+#: includes/Sync/Orders.php:1451
 msgid "No se pudo vincular el envío con un ítem de Alegra. La factura no se creó."
 msgstr ""
 
-#: includes/Sync/Orders.php:1238
+#: includes/Sync/Orders.php:1354
 msgid "No se pudo vincular el producto \"%s\" con un ítem de Alegra. Sincroniza el producto antes de facturar."
 msgstr ""
 
-#: includes/Sync/Orders.php:1388
+#: includes/Sync/Orders.php:1504
 msgid "No se pudo vincular un recargo con un ítem de Alegra. La factura no se creó."
 msgstr ""
 
@@ -2254,7 +2254,7 @@ msgstr ""
 msgid "Nombre"
 msgstr ""
 
-#: includes/Sync/Orders.php:713
+#: includes/Sync/Orders.php:829
 msgid "Nota de crédito Alegra #%s creada por reembolso de %s."
 msgstr ""
 
@@ -2389,7 +2389,7 @@ msgstr ""
 msgid "Pedido"
 msgstr ""
 
-#: includes/Sync/Orders.php:1554
+#: includes/Sync/Orders.php:1670
 msgid "Pedido #%1$d — %2$s"
 msgstr ""
 
@@ -2401,7 +2401,7 @@ msgstr ""
 msgid "Pedido #%d tiene pagos múltiples. El método de pago no se sincronizó."
 msgstr ""
 
-#: includes/Sync/Orders.php:824
+#: includes/Sync/Orders.php:940
 msgid "Pedido WooCommerce #%d"
 msgstr ""
 
@@ -2410,7 +2410,7 @@ msgstr ""
 msgid "Pedido invalido."
 msgstr ""
 
-#: includes/Sync/Controller.php:306
+#: includes/Sync/Controller.php:342
 msgid "Pedido no encontrado"
 msgstr ""
 
@@ -2424,7 +2424,7 @@ msgstr ""
 msgid "Pedido no válido"
 msgstr ""
 
-#: includes/Sync/Orders.php:553
+#: includes/Sync/Orders.php:669
 msgid "Pedido no válido."
 msgstr ""
 
@@ -2603,7 +2603,7 @@ msgstr ""
 msgid "Producto"
 msgstr ""
 
-#: includes/Sync/Controller.php:270
+#: includes/Sync/Controller.php:306
 msgid "Producto no encontrado"
 msgstr ""
 
@@ -2682,7 +2682,7 @@ msgstr ""
 msgid "Reactivar ahora"
 msgstr ""
 
-#: includes/Sync/Orders.php:1378
+#: includes/Sync/Orders.php:1494
 msgid "Recargo"
 msgstr ""
 
@@ -2690,12 +2690,12 @@ msgstr ""
 msgid "Reembolsado"
 msgstr ""
 
-#: includes/Sync/Orders.php:525
+#: includes/Sync/Orders.php:641
 msgid "Reembolso de pedido #%d - WooCommerce"
 msgstr ""
 
-#: includes/Sync/Orders.php:646
-#: includes/Sync/Orders.php:647
+#: includes/Sync/Orders.php:762
+#: includes/Sync/Orders.php:763
 msgid "Reembolso parcial"
 msgstr ""
 
@@ -3373,7 +3373,7 @@ msgstr ""
 msgid "Verifica que las credenciales sean correctas antes de guardar."
 msgstr ""
 
-#: includes/Sync/Controller.php:228
+#: includes/Sync/Controller.php:264
 msgid "Verificando estado de facturas en Alegra..."
 msgstr ""
 
@@ -3448,7 +3448,7 @@ msgstr ""
 msgid "Ya puedes empezar a sincronizar. Recomendamos hacer una primera prueba manual antes de activar sync automatico."
 msgstr ""
 
-#: includes/Sync/Orders.php:518
+#: includes/Sync/Orders.php:634
 msgid "Ya se emitió una nota de crédito para este pedido."
 msgstr ""
 
@@ -3456,8 +3456,12 @@ msgstr ""
 msgid "[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente."
 msgstr ""
 
-#: includes/Sync/Orders.php:1621
+#: includes/Sync/Orders.php:1737
 msgid "[Alegra] Aviso: el total del pedido (%1$s) no coincide con el saldo de la factura #%2$s (%3$s). Se registró el pago por el total del pedido; revisá la factura."
+msgstr ""
+
+#: public/Public/Public_.php:299
+msgid "[Alegra] El pedido está pagado y tiene factura, pero no hay cuenta de destino configurada; el pago NO se registró. Configurala en Ajustes > Avanzado."
 msgstr ""
 
 #: includes/Sync/Orders.php:328
@@ -3468,7 +3472,7 @@ msgstr ""
 msgid "[Alegra] Factura #%s abierta (ya no es borrador)."
 msgstr ""
 
-#: includes/Sync/Orders.php:2003
+#: includes/Sync/Orders.php:2119
 msgid "[Alegra] Factura #%s pagada. Pedido completado automaticamente."
 msgstr ""
 
@@ -3542,7 +3546,7 @@ msgstr ""
 msgid "importados"
 msgstr ""
 
-#: includes/Sync/Orders.php:1021
+#: includes/Sync/Orders.php:1137
 msgid "modo de prueba (dry run) activo"
 msgstr ""
 

@@ -4038,4 +4038,198 @@ TestRunner::test('T-DRAFT-1b an already-open invoice is not re-opened before pay
     TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must still be posted');
 });
 
+// ===========================================================================
+// T26 — Reconciliación del pago posterior (Fase 3+4)
+//
+// Spec:   docs/sdd/payments/spec.md   (REQ-REC-1..6)
+// Design: docs/sdd/payments/design.md (§5 hooks siempre-activos, §6 barrido)
+// ===========================================================================
+echo "\nT26 — Reconciliación del pago posterior (Fase 3+4)\n";
+
+function make_public(?Logger $logger = null): \Alegra\Connector\Public\Public_
+{
+    $logger = $logger ?? make_logger();
+    return new \Alegra\Connector\Public\Public_(new Client($logger), $logger);
+}
+
+/**
+ * An order that ALREADY has an invoice in Alegra and no payment recorded.
+ */
+function make_reconcilable_order(int $order_id, string $invoice_id, array $data = []): WC_Order
+{
+    alegra_mock_seed_invoice($invoice_id, ['status' => 'open', 'total' => 10.0, 'balance' => 10.0]);
+    return alegra_make_order($order_id, array_merge([
+        'total' => 10.0,
+        'status' => 'processing',
+        'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => $invoice_id],
+    ], $data));
+}
+
+TestRunner::test('T-REC-1 reconcile hooks are registered OUTSIDE the push_orders_enabled gate', function (): void {
+    alegra_test_reset();
+    unset($GLOBALS['wp_options']['alegra_connector_push_orders_enabled']); // fresh install: option absent
+    $public = make_public();
+
+    TestRunner::assertTrue(has_action('woocommerce_payment_complete', [$public, 'on_order_paid_reconcile']) !== false, 'payment_complete must reconcile');
+    TestRunner::assertTrue(has_action('woocommerce_order_status_processing', [$public, 'on_order_paid_reconcile']) !== false, 'processing must reconcile');
+    TestRunner::assertTrue(has_action('woocommerce_order_status_completed', [$public, 'on_order_paid_reconcile']) !== false, 'completed must reconcile');
+    TestRunner::assertFalse(has_action('woocommerce_new_order', [$public, 'on_new_order']), 'manual mode must not create invoices');
+    TestRunner::assertFalse(has_action('woocommerce_payment_complete', [$public, 'on_payment_complete']), 'the gated method must stay unregistered (T12.1)');
+});
+
+TestRunner::test('T-REC-2a no linked invoice: the hook neither creates one nor pays', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    alegra_make_order(8001, ['total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago']);
+
+    do_action('woocommerce_order_status_processing', 8001);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'manual reconciliation must never create an invoice');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no invoice means no payment');
+});
+
+TestRunner::test('T-REC-2b an already-paid order is not paid twice', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8002, 'inv-rec-2b', ['meta' => ['_alegra_invoice_id' => 'inv-rec-2b', '_alegra_payment_id' => 'pay-1']]);
+
+    do_action('woocommerce_order_status_processing', 8002);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'a recorded payment must not be duplicated');
+});
+
+TestRunner::test('T-REC-2c an unpaid order is not reconciled', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8003, 'inv-rec-2c', ['status' => 'on-hold']);
+
+    do_action('woocommerce_payment_complete', 8003);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'is_paid() is the authority');
+});
+
+TestRunner::test('T-REC-3a status processing reconciles a payment onto an existing invoice', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    $order = make_reconcilable_order(8010, 'inv-rec-3a');
+
+    do_action('woocommerce_order_status_processing', 8010);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'the invoice already exists');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be registered');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_payment_id', true) !== '', 'the payment id must be stored');
+});
+
+TestRunner::test('T-REC-3b payment_complete and processing together post exactly ONE payment', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8011, 'inv-rec-3b');
+
+    do_action('woocommerce_payment_complete', 8011);
+    do_action('woocommerce_order_status_processing', 8011);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'two triggers must yield one payment');
+});
+
+TestRunner::test('T-REC-3c status completed reconciles the payment too', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8012, 'inv-rec-3c', ['status' => 'completed']);
+
+    do_action('woocommerce_order_status_completed', 8012);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'completed is a paid status');
+});
+
+TestRunner::test('T-REC-5 manual reconciliation with an existing invoice only records the payment', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8020, 'inv-rec-5');
+
+    do_action('woocommerce_order_status_processing', 8020);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no invoice may be created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be attached');
+});
+
+TestRunner::test('T-REC-6 the hook and the sweep cannot double-pay the same order', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    make_reconcilable_order(8030, 'inv-rec-6');
+
+    do_action('woocommerce_order_status_processing', 8030); // hook path
+    make_controller()->run_payment_reconcile();              // sweep path, same order
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'hook + sweep must yield one payment');
+});
+
+TestRunner::test('T-REC-4a the sweep pays paid orders whose payment was missed', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_reconcilable_order(8101, 'inv-rec-4a-1');
+    make_reconcilable_order(8102, 'inv-rec-4a-2');
+
+    $result = make_controller()->run_payment_reconcile();
+
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/payments'), 'each pending order must be paid');
+    TestRunner::assertSame(2, (int) ($result['reconciled'] ?? 0), 'the result must report reconciled=2');
+});
+
+TestRunner::test('T-REC-4b the sweep is idempotent (running twice posts one payment)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_reconcilable_order(8111, 'inv-rec-4b');
+    $controller = make_controller();
+
+    $controller->run_payment_reconcile();
+    $controller->run_payment_reconcile();
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'a second sweep must not re-pay');
+});
+
+TestRunner::test('T-REC-4c the kill switch stops the sweep', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_reconcilable_order(8121, 'inv-rec-4c');
+    \Alegra\Connector\Kill_Switch::activate('test');
+
+    $result = make_controller()->run_payment_reconcile();
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'the kill switch must stop the sweep');
+    TestRunner::assertSame('skipped_kill_switch', (string) ($result['skipped'] ?? ''), 'the result must report the kill switch');
+});
+
+TestRunner::test('T-REC-4d the global lock prevents two simultaneous sweeps', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_reconcilable_order(8131, 'inv-rec-4d');
+    $token = Controller::acquire_lock('alegra_payment_reconcile', 300);
+
+    $result = make_controller()->run_payment_reconcile();
+    Controller::release_lock('alegra_payment_reconcile', (string) $token);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'a held lock must stop the sweep');
+    TestRunner::assertSame('skipped_locked', (string) ($result['skipped'] ?? ''), 'the result must report the lock');
+});
+
+TestRunner::test('T-REC-4e the sweep ignores paid orders without an invoice', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_make_order(8141, ['total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago']);
+
+    make_controller()->run_payment_reconcile();
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'the sweep must not create invoices');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no invoice means no payment');
+});
+
 exit(TestRunner::summary());

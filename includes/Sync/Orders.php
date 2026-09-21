@@ -441,6 +441,122 @@ class Orders
     }
 
     /**
+     * Reconcile the payment of an order whose invoice ALREADY exists in Alegra.
+     *
+     * This is the payment-only path used by the always-active WC hooks and the
+     * retry sweep. It NEVER creates an invoice (REQ-REC-5): when no invoice is
+     * linked the guard returns before touching the API. Idempotent via the
+     * per-order lock plus the shared record_payment_for_invoice() guards.
+     *
+     * Guard (REQ-REC-2): invoice linked AND no payment yet AND WC says paid.
+     *
+     * @return array|\WP_Error The payment payload, a ['skipped' => true, ...]
+     *                        array, or a WP_Error from the POST.
+     */
+    public function reconcile_payment_only(\WC_Order $order): array|\WP_Error
+    {
+        $order_id   = (int) $order->get_id();
+        $invoice_id = (string) $order->get_meta('_alegra_invoice_id', true);
+        $payment_id = (string) $order->get_meta('_alegra_payment_id', true);
+
+        if ($invoice_id === '' || $payment_id !== '' || !$order->is_paid()) {
+            return ['skipped' => true, 'reason' => 'guard'];
+        }
+
+        $account = (string) get_option('alegra_connector_payment_account_id', '');
+        if (in_array($account, ['', '0'], true)) {
+            return ['skipped' => true, 'reason' => 'no_account'];
+        }
+
+        // Per-order lock: two concurrent triggers (hook + sweep) cannot both
+        // post a payment for the same order (REQ-REC-6).
+        $lock_key = 'alegra_payment_lock_' . $order_id;
+        $token = Controller::acquire_lock($lock_key, 60);
+        if ($token === false) {
+            return ['skipped' => true, 'reason' => 'locked'];
+        }
+
+        try {
+            return $this->record_payment_for_invoice($order, $invoice_id);
+        } finally {
+            Controller::release_lock($lock_key, $token);
+        }
+    }
+
+    /**
+     * Retry sweep: reconcile every paid order with a linked invoice and no
+     * payment yet (REQ-REC-4). Bounded batch, kill-switch and cancellation
+     * aware. Called by the hourly `alegra_connector_payment_reconcile` cron.
+     *
+     * @return array{checked:int,reconciled:int,errors:int,skipped?:string}
+     */
+    public function reconcile_missing_payments(): array
+    {
+        if (!get_option('alegra_connector_payment_reconcile_enabled', true)) {
+            return ['reconciled' => 0, 'skipped' => 'skipped_disabled'];
+        }
+
+        $limit = max(1, (int) get_option('alegra_connector_payment_reconcile_batch', 20));
+
+        // A payment-less order may have no `_alegra_payment_id` row at all, so
+        // the clause matches both an explicit empty value and a missing key.
+        $order_ids = wc_get_orders([
+            'limit'   => $limit,
+            'status'  => ['processing', 'completed'],
+            'orderby' => 'date',
+            'order'   => 'DESC',
+            'return'  => 'ids',
+            'meta_query' => [
+                'relation' => 'AND',
+                [
+                    'key'     => '_alegra_invoice_id',
+                    'value'   => '',
+                    'compare' => '!=',
+                ],
+                [
+                    'relation' => 'OR',
+                    [
+                        'key'     => '_alegra_payment_id',
+                        'value'   => '',
+                        'compare' => '=',
+                    ],
+                    [
+                        'key'     => '_alegra_payment_id',
+                        'compare' => 'NOT EXISTS',
+                    ],
+                ],
+            ],
+        ]);
+
+        $result = ['checked' => 0, 'reconciled' => 0, 'errors' => 0];
+        foreach ((array) $order_ids as $order_id) {
+            // Re-check the kill switch and the cancellation transient so an
+            // in-flight sweep stops (REQ-REC-4).
+            if (\Alegra\Connector\Kill_Switch::is_active() || get_transient('alegra_sync_cancelled')) {
+                break;
+            }
+
+            $order = wc_get_order($order_id);
+            if (!$order instanceof \WC_Order) {
+                continue;
+            }
+
+            $result['checked']++;
+            $r = $this->reconcile_payment_only($order);
+            if (is_wp_error($r)) {
+                $result['errors']++;
+            } elseif (!empty($r['skipped'])) {
+                continue;
+            } else {
+                $result['reconciled']++;
+            }
+        }
+
+        $this->logger->info('Payment reconcile completed', $result);
+        return $result;
+    }
+
+    /**
      * Open a draft invoice in Alegra and return its resulting state.
      *
      * No-op when the invoice is already open (returns it unchanged). Used by

@@ -1134,6 +1134,7 @@ class WC_Order
 
     public function get_id(): int { return $this->id; }
     public function get_meta($key, $single = true) { return $this->meta[$key] ?? ($single ? '' : []); }
+    public function meta_exists($key) { return array_key_exists($key, $this->meta); }
     public function update_meta_data($key, $value) { $this->meta[$key] = $value; return $this; }
     public function delete_meta_data($key) { unset($this->meta[$key]); return $this; }
     public function save() { return $this->id; }
@@ -1217,6 +1218,69 @@ function wc_get_product($product_id)
     $product_id = (int) $product_id;
     return $GLOBALS['wc_products'][$product_id] ?? false;
 }
+
+/**
+ * Recursively evaluate a WP-style meta_query against a stubbed WC_Order.
+ *
+ * Mirrors WP_Meta_Query semantics closely enough for the harness: a `= ''`
+ * clause matches only an existing empty row, while `NOT EXISTS` matches a
+ * missing key — the same distinction the real query has to handle.
+ */
+function alegra_stub_meta_query_matches($order, array $meta_query): bool
+{
+    $relation = strtoupper((string) ($meta_query['relation'] ?? 'AND'));
+    $clauses = array_filter($meta_query, static fn ($k) => $k !== 'relation', ARRAY_FILTER_USE_KEY);
+
+    if ($clauses === []) {
+        return true;
+    }
+
+    foreach ($clauses as $clause) {
+        if (!is_array($clause)) {
+            continue;
+        }
+        $nested = isset($clause['relation']) || (isset($clause[0]) && is_array($clause[0]));
+        $ok = $nested
+            ? alegra_stub_meta_query_matches($order, $clause)
+            : alegra_stub_meta_clause_matches($order, $clause);
+
+        if ($relation === 'OR') {
+            if ($ok) { return true; }
+        } elseif (!$ok) {
+            return false;
+        }
+    }
+
+    return $relation !== 'OR';
+}
+
+function alegra_stub_meta_clause_matches($order, array $clause): bool
+{
+    $key = (string) ($clause['key'] ?? '');
+    if ($key === '' || !method_exists($order, 'meta_exists')) {
+        return false;
+    }
+
+    $compare = strtoupper((string) ($clause['compare'] ?? '='));
+    $value   = (string) ($clause['value'] ?? '');
+    $exists  = (bool) $order->meta_exists($key);
+    $actual  = (string) $order->get_meta($key, true);
+
+    switch ($compare) {
+        case 'NOT EXISTS':
+            return !$exists;
+        case 'EXISTS':
+            return $exists;
+        case '!=':
+            return $exists && $actual !== $value;
+        case 'LIKE':
+            return $exists && stripos($actual, trim($value, '%')) !== false;
+        case '=':
+        default:
+            return $exists && $actual === $value;
+    }
+}
+
 function wc_get_orders($args = [])
 {
     $orders = array_values($GLOBALS['wc_orders'] ?? []);
@@ -1229,6 +1293,13 @@ function wc_get_orders($args = [])
             $val = $o->get_meta($mk, true);
             if ($val === '' || $val === null) { return false; }
             return $mv === null ? true : (string) $val === $mv;
+        }));
+    }
+
+    if (!empty($args['meta_query']) && is_array($args['meta_query'])) {
+        $mq = $args['meta_query'];
+        $orders = array_values(array_filter($orders, static function ($o) use ($mq) {
+            return alegra_stub_meta_query_matches($o, $mq);
         }));
     }
 

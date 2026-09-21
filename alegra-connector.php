@@ -162,6 +162,8 @@ final class Alegra_Connector
         // Self-heal the periodic schedule if it is ever missing (old "Run now"/
         // "skip" destroyed it; a plugin conflict or manual DB edit can too).
         add_action('init', [$this, 'maybe_self_heal_cron'], 20);
+        // Same self-heal for the hourly payment retry sweep.
+        add_action('init', [$this, 'maybe_self_heal_payment_reconcile'], 21);
         register_activation_hook(__FILE__, [$this, 'activate']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
 
@@ -420,6 +422,7 @@ final class Alegra_Connector
         // Schedule cron on activation
         $this->schedule_cron();
         Maintenance::schedule();
+        $this->maybe_self_heal_payment_reconcile();
 
         // Log activation
         if ($this->logger) {
@@ -457,7 +460,7 @@ final class Alegra_Connector
         );
 
         // 3. Clear ALL cron events with alegra prefix
-        $cron_hooks = ['alegra_connector_cron_sync', Maintenance::CRON_HOOK];
+        $cron_hooks = ['alegra_connector_cron_sync', Maintenance::CRON_HOOK, 'alegra_connector_payment_reconcile'];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }
@@ -547,6 +550,24 @@ final class Alegra_Connector
         }
 
         wp_schedule_event(time() + 60, 'alegra_connector_' . $frequency . 'min', $hook);
+    }
+
+    /**
+     * Self-heal the hourly payment reconciliation schedule (REQ-REC-4).
+     *
+     * Safety net for a missing event (a fresh install, a plugin conflict or a
+     * manual DB edit). The sweep enforces the kill switch, the global lock and
+     * the cancellation transient itself, so scheduling it unconditionally is
+     * safe; disabling it is done through `alegra_connector_payment_reconcile_enabled`.
+     */
+    public function maybe_self_heal_payment_reconcile(): void
+    {
+        $hook = 'alegra_connector_payment_reconcile';
+        if (wp_next_scheduled($hook) !== false) {
+            return;
+        }
+
+        wp_schedule_event(time() + 300, 'hourly', $hook);
     }
 
     /**

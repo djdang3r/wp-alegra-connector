@@ -64,6 +64,42 @@ class Controller
         if (!has_action('alegra_sync_inventory_from_alegra', [$this, 'run_inventory_sync'])) {
             add_action('alegra_sync_inventory_from_alegra', [$this, 'run_inventory_sync']);
         }
+
+        // Payment retry sweep. Registered under its own hook so it can be
+        // triggered manually (do_action / WP-CLI) and so the hourly schedule
+        // is independent from the inbound sync cron.
+        if (!has_action('alegra_connector_payment_reconcile', [$this, 'run_payment_reconcile'])) {
+            add_action('alegra_connector_payment_reconcile', [$this, 'run_payment_reconcile']);
+        }
+    }
+
+    /**
+     * Payment retry sweep entry point (REQ-REC-4).
+     *
+     * Kill switch + one global lock around the whole run; the per-order lock
+     * lives in Orders::reconcile_payment_only(). The batch itself is bounded by
+     * the `alegra_connector_payment_reconcile_batch` option.
+     *
+     * @return array{checked:int,reconciled:int,errors:int,skipped?:string}
+     */
+    public function run_payment_reconcile(): array
+    {
+        if (Kill_Switch::is_active()) {
+            $this->logger->info('Payment reconcile skipped: kill switch active');
+            return ['reconciled' => 0, 'skipped' => 'skipped_kill_switch'];
+        }
+
+        $lock = self::acquire_lock('alegra_payment_reconcile', 300);
+        if ($lock === false) {
+            $this->logger->info('Payment reconcile skipped: another run is in progress');
+            return ['reconciled' => 0, 'skipped' => 'skipped_locked'];
+        }
+
+        try {
+            return $this->orders->reconcile_missing_payments();
+        } finally {
+            self::release_lock('alegra_payment_reconcile', $lock);
+        }
     }
 
     /**
