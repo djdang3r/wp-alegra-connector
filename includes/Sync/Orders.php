@@ -771,7 +771,7 @@ class Orders
         // Resolve the client — required by POST /credit-notes.
         $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
         if ($client_id === '') {
-            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            $cf = \Alegra\Connector\Consumidor_Final::get_or_create_id();
             $client_id = $cf !== false ? (string) $cf : '';
         }
         if ($client_id === '') {
@@ -1003,7 +1003,7 @@ class Orders
 
         // Mode: always use the generic client (Consumidor Final).
         if ($mode === 'always_generic') {
-            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            $cf = \Alegra\Connector\Consumidor_Final::get_or_create_id();
             if ($cf !== false && $cf !== '') {
                 $this->persist_contact_id($order, $customer, (string) $cf);
                 return (string) $cf;
@@ -1152,7 +1152,7 @@ class Orders
         // the invoice aborts with `customer_unresolved` instead of silently
         // invoicing a generic consumer.
         if ($mode !== 'require_data') {
-            $cf = \Alegra\Connector\Consumidor_Final::get_id();
+            $cf = \Alegra\Connector\Consumidor_Final::get_or_create_id();
             if ($cf !== false && $cf !== '') {
                 $this->persist_contact_id($order, $customer, (string) $cf);
                 $this->logger->info('Using Consumidor Final for order', ['order_id' => $order_id]);

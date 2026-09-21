@@ -14,8 +14,10 @@ $kill_switch = \Alegra\Connector\Kill_Switch::is_active();
 // Billing health data.
 $dry_run = (bool) get_option('alegra_connector_dry_run', false);
 $consumidor_final_checked = $is_connected && class_exists('\Alegra\Connector\Consumidor_Final');
+// REQ-RB-1: read-only check. Rendering the dashboard must never resolve or
+// create the contact (is_available()/get_id() could POST /contacts).
 $consumidor_final_available = $consumidor_final_checked
-    ? \Alegra\Connector\Consumidor_Final::is_available()
+    ? \Alegra\Connector\Consumidor_Final::is_configured()
     : false;
 
 $page_title = __('Dashboard', 'alegra-connector');

@@ -290,6 +290,23 @@ class Public_
             return;
         }
 
+        // REQ-CFG-1 / T3.1: the single `payment_reconcile_enabled` flag governs
+        // BOTH the hourly sweep and this real-time hook. Turning it off stops
+        // the real-time path too — there is NO silent fallback to the sweep,
+        // because the sweep reads the same flag and is off as well. The kill
+        // switch is a fast-path here; the authority is Client::request().
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            return;
+        }
+        if (!get_option('alegra_connector_payment_reconcile_enabled', true)) {
+            if ($this->logger) {
+                $this->logger->debug('Real-time payment reconcile skipped: reconciliation disabled', [
+                    'order_id' => $order_id,
+                ]);
+            }
+            return;
+        }
+
         $order = wc_get_order($order_id);
         if (!$order instanceof \WC_Order) {
             return;

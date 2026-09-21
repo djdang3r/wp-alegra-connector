@@ -4984,4 +4984,274 @@ TestRunner::test('T-CFG2-15 uninstall removes the new options (REQ-CFG-1)', func
     TestRunner::assertStringContains("delete_option('alegra_connector_gate_migration_version')", $uninstall, 'uninstall must delete the migration version');
 });
 
+// ===========================================================================
+// T-RB — Fase 3 (reconcile/refund gates) + Fase 4 (robustez)
+//
+// Spec:   docs/sdd/config-gates/spec.md   (REQ-CFG-1, REQ-ENF-2, REQ-RB-1..3)
+// Design: docs/sdd/config-gates/design.md (§3.5, §4.1, §4.2, §4.3, §4.4)
+// ===========================================================================
+echo "\nT-RB — Fase 3+4: reconcile/refund gates y robustez\n";
+
+// ---------------------------------------------------------------------------
+// 3a — the real-time reconcile honours payment_reconcile_enabled (REQ-CFG-1)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-1a payment_reconcile_enabled=false stops the REAL-TIME reconcile (REQ-CFG-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    update_option('alegra_connector_payment_reconcile_enabled', false);
+    make_public();
+    $order = make_reconcilable_order(9601, 'inv-rb-1a');
+
+    do_action('woocommerce_order_status_processing', 9601);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'a disabled flag must stop the real-time payment');
+    // The fast-path returns BEFORE the idempotency pre-search, so no GET either.
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/payments'), 'the disabled flag must skip the pre-search GET');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/invoices/inv-rb-1a'), 'the disabled flag must skip the invoice read');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), '_alegra_payment_id must stay empty');
+});
+
+TestRunner::test('T-RB-1b payment_reconcile_enabled=true lets the REAL-TIME reconcile post (REQ-CFG-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    update_option('alegra_connector_payment_reconcile_enabled', true);
+    make_public();
+    $order = make_reconcilable_order(9602, 'inv-rb-1b');
+
+    do_action('woocommerce_order_status_processing', 9602);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'an enabled flag must let the real-time payment through');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_payment_id', true) !== '', '_alegra_payment_id must be written');
+});
+
+// ---------------------------------------------------------------------------
+// 3b — refund / payment-method entity gates (REQ-ENF-2)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-2a manual mode: an AUTOMATIC refund emits no credit note (REQ-ENF-2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    build_refund_world(100.0, 100.0, 9610, 9611);
+
+    $result = State_Sync::handle_refund(9610, 9611);
+
+    TestRunner::assertTrue(\Alegra\Connector\API\Client::write_was_blocked($result), 'the automatic refund must be blocked');
+    TestRunner::assertSame('entity_disabled', $result['reason'] ?? null, 'the reason must be entity_disabled (credit_note)');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/credit-notes'), 'no credit note may be POSTed');
+});
+
+TestRunner::test('T-RB-2b manual mode: the EXPLICIT refund path still emits the credit note (REQ-ENF-2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    build_refund_world(100.0, 100.0, 9612, 9613);
+
+    $result = \Alegra\Connector\Write_Gate::run_explicit(
+        fn () => State_Sync::handle_refund(9612, 9613)
+    );
+
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($result), 'an explicit refund must not be blocked');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/credit-notes'), 'the explicit refund must reach Alegra');
+});
+
+TestRunner::test('T-RB-3 manual mode: an automatic payment-method change does NOT update the invoice (REQ-ENF-2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_make_user(7, ['user_email' => 'pm-rb@example.test'], [
+        'billing_alegra_idtype'         => 'CC',
+        'billing_alegra_identification' => '1234567890',
+    ]);
+    alegra_make_order(9620, [
+        'total' => 50.0, 'currency' => 'COP', 'payment_method' => 'cod', 'customer_id' => 7,
+        'meta' => ['_alegra_invoice_id' => '1nv-9620', '_alegra_last_payment_method' => 'bacs'],
+    ]);
+
+    State_Sync::handle_payment_method_change(9620);
+
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/1nv-9620'), 'manual mode must not update the invoice automatically');
+});
+
+// ---------------------------------------------------------------------------
+// 4a — the dashboard render never creates the Consumidor Final (REQ-RB-1)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-4a rendering the dashboard does NOT POST /contacts (REQ-RB-1)', function (): void {
+    alegra_test_reset();
+    // Connected, no CF cache/override, contact entity ENABLED: a create WOULD
+    // reach Alegra if the render called the resolving path.
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_push_customers_enabled', true);
+
+    $is_connected = true;
+    ob_start();
+    include $GLOBALS['alegra_plugin_root'] . 'templates/admin-dashboard.php';
+    $html = (string) ob_get_clean();
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'rendering the dashboard must not create the CF contact');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'rendering the dashboard must not even search for the CF');
+    TestRunner::assertStringContains('Consumidor Final', $html, 'the dashboard must still render the CF health row');
+});
+
+TestRunner::test('T-RB-4b peek_id() is read-only and is_configured() mirrors it (REQ-RB-1)', function (): void {
+    alegra_test_reset();
+    TestRunner::assertFalse(\Alegra\Connector\Consumidor_Final::peek_id(), 'no cache => false');
+    TestRunner::assertFalse(\Alegra\Connector\Consumidor_Final::is_configured(), 'is_configured must mirror peek_id');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'peek must not GET /contacts');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'peek must not POST /contacts');
+
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-cached');
+    TestRunner::assertSame('cf-cached', \Alegra\Connector\Consumidor_Final::peek_id(), 'peek serves the option cache');
+    TestRunner::assertTrue(\Alegra\Connector\Consumidor_Final::is_configured(), 'a cached id is configured');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'peek still makes no request');
+});
+
+TestRunner::test('T-RB-4c a non-explicit create with the contact entity disabled is refused (REQ-RB-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_customers_enabled', false);
+    alegra_make_user(2, ['user_email' => 'nodata-rb@example.test']);
+    $order = make_invoice_order(9630, 2, 'nodata-rb@example.test');
+
+    make_orders()->create_invoice($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'a non-explicit create with the contact entity disabled must be refused');
+});
+
+// ---------------------------------------------------------------------------
+// 4b — the chunked flows honour the cancellation flag (REQ-RB-2)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-5 ajax_sync_page stops in the next batch when cancelled (REQ-RB-2)', function (): void {
+    alegra_test_reset();
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'page' => 0,
+        'imported' => 0, 'updated' => 0, 'errors' => 0, 'skipped' => 0,
+    ], 600);
+    set_transient('alegra_sync_cancelled', 1, 120);
+    alegra_mock_seed_item('itm-rb-5', ['name' => 'One', 'reference' => 'SKU-RB-5', 'type' => 'product']);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+
+    TestRunner::assertTrue($resp->success, 'the cancel response must be a success envelope');
+    TestRunner::assertSame(true, $resp->payload['cancelled'] ?? null, 'the response must be flagged cancelled');
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'the response must be done');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'no batch may be fetched after cancellation');
+});
+
+TestRunner::test('T-RB-6 ajax_sync_pending_page stops when cancelled (REQ-RB-2)', function (): void {
+    alegra_test_reset();
+    set_transient('alegra_pending_invoice_batch', [
+        'order_ids' => range(9700, 9729), 'total' => 30,
+        'processed' => 0, 'synced' => 0, 'errors' => 0,
+    ], 600);
+    set_transient('alegra_sync_cancelled', 1, 120);
+    // A non-cancelled run WOULD invoice this order.
+    make_reconcilable_order(9700, 'inv-rb-6');
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_pending_page());
+
+    TestRunner::assertTrue($resp->success, 'the cancel response must be a success envelope');
+    TestRunner::assertSame(true, $resp->payload['cancelled'] ?? null, 'the response must be flagged cancelled');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no invoice may be created after cancellation');
+});
+
+TestRunner::test('T-RB-7 the per-item importers skip on kill switch / cancellation (REQ-RB-2)', function (): void {
+    alegra_test_reset();
+    $item = ['id' => 'itm-rb-7', 'name' => 'Blocked', 'reference' => 'SKU-RB-7', 'type' => 'product'];
+
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $r = make_products()->import_single_item_public($item);
+    TestRunner::assertSame('skipped', $r, 'a kill-switched item must be skipped');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items/itm-rb-7'), 'no per-item GET may happen');
+
+    \Alegra\Connector\Kill_Switch::deactivate();
+    set_transient('alegra_sync_cancelled', 1, 120);
+    $r2 = make_products()->import_single_item_public($item);
+    TestRunner::assertSame('skipped', $r2, 'a cancelled item must be skipped');
+
+    $contact = ['id' => 'ct-rb-7', 'email' => 'rb7@example.test', 'name' => 'Blocked'];
+    $r3 = make_customers()->import_single_contact_public($contact);
+    TestRunner::assertSame('skipped', $r3, 'a cancelled contact must be skipped');
+});
+
+// ---------------------------------------------------------------------------
+// 4c — ajax_disconnect is honest (REQ-RB-3)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-8 ajax_disconnect deletes the webhooks BEFORE killing the plugin (REQ-RB-3)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_subscriptions', [
+        ['id' => 'wh-1', 'event' => 'new-invoice'],
+        ['id' => 'wh-2', 'event' => 'new-client'],
+    ], false);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_disconnect());
+
+    TestRunner::assertSame(1, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-1'), 'wh-1 must be deleted in Alegra');
+    TestRunner::assertSame(1, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-2'), 'wh-2 must be deleted in Alegra');
+    TestRunner::assertSame(2, $resp->payload['webhooks_deleted'] ?? null, 'the real deleted count must be reported');
+    TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(), 'the kill switch must end active');
+});
+
+TestRunner::test('T-RB-9 ajax_disconnect under dry run does not lie about deleted webhooks (REQ-RB-3)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_dry_run', true);
+    update_option('alegra_connector_webhook_subscriptions', [
+        ['id' => 'wh-1', 'event' => 'new-invoice'],
+        ['id' => 'wh-2', 'event' => 'new-client'],
+    ], false);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_disconnect());
+
+    TestRunner::assertSame(0, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-1'), 'no DELETE may be sent in dry run');
+    TestRunner::assertNotSame(2, $resp->payload['webhooks_deleted'] ?? null, 'dry run must not report 2 as deleted');
+    TestRunner::assertSame(0, $resp->payload['webhooks_deleted'] ?? null, 'the real deleted count is 0');
+    TestRunner::assertStringContains('prueba', strtolower((string) ($resp->payload['message'] ?? '')), 'the message must mention the dry run');
+});
+
+TestRunner::test('T-RB-10 ajax_disconnect while already disconnected reports the block (REQ-RB-3)', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    update_option('alegra_connector_webhook_subscriptions', [
+        ['id' => 'wh-1', 'event' => 'new-invoice'],
+        ['id' => 'wh-2', 'event' => 'new-client'],
+    ], false);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+    $resp = alegra_capture_json(fn () => $admin->ajax_disconnect());
+
+    TestRunner::assertSame(0, alegra_mock_count('DELETE', '/webhooks/subscriptions/wh-1'), 'the gate must block the DELETE');
+    TestRunner::assertSame(0, $resp->payload['webhooks_deleted'] ?? null, 'nothing may be reported as deleted');
+    TestRunner::assertSame('kill_switch', $resp->payload['reason'] ?? null, 'the reason must be kill_switch');
+    TestRunner::assertTrue($resp->payload['blocked'] ?? false, 'the response must be flagged blocked');
+});
+
+// ---------------------------------------------------------------------------
+// 4d — the public webhook receiver honours the kill switch (REQ-ENF-1)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T-RB-11 the public webhook receiver ACKs but processes nothing when disconnected (REQ-ENF-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok-rb-11');
+    \Alegra\Connector\Kill_Switch::activate('test');
+
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = json_encode(['subject' => 'new-invoice', 'message' => ['id' => 'inv-x']]);
+
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok-rb-11']));
+
+    TestRunner::assertSame(200, $res->get_status(), 'the receiver must ACK with 200 (never a 4xx)');
+    TestRunner::assertSame('kill_switch', $res->get_data()['reason'] ?? null, 'the ACK must report the kill switch');
+    TestRunner::assertSame(0, count(alegra_mock_requests()), 'no handler work may hit Alegra');
+});
+
 exit(TestRunner::summary());

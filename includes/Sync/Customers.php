@@ -335,6 +335,16 @@ class Customers
 
     private function import_single_contact(array $contact): bool|string
     {
+        // REQ-RB-2: honour the kill switch and the cancellation flag like
+        // import_from_alegra(). The return type is bool|string, so the "stop"
+        // sentinel is 'skipped' (a WP_Error would be a TypeError).
+        if (\Alegra\Connector\Kill_Switch::is_active() || get_transient('alegra_sync_cancelled')) {
+            $this->logger->info('Contact import skipped: kill switch active or sync cancelled', [
+                'alegra_id' => (string) ($contact['id'] ?? ''),
+            ]);
+            return 'skipped';
+        }
+
         $alegra_id = $contact['id'];
         $email = $contact['email'] ?? '';
 

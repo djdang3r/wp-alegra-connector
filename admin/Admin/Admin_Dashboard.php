@@ -524,7 +524,7 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => max(1, min(100, (int) $v)),
             'default' => 20,
         ]);
-        // Manual Consumidor Final override (read by Consumidor_Final::get_id()).
+        // Manual Consumidor Final override (read by Consumidor_Final::peek_id()).
         register_setting('alegra_connector_settings', 'alegra_connector_consumidor_final_manual_override', [
             'sanitize_callback' => 'rest_sanitize_boolean',
             'default' => false,
@@ -1945,6 +1945,19 @@ class Admin_Dashboard
         $state = get_transient('alegra_batch_state');
         if (!$state) wp_send_json_error(['message' => __('No hay un proceso de sincronización en curso.', 'alegra-connector')]);
 
+        // REQ-RB-2: honour the cancellation flag at the START of every batch so
+        // the chunked flow stops in the next batch instead of running to the
+        // end. (Per-item cancellation is also enforced by the importers.)
+        if (get_transient('alegra_sync_cancelled')) {
+            delete_transient('alegra_sync_progress');
+            delete_transient('alegra_batch_state');
+            wp_send_json_success([
+                'done'      => true,
+                'cancelled' => true,
+                'message'   => __('Sincronización cancelada.', 'alegra-connector'),
+            ]);
+        }
+
         $page = ((int) ($state['page'] ?? 0)) + 1;
         $type = $state['type'];
         $per_page = 30; // Max allowed by Alegra API
@@ -3076,6 +3089,19 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('No hay pedidos pendientes', 'alegra-connector')]);
         }
 
+        // REQ-RB-2: stop the chunked invoicing in the next batch when the
+        // merchant cancelled. `ajax_cancel_sync` does not clear this state, so
+        // the flag is the only signal here.
+        if (get_transient('alegra_sync_cancelled')) {
+            delete_transient('alegra_sync_progress');
+            delete_transient('alegra_pending_invoice_batch');
+            wp_send_json_success([
+                'done'      => true,
+                'cancelled' => true,
+                'message'   => __('Sincronización cancelada.', 'alegra-connector'),
+            ]);
+        }
+
         $orders_sync = new Sync\Orders($this->api, $this->logger);
         $batch = array_splice($state['order_ids'], 0, 10);
 
@@ -3157,24 +3183,48 @@ class Admin_Dashboard
         // Clears the whole integration config: admin-level (AC-33).
         if (!current_user_can('manage_options')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
 
-        // 1. Activate kill switch IMMEDIATELY so any in-flight request stops
-        \Alegra\Connector\Kill_Switch::activate('user_disconnected');
-
-        // 2. Clean up webhook subscriptions in Alegra (best-effort, no fatal error if it fails)
+        // 1. Delete the webhook subscriptions in Alegra FIRST (REQ-RB-3). The old
+        //    order activated the kill switch first, so the write gate blocked
+        //    these DELETEs and the remote subscriptions were orphaned.
         $subscriptions = (array) get_option('alegra_connector_webhook_subscriptions', []);
-        foreach ($subscriptions as $sub) {
-            $id = $sub['id'] ?? '';
-            if (!empty($id) && $this->api) {
+        $deleted = 0;
+        $blocked = 0;
+        $simulated = 0;
+        if ($this->api) {
+            foreach ($subscriptions as $sub) {
+                $id = (string) ($sub['id'] ?? '');
+                if ($id === '') {
+                    continue;
+                }
                 try {
-                    $this->api->delete_webhook_subscription((string) $id);
+                    $result = $this->api->delete_webhook_subscription($id);
                 } catch (\Throwable $e) {
                     $this->log('warning', 'Failed to delete webhook subscription', [
                         'subscription_id' => $id,
                         'error' => $e->getMessage(),
                     ]);
+                    continue;
+                }
+
+                // Count only what the API actually deleted. A dry-run or a
+                // gate-blocked response means nothing reached Alegra.
+                if (API\Client::is_gate_blocked_response($result)) {
+                    $blocked++;
+                } elseif (API\Client::is_dry_run_response($result)) {
+                    $simulated++;
+                } elseif (is_wp_error($result)) {
+                    $this->log('warning', 'Failed to delete webhook subscription', [
+                        'subscription_id' => $id,
+                        'error' => $result->get_error_message(),
+                    ]);
+                } else {
+                    $deleted++;
                 }
             }
         }
+
+        // 2. NOW activate the kill switch, after the cleanup reached Alegra.
+        \Alegra\Connector\Kill_Switch::activate('user_disconnected');
         delete_option('alegra_connector_webhook_subscriptions');
 
         // 3. Clear ALL alegra_* transients (1 query, efficient)
@@ -3199,15 +3249,49 @@ class Admin_Dashboard
         update_option('alegra_connector_company_email', '');
         update_option('alegra_connector_disconnected_at', current_time('mysql'));
 
-        $this->log('info', 'Disconnected from Alegra (kill switch active, all resources cleaned)');
+        $this->log('info', 'Disconnected from Alegra (kill switch active, all resources cleaned)', [
+            'webhooks_deleted'   => $deleted,
+            'webhooks_blocked'   => $blocked,
+            'webhooks_simulated' => $simulated,
+        ]);
+
+        $cleaned = [
+            'transients_cleared' => true,
+            'cron_cleared'       => count($cron_hooks),
+            'webhooks_deleted'   => $deleted,
+            'webhooks_blocked'   => $blocked,
+            'webhooks_simulated' => $simulated,
+        ];
+
+        // Already disconnected: the gate blocked every DELETE. Report the block
+        // honestly instead of claiming the webhooks were removed (REQ-RB-3).
+        if ($blocked > 0 && $deleted === 0 && $simulated === 0) {
+            wp_send_json_error([
+                'message'            => __('La configuración bloqueó la eliminación de webhooks; no se envió nada a Alegra.', 'alegra-connector'),
+                'blocked'            => true,
+                'reason'             => 'kill_switch',
+                'webhooks_deleted'   => $deleted,
+                'webhooks_simulated' => $simulated,
+                'cleaned'            => $cleaned,
+            ]);
+        }
+
+        // Dry-run: nothing reached Alegra; do not report the local count as deleted.
+        if ($simulated > 0) {
+            wp_send_json_success([
+                'dry_run'            => true,
+                'message'            => __('Modo de prueba activo: no se eliminó ningún webhook en Alegra.', 'alegra-connector'),
+                'webhooks_deleted'   => $deleted,
+                'webhooks_simulated' => $simulated,
+                'cleaned'            => $cleaned,
+            ]);
+        }
 
         wp_send_json_success([
-            'message' => __('Desconectado de Alegra. Procesos detenidos, configuracion preservada.', 'alegra-connector'),
-            'cleaned' => [
-                'transients_cleared' => true,
-                'cron_cleared' => count($cron_hooks),
-                'webhooks_deleted' => count($subscriptions),
-            ],
+            'message'            => __('Desconectado de Alegra. Procesos detenidos, configuracion preservada.', 'alegra-connector'),
+            'webhooks_deleted'   => $deleted,
+            'webhooks_simulated' => $simulated,
+            'cleaned'            => $cleaned,
         ]);
     }
 

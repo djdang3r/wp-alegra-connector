@@ -80,6 +80,17 @@ class Receiver
             return new \WP_REST_Response(['error' => 'Invalid signature'], 401);
         }
 
+        // Kill switch: the plugin is disconnected, so process nothing. ACK with
+        // 200 (a non-2XX would count toward Alegra's 10-strike deletion of the
+        // subscription) but skip every handler and local mutation. The kill
+        // switch already blocks any write a handler could attempt (REQ-ENF-1).
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            if ($this->logger) {
+                $this->logger->warning('Webhook ignored: kill switch active');
+            }
+            return new \WP_REST_Response(['received' => true, 'ignored' => true, 'reason' => 'kill_switch'], 200);
+        }
+
         $payload = json_decode($body, true);
 
         // A body we cannot parse, or one without a string subject, is ignored

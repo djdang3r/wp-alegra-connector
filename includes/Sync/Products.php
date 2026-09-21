@@ -1427,6 +1427,17 @@ class Products
      */
     private function import_single_item_from_alegra(array $item): bool|string
     {
+        // REQ-RB-2: the per-item importer must honour the kill switch and the
+        // cancellation flag, exactly like import_from_alegra(). The return type
+        // is bool|string, so the "stop" sentinel is 'skipped' (a WP_Error would
+        // be a TypeError). Nothing is fetched or written.
+        if (\Alegra\Connector\Kill_Switch::is_active() || get_transient('alegra_sync_cancelled')) {
+            $this->logger->info('Item import skipped: kill switch active or sync cancelled', [
+                'alegra_id' => (string) ($item['id'] ?? ''),
+            ]);
+            return 'skipped';
+        }
+
         $alegra_id = (string) ($item['id'] ?? '');
         $sku = $item['reference'] ?? '';
         $name = $item['name'] ?? '';

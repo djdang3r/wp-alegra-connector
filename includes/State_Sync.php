@@ -71,6 +71,26 @@ class State_Sync
      */
     public static function handle_refund(int $order_id, int $refund_id = 0): array|\WP_Error
     {
+        // Fast-path: the authority is Client::request() (Write_Gate). With the
+        // kill switch active every write is blocked there, so skip the lock and
+        // the API round-trip here. The marker mirrors the gate's shape so
+        // callers that check Client::write_was_blocked() behave identically.
+        // (The entity gate — `credit_note` => `alegra_connector_push_orders_enabled`
+        // — decides the automatic refund in manual mode; the gate, not this
+        // method, is the authority.)
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            self::log('warning', 'Refund sync skipped (kill switch active)', [
+                'order_id'  => $order_id,
+                'refund_id' => $refund_id,
+            ]);
+            return [
+                'blocked_by_gate' => true,
+                'reason'          => 'kill_switch',
+                'entity'          => 'credit_note',
+                'blocked'         => 'POST /credit-notes',
+            ];
+        }
+
         $lock_key = sprintf('alegra_sync_refund_lock_%d_%d', $order_id, $refund_id);
 
         $token = \Alegra\Connector\Sync\Controller::acquire_lock($lock_key, 30);
@@ -235,6 +255,18 @@ class State_Sync
      */
     public static function handle_payment_method_change(int $order_id): void
     {
+        // Fast-path: the authority is Client::request() (Write_Gate). With the
+        // kill switch active the invoice update is blocked there; skip the
+        // bookkeeping here. In manual mode (`push_orders_enabled = false`) the
+        // entity gate blocks the automatic `PUT /invoices/{id}` too — a merchant
+        // who wants it must trigger it explicitly (Write_Gate::run_explicit()).
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            self::log('warning', 'Payment method sync skipped (kill switch active)', [
+                'order_id' => $order_id,
+            ]);
+            return;
+        }
+
         if (!function_exists('wc_get_order')) {
             return;
         }

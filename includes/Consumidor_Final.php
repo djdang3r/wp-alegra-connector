@@ -31,15 +31,17 @@ class Consumidor_Final
     private const LOCK_TTL           = 60;
 
     /**
-     * Get the Consumidor Final contact ID, resolving it lazily if needed.
+     * Read the Consumidor Final contact ID WITHOUT touching the network or
+     * creating anything (REQ-RB-1).
      *
-     * Resolution order: manual override → transient cache → option cache →
-     * live resolution against the Alegra API. Returns false when the contact
-     * cannot be resolved.
+     * Resolution order: manual override → transient cache → option cache. A
+     * miss returns false; it never calls resolve()/create(). This is the
+     * read-only check a page render must use (the dashboard previously called
+     * get_id(), so merely viewing it could POST /contacts).
      *
-     * @return string|false Contact ID on success, false otherwise.
+     * @return string|false Contact ID when cached/overridden, false otherwise.
      */
-    public static function get_id(): string|false
+    public static function peek_id(): string|false
     {
         // 1. Manual override wins when present and non-empty.
         if (get_option('alegra_connector_consumidor_final_manual_override', false)) {
@@ -55,14 +57,50 @@ class Consumidor_Final
             return $cached;
         }
 
-        // 3. Option cache — hydrate the transient for subsequent requests.
+        // 3. Option cache. No transient hydration: this is a read-only peek.
         $option = get_option(self::cache_key(self::OPTION_KEY), '');
         if (is_string($option) && $option !== '') {
-            set_transient(self::cache_key(self::CACHE_TRANSIENT), $option, self::CACHE_TTL);
             return $option;
         }
 
-        // 4. Lazy resolution.
+        return false;
+    }
+
+    /**
+     * Whether the Consumidor Final contact is already resolved/cached.
+     *
+     * Read-only: safe to call from a page render (REQ-RB-1).
+     */
+    public static function is_configured(): bool
+    {
+        return self::peek_id() !== false;
+    }
+
+    /**
+     * Get the Consumidor Final contact ID, resolving it lazily if needed.
+     *
+     * Resolution order: manual override → transient cache → option cache →
+     * live resolution against the Alegra API. Returns false when the contact
+     * cannot be resolved.
+     *
+     * WARNING: this may WRITE (POST /contacts) when the contact is not cached.
+     * Never call it from a page render — use peek_id()/is_configured() there.
+     *
+     * @return string|false Contact ID on success, false otherwise.
+     */
+    public static function get_or_create_id(): string|false
+    {
+        // Serve every cached/override representation first (read-only).
+        $peeked = self::peek_id();
+        if ($peeked !== false) {
+            // Hydrate the transient when the option cache served it.
+            if (get_transient(self::cache_key(self::CACHE_TRANSIENT)) === false) {
+                set_transient(self::cache_key(self::CACHE_TRANSIENT), $peeked, self::CACHE_TTL);
+            }
+            return $peeked;
+        }
+
+        // Lazy resolution (may create the contact).
         $resolved = self::resolve();
         if ($resolved === false) {
             return false;
@@ -72,6 +110,19 @@ class Consumidor_Final
         update_option(self::cache_key(self::OPTION_KEY), $resolved);
 
         return $resolved;
+    }
+
+    /**
+     * Backwards-compatible alias of get_or_create_id().
+     *
+     * @deprecated Use get_or_create_id() for the write path, or
+     *             peek_id()/is_configured() for read-only checks.
+     *
+     * @return string|false
+     */
+    public static function get_id(): string|false
+    {
+        return self::get_or_create_id();
     }
 
     /**
@@ -211,6 +262,20 @@ class Consumidor_Final
      */
     private static function create(Client $client): string|false
     {
+        // REQ-RB-1: creating the CF contact is a WRITE. It must only happen from
+        // a merchant action (explicit context) or when the `contact` entity is
+        // enabled for automatic writes (`push_customers_enabled`) — never from a
+        // page render. The dashboard uses is_configured()/peek_id() and never
+        // reaches here; this is the hard defence in depth. It mirrors the entity
+        // gate exactly (explicit OR push_customers_enabled), so no automatic
+        // invoice path that could write the contact before is broken.
+        if (!\Alegra\Connector\Write_Gate::is_explicit()
+            && !get_option('alegra_connector_push_customers_enabled', false)
+        ) {
+            self::log_error('Consumidor Final: creación bloqueada (requiere acción explícita o push de clientes habilitado)');
+            return false;
+        }
+
         $result = $client->create_contact(self::build_create_payload());
 
         // Dry run / Write Gate: the contact was NOT created. Never cache a fake id.
@@ -310,10 +375,15 @@ class Consumidor_Final
 
     /**
      * Whether the Consumidor Final contact is available for use.
+     *
+     * WARNING: this resolves (and may CREATE) the contact. A page render must
+     * use is_configured()/peek_id() instead (REQ-RB-1).
+     *
+     * @deprecated Use is_configured() for read-only checks.
      */
     public static function is_available(): bool
     {
-        return self::get_id() !== false;
+        return self::get_or_create_id() !== false;
     }
 
     /**
