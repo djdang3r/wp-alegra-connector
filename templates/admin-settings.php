@@ -75,10 +75,10 @@
 </fieldset></td></tr>
 <tr><th><label for="alegra_connector_sync_frequency"><?php esc_html_e('Frecuencia periodica:','alegra-connector');?></label></th><td><select id="alegra_connector_sync_frequency" name="alegra_connector_sync_frequency"><option value="5" <?php selected(get_option('alegra_connector_sync_frequency'),5);?>>5 min</option><option value="15" <?php selected(get_option('alegra_connector_sync_frequency',15),15);?>>15 min</option><option value="30" <?php selected(get_option('alegra_connector_sync_frequency'),30);?>>30 min</option><option value="60" <?php selected(get_option('alegra_connector_sync_frequency'),60);?>>1 hora</option></select><p class="description"><?php esc_html_e('Cada cuanto tiempo se ejecuta la sincronizacion automatica. Solo aplica si usas modo Periódica o Ambos.','alegra-connector');?></p></td></tr>
 <tr><th><?php esc_html_e('Entidades a sincronizar:','alegra-connector');?></th><td><fieldset>
-<label><input type="checkbox" name="alegra_connector_sync_products" value="1" <?php checked(get_option('alegra_connector_sync_products',true));?>> <?php esc_html_e('Productos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae productos, variaciones e imagenes desde Alegra.','alegra-connector');?></p>
-<label><input type="checkbox" name="alegra_connector_sync_customers" value="1" <?php checked(get_option('alegra_connector_sync_customers',true));?>> <?php esc_html_e('Clientes','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae contactos desde Alegra a la lista de clientes de WooCommerce.','alegra-connector');?></p>
-<label><input type="checkbox" name="alegra_connector_sync_orders" value="1" <?php checked(get_option('alegra_connector_sync_orders',true));?>> <?php esc_html_e('Pedidos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Verifica el estado de las facturas en Alegra y actualiza los pedidos cuando se pagan.','alegra-connector');?></p>
-<label><input type="checkbox" name="alegra_connector_sync_categories" value="1" <?php checked(get_option('alegra_connector_sync_categories',true));?>> <?php esc_html_e('Categorías','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae categorias de items desde Alegra.','alegra-connector');?></p>
+<label><input type="checkbox" name="alegra_connector_sync_products" value="1" <?php checked(get_option('alegra_connector_sync_products',false));?>> <?php esc_html_e('Productos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae productos, variaciones e imagenes desde Alegra.','alegra-connector');?></p>
+<label><input type="checkbox" name="alegra_connector_sync_customers" value="1" <?php checked(get_option('alegra_connector_sync_customers',false));?>> <?php esc_html_e('Clientes','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae contactos desde Alegra a la lista de clientes de WooCommerce.','alegra-connector');?></p>
+<label><input type="checkbox" name="alegra_connector_sync_orders" value="1" <?php checked(get_option('alegra_connector_sync_orders',false));?>> <?php esc_html_e('Pedidos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Verifica el estado de las facturas en Alegra y actualiza los pedidos cuando se pagan.','alegra-connector');?></p>
+<label><input type="checkbox" name="alegra_connector_sync_categories" value="1" <?php checked(get_option('alegra_connector_sync_categories',false));?>> <?php esc_html_e('Categorías','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Trae categorias de items desde Alegra.','alegra-connector');?></p>
 <label><input type="checkbox" name="alegra_connector_sync_images" value="1" <?php checked(get_option('alegra_connector_sync_images',true));?>> <?php esc_html_e('Imagenes de productos','alegra-connector');?></label><p class="description" style="margin:0 0 6px 24px;"><?php esc_html_e('Activa la sincronizacion bidireccional de imagenes de productos. Al desactivar, no se descargan ni se suben imagenes.','alegra-connector');?></p>
 <div style="margin:0 0 12px 24px;">
 <label style="font-size:12px;font-weight:600;color:var(--ac-text-secondary);display:block;margin-bottom:4px;"><?php esc_html_e('Al traer desde Alegra:','alegra-connector');?></label>
@@ -99,6 +99,10 @@
 <tr><th><?php esc_html_e('Subir productos a Alegra:','alegra-connector');?></th><td><fieldset>
 <label><input type="checkbox" name="alegra_connector_push_products_enabled" value="1" <?php checked(get_option('alegra_connector_push_products_enabled',false));?>> <strong><?php esc_html_e('Activar envio automatico de productos y clientes a Alegra','alegra-connector');?></strong></label>
 <p class="description" style="margin:2px 0 0 24px;"><?php esc_html_e('PRECAUCION: Al activar, cada vez que crees o actualices un producto o cliente en WooCommerce, se enviara automaticamente a Alegra. Esto puede sobrescribir datos existentes. Por defecto esta desactivado. Cuando este toggle esta apagado, solo puedes subir productos a Alegra manualmente desde los botones "Actualizar" de la pagina de detalle del producto, o usando los botones "Enviar seleccionados" del listado de productos.','alegra-connector');?></p>
+</fieldset></td></tr>
+<tr><th><?php esc_html_e('Subir clientes a Alegra:','alegra-connector');?></th><td><fieldset>
+<label><input type="checkbox" name="alegra_connector_push_customers_enabled" value="1" <?php checked(get_option('alegra_connector_push_customers_enabled',false));?>> <strong><?php esc_html_e('Activar envio automatico de clientes a Alegra','alegra-connector');?></strong></label>
+<p class="description" style="margin:2px 0 0 24px;"><?php esc_html_e('Independiente del envio de productos. Al activar, cada vez que crees o actualices un cliente en WooCommerce se enviara automaticamente a Alegra. Por defecto esta desactivado.','alegra-connector');?></p>
 </fieldset></td></tr>
 <?php $ac_product_cats = get_terms(['taxonomy'=>'product_cat','hide_empty'=>false]); if(is_wp_error($ac_product_cats))$ac_product_cats=[]; ?>
 <tr><th><label for="alegra_connector_push_category_strategy"><?php esc_html_e('Categoría a enviar a Alegra:','alegra-connector');?></label></th><td>
@@ -365,6 +369,15 @@ $ac_preserve_fields = [
 <p class="description"><?php esc_html_e('ID del termino de pago en Alegra. Conecta con Alegra para ver tus terminos.','alegra-connector');?></p>
 <?php endif;?>
 </td></tr>
+
+<!-- Payment reconciliation (REQ-CFG-1) -->
+<tr><th><?php esc_html_e('Reconciliacion automatica de pagos:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_payment_reconcile_enabled" value="1" <?php checked(get_option('alegra_connector_payment_reconcile_enabled',true));?>> <strong><?php esc_html_e('Registrar automaticamente los pagos de facturas ya vinculadas','alegra-connector');?></strong></label>
+<p class="description" style="margin:2px 0 0 24px;"><?php esc_html_e('Activa el barrido horario y los hooks que registran el pago en Alegra cuando una factura vinculada ya fue pagada en WooCommerce. Desactivado, no se registra ningun pago automatico (los pagos manuales siguen disponibles).','alegra-connector');?></p>
+</td></tr>
+<tr><th><label for="alegra_connector_payment_reconcile_batch"><?php esc_html_e('Pagos por corrida:','alegra-connector');?></label></th><td>
+<input type="number" id="alegra_connector_payment_reconcile_batch" name="alegra_connector_payment_reconcile_batch" value="<?php echo esc_attr(get_option('alegra_connector_payment_reconcile_batch',20));?>" class="small-text" min="1" max="100">
+<p class="description"><?php esc_html_e('Cuantos pedidos revisa cada corrida del barrido de pagos. Entre 1 y 100.','alegra-connector');?></p></td></tr>
 </table>
 
 <!-- ==================== WEBHOOKS ==================== -->

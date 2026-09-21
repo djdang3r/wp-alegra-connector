@@ -343,6 +343,13 @@ function sanitize_textarea_field($text)
     return trim(strip_tags((string) $text));
 }
 function sanitize_key($text) { return preg_replace('/[^a-z0-9_\-]/', '', strtolower((string) $text)); }
+function map_deep($value, $callback)
+{
+    if (is_array($value)) {
+        return array_map(static fn($item) => map_deep($item, $callback), $value);
+    }
+    return is_callable($callback) ? $callback($value) : $value;
+}
 function sanitize_title($title, $fallback_title = '', $context = 'save')
 {
     $title = strtolower(trim((string) $title));

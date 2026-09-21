@@ -200,6 +200,12 @@ final class Alegra_Connector
         // DB migrations on plugins_loaded (idempotent via dbDelta)
         add_action('plugins_loaded', [\Alegra\Connector\Schema::class, 'migrate'], 5);
 
+        // Option migration (REQ-CFG-2/4). Idempotent via a version guard; seeds
+        // push_customers_enabled from push_products_enabled on upgrade so the
+        // Phase-1 regression (absent -> false) cannot silently stop the
+        // automatic customer pushes an existing install already relied on.
+        add_action('plugins_loaded', [\Alegra\Connector\Write_Gate::class, 'maybe_migrate'], 5);
+
         // NOTE: Checkout_Integration::register() and State_Sync::register_hooks()
         // are wired from on_plugins_loaded() AFTER the WooCommerce guard (AC-17),
         // so they are never registered when WooCommerce is inactive.
@@ -406,6 +412,15 @@ final class Alegra_Connector
             'alegra_connector_sync_method' => 'cron',
             'alegra_connector_push_orders_enabled' => false,
             'alegra_connector_push_products_enabled' => false,
+            // Independent customer toggle (REQ-CFG-4). Fresh installs default to
+            // false; the upgrade migration seeds it from push_products_enabled
+            // so an existing install that relied on the shared hook keeps
+            // pushing customers.
+            'alegra_connector_push_customers_enabled' => false,
+            // Controllable payment sweep (REQ-CFG-1). Default true preserves the
+            // hourly retry sweep on an install that never toggled it.
+            'alegra_connector_payment_reconcile_enabled' => true,
+            'alegra_connector_payment_reconcile_batch' => 20,
             'alegra_connector_sync_products' => false,
             'alegra_connector_sync_customers' => false,
             'alegra_connector_sync_orders' => false,
@@ -436,6 +451,11 @@ final class Alegra_Connector
             'alegra_connector_sync_categories',
             'alegra_connector_log_retention_days',
             'alegra_connector_sync_inactive_products',
+            // Only read in admin/cron context (REQ-CFG-1).
+            'alegra_connector_payment_reconcile_enabled',
+            'alegra_connector_payment_reconcile_batch',
+            // Migration guard: never read on the frontend.
+            'alegra_connector_gate_migration_version',
         ];
 
         foreach ($defaults as $key => $value) {
@@ -443,6 +463,11 @@ final class Alegra_Connector
                 add_option($key, $value, '', in_array($key, $non_autoload, true) ? 'no' : 'yes');
             }
         }
+
+        // Seed the gate options the defaults loop above cannot cover (the
+        // migration version) and preserve an existing install's push choice
+        // (REQ-CFG-4). Idempotent.
+        \Alegra\Connector\Write_Gate::maybe_migrate();
 
         // Create/upgrade the schema immediately on activation (AC-06). The
         // plugins_loaded migration hook has already fired by the time an

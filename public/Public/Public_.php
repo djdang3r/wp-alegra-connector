@@ -66,13 +66,17 @@ class Public_
         add_action('woocommerce_order_status_processing', [$this, 'on_order_paid_reconcile'], 10, 1);
         add_action('woocommerce_order_status_completed', [$this, 'on_order_paid_reconcile'], 10, 1);
 
-        // Products and Customers hooks: DISABLED by default.
-        // These can only push data when the user explicitly enables this option,
-        // AND should still be triggered manually from the dashboard for safety.
+        // Product hooks: DISABLED by default. They push only when the merchant
+        // explicitly enables the products option.
         if (get_option('alegra_connector_push_products_enabled', false)) {
             add_action('woocommerce_new_product', [$this, 'on_new_product'], 10, 1);
             add_action('woocommerce_update_product', [$this, 'on_update_product'], 10, 1);
             add_action('woocommerce_delete_product', [$this, 'on_delete_product'], 10, 1);
+        }
+
+        // Customer hooks: an INDEPENDENT toggle (REQ-CFG-4). Enabling products
+        // must never enable customers on its own.
+        if (get_option('alegra_connector_push_customers_enabled', false)) {
             add_action('woocommerce_new_customer', [$this, 'on_new_customer'], 10, 1);
             add_action('woocommerce_update_customer', [$this, 'on_update_customer'], 10, 1);
         }

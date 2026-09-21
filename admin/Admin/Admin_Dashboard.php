@@ -410,6 +410,22 @@ class Admin_Dashboard
             'default' => false,
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_push_products_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
+        // Independent customer toggle (REQ-CFG-4): enabling products must never
+        // enable customers on its own.
+        register_setting('alegra_connector_settings', 'alegra_connector_push_customers_enabled', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
+        // Payment sweep controls (REQ-CFG-1): registered so the Avanzado tab can
+        // actually set them; read by Orders::reconcile_missing_payments().
+        register_setting('alegra_connector_settings', 'alegra_connector_payment_reconcile_enabled', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => true,
+        ]);
+        register_setting('alegra_connector_settings', 'alegra_connector_payment_reconcile_batch', [
+            'sanitize_callback' => [self::class, 'sanitize_reconcile_batch'],
+            'default' => 20,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_currency', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_log_retention_days', ['sanitize_callback' => 'intval']);
         register_setting('alegra_connector_settings', 'alegra_connector_conflict_resolution', ['sanitize_callback' => 'sanitize_text_field']);
@@ -451,16 +467,11 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_webhook_secret', [
             'sanitize_callback' => fn($value) => self::sanitize_masked_secret((string) $value, 'alegra_connector_webhook_secret'),
         ]);
-        register_setting('alegra_connector_settings', 'alegra_connector_field_mapping', [
-            'sanitize_callback' => function ($value) {
-                return is_array($value) ? map_deep($value, 'sanitize_text_field') : [];
-            },
-        ]);
-        register_setting('alegra_connector_settings', 'alegra_connector_tax_mapping', [
-            'sanitize_callback' => function ($value) {
-                return is_array($value) ? map_deep($value, 'sanitize_text_field') : [];
-            },
-        ]);
+        // NOTE: field_mapping / tax_mapping are registered ONLY in the
+        // `alegra_connector_mapping` group below. Registering them in
+        // `alegra_connector_settings` too made wp-admin/options.php null them
+        // when the Settings page (which does not render them) was saved
+        // (REQ-CFG-3).
         register_setting('alegra_connector_settings', 'alegra_connector_customer_resolution_mode', [
             'sanitize_callback' => function ($value) {
                 $allowed = ['auto', 'always_generic', 'require_data'];
@@ -559,16 +570,20 @@ class Admin_Dashboard
             update_option(\Alegra\Connector\Billing_Fields::OPTION_ENABLED, $seed);
         }
 
-        // Mapping settings group
-        register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping');
-        register_setting('alegra_connector_mapping', 'alegra_connector_tax_mapping');
+        // Mapping settings group. The callbacks treat null / a non-array as
+        // "no change" (keep the stored mapping) instead of wiping it, so any
+        // option_page that includes the option without posting every field is
+        // harmless (REQ-CFG-3, double defence).
+        register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping', [
+            'sanitize_callback' => [self::class, 'sanitize_field_mapping'],
+        ]);
+        register_setting('alegra_connector_mapping', 'alegra_connector_tax_mapping', [
+            'sanitize_callback' => [self::class, 'sanitize_tax_mapping'],
+        ]);
 
-        add_settings_section('alegra_connector_connection', __('Conexión con Alegra', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_sync_settings', __('Sincronización', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_currency_section', __('Moneda', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_warehouse_section', __('Bodegas', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_billing_section', __('Datos de facturación', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
-        add_settings_section('alegra_connector_advanced', __('Avanzado', 'alegra-connector'), fn() => null, 'alegra_connector_settings');
+        // The six settings sections were removed: do_settings_sections() is
+        // never called and the templates render their own tables, so the
+        // sections were pure dead code (REQ-HYG-2).
     }
 
     public function enqueue_assets(string $hook): void
@@ -1625,6 +1640,15 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce')) wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
 
         $sync_type = sanitize_text_field($_POST['sync_type'] ?? 'all');
+
+        // REQ-CFG-5: "Sincronizar ahora" must be honest. run_cron_sync() early
+        // returns when sync_method is not cron/both, which used to look like a
+        // silent success. Explain why instead.
+        $blocked = $this->sync_now_blocked_payload();
+        if ($blocked !== null) {
+            wp_send_json_error($blocked);
+        }
+
         $sync_controller = new Sync\Controller($this->api, $this->logger);
 
         if ($sync_type === 'all') {
@@ -1633,6 +1657,45 @@ class Admin_Dashboard
         }
         // For specific types, redirect to chunked sync via JS (handled by ajax_sync_start + ajax_sync_page)
         wp_send_json_success(['message' => __('ok', 'alegra-connector'), 'use_chunked' => true, 'type' => $sync_type]);
+    }
+
+    /**
+     * Why "Run now" / "Sincronizar ahora" cannot execute, or null when it can.
+     *
+     * Shared by ajax_sync_now() and ajax_run_cron_now() so both buttons tell the
+     * same truth (REQ-CFG-5). run_cron_sync() still keeps its own early-return
+     * as defence in depth.
+     *
+     * @return array{message:string,blocked:bool,reason:string}|null
+     */
+    private function sync_now_blocked_payload(): ?array
+    {
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            return [
+                'message' => __('El plugin está desconectado (kill switch activo). Reconéctalo antes de sincronizar.', 'alegra-connector'),
+                'blocked' => true,
+                'reason'  => 'kill_switch',
+            ];
+        }
+
+        $sync_method = (string) get_option('alegra_connector_sync_method', 'cron');
+        if (!in_array($sync_method, ['cron', 'both'], true)) {
+            $message = $sync_method === 'real-time'
+                ? __('El método de sincronización es "Solo Tiempo Real": no hay traída periódica que ejecutar. Cambialo a "Periódica" para usar esta acción.', 'alegra-connector')
+                : sprintf(
+                    /* translators: %s: current sync method */
+                    __('La sincronización periódica está desactivada (método actual: %s). Cambiala a "Periódica" o "Periódica + Tiempo Real" para ejecutar ahora.', 'alegra-connector'),
+                    $sync_method
+                );
+
+            return [
+                'message' => $message,
+                'blocked' => true,
+                'reason'  => 'sync_method',
+            ];
+        }
+
+        return null;
     }
 
     /**
@@ -1724,6 +1787,51 @@ class Admin_Dashboard
         }
 
         return array_values(array_unique($out));
+    }
+
+    /**
+     * Clamp the payment sweep batch size to 1..100 (REQ-CFG-1).
+     *
+     * Used as the `sanitize_callback` of
+     * `alegra_connector_payment_reconcile_batch`.
+     *
+     * @param mixed $value
+     */
+    public static function sanitize_reconcile_batch($value): int
+    {
+        return max(1, min(100, (int) $value));
+    }
+
+    /**
+     * Sanitize the field mapping without ever wiping it (REQ-CFG-3).
+     *
+     * A null / non-array value means the option was not posted in full; return
+     * the stored value so `update_option()` becomes a no-op instead of writing
+     * an empty array over the merchant's mapping.
+     *
+     * @param mixed $value
+     * @return array<string,mixed>
+     */
+    public static function sanitize_field_mapping($value): array
+    {
+        if (!is_array($value)) {
+            return (array) get_option('alegra_connector_field_mapping', []);
+        }
+        return map_deep($value, 'sanitize_text_field');
+    }
+
+    /**
+     * Sanitize the tax mapping without ever wiping it (REQ-CFG-3).
+     *
+     * @param mixed $value
+     * @return array<string,mixed>
+     */
+    public static function sanitize_tax_mapping($value): array
+    {
+        if (!is_array($value)) {
+            return (array) get_option('alegra_connector_tax_mapping', []);
+        }
+        return map_deep($value, 'sanitize_text_field');
     }
 
     /**
@@ -3300,6 +3408,13 @@ class Admin_Dashboard
         $allowed_hooks = ['alegra_connector_cron_sync'];
         if (!in_array($hook, $allowed_hooks, true)) {
             wp_send_json_error(['message' => __('Solo se permiten hooks de Alegra.', 'alegra-connector')]);
+        }
+
+        // REQ-CFG-5: do not queue a no-op. If the method is not periodic or the
+        // kill switch is active, explain why the run cannot happen.
+        $blocked = $this->sync_now_blocked_payload();
+        if ($blocked !== null) {
+            wp_send_json_error($blocked);
         }
 
         // Queue a ONE-OFF under a DEDICATED hook, then trigger WP's cron spawn

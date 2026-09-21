@@ -59,6 +59,10 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_sync_method');
     delete_option('alegra_connector_push_orders_enabled');
     delete_option('alegra_connector_push_products_enabled');
+    delete_option('alegra_connector_push_customers_enabled');
+    delete_option('alegra_connector_payment_reconcile_enabled');
+    delete_option('alegra_connector_payment_reconcile_batch');
+    delete_option('alegra_connector_gate_migration_version');
     delete_option('alegra_connector_currency');
     delete_option('alegra_connector_log_retention_days');
     delete_option('alegra_connector_log_suffix');

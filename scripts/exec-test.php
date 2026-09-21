@@ -4758,4 +4758,230 @@ TestRunner::test('T-GATE-9 kill switch ON: an automatic refund writes zero credi
     TestRunner::assertSame('', (string) $order->get_meta('_alegra_credited_amount', true), '_alegra_credited_amount must not be written');
 });
 
+// ===========================================================================
+// T-CFG2 — Phase 2: configuration honesty + migration (REQ-CFG-1..5, HYG-2)
+//
+// The Phase-1 gate made `push_customers_enabled` authoritative for contacts.
+// It is absent -> false, so an existing install that relied on the shared
+// `push_products_enabled` hook would silently stop pushing customers. These
+// tests prove the migration closes that gap, that the payment sweep is
+// controllable, that the UI defaults match the runtime, that saving Settings
+// no longer wipes the mappings, and that "Run now" explains itself.
+// ===========================================================================
+echo "\nT-CFG2 — Config honesty + migration\n";
+
+function cfg2_source(string $relative): string
+{
+    return (string) file_get_contents($GLOBALS['alegra_plugin_root'] . $relative);
+}
+
+TestRunner::test('T-CFG2-1 migration seeds push_customers_enabled from push_products_enabled (Phase-1 regression)', function (): void {
+    alegra_test_reset();
+    // Existing install: products enabled, the new customer option never existed.
+    update_option('alegra_connector_push_products_enabled', true);
+    unset($GLOBALS['wp_options']['alegra_connector_push_customers_enabled']);
+    unset($GLOBALS['wp_options']['alegra_connector_gate_migration_version']);
+
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+
+    TestRunner::assertSame(true, get_option('alegra_connector_push_customers_enabled'), 'the migration must seed customers from products (true)');
+    TestRunner::assertSame(1, (int) get_option('alegra_connector_gate_migration_version'), 'the migration version must advance');
+
+    // The gate must now ALLOW an automatic contact write (kill switch off).
+    $r = make_api()->create_contact(['name' => 'Migrated Co']);
+    TestRunner::assertFalse(\Alegra\Connector\API\Client::write_was_blocked($r), 'an automatic contact write must not be blocked after migration');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'the contact write must reach Alegra');
+});
+
+TestRunner::test('T-CFG2-2 fresh install (products off) seeds push_customers_enabled = false', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_products_enabled', false);
+    unset($GLOBALS['wp_options']['alegra_connector_push_customers_enabled']);
+    unset($GLOBALS['wp_options']['alegra_connector_gate_migration_version']);
+
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+
+    TestRunner::assertSame(false, get_option('alegra_connector_push_customers_enabled'), 'no products push => no customers push');
+
+    // The activation defaults also carry false, so a brand-new install agrees.
+    $bootstrap = cfg2_source('alegra-connector.php');
+    TestRunner::assertStringContains("'alegra_connector_push_customers_enabled' => false", $bootstrap, 'the activation default must be false');
+});
+
+TestRunner::test('T-CFG2-3 the migration is idempotent and guarded by the version option', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_products_enabled', true);
+    unset($GLOBALS['wp_options']['alegra_connector_push_customers_enabled']);
+    unset($GLOBALS['wp_options']['alegra_connector_gate_migration_version']);
+
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+    $first = [
+        'customers' => get_option('alegra_connector_push_customers_enabled'),
+        'reconcile' => get_option('alegra_connector_payment_reconcile_enabled'),
+        'batch' => get_option('alegra_connector_payment_reconcile_batch'),
+        'version' => (int) get_option('alegra_connector_gate_migration_version'),
+    ];
+
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+
+    TestRunner::assertSame($first['customers'], get_option('alegra_connector_push_customers_enabled'), 'a second run must not change customers');
+    TestRunner::assertSame($first['reconcile'], get_option('alegra_connector_payment_reconcile_enabled'), 'a second run must not change reconcile');
+    TestRunner::assertSame($first['batch'], get_option('alegra_connector_payment_reconcile_batch'), 'a second run must not change the batch');
+    TestRunner::assertSame(1, (int) get_option('alegra_connector_gate_migration_version'), 'the version must stay 1');
+
+    // Version guard: once migrated, a deleted option is NOT resurrected.
+    unset($GLOBALS['wp_options']['alegra_connector_push_customers_enabled']);
+    update_option('alegra_connector_push_products_enabled', true);
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+    TestRunner::assertFalse(array_key_exists('alegra_connector_push_customers_enabled', $GLOBALS['wp_options']), 'the version guard must stop a second migration from re-seeding');
+});
+
+TestRunner::test('T-CFG2-4 the migration is actually wired (hook + activation)', function (): void {
+    $bootstrap = cfg2_source('alegra-connector.php');
+    TestRunner::assertStringContains("Write_Gate::class, 'maybe_migrate'", $bootstrap, 'the migration must run on plugins_loaded');
+    TestRunner::assertStringContains('Write_Gate::maybe_migrate()', $bootstrap, 'the migration must also run on activation');
+});
+
+TestRunner::test('T-CFG2-5 payment_reconcile_enabled/_batch are registered and exposed', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    $tpl = cfg2_source('templates/admin-settings.php');
+
+    TestRunner::assertStringContains("register_setting('alegra_connector_settings', 'alegra_connector_payment_reconcile_enabled'", $admin, 'the sweep flag must be registered');
+    TestRunner::assertStringContains("register_setting('alegra_connector_settings', 'alegra_connector_payment_reconcile_batch'", $admin, 'the batch must be registered');
+    TestRunner::assertStringContains('name="alegra_connector_payment_reconcile_enabled"', $tpl, 'the sweep flag must be rendered');
+    TestRunner::assertStringContains('name="alegra_connector_payment_reconcile_batch"', $tpl, 'the batch must be rendered');
+
+    $bootstrap = cfg2_source('alegra-connector.php');
+    TestRunner::assertStringContains("'alegra_connector_payment_reconcile_enabled' => true", $bootstrap, 'the default must preserve the sweep (branch A)');
+    TestRunner::assertStringContains("'alegra_connector_payment_reconcile_batch' => 20", $bootstrap, 'the default batch must be 20');
+});
+
+TestRunner::test('T-CFG2-6 the hourly sweep honours payment_reconcile_enabled', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_reconcilable_order(9801, 'inv-cfg2-6');
+
+    update_option('alegra_connector_payment_reconcile_enabled', false);
+    $off = make_controller()->run_payment_reconcile();
+    TestRunner::assertSame('skipped_disabled', (string) ($off['skipped'] ?? ''), 'a disabled sweep must report skipped_disabled');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'a disabled sweep must post no payment');
+
+    update_option('alegra_connector_payment_reconcile_enabled', true);
+    make_controller()->run_payment_reconcile();
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'an enabled sweep must post the payment');
+});
+
+TestRunner::test('T-CFG2-7 the batch sanitizer clamps to 1..100', function (): void {
+    TestRunner::assertSame(1, \Alegra\Connector\Admin\Admin_Dashboard::sanitize_reconcile_batch(0), '0 must clamp up to 1');
+    TestRunner::assertSame(1, \Alegra\Connector\Admin\Admin_Dashboard::sanitize_reconcile_batch(-7), 'a negative must clamp to 1');
+    TestRunner::assertSame(100, \Alegra\Connector\Admin\Admin_Dashboard::sanitize_reconcile_batch(999), '999 must clamp down to 100');
+    TestRunner::assertSame(20, \Alegra\Connector\Admin\Admin_Dashboard::sanitize_reconcile_batch(20), 'a valid value must pass through');
+});
+
+TestRunner::test('T-CFG2-8 the four sync_* checkboxes use the runtime default (false)', function (): void {
+    $tpl = cfg2_source('templates/admin-settings.php');
+
+    foreach (['sync_products', 'sync_customers', 'sync_orders', 'sync_categories'] as $key) {
+        $opt = 'alegra_connector_' . $key;
+        TestRunner::assertStringNotContains("get_option('$opt',true)", $tpl, "$opt must not default to true in the UI");
+        TestRunner::assertStringContains("get_option('$opt',false)", $tpl, "$opt must default to false in the UI");
+        // Absent option: UI default == runtime default == false.
+        TestRunner::assertSame(false, get_option($opt, false), "$opt must read as false when absent");
+    }
+});
+
+TestRunner::test('T-CFG2-9 saving Settings no longer wipes field_mapping / tax_mapping', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_field_mapping', ['default_category' => 'cat-1']);
+    update_option('alegra_connector_tax_mapping', ['iva' => 'tax-1']);
+
+    TestRunner::assertSame(['default_category' => 'cat-1'], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_field_mapping(null), 'a null field_mapping must keep the stored value');
+    TestRunner::assertSame(['iva' => 'tax-1'], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_tax_mapping(null), 'a null tax_mapping must keep the stored value');
+    TestRunner::assertSame(['default_category' => 'cat-2'], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_field_mapping(['default_category' => 'cat-2']), 'a real mapping update must still apply');
+
+    // One registration per mapping option, in the mapping group only.
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains("register_setting('alegra_connector_settings', 'alegra_connector_field_mapping'", $admin, 'field_mapping must not be in the Settings group');
+    TestRunner::assertStringNotContains("register_setting('alegra_connector_settings', 'alegra_connector_tax_mapping'", $admin, 'tax_mapping must not be in the Settings group');
+    TestRunner::assertStringContains("register_setting('alegra_connector_mapping', 'alegra_connector_field_mapping'", $admin, 'field_mapping must be registered in the mapping group');
+    TestRunner::assertStringContains("register_setting('alegra_connector_mapping', 'alegra_connector_tax_mapping'", $admin, 'tax_mapping must be registered in the mapping group');
+});
+
+TestRunner::test('T-CFG2-10 the customer hooks are independent of the product hooks (REQ-CFG-4)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_products_enabled', true);
+    update_option('alegra_connector_push_customers_enabled', false);
+    $public = make_public();
+
+    TestRunner::assertTrue(has_action('woocommerce_new_product', [$public, 'on_new_product']) !== false, 'products on => product hook registered');
+    TestRunner::assertFalse(has_action('woocommerce_new_customer', [$public, 'on_new_customer']), 'products on + customers off => customer hook must NOT register');
+
+    alegra_test_reset();
+    update_option('alegra_connector_push_customers_enabled', true);
+    $public2 = make_public();
+    TestRunner::assertTrue(has_action('woocommerce_new_customer', [$public2, 'on_new_customer']) !== false, 'customers on => customer hook registered');
+});
+
+TestRunner::test('T-CFG2-11 "Sincronizar ahora" with a non-periodic method explains instead of no-op', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'disabled');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['sync_type' => 'all'];
+
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_now());
+    $_POST = [];
+
+    TestRunner::assertFalse($resp->success, 'a disabled method must return an error, not a fake success');
+    TestRunner::assertStringContains('desactivada', (string) ($resp->payload['message'] ?? ''), 'the message must say the periodic sync is disabled');
+    TestRunner::assertSame('sync_method', $resp->payload['reason'] ?? null, 'the reason must be sync_method');
+    TestRunner::assertSame(0, count(alegra_single_events('alegra_connector_cron_sync_now')), 'no cron event may be queued');
+
+    update_option('alegra_connector_sync_method', 'real-time');
+    $_POST = ['sync_type' => 'all'];
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_sync_now());
+    $_POST = [];
+    TestRunner::assertFalse($resp2->success, 'real-time only must return an error');
+    TestRunner::assertStringContains('Tiempo Real', (string) ($resp2->payload['message'] ?? ''), 'the message must explain the real-time-only mode');
+});
+
+TestRunner::test('T-CFG2-12 "Run now" with the kill switch active explains the disconnection', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['hook' => 'alegra_connector_cron_sync'];
+
+    $resp = alegra_capture_json(fn () => $admin->ajax_run_cron_now());
+    $_POST = [];
+
+    TestRunner::assertFalse($resp->success, 'the kill switch must block Run now');
+    TestRunner::assertStringContains('desconectado', (string) ($resp->payload['message'] ?? ''), 'the message must explain the kill switch');
+    TestRunner::assertSame('kill_switch', $resp->payload['reason'] ?? null, 'the reason must be kill_switch');
+    TestRunner::assertSame(0, count(alegra_single_events('alegra_connector_cron_sync_now')), 'no cron event may be queued');
+});
+
+TestRunner::test('T-CFG2-13 "Sincronizar ahora" with a periodic method executes', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'cron');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['sync_type' => 'all'];
+
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_now());
+    $_POST = [];
+
+    TestRunner::assertTrue($resp->success, 'a periodic method must execute');
+});
+
+TestRunner::test('T-CFG2-14 the decorative settings sections are gone (REQ-HYG-2)', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains('add_settings_section(', $admin, 'the 6 dead sections must be removed');
+});
+
+TestRunner::test('T-CFG2-15 uninstall removes the new options (REQ-CFG-1)', function (): void {
+    $uninstall = cfg2_source('uninstall.php');
+    TestRunner::assertStringContains("delete_option('alegra_connector_payment_reconcile_enabled')", $uninstall, 'uninstall must delete the sweep flag');
+    TestRunner::assertStringContains("delete_option('alegra_connector_payment_reconcile_batch')", $uninstall, 'uninstall must delete the batch');
+    TestRunner::assertStringContains("delete_option('alegra_connector_push_customers_enabled')", $uninstall, 'uninstall must delete the customer toggle');
+    TestRunner::assertStringContains("delete_option('alegra_connector_gate_migration_version')", $uninstall, 'uninstall must delete the migration version');
+});
+
 exit(TestRunner::summary());

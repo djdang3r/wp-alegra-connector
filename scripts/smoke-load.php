@@ -569,12 +569,21 @@ check(
     '— the identification must be mirrored on customer pull'
 );
 
-// ---- 32: new admin settings section ----
-echo "\n[32] New admin settings section renders\n";
+// ---- 32: billing fields are actually rendered by the settings template ----
+// REQ-HYG-2: the 6 decorative add_settings_section() calls were removed (no
+// do_settings_sections() / add_settings_field() existed). The meaningful
+// assertion is that the settings template renders the billing controls.
+echo "\n[32] Billing fields render in the settings template\n";
+$settings_tpl_src = file_source($plugin_root . 'templates/admin-settings.php');
 check(
-    "add_settings_section('alegra_connector_billing_section', ...) is registered",
-    str_contains($admin_src, "add_settings_section('alegra_connector_billing_section'"),
-    '— the Datos de facturación section must exist in settings'
+    'templates/admin-settings.php renders the billing field controls',
+    str_contains($settings_tpl_src, 'alegra_connector_billing_field_catalog_enabled'),
+    '— the Datos de facturación controls must be rendered by the template'
+);
+check(
+    'no decorative add_settings_section() remains in Admin_Dashboard.php',
+    !str_contains($admin_src, 'add_settings_section('),
+    '— the sections were dead code (REQ-HYG-2)'
 );
 
 // ---- 33: wp_set_object_terms append flag is true ----
