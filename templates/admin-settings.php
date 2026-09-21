@@ -413,8 +413,24 @@ $webhook_url = $ac_webhook_token !== ''
 <button type="button" class="ac-btn ac-btn-danger" id="alegra-delete-webhooks"><?php esc_html_e('Eliminar webhooks en Alegra','alegra-connector');?></button>
 <span id="alegra-webhook-status" style="font-size:12px;"></span>
 </div>
-<p class="description"><?php esc_html_e('Registra automaticamente 6 eventos: creacion/edicion de items, clientes y facturas. Los webhooks se eliminan automaticamente al desconectar.','alegra-connector');?></p>
+<p class="description"><?php esc_html_e('Registra en Alegra los eventos marcados abajo. Al guardar y volver a registrar, los eventos desmarcados se eliminan en Alegra. Los webhooks se eliminan automaticamente al desconectar.','alegra-connector');?></p>
 </td></tr>
+
+<tr><th><?php esc_html_e('Eventos a suscribir:','alegra-connector');?></th>
+<td><fieldset>
+<input type="hidden" name="alegra_connector_webhook_selected_events[]" value="">
+<div style="margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;">
+<button type="button" class="ac-btn ac-btn-sm" id="alegra-webhook-events-select-all"><?php esc_html_e('Seleccionar todo','alegra-connector');?></button>
+<button type="button" class="ac-btn ac-btn-sm" id="alegra-webhook-events-select-none"><?php esc_html_e('Quitar todo','alegra-connector');?></button>
+</div>
+<?php
+$ac_selected_events = \Alegra\Connector\Webhooks\Receiver::selected_events();
+$ac_event_labels = \Alegra\Connector\API\Client::get_webhook_event_labels();
+foreach ($ac_event_labels as $ac_slug => $ac_label): ?>
+<label style="display:block;margin:2px 0;"><input type="checkbox" class="alegra-webhook-event-check" name="alegra_connector_webhook_selected_events[]" value="<?php echo esc_attr($ac_slug); ?>" <?php checked(in_array($ac_slug, $ac_selected_events, true)); ?>> <code><?php echo esc_html($ac_slug); ?></code> &mdash; <?php echo esc_html($ac_label); ?></label>
+<?php endforeach; ?>
+<p class="description"><?php esc_html_e('Se registran todos por defecto. Desmarca los que no quieras recibir.','alegra-connector');?></p>
+</fieldset></td></tr>
 
 <?php $subscriptions = (array) get_option('alegra_connector_webhook_subscriptions', []); if (!empty($subscriptions)): ?>
 <tr><th><?php esc_html_e('Suscripciones activas:','alegra-connector');?></th>

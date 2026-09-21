@@ -468,6 +468,14 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_webhook_secret', [
             'sanitize_callback' => fn($value) => self::sanitize_masked_secret((string) $value, 'alegra_connector_webhook_secret'),
         ]);
+        // Which webhook events the merchant wants. Allowlisted against the
+        // documented enum so an unknown slug can never be subscribed. The
+        // default is ALL events: registering nothing by default would silently
+        // stop the real-time sync on an install that never opened the selector.
+        register_setting('alegra_connector_settings', \Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION, [
+            'sanitize_callback' => [self::class, 'sanitize_webhook_selected_events'],
+            'default' => API\Client::get_webhook_events(),
+        ]);
         // NOTE: field_mapping / tax_mapping are registered ONLY in the
         // `alegra_connector_mapping` group below. Registering them in
         // `alegra_connector_settings` too made wp-admin/options.php null them
@@ -1804,6 +1812,36 @@ class Admin_Dashboard
     }
 
     /**
+     * Sanitize the merchant's webhook event selection.
+     *
+     * Only slugs from the documented enum survive; anything else (typos,
+     * injections, a stale slug) is dropped. A non-array value means the option
+     * was not posted at all and yields an empty selection — the selector always
+     * posts the array (with a hidden empty entry) so an intentional "none" is
+     * representable.
+     *
+     * @param mixed $value
+     * @return array<int,string>
+     */
+    public static function sanitize_webhook_selected_events($value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $allowed = API\Client::get_webhook_events();
+        $out = [];
+        foreach ($value as $event) {
+            $event = sanitize_text_field((string) $event);
+            if ($event !== '' && in_array($event, $allowed, true)) {
+                $out[] = $event;
+            }
+        }
+
+        return array_values(array_unique($out));
+    }
+
+    /**
      * Sanitize the field mapping without ever wiping it (REQ-CFG-3).
      *
      * A null / non-array value means the option was not posted in full; return
@@ -2912,13 +2950,20 @@ class Admin_Dashboard
         // this is the only credential that can authenticate a delivery. The
         // Receiver enforces it with hash_equals().
         $webhook_url = \Alegra\Connector\Webhooks\Receiver::registration_url();
-        $events = API\Client::get_webhook_events();
+
+        // Register ONLY the events the merchant selected. An absent option
+        // means "all events", so an install that never opened the selector
+        // keeps subscribing to every documented event (no behaviour change).
+        $selected = \Alegra\Connector\Webhooks\Receiver::selected_events();
+        $deselected = array_values(array_diff(API\Client::get_webhook_events(), $selected));
+
         $created = [];
         $already = [];
         $errors = [];
+        $deleted = [];
         $blocked = 0;
 
-        foreach ($events as $event) {
+        foreach ($selected as $event) {
             $result = $this->api->create_webhook_subscription($event, $webhook_url);
             if (API\Client::write_was_blocked($result)) {
                 // Kill switch / dry-run: nothing reached Alegra.
@@ -2960,12 +3005,56 @@ class Admin_Dashboard
             }
         }
 
+        // Unsubscribe the events the merchant deselected. Alegra has no
+        // "delete by event", so resolve the id from GET /webhooks/subscriptions
+        // and DELETE it. Only subscriptions pointing at OUR URL are touched, so
+        // another integration's events are never removed. Best-effort: a failed
+        // delete keeps its local entry so a later run can retry.
+        $remote = !empty($deselected) ? $this->remote_webhook_subscriptions_by_event() : [];
+        foreach ($deselected as $event) {
+            $sub = $remote[$event] ?? null;
+            if (!is_array($sub) || empty($sub['id'])) {
+                // Not subscribed remotely (or the listing failed): nothing to
+                // delete.
+                continue;
+            }
+            if (!empty($sub['url']) && $sub['url'] !== $webhook_url) {
+                // A different integration owns this event; leave it alone.
+                continue;
+            }
+            $result = $this->api->delete_webhook_subscription((string) $sub['id']);
+            if (API\Client::write_was_blocked($result)) {
+                // Kill switch / dry-run: nothing reached Alegra.
+                $blocked++;
+                continue;
+            }
+            if (is_wp_error($result)) {
+                $errors[] = $event . ': ' . $result->get_error_message();
+                continue;
+            }
+            $deleted[] = $event;
+        }
+
         // Persist every subscription we know about, not only the newly created
         // ones. The DELETE flow deletes by id, and a 400 "already exists"
         // carries no id, so dropping the previously stored entry would orphan
-        // the remote subscription and make it impossible to remove.
+        // the remote subscription and make it impossible to remove. Then drop
+        // the deselected events that are actually gone (deleted, or absent
+        // remotely); a failed delete keeps its entry so a later run retries.
         $subscriptions = $this->merge_webhook_subscriptions($created, $already);
-        if (!empty($subscriptions)) {
+        $drop = $deleted;
+        foreach ($deselected as $event) {
+            if (!in_array($event, $deleted, true) && empty($remote[$event]['id'])) {
+                $drop[] = $event;
+            }
+        }
+        if (!empty($drop)) {
+            $subscriptions = array_values(array_filter(
+                $subscriptions,
+                static fn($sub) => !in_array((string) ($sub['event'] ?? ''), $drop, true)
+            ));
+        }
+        if (!empty($subscriptions) || !empty($drop) || !empty($created) || !empty($already)) {
             // AC-81: the subscription list grows with configuration; do not
             // autoload it on every request.
             update_option('alegra_connector_webhook_subscriptions', $subscriptions, false);
@@ -2985,6 +3074,12 @@ class Admin_Dashboard
             count($already),
             count($errors)
         );
+        if (!empty($deleted)) {
+            $message .= ' ' . sprintf(
+                __('%d webhooks eliminados.', 'alegra-connector'),
+                count($deleted)
+            );
+        }
         if (!empty($errors)) {
             $message .= ' ' . sprintf(__('Errores: %s', 'alegra-connector'), implode(', ', $errors));
         }
@@ -2993,6 +3088,7 @@ class Admin_Dashboard
             'message' => $message,
             'creados' => count($created),
             'ya_existian' => count($already),
+            'eliminados' => count($deleted),
             'errores' => count($errors),
             'blocked' => $blocked,
         ]);
@@ -3063,6 +3159,23 @@ class Admin_Dashboard
      */
     private function remote_webhook_ids_by_event(): array
     {
+        $map = [];
+        foreach ($this->remote_webhook_subscriptions_by_event() as $event => $sub) {
+            $map[$event] = $sub['id'];
+        }
+        return $map;
+    }
+
+    /**
+     * Remote subscriptions keyed by event, each with id, event and url.
+     * Best-effort: any failure (or an unexpected shape) yields an empty map
+     * rather than aborting registration. The url lets the caller avoid
+     * deleting a subscription that belongs to another integration.
+     *
+     * @return array<string, array{id:string, event:string, url:string}>
+     */
+    private function remote_webhook_subscriptions_by_event(): array
+    {
         $result = $this->api->get_webhook_subscriptions();
         if (is_wp_error($result) || !is_array($result)) {
             return [];
@@ -3072,7 +3185,11 @@ class Admin_Dashboard
         $map = [];
         foreach ((array) $list as $sub) {
             if (is_array($sub) && !empty($sub['id']) && !empty($sub['event'])) {
-                $map[(string) $sub['event']] = (string) $sub['id'];
+                $map[(string) $sub['event']] = [
+                    'id' => (string) $sub['id'],
+                    'event' => (string) $sub['event'],
+                    'url' => (string) ($sub['url'] ?? ''),
+                ];
             }
         }
         return $map;

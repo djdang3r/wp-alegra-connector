@@ -18,6 +18,12 @@ class Receiver
      */
     private const REPLAY_WINDOW_SECONDS = 900; // 15 minutes
 
+    /**
+     * Option holding the event slugs the merchant chose to receive. Absent means
+     * "all events" (the historical behaviour).
+     */
+    public const EVENTS_OPTION = 'alegra_connector_webhook_selected_events';
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -128,6 +134,19 @@ class Receiver
             return new \WP_REST_Response(['received' => true, 'ignored' => true], 200);
         }
 
+        // Defence in depth: the subscription list is what limits delivery, but
+        // a stale subscription (or one re-created outside the plugin) can still
+        // deliver an event the merchant deselected. Honour the selection: ACK
+        // with 2XX (a 4xx would count toward Alegra's 10-strike deletion) but
+        // skip every handler. An absent option means "all events", so the
+        // default install processes exactly as before.
+        if (!self::is_event_selected($event)) {
+            if ($this->logger) {
+                $this->logger->info('Webhook ignored: event not selected by the merchant', ['event' => $event]);
+            }
+            return new \WP_REST_Response(['received' => true, 'ignored' => true, 'reason' => 'event_not_selected'], 200);
+        }
+
         if ($this->logger) {
             $this->logger->info('Webhook received', ['event' => $event]);
         }
@@ -208,6 +227,33 @@ class Receiver
     public static function token_option(): string
     {
         return 'alegra_connector_webhook_token';
+    }
+
+    /**
+     * The event slugs the merchant chose to receive.
+     *
+     * An ABSENT option (a fresh install before activation, or an install that
+     * predates the selector and has not migrated yet) means "all events", so
+     * nothing silently stops being delivered. An explicitly stored empty array
+     * means "none" and is honoured.
+     *
+     * @return string[]
+     */
+    public static function selected_events(): array
+    {
+        $stored = get_option(self::EVENTS_OPTION, null);
+        if (!is_array($stored)) {
+            return API\Client::get_webhook_events();
+        }
+        return array_values(array_unique(array_map('strval', $stored)));
+    }
+
+    /**
+     * Whether an event is part of the merchant's selection.
+     */
+    public static function is_event_selected(string $event): bool
+    {
+        return in_array($event, self::selected_events(), true);
     }
 
     /**

@@ -5618,4 +5618,166 @@ TestRunner::test('T-HYG-5 no decorative settings sections and no do_settings_sec
     }
 });
 
+// ===========================================================================
+// T-WH-SEL — webhook event selector: all events by default, deselect to opt out
+// ===========================================================================
+echo "\nT-WH-SEL — webhook event selector\n";
+
+TestRunner::test('T-WH-SEL-1 an absent selection means ALL 12 events (default, no regression)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    $all = Client::get_webhook_events();
+    TestRunner::assertSame($all, \Alegra\Connector\Webhooks\Receiver::selected_events(), 'an absent option must mean all events');
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(count($all), (int) ($response->payload['creados'] ?? -1), 'all 12 events must be registered by default');
+    TestRunner::assertSame(0, (int) ($response->payload['eliminados'] ?? -1), 'nothing is deleted by default');
+    TestRunner::assertSame(count($all), alegra_mock_count('POST', '/webhooks/subscriptions'), 'exactly 12 subscription POSTs');
+    TestRunner::assertSame(0, count(alegra_mock_requests('DELETE')), 'no DELETE without a deselection');
+});
+
+TestRunner::test('T-WH-SEL-2 deselecting an event keeps it out of the registration', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    $selected = array_values(array_diff(Client::get_webhook_events(), ['edit-item']));
+    update_option(\Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION, $selected, false);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(count($selected), (int) ($response->payload['creados'] ?? -1), 'only the selected events are created');
+
+    $posted = [];
+    foreach (alegra_mock_requests('POST', '/webhooks/subscriptions') as $req) {
+        $posted[] = (string) ($req['body']['event'] ?? '');
+    }
+    TestRunner::assertFalse(in_array('edit-item', $posted, true), 'the deselected event must NOT be subscribed');
+    sort($posted);
+    $expected = $selected;
+    sort($expected);
+    TestRunner::assertSame($expected, $posted, 'exactly the selected events are subscribed');
+    TestRunner::assertSame(0, (int) ($response->payload['eliminados'] ?? -1), 'nothing to delete when the event was never subscribed');
+});
+
+TestRunner::test('T-WH-SEL-3 deselecting a previously-subscribed event DELETEs it in Alegra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    // The event is already subscribed in Alegra (and known locally). Seed the
+    // mock state directly: a bare API write would be blocked by the Write Gate
+    // (only ajax_register_webhooks runs it explicitly).
+    $url = \Alegra\Connector\Webhooks\Receiver::registration_url();
+    $id = 'wh-sel-edit';
+    $GLOBALS['alegra_mock_state']['subscriptions'][$id] = ['id' => $id, 'event' => 'edit-item', 'url' => $url];
+    update_option('alegra_connector_webhook_subscriptions', [['id' => $id, 'event' => 'edit-item']], false);
+
+    $selected = array_values(array_diff(Client::get_webhook_events(), ['edit-item']));
+    update_option(\Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION, $selected, false);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(1, (int) ($response->payload['eliminados'] ?? -1), 'the response must report one unsubscription');
+    TestRunner::assertSame(1, alegra_mock_count('DELETE', '/webhooks/subscriptions/' . $id), 'the stale subscription must be DELETEd in Alegra');
+    TestRunner::assertStringContains('eliminados', (string) ($response->payload['message'] ?? ''), 'the message must report the unsubscriptions');
+
+    $stored = (array) get_option('alegra_connector_webhook_subscriptions', []);
+    foreach ($stored as $sub) {
+        TestRunner::assertFalse(($sub['event'] ?? '') === 'edit-item', 'the local list must drop the deselected event');
+    }
+});
+
+TestRunner::test('T-WH-SEL-3b a deselected event owned by ANOTHER URL is never deleted', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    $fid = 'wh-sel-foreign';
+    $GLOBALS['alegra_mock_state']['subscriptions'][$fid] = ['id' => $fid, 'event' => 'delete-item', 'url' => 'otro.test/hook'];
+    $selected = array_values(array_diff(Client::get_webhook_events(), ['delete-item']));
+    update_option(\Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION, $selected, false);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(0, alegra_mock_count('DELETE', '/webhooks/subscriptions/' . $fid), 'a subscription owned by another URL must be left alone');
+    TestRunner::assertSame(0, (int) ($response->payload['eliminados'] ?? -1), 'nothing was ours to delete');
+});
+
+TestRunner::test('T-WH-SEL-4 the sanitizer accepts only documented slugs', function (): void {
+    $clean = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_webhook_selected_events([
+        'new-invoice', 'not-an-event', 'edit-item', 'delete-item', '', 'DROP TABLE',
+    ]);
+    TestRunner::assertSame(['new-invoice', 'edit-item', 'delete-item'], $clean, 'unknown slugs must be rejected');
+
+    TestRunner::assertSame([], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_webhook_selected_events('new-invoice'), 'a non-array value yields an empty selection');
+    TestRunner::assertSame([], \Alegra\Connector\Admin\Admin_Dashboard::sanitize_webhook_selected_events(['bogus']), 'an all-unknown list yields empty');
+});
+
+TestRunner::test('T-WH-SEL-5 the migration seeds all 12 for an existing install (and is idempotent)', function (): void {
+    alegra_test_reset();
+    // Existing install: already gate-migrated, selector option never existed.
+    update_option('alegra_connector_gate_migration_version', 1);
+    unset($GLOBALS['wp_options']['alegra_connector_webhook_selected_events']);
+    unset($GLOBALS['wp_options']['alegra_connector_webhook_events_migration_version']);
+
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+
+    TestRunner::assertSame(Client::get_webhook_events(), get_option('alegra_connector_webhook_selected_events'), 'the migration must seed all 12');
+    TestRunner::assertSame(1, (int) get_option('alegra_connector_webhook_events_migration_version'), 'the selector migration must be versioned');
+    TestRunner::assertSame(1, (int) get_option('alegra_connector_gate_migration_version'), 'the gate migration version must stay 1');
+
+    // Never overwrite a merchant's narrowed selection.
+    update_option('alegra_connector_webhook_selected_events', ['new-invoice'], false);
+    unset($GLOBALS['wp_options']['alegra_connector_webhook_events_migration_version']);
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+    TestRunner::assertSame(['new-invoice'], get_option('alegra_connector_webhook_selected_events'), 'an existing selection must not be overwritten');
+});
+
+TestRunner::test('T-WH-SEL-6 a deselected event delivered by a stale subscription is ignored', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok-sel');
+    update_option(
+        \Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION,
+        array_values(array_diff(Client::get_webhook_events(), ['edit-item'])),
+        false
+    );
+
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(make_api(), make_logger());
+    $body = json_encode(['subject' => 'edit-item', 'message' => ['id' => 'it-1']]);
+    $ignored = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok-sel']));
+
+    TestRunner::assertSame(200, $ignored->get_status(), 'a deselected event must be ACKed (never a 4xx)');
+    TestRunner::assertSame('event_not_selected', $ignored->get_data()['reason'] ?? null, 'the ignore reason must name the selection');
+    TestRunner::assertFalse(\Alegra\Connector\Webhooks\Receiver::is_event_selected('edit-item'), 'edit-item is deselected');
+
+    // The same event IS accepted when the selection is absent (all events).
+    delete_option(\Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION);
+    TestRunner::assertTrue(\Alegra\Connector\Webhooks\Receiver::is_event_selected('edit-item'), 'an absent selection accepts every event');
+});
+
+TestRunner::test('T-WH-SEL-7 the selector is wired: option, UI, labels and activation default', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    $tpl = cfg2_source('templates/admin-settings.php');
+    $client = cfg2_source('includes/API/Client.php');
+    $bootstrap = cfg2_source('alegra-connector.php');
+
+    TestRunner::assertStringContains('sanitize_webhook_selected_events', $admin, 'the sanitizer must be registered');
+    TestRunner::assertStringContains('register_setting(\'alegra_connector_settings\', \Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION', $admin, 'the option must be registered in the settings group');
+
+    TestRunner::assertStringContains('name="alegra_connector_webhook_selected_events[]"', $tpl, 'the template must render the event checkboxes');
+    TestRunner::assertStringContains('Se registran todos por defecto. Desmarca los que no quieras recibir.', $tpl, 'the helper text must state the default and how to narrow');
+    TestRunner::assertStringContains('get_webhook_event_labels', $tpl, 'the template must render the event labels');
+    TestRunner::assertStringContains('alegra-webhook-events-select-all', $tpl, 'the select-all control must exist');
+    TestRunner::assertStringContains('alegra-webhook-events-select-none', $tpl, 'the select-none control must exist');
+
+    TestRunner::assertStringContains("'new-invoice'", $client, 'the labels map must cover new-invoice');
+    TestRunner::assertStringContains('Factura nueva', $client, 'the labels map must translate the event');
+
+    TestRunner::assertStringContains("'alegra_connector_webhook_selected_events' => \Alegra\Connector\API\Client::get_webhook_events()", $bootstrap, 'activation must default to all events');
+});
+
 exit(TestRunner::summary());

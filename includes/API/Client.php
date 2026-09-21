@@ -867,6 +867,37 @@ class Client
         ];
     }
 
+    /**
+     * Human-readable label per webhook event, grouped by entity exactly as the
+     * Alegra documentation describes them:
+     * https://developer.alegra.com/reference/post_webhooks-subscriptions.md
+     *
+     * Used by the settings selector so the merchant sees what each slug means.
+     *
+     * @return array<string,string> event slug => label
+     */
+    public static function get_webhook_event_labels(): array
+    {
+        return [
+            // Facturas
+            'new-invoice'    => __('Factura nueva', 'alegra-connector'),
+            'edit-invoice'   => __('Factura actualizada', 'alegra-connector'),
+            'delete-invoice' => __('Factura eliminada', 'alegra-connector'),
+            // Facturas de compra
+            'new-bill'       => __('Factura de compra nueva', 'alegra-connector'),
+            'edit-bill'      => __('Factura de compra actualizada', 'alegra-connector'),
+            'delete-bill'    => __('Factura de compra eliminada', 'alegra-connector'),
+            // Clientes
+            'new-client'     => __('Cliente nuevo', 'alegra-connector'),
+            'edit-client'    => __('Cliente actualizado', 'alegra-connector'),
+            'delete-client'  => __('Cliente eliminado', 'alegra-connector'),
+            // Ítems
+            'new-item'       => __('Ítem nuevo', 'alegra-connector'),
+            'edit-item'      => __('Ítem actualizado', 'alegra-connector'),
+            'delete-item'    => __('Ítem eliminado', 'alegra-connector'),
+        ];
+    }
+
     // Item attachments (images)
     public function upload_item_image(string $item_id, string $file_path): array|\WP_Error
     {

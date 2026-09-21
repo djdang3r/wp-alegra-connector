@@ -436,6 +436,9 @@ final class Alegra_Connector
             'alegra_connector_invoice_status' => 'draft',
             'alegra_connector_payment_account_id' => '',
             'alegra_connector_dry_run' => false,
+            // Webhook event selection. All 12 documented events are registered
+            // by default; the merchant can narrow the list in the Avanzado tab.
+            'alegra_connector_webhook_selected_events' => \Alegra\Connector\API\Client::get_webhook_events(),
         ];
 
         // AC-81: options that are only ever read in admin/cron context must not
@@ -456,6 +459,9 @@ final class Alegra_Connector
             'alegra_connector_payment_reconcile_batch',
             // Migration guard: never read on the frontend.
             'alegra_connector_gate_migration_version',
+            // Only read in admin/REST context (webhook registration/receiver).
+            'alegra_connector_webhook_selected_events',
+            'alegra_connector_webhook_events_migration_version',
         ];
 
         foreach ($defaults as $key => $value) {

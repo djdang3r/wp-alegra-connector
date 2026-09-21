@@ -175,36 +175,66 @@ class Write_Gate
      */
     public static function maybe_migrate(): void
     {
-        if ((int) get_option('alegra_connector_gate_migration_version', 0) >= 1) {
+        // Guard 1: the gate options (payment sweep, sync flags, customer
+        // toggle). The version stays at 1 so existing installs are untouched.
+        if ((int) get_option('alegra_connector_gate_migration_version', 0) < 1) {
+            // 1. Controllable payment sweep (branch A of Phase 0.4: default true).
+            if (get_option('alegra_connector_payment_reconcile_enabled') === false) {
+                add_option('alegra_connector_payment_reconcile_enabled', true, '', 'no');
+            }
+            if (get_option('alegra_connector_payment_reconcile_batch') === false) {
+                add_option('alegra_connector_payment_reconcile_batch', 20, '', 'no');
+            }
+
+            // 2. sync_*: close the UI/runtime gap on installs missing the row.
+            foreach (['sync_products', 'sync_customers', 'sync_orders', 'sync_categories'] as $key) {
+                $option = 'alegra_connector_' . $key;
+                if (get_option($option) === false) {
+                    add_option($option, false, '', 'no');
+                }
+            }
+
+            // 3. Independent customer toggle: preserve the previous behaviour.
+            if (get_option('alegra_connector_push_customers_enabled') === false) {
+                add_option(
+                    'alegra_connector_push_customers_enabled',
+                    (bool) get_option('alegra_connector_push_products_enabled', false),
+                    '',
+                    'yes'
+                );
+            }
+
+            update_option('alegra_connector_gate_migration_version', 1);
+        }
+
+        // Guard 2 (independent): webhook event selection. An existing install
+        // must keep receiving every event, so seed all 12 when the option is
+        // absent. Its own guard leaves the gate migration version at 1.
+        self::maybe_migrate_webhook_events();
+    }
+
+    /**
+     * Seed the webhook event selection with ALL documented events for an
+     * existing install, so adding the selector is a no-op on upgrade.
+     *
+     * Idempotent via `alegra_connector_webhook_events_migration_version` and it
+     * never overwrites a selection the merchant already made.
+     */
+    private static function maybe_migrate_webhook_events(): void
+    {
+        if ((int) get_option('alegra_connector_webhook_events_migration_version', 0) >= 1) {
             return;
         }
 
-        // 1. Controllable payment sweep (branch A of Phase 0.4: default true).
-        if (get_option('alegra_connector_payment_reconcile_enabled') === false) {
-            add_option('alegra_connector_payment_reconcile_enabled', true, '', 'no');
-        }
-        if (get_option('alegra_connector_payment_reconcile_batch') === false) {
-            add_option('alegra_connector_payment_reconcile_batch', 20, '', 'no');
-        }
-
-        // 2. sync_*: close the UI/runtime gap on installs missing the row.
-        foreach (['sync_products', 'sync_customers', 'sync_orders', 'sync_categories'] as $key) {
-            $option = 'alegra_connector_' . $key;
-            if (get_option($option) === false) {
-                add_option($option, false, '', 'no');
-            }
-        }
-
-        // 3. Independent customer toggle: preserve the previous behaviour.
-        if (get_option('alegra_connector_push_customers_enabled') === false) {
+        if (get_option('alegra_connector_webhook_selected_events') === false) {
             add_option(
-                'alegra_connector_push_customers_enabled',
-                (bool) get_option('alegra_connector_push_products_enabled', false),
+                'alegra_connector_webhook_selected_events',
+                \Alegra\Connector\API\Client::get_webhook_events(),
                 '',
-                'yes'
+                'no'
             );
         }
 
-        update_option('alegra_connector_gate_migration_version', 1);
+        update_option('alegra_connector_webhook_events_migration_version', 1);
     }
 }

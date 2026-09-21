@@ -124,6 +124,7 @@ function current_time($type = 'mysql', $gmt = 0) { return date('Y-m-d H:i:s'); }
 function wp_json_encode($data, $flags = 0, $depth = 512) { return (string) json_encode($data, $flags, $depth); }
 function wp_upload_dir() { return ['basedir' => sys_get_temp_dir() . '/alegra-smoke', 'path' => sys_get_temp_dir() . '/alegra-smoke']; }
 function wp_mkdir_p($dir) { return is_dir($dir) || @mkdir($dir, 0777, true); }
+function __($text, $domain = '') { return $text; }
 function esc_html__($text, $domain = '') { return $text; }
 function esc_attr__($text, $domain = '') { return $text; }
 function wp_die($message = '', $title = '', $args = []) { return; }
@@ -651,6 +652,37 @@ check(
     'no source string uses a space where an accent belongs',
     $mojibake_hits === [],
     '— mojibake found: ' . implode(', ', array_slice($mojibake_hits, 0, 10))
+);
+
+// ---- 37: webhook event selector is wired (all events by default) ----
+echo "\n[37] Webhook event selector: option + UI + all-events default\n";
+$receiver_src  = file_source($plugin_root . 'includes/Webhooks/Receiver.php');
+$settings_tpl  = file_source($plugin_root . 'templates/admin-settings.php');
+$bootstrap_src = file_source($plugin_root . 'alegra-connector.php');
+
+check(
+    'Receiver exposes the selection option and helpers',
+    str_contains($receiver_src, 'alegra_connector_webhook_selected_events')
+        && str_contains($receiver_src, 'function selected_events')
+        && str_contains($receiver_src, 'function is_event_selected'),
+    '— the option + selected_events()/is_event_selected() must exist'
+);
+check(
+    'the settings template renders the event checkboxes',
+    str_contains($settings_tpl, 'name="alegra_connector_webhook_selected_events[]"')
+        && str_contains($settings_tpl, 'Se registran todos por defecto'),
+    '— the selector must render with the "all by default" helper text'
+);
+check(
+    'activation defaults the selection to all documented events',
+    str_contains($bootstrap_src, "'alegra_connector_webhook_selected_events' => \\Alegra\\Connector\\API\\Client::get_webhook_events()"),
+    '— activation must seed all 12 events'
+);
+check(
+    'the API client maps every event slug to a Spanish label',
+    class_exists(\Alegra\Connector\API\Client::class)
+        && count(\Alegra\Connector\API\Client::get_webhook_event_labels()) === count(\Alegra\Connector\API\Client::get_webhook_events()),
+    '— every event slug must have a label'
 );
 
 // ---- Done ----

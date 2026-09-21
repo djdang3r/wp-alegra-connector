@@ -498,6 +498,15 @@
                     error: function() { $btn.prop('disabled', false).text(S.deleteWebhooks); showNotice(S.connectionError, 'error'); }
                 });
             });
+
+            // Select all / none for the webhook event selector. A convenience
+            // only; the checkboxes themselves are the source of truth.
+            $('#alegra-webhook-events-select-all').on('click', function() {
+                $('.alegra-webhook-event-check').prop('checked', true);
+            });
+            $('#alegra-webhook-events-select-none').on('click', function() {
+                $('.alegra-webhook-event-check').prop('checked', false);
+            });
         },
 
 
