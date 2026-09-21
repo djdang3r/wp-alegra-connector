@@ -1189,6 +1189,16 @@ class Products
                     }
 
                     $new_qty = (int) $item['inventory']['availableQuantity'];
+                    if ($new_qty < 0) {
+                        // Alegra permits negative stock; WooCommerce does not.
+                        // Mirror apply_inventory_to_product() and clamp to 0.
+                        $this->logger->warning('Clamping negative Alegra stock to 0', [
+                            'product_id' => $product_id,
+                            'alegra_id'  => $item['id'],
+                            'original'   => $new_qty,
+                        ]);
+                        $new_qty = 0;
+                    }
                     if (!$product->get_manage_stock()) {
                         continue;
                     }
@@ -1196,6 +1206,10 @@ class Products
                     try {
                         $old_qty = $product->get_stock_quantity();
                         $product->set_stock_quantity($new_qty);
+                        // WC does not derive _stock_status from the quantity on
+                        // save(); it must be set explicitly so a 0 becomes
+                        // outofstock instead of keeping a stale instock.
+                        $product->set_stock_status($new_qty > 0 ? 'instock' : 'outofstock');
                         $product->save();
                         $result['updated']++;
 

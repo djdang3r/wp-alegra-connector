@@ -326,6 +326,7 @@ function _e($text, $domain = '') { echo $text; }
 function esc_html__($text, $domain = '') { return $text; }
 function esc_attr__($text, $domain = '') { return $text; }
 function esc_html_e($text, $domain = '') { echo $text; }
+function esc_attr_e($text, $domain = '') { echo $text; }
 function esc_html($text) { return (string) $text; }
 function esc_attr($text) { return (string) $text; }
 function esc_textarea($text) { return (string) $text; }
@@ -1243,6 +1244,7 @@ class WC_Order
     public function get_billing_postcode(): string { return (string) ($this->billing['postcode'] ?? ''); }
     public function get_payment_method(): string { return $this->payment_method; }
     public function get_payment_method_title(): string { return $this->payment_method_title; }
+    public function get_transaction_id(): string { return (string) ($this->meta['_transaction_id'] ?? ''); }
     public function get_currency(): string { return $this->currency; }
     public function get_status(): string { return $this->status; }
     public function update_status($status) { $this->status = (string) $status; return true; }
@@ -1422,6 +1424,46 @@ function wc_get_product_id_by_sku($sku)
         if ($product->get_sku() === (string) $sku) { return $product->get_id(); }
     }
     return 0;
+}
+
+// Minimal order-status + price helpers so the admin templates can be rendered
+// in the harness (the orders list badge test includes templates/admin-orders.php).
+function wc_get_order_statuses()
+{
+    return [
+        'wc-pending'    => 'Pendiente de pago',
+        'wc-processing' => 'Procesando',
+        'wc-on-hold'    => 'En espera',
+        'wc-completed'  => 'Completado',
+        'wc-cancelled'  => 'Cancelado',
+        'wc-refunded'   => 'Reembolsado',
+        'wc-failed'     => 'Fallido',
+    ];
+}
+
+function wc_get_order_status_name($status)
+{
+    $status = str_replace('wc-', '', (string) $status);
+    $statuses = [
+        'pending'    => 'Pendiente de pago',
+        'processing' => 'Procesando',
+        'on-hold'    => 'En espera',
+        'completed'  => 'Completado',
+        'cancelled'  => 'Cancelado',
+        'refunded'   => 'Reembolsado',
+        'failed'     => 'Fallido',
+    ];
+    return $statuses[$status] ?? $status;
+}
+
+function wc_price($price, $args = [])
+{
+    return '$' . number_format((float) $price, 2, '.', ',');
+}
+
+function wp_date($format, $timestamp = null, $timezone = null)
+{
+    return date((string) $format, $timestamp === null ? time() : (int) $timestamp);
 }
 
 // ---------------------------------------------------------------------------

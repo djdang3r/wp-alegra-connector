@@ -183,35 +183,57 @@ class Handlers
             return;
         }
 
-        $status = $fresh['status'] ?? '';
+        $status = (string) ($fresh['status'] ?? '');
         $balance = (float) ($fresh['balance'] ?? 0);
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
-        if ($status === 'paid' && $balance <= 0 && $should_complete) {
-            // HPOS-safe order lookup: wc_get_orders() reads the correct storage
-            // (wc_orders_meta on HPOS, postmeta on legacy) through the CRUD API.
-            $found = wc_get_orders([
-                'meta_key'   => '_alegra_invoice_id',
-                'meta_value' => $alegra_invoice_id,
-                'limit'      => 1,
-                'return'     => 'ids',
-            ]);
-            $order_id = !empty($found) ? (int) $found[0] : 0;
+        // Only a paid or a voided invoice changes the linked order.
+        if ($status !== 'paid' && $status !== 'void') {
+            return;
+        }
 
-            if ($order_id) {
-                $order = wc_get_order($order_id);
-                if ($order && $order->get_status() !== 'completed') {
-                    $order->add_order_note(sprintf(
-                        __('[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),
-                        $fresh['number'] ?? $alegra_invoice_id
-                    ));
-                    $order->update_status('completed');
-                    if ($this->logger) $this->logger->info('Webhook: Order completed from paid invoice', [
-                        'order_id' => $order_id,
-                        'invoice_id' => $alegra_invoice_id,
-                    ]);
-                }
+        // HPOS-safe order lookup: wc_get_orders() reads the correct storage
+        // (wc_orders_meta on HPOS, postmeta on legacy) through the CRUD API.
+        $found = wc_get_orders([
+            'meta_key'   => '_alegra_invoice_id',
+            'meta_value' => $alegra_invoice_id,
+            'limit'      => 1,
+            'return'     => 'ids',
+        ]);
+        $order_id = !empty($found) ? (int) $found[0] : 0;
+        if (!$order_id) {
+            return;
+        }
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return;
+        }
+
+        $orders = new Sync\Orders($this->api, $this->logger);
+        $orders->persist_invoice_status($order, $fresh);
+
+        if ($status === 'void') {
+            // The order is deliberately NOT cancelled: an Alegra void does not
+            // prove the WC order was cancelled, so the merchant decides.
+            if ($orders->note_invoice_voided($order, $fresh) && $this->logger) {
+                $this->logger->info('Webhook: Invoice voided, order note added', [
+                    'order_id'   => $order_id,
+                    'invoice_id' => $alegra_invoice_id,
+                ]);
             }
+            return;
+        }
+
+        if ($balance <= 0 && $should_complete && $order->get_status() !== 'completed') {
+            $order->add_order_note(sprintf(
+                __('[Alegra Webhook] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),
+                $fresh['number'] ?? $alegra_invoice_id
+            ));
+            $order->update_status('completed');
+            if ($this->logger) $this->logger->info('Webhook: Order completed from paid invoice', [
+                'order_id' => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+            ]);
         }
     }
 }

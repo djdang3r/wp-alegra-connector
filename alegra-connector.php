@@ -432,6 +432,10 @@ final class Alegra_Connector
             'alegra_connector_log_retention_days' => 30,
             'alegra_connector_conflict_resolution' => 'alegra_wins',
             'alegra_connector_inventory_source' => 'alegra',
+            // Independent gate for the Alegra -> WC stock pull. It no longer
+            // rides on sync_products: a merchant who uses Alegra as the
+            // inventory source but does not import products still gets stock.
+            'alegra_connector_inventory_sync_enabled' => true,
             'alegra_connector_customer_resolution_mode' => 'auto',
             'alegra_connector_invoice_status' => 'draft',
             'alegra_connector_payment_account_id' => '',
@@ -452,6 +456,7 @@ final class Alegra_Connector
             'alegra_connector_sync_customers',
             'alegra_connector_sync_orders',
             'alegra_connector_sync_categories',
+            'alegra_connector_inventory_sync_enabled',
             'alegra_connector_log_retention_days',
             'alegra_connector_sync_inactive_products',
             // Only read in admin/cron context (REQ-CFG-1).

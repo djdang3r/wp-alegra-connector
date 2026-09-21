@@ -449,6 +449,7 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_sync_orders', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_categories', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_inventory_source', ['sanitize_callback' => 'sanitize_text_field']);
+        register_setting('alegra_connector_settings', 'alegra_connector_inventory_sync_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_warehouse_id', [
             'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_warehouse_id'),
         ]);

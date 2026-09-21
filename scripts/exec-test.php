@@ -5780,4 +5780,181 @@ TestRunner::test('T-WH-SEL-7 the selector is wired: option, UI, labels and activ
     TestRunner::assertStringContains("'alegra_connector_webhook_selected_events' => \Alegra\Connector\API\Client::get_webhook_events()", $bootstrap, 'activation must default to all events');
 });
 
+// ===========================================================================
+// T-VOID — BUG 1: a voided invoice must be shown honestly
+// ===========================================================================
+echo "\nT-VOID — voided invoices\n";
+
+TestRunner::test('T-VOID-1 the invoice status helper maps every documented status (never a silent "Facturado")', function (): void {
+    $S = \Alegra\Connector\Invoice_Status::class;
+
+    TestRunner::assertSame('warning', $S::badge_class('draft'), 'draft is a warning');
+    TestRunner::assertSame('success', $S::badge_class('open'), 'open is success');
+    TestRunner::assertSame('success', $S::badge_class('closed'), 'closed (settled) is success');
+    TestRunner::assertSame('success', $S::badge_class('paid'), 'paid is success (legacy/mock value)');
+    TestRunner::assertSame('danger', $S::badge_class('void'), 'void is danger');
+    TestRunner::assertSame('neutral', $S::badge_class('mystery'), 'an unknown status must be neutral, not success');
+
+    TestRunner::assertSame('Anulada en Alegra', $S::label('void'), 'void is translated');
+    TestRunner::assertSame('Anulada en Alegra', $S::label('VOID'), 'the status is case-insensitive');
+    TestRunner::assertSame('Pagada', $S::label('closed'), 'closed is translated');
+    TestRunner::assertSame('Sin estado', $S::label(''), 'an empty status has a neutral label');
+    TestRunner::assertSame('Sin estado', $S::label('mystery'), 'an unknown status has a neutral label');
+    TestRunner::assertTrue($S::is_void('void'), 'is_void detects void');
+    TestRunner::assertFalse($S::is_void('open'), 'is_void rejects open');
+});
+
+TestRunner::test('T-VOID-2 the orders list renders "Anulada en Alegra" for a void and never "Facturado"', function (): void {
+    alegra_test_reset();
+    $void = alegra_make_order(7101, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_id' => 'inv-v', '_alegra_invoice_number' => 'FV-9', '_alegra_invoice_status' => 'void',
+    ]]);
+    $unknown = alegra_make_order(7102, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_id' => 'inv-u', '_alegra_invoice_number' => 'FV-10', '_alegra_invoice_status' => 'mystery',
+    ]]);
+    $orders = [$void, $unknown];
+    $total_orders = 2;
+    $synced_orders = 2;
+    $total_pages = 1;
+    $page = 1;
+    $payment_count = 0;
+
+    ob_start();
+    include $GLOBALS['alegra_plugin_root'] . 'templates/admin-orders.php';
+    $html = (string) ob_get_clean();
+
+    TestRunner::assertStringContains('<span class="ac-badge danger">Anulada en Alegra</span>', $html, 'a voided invoice must render the red Anulada badge');
+    TestRunner::assertStringNotContains('<span class="ac-badge success">Facturado</span>', $html, 'a voided invoice must never render as Facturado');
+    TestRunner::assertStringContains('<span class="ac-badge neutral">Sin estado</span>', $html, 'an unknown status must render neutrally');
+});
+
+TestRunner::test('T-VOID-3 the order detail translates the status and warns on a void', function (): void {
+    alegra_test_reset();
+    $order = alegra_make_order(7200, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_id' => 'inv-dv', '_alegra_invoice_number' => 'FV-11',
+    ]]);
+    $alegra_invoice_id = 'inv-dv';
+    $alegra_invoice_number = 'FV-11';
+    $alegra_data = ['id' => 'inv-dv', 'number' => 'FV-11', 'status' => 'void', 'total' => 10, 'balance' => 0];
+    $alegra_error = null;
+    $alegra_api = null;
+
+    ob_start();
+    include $GLOBALS['alegra_plugin_root'] . 'templates/admin-order-detail.php';
+    $html = (string) ob_get_clean();
+
+    TestRunner::assertStringContains('Anulada en Alegra', $html, 'the raw status must be translated to Spanish');
+    TestRunner::assertStringContains('Factura anulada en Alegra', $html, 'a prominent warning must be rendered');
+    TestRunner::assertStringNotContains('<td>void</td>', $html, 'the raw API status must not leak to the UI');
+});
+
+TestRunner::test('T-VOID-4 the webhook notes a voided invoice once, caches the status and never cancels the order', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-void-wh', ['status' => 'void', 'balance' => 0, 'total' => 50, 'number' => 'FV-77']);
+    alegra_make_order(7300, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-void-wh']]);
+
+    $logger = make_logger();
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+
+    // The payload lies (claims paid); the re-fetch is authoritative and says void.
+    $handlers->process_event('new-invoice', ['invoice' => ['id' => 'inv-void-wh', 'status' => 'paid', 'balance' => 0]]);
+    $handlers->process_event('edit-invoice', ['invoice' => ['id' => 'inv-void-wh', 'status' => 'paid', 'balance' => 0]]);
+
+    $notes = wc_get_order(7300)->get_notes();
+    $void_notes = array_values(array_filter($notes, static fn ($n) => str_contains((string) $n, 'anulada en Alegra')));
+    TestRunner::assertSame(1, count($void_notes), 'the void note must be written exactly once');
+    TestRunner::assertSame('processing', wc_get_order(7300)->get_status(), 'a void must never cancel the order');
+    TestRunner::assertSame('void', (string) wc_get_order(7300)->get_meta('_alegra_invoice_status', true), 'the cached status must become void');
+});
+
+TestRunner::test('T-VOID-5 the poll notes a void once (idempotent) and covers completed orders', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-void-poll', ['status' => 'void', 'balance' => 0, 'total' => 30, 'number' => 'FV-88']);
+    alegra_make_order(7400, ['status' => 'completed', 'meta' => ['_alegra_invoice_id' => 'inv-void-poll']]);
+
+    $orders = make_orders();
+    $orders->poll_invoice_statuses();
+    $orders->poll_invoice_statuses();
+
+    $notes = wc_get_order(7400)->get_notes();
+    $void_notes = array_values(array_filter($notes, static fn ($n) => str_contains((string) $n, 'anulada en Alegra')));
+    TestRunner::assertSame(1, count($void_notes), 'the poll must note the void exactly once across runs');
+    TestRunner::assertSame('completed', wc_get_order(7400)->get_status(), 'a void must not change a completed order');
+    TestRunner::assertSame('void', (string) wc_get_order(7400)->get_meta('_alegra_invoice_status', true), 'the poll must cache the void status');
+});
+
+// ===========================================================================
+// T-INV-GATE — BUG 2: the inventory pull has its own gate + writes _stock_status
+// ===========================================================================
+echo "\nT-INV-GATE — inventory pull gate + stock status\n";
+
+TestRunner::test('T-INV-GATE-1 the cron pulls inventory independently of sync_products', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_sync_enabled', true);
+    alegra_mock_seed_item('item-inv-1', ['name' => 'P1', 'reference' => 'SKU-1', 'type' => 'simple', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 3]]);
+
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'with sync_products off but inventory sync on, the pull must run');
+
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_sync_enabled', false);
+    alegra_mock_seed_item('item-inv-2', ['name' => 'P2', 'reference' => 'SKU-2', 'type' => 'simple', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 3]]);
+
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'with inventory sync off, the pull must not run');
+});
+
+TestRunner::test('T-INV-GATE-2 the pull writes _stock_status so a 0 quantity becomes outofstock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(5001, ['name' => 'Zero', 'sku' => 'Z-1', 'regular_price' => '5', 'stock' => 9, 'manage_stock' => true, 'stock_status' => 'instock']);
+    update_post_meta(5001, '_alegra_item_id', 'item-zero');
+    alegra_mock_seed_item('item-zero', ['name' => 'Zero', 'reference' => 'Z-1', 'type' => 'simple', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 0]]);
+
+    make_products()->sync_inventory_from_alegra();
+
+    $product = wc_get_product(5001);
+    TestRunner::assertSame(0, $product->get_stock_quantity(), 'the quantity must be 0');
+    TestRunner::assertSame('outofstock', $product->get_stock_status(), 'a 0 quantity must become outofstock, not keep a stale instock');
+});
+
+TestRunner::test('T-INV-GATE-3 the pull keeps its kill switch / lock / cancellation gates', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_sync_enabled', true);
+
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $killed = make_products()->sync_inventory_from_alegra();
+    \Alegra\Connector\Kill_Switch::deactivate();
+    TestRunner::assertTrue(!empty($killed['skipped']), 'the kill switch must skip the pull');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'the kill switch must block the fetch');
+
+    $token = Controller::acquire_lock('alegra_sync_running_products', 300);
+    $locked = make_products()->sync_inventory_from_alegra();
+    Controller::release_lock('alegra_sync_running_products', $token);
+    TestRunner::assertTrue(!empty($locked['locked']), 'a held products lock must report locked');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'a held lock must block the fetch');
+
+    set_transient('alegra_sync_cancelled', 1, 60);
+    $cancelled = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'a cancelled pull must not fetch');
+    TestRunner::assertTrue(!empty($cancelled['updated']) === false, 'a cancelled pull must update nothing');
+});
+
+TestRunner::test('T-INV-GATE-4 the inventory-sync gate is wired: option, UI, default and uninstall', function (): void {
+    $admin = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    $tpl = cfg2_source('templates/admin-settings.php');
+    $bootstrap = cfg2_source('alegra-connector.php');
+    $uninstall = cfg2_source('uninstall.php');
+
+    TestRunner::assertStringContains("register_setting('alegra_connector_settings', 'alegra_connector_inventory_sync_enabled'", $admin, 'the option must be registered');
+    TestRunner::assertStringContains('name="alegra_connector_inventory_sync_enabled"', $tpl, 'the option must be rendered in the UI');
+    TestRunner::assertStringContains("'alegra_connector_inventory_sync_enabled' => true", $bootstrap, 'the activation default must be true (preserves the Alegra source)');
+    TestRunner::assertStringContains("delete_option('alegra_connector_inventory_sync_enabled')", $uninstall, 'uninstall must delete the option');
+});
+
 exit(TestRunner::summary());

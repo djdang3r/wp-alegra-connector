@@ -191,17 +191,19 @@ class Controller
             } elseif (isset($products_result) && is_wp_error($products_result)) {
                 $result['errors']['products'] = $products_result->get_error_message();
             }
+        }
 
-            // Inventory pull (Alegra → WC stock). Only when the merchant chose
-            // Alegra as the source. It runs AFTER the products import released
-            // the 'products' lock, so it does not contend with it. The pull
-            // itself re-checks the kill switch, the lock, the cancellation
-            // transient and inventory_source.
-            if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'alegra') {
-                $inventory_result = $this->products->sync_inventory_from_alegra($run_id);
-                if (!empty($inventory_result['updated'])) {
-                    $result['inventory'] = (int) $inventory_result['updated'];
-                }
+        // Inventory pull (Alegra → WC stock). Its own gate, independent of
+        // sync_products: a merchant who uses Alegra as the inventory source but
+        // does not import the product catalog still gets stock. It runs outside
+        // the products lock so it never contends with the import, and the pull
+        // itself re-checks the kill switch, the lock, the cancellation
+        // transient, the per-run stop and inventory_source.
+        if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'alegra'
+            && get_option('alegra_connector_inventory_sync_enabled', true)) {
+            $inventory_result = $this->products->sync_inventory_from_alegra($run_id);
+            if (!empty($inventory_result['updated'])) {
+                $result['inventory'] = (int) $inventory_result['updated'];
             }
         }
 

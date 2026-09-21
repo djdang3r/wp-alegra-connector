@@ -36,6 +36,12 @@ class Orders
     private const GENERIC_ITEM_REFERENCE = 'alegra-connector-adjustment';
 
     /**
+     * Order meta holding the invoice id whose "voided" note was already written,
+     * so the webhook and the poll never duplicate it.
+     */
+    public const VOID_NOTIFIED_META = '_alegra_invoice_void_notified';
+
+    /**
      * Valid Alegra `paymentMethod` enum values for POST /payments.
      *
      * Any mapped value outside this list is a configuration bug; the resolver
@@ -198,6 +204,53 @@ class Orders
         }
         $order->update_meta_data('_alegra_invoice_status', $status);
         $order->save();
+    }
+
+    /**
+     * Add the "invoice voided in Alegra" order note exactly once per invoice.
+     *
+     * Idempotent: both the webhook and the periodic poll call it, and the poll
+     * runs on every cron tick. The invoice id is stored in `_alegra_invoice_void_notified`
+     * so a second observation is a no-op. The order status is deliberately left
+     * untouched: an Alegra void does not prove the WC order was cancelled, so
+     * the merchant decides.
+     *
+     * @return bool True when a note was written, false when it was already there.
+     */
+    public function note_invoice_voided(\WC_Order $order, array $invoice): bool
+    {
+        $invoice_id = (string) ($invoice['id'] ?? $order->get_meta('_alegra_invoice_id', true));
+
+        // `numberTemplate` can be an object or an array depending on the
+        // endpoint; isset() keeps a string value from being offset-accessed.
+        $number = $invoice_id;
+        if (isset($invoice['numberTemplate']['fullNumber'])) {
+            $number = (string) $invoice['numberTemplate']['fullNumber'];
+        } elseif (isset($invoice['numberTemplate']['number'])) {
+            $number = (string) $invoice['numberTemplate']['number'];
+        } elseif (isset($invoice['number'])) {
+            $number = (string) $invoice['number'];
+        }
+
+        if ($invoice_id !== '' && (string) $order->get_meta(self::VOID_NOTIFIED_META, true) === $invoice_id) {
+            return false;
+        }
+
+        $order->add_order_note(sprintf(
+            __('[Alegra] Factura #%s anulada en Alegra. El pedido NO se cancela automáticamente; revisá su estado manualmente.', 'alegra-connector'),
+            $number
+        ));
+        $order->update_meta_data(self::VOID_NOTIFIED_META, $invoice_id);
+        $order->save();
+
+        if ($this->logger) {
+            $this->logger->info('Order note added: invoice voided in Alegra', [
+                'order_id'   => (int) $order->get_id(),
+                'invoice_id' => $invoice_id,
+            ]);
+        }
+
+        return true;
     }
 
     /**
@@ -967,6 +1020,12 @@ class Orders
                 __('Factura Alegra #%s anulada.', 'alegra-connector'),
                 $alegra_invoice_id
             ));
+            // Keep the cached status truthful so the orders list stops showing
+            // the invoice as active. Only when Alegra confirms the void.
+            if (($result['status'] ?? '') === 'void') {
+                $order->update_meta_data('_alegra_invoice_status', 'void');
+                $order->save();
+            }
             $this->logger->info('Invoice voided in Alegra', [
                 'order_id' => $order->get_id(),
                 'invoice_id' => $alegra_invoice_id,
@@ -2175,9 +2234,15 @@ class Orders
 
             // AC-18: fetch IDs + filter in SQL. `return => ids` avoids
             // hydrating full WC_Order objects just to read one meta.
+            //
+            // `completed` is included so a void issued AFTER the order was
+            // completed is still noticed. The batch (`orders_poll_batch`,
+            // default 20) bounds the per-run API cost regardless of how many
+            // completed orders exist, and the date DESC ordering keeps the
+            // most-recent orders (the ones still pending/completing) first.
             $query = [
                 'limit'   => $limit,
-                'status'  => ['processing', 'pending', 'on-hold'],
+                'status'  => ['processing', 'pending', 'on-hold', 'completed'],
                 'orderby' => 'date',
                 'order'   => 'DESC',
                 'return'  => 'ids',
@@ -2218,8 +2283,15 @@ class Orders
                 // Keep the cached status fresh for the orders list.
                 $this->persist_invoice_status($order, $invoice);
 
-                $status = $invoice['status'] ?? '';
+                $status = (string) ($invoice['status'] ?? '');
                 $balance = (float) ($invoice['balance'] ?? 0);
+
+                // A voided invoice never auto-completes. Note it once and leave
+                // the WC order status alone: the merchant decides.
+                if ($status === 'void') {
+                    $this->note_invoice_voided($order, $invoice);
+                    continue;
+                }
 
                 if ($status === 'paid' && $balance <= 0 && $should_complete) {
                     if ($order->get_status() !== 'completed') {

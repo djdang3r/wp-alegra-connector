@@ -10,9 +10,14 @@ $alegra_invoice_number = $alegra_invoice_number ?? '';
 $alegra_data = $alegra_data ?? null;
 $alegra_error = $alegra_error ?? null;
 
+$alegra_status = is_array($alegra_data) ? (string) ($alegra_data['status'] ?? '') : '';
+$alegra_is_void = $alegra_status !== '' && \Alegra\Connector\Invoice_Status::is_void($alegra_status);
+
 $page_title = sprintf(__('Pedido #%d', 'alegra-connector'), $order->get_id());
 if ($alegra_invoice_id !== '' && $alegra_invoice_id !== null) {
-    $page_subtitle = __('Facturado en Alegra', 'alegra-connector');
+    $page_subtitle = $alegra_is_void
+        ? __('Factura anulada en Alegra', 'alegra-connector')
+        : __('Facturado en Alegra', 'alegra-connector');
 } elseif ($payment_synced) {
     $page_subtitle = __('Pago registrado', 'alegra-connector');
 } else {
@@ -76,6 +81,9 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
 
     <div class="ac-detail-panel">
         <h2><span class="dashicons dashicons-cloud" style="color:var(--ac-primary);"></span> Alegra</h2>
+        <?php if ($alegra_is_void): ?>
+            <div class="ac-notice error"><p><strong><?php esc_html_e('Factura anulada en Alegra.', 'alegra-connector'); ?></strong> <?php esc_html_e('El pedido ya no tiene una factura válida. No se canceló automáticamente: revisá su estado y, si corresponde, creá una nueva factura o cancelá el pedido manualmente.', 'alegra-connector'); ?></p></div>
+        <?php endif; ?>
         <?php if ($alegra_error): ?>
             <div class="ac-notice error"><p><?php echo esc_html($alegra_error); ?></p></div>
         <?php elseif ($alegra_data): ?>
@@ -84,7 +92,7 @@ $order_pdf_nonce = wp_create_nonce('alegra_connector_nonce');
                 <tr><th><?php esc_html_e('Número', 'alegra-connector'); ?></th><td><?php echo esc_html($alegra_data['number'] ?? '--'); ?></td></tr>
                 <tr><th><?php esc_html_e('Fecha', 'alegra-connector'); ?></th><td><?php echo esc_html($alegra_data['date'] ?? ''); ?></td></tr>
                 <tr><th><?php esc_html_e('Vencimiento', 'alegra-connector'); ?></th><td><?php echo esc_html($alegra_data['dueDate'] ?? ''); ?></td></tr>
-                <tr><th><?php esc_html_e('Estado', 'alegra-connector'); ?></th><td><?php echo esc_html($alegra_data['status'] ?? ''); ?></td></tr>
+                <tr><th><?php esc_html_e('Estado', 'alegra-connector'); ?></th><td><span class="ac-badge <?php echo esc_attr(\Alegra\Connector\Invoice_Status::badge_class($alegra_status)); ?>"><?php echo esc_html(\Alegra\Connector\Invoice_Status::label($alegra_status)); ?></span></td></tr>
                 <tr><th><?php esc_html_e('Total', 'alegra-connector'); ?></th><td><strong><?php echo isset($alegra_data['total']) ? wp_kses_post(wc_price((float) $alegra_data['total'])) : '--'; ?></strong></td></tr>
                 <tr><th><?php esc_html_e('Saldo', 'alegra-connector'); ?></th><td><?php echo isset($alegra_data['balance']) ? wp_kses_post(wc_price((float) $alegra_data['balance'])) : '--'; ?></td></tr>
             </table>
