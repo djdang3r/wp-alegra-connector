@@ -2,6 +2,64 @@
 
 All notable changes to Alegra Connector.
 
+## [2.4.0] - 2026-09-21
+
+> **Write-gate release (behavioural, with a migration).** Until now the kill
+> switch and the per-entity toggles were decorative: the "disconnected" state
+> still let manual admin/REST pushes reach Alegra, the cron ignored the "what to
+> sync" checkboxes, and a refund in manual mode emitted a credit note behind your
+> back. This release moves enforcement to a single choke point (`Write_Gate`),
+> makes the settings tell the truth, and adds the manual credit-note action that
+> replaces the now-gated automatic one. **Read the upgrade notes before updating.**
+
+### Added
+
+- **Central write enforcement.** The kill switch and the per-entity enablement
+  are now enforced at a single choke point (`includes/Write_Gate.php`, wired into
+  `Client::request()`), so no write reaches Alegra from any path — hooks, admin,
+  REST, cron or dashboard render — while disconnected or while the entity is
+  disabled.
+- A new **`push_customers_enabled`** option, so customers can be pushed
+  independently of products.
+- **`payment_reconcile_enabled`** and **`payment_reconcile_batch`**, now
+  registered and exposed in the dashboard (they were read but uncontrollable).
+- A manual **"Emitir nota de crédito"** action on the order screen.
+
+### Changed
+
+- **The kill switch is now real.** With the plugin "disconnected", manual
+  admin/REST pushes are blocked (they used to reach Alegra).
+- **Manual mode (`push_orders_enabled=false`): a WooCommerce refund no longer
+  automatically emits a credit note, and a payment-method change no longer
+  updates the invoice.** Use the new **"Emitir nota de crédito"** button.
+- **`payment_reconcile_enabled=false` stops BOTH** the hourly sweep and the
+  real-time payment reconciliation.
+- **Viewing the dashboard no longer creates the Consumidor Final contact**; it is
+  created on the first invoicing.
+- The four **"what to sync" checkboxes now show the real value** (they displayed
+  checked while the cron treated them as off).
+
+### Fixed
+
+- Saving the Settings page no longer wipes the field/tax mappings.
+- "Run now" / "Sincronizar ahora" explains why it cannot run instead of doing
+  nothing.
+- Disconnecting now actually deletes the webhook subscriptions in Alegra (a
+  regression introduced by the new gate) and reports the real count.
+- The chunked import flows now stop when the sync is cancelled.
+
+### Upgrade notes (critical)
+
+- The migration seeds **`push_customers_enabled` from `push_products_enabled`** so
+  existing installs keep pushing customers; fresh installs get it off.
+- If you relied on manual pushes working while "disconnected", they no longer do
+  — that is the point of the kill switch.
+- If you relied on automatic credit notes on refund in manual mode, use the new
+  **"Emitir nota de crédito"** button.
+- Re-save the payment account if the settings ever showed "Sin cuenta".
+- `Schema::SCHEMA_VERSION` is unchanged (`2.3.1`): this release has **no schema
+  change**; the migration only seeds an option.
+
 ## [2.3.11] - 2026-09-16
 
 > **Payments reliability release.** The "Facturar" button on the order detail
@@ -601,7 +659,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.3.11_VERIFICATION.md` for the assumptions that still require a live API test (this guide was renamed from `RELEASE_2.3.7_VERIFICATION.md`).
+- See `docs/RELEASE_2.4.0_VERIFICATION.md` for the assumptions that still require a live API test (this guide was renamed from `RELEASE_2.3.7_VERIFICATION.md`).
 
 ---
 

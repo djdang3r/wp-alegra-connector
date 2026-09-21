@@ -1,17 +1,20 @@
-# Verificación en Producción — Alegra Connector 2.3.11
+# Verificación en Producción — Alegra Connector 2.4.0
 
-Esta guía es la **lista de validación** de la versión **2.3.11**. La 2.3.11 es una
-**versión de confiabilidad de pagos**: el botón **"Facturar"** creaba la factura
-pero **nunca registraba el pago**, así que un pedido ya pagado quedaba con la
-factura **"Por Cobrar"** en Alegra. Ahora "Facturar" registra el pago desde
-WooCommerce cuando el pedido `is_paid()`, los datos del pago salen de WC (fecha,
-monto, pasarela) y la reconciliación (hooks siempre activos + barrido horario)
-adjunta un pago posterior a una factura ya creada.
+Esta guía es la **lista de validación** de la versión **2.4.0**. La 2.4.0 es una
+**versión de comportamiento con migración**: el **kill switch** y los **toggles
+por entidad** dejaron de ser decorativos y ahora se aplican en un único punto de
+control (`Write_Gate`, dentro de `Client::request()`), de modo que **ninguna
+escritura llega a Alegra** mientras el plugin está "desconectado" o la entidad
+está deshabilitada. Además: el modo manual ya no emite notas de crédito
+automáticas por reembolso (hay un botón manual **"Emitir nota de crédito"**), el
+barrido/reconciliación respeta `payment_reconcile_enabled`, el dashboard ya no
+crea el Consumidor Final al renderizar, y los cuatro checkboxes de "qué
+sincronizar" muestran el valor real.
 
-La 2.3.11 **conserva** las verificaciones de la 2.3.7 (webhooks), de la 2.3.6
-(stock, categoría comercial, clientes, pedidos y orquestación) y de las versiones
-anteriores: siguen siendo válidas y están más abajo. Lo **nuevo** es la sección
-de **pagos (★★★)**, que es el bug reportado.
+La 2.4.0 **conserva** las verificaciones de la 2.3.11 (pagos), de la 2.3.7
+(webhooks), de la 2.3.6 (stock, categoría comercial, clientes, pedidos y
+orquestación) y de las versiones anteriores: siguen siendo válidas y están más
+abajo. Lo **nuevo** es la sección de **write gates (★★★)**.
 
 **Guía complementaria:** este documento **no** repite cómo instalar ni cómo
 revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
@@ -32,6 +35,86 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 | **Alto** | Si falla, la factura sale con el **destinatario equivocado**, no se factura, se factura sin querer, el stock queda desalineado, o los webhooks se **borran solos**. **Bloquea** el uso real hasta resolverse. |
 | **Medio** | Si falla, una función secundaria (categorías, checkout) queda degradada. No bloquea facturar, pero hay que arreglarlo. |
 | **Bajo** | Caso borde o comportamiento tolerable. Se puede convivir con él; el poll/fallback cubre la mayoría. |
+
+---
+
+## ★★★ Write gates — lo nuevo de la 2.4.0 (comportamiento)
+
+> **Leé esto antes de actualizar.** La 2.4.0 cambia el comportamiento de forma
+> deliberada: mientras el plugin esté **"desconectado"** (kill switch), **ninguna
+> escritura sale** hacia Alegra, ni siquiera las que hacías a mano desde el admin.
+> En **modo manual** (`push_orders_enabled=false`), un reembolso **ya no** emite
+> la nota de crédito sola: se usa el botón **"Emitir nota de crédito"**.
+
+### ★★★.a — El kill switch ahora bloquea una factura/pago manual
+
+1. Andá a **Alegra Connector → Configuración** y **desconectá** el plugin (o
+   apagá el kill switch). Confirmá que figura como **desconectado**.
+2. En el detalle de un pedido sin factura, apretá **"Facturar"**. Probá también
+   un push por REST/acción manual si tenés una.
+3. **Resultado esperado:** **no** se crea factura ni pago en Alegra; el plugin
+   reporta el bloqueo (aviso/nota) en vez de escribir. En los logs no aparece
+   ningún `POST /invoices` ni `POST /payments`.
+4. **Antes de la 2.4.0** ese push manual **sí** llegaba a Alegra aunque el plugin
+   estuviera "desconectado". Ese es exactamente el agujero que tapa esta versión.
+5. **Si falla:** es un bloqueante — el kill switch no es real. Revisá
+   `includes/Write_Gate.php` y que `Client::request()` lo invoque.
+
+### ★★★.b — `payment_reconcile_enabled=false` frena el barrido
+
+1. En **Configuración**, poné **`payment_reconcile_enabled`** (reconciliación de
+   pagos) en **apagado**.
+2. Tomá un pedido **pagado**, ya facturado y **sin pago** en Alegra, y esperá el
+   barrido horario (o forzá el cron `alegra_connector_payment_reconcile`).
+3. **Resultado esperado:** **ni** el barrido horario **ni** la reconciliación en
+   tiempo real registran el pago; la factura sigue "Por Cobrar".
+4. Volvé a prenderlo y confirmá que el pago se adjunta (sin duplicar).
+5. **Riesgo: Alto.** Si el flag no frena ambas vías, seguís pagando de más sin
+   control.
+
+### ★★★.c — El botón manual "Emitir nota de crédito" (modo manual)
+
+1. Con **`push_orders_enabled=false`** (modo manual) y una factura vinculada,
+   **reembolsá** un pedido en WooCommerce.
+2. **Resultado esperado:** **no** se emite nota de crédito automáticamente.
+3. Ahora apretá **"Emitir nota de crédito"** en la pantalla del pedido.
+4. **Resultado esperado:** se emite **exactamente una** nota de crédito en Alegra
+   ligada a la factura. Repetir el clic no debe duplicarla.
+5. **Casos borde:** sin factura vinculada, el botón avisa y no postea nada; con
+   factura en **borrador**, pide abrirla primero; en **dry run** o con el kill
+   switch activo, reporta el bloqueo y no escribe.
+6. **Riesgo: Alto.** Reemplaza la nota automática que la 2.4.0 dejó de emitir.
+
+### ★★★.d — Los cuatro checkboxes de "qué sincronizar" dicen la verdad
+
+1. En **Configuración → Sincronización**, mirá los cuatro checkboxes
+   (`push_products_enabled`, `push_customers_enabled`, `push_orders_enabled` y
+   el restante).
+2. **Resultado esperado:** lo que muestra cada checkbox **coincide con lo que el
+   cron realmente hace**. Antes se veían tildados mientras el cron los trataba
+   como apagados.
+3. **Migración:** `push_customers_enabled` se sembró desde
+   `push_products_enabled`, así que una instalación existente **sigue empujando
+   clientes**. Una instalación nueva lo tiene **apagado** por defecto.
+4. **Riesgo: Medio.** Un desfase acá hace que creas que sincronizás algo que no.
+
+### ★★★.e — Guardar Configuración conserva los mapeos
+
+1. Anotá los mapeos de **campos** y de **impuestos** en **Configuración**.
+2. Guardá la página (aunque no toques nada).
+3. **Resultado esperado:** los mapeos **siguen ahí**, intactos. Antes, guardar
+   los borraba.
+4. **Riesgo: Alto.** Perder los mapeos rompe la facturación con impuestos.
+
+### ★★★.f — El dashboard ya no crea el Consumidor Final al renderizar
+
+1. Asegurate de que **no** exista todavía el contacto **Consumidor Final** en
+   Alegra (o mirá su `id`/fecha).
+2. Abrí **Alegra Connector → Dashboard** varias veces.
+3. **Resultado esperado:** **no** se hace ningún `POST /contacts` al renderizar;
+   el Consumidor Final **no** se crea por mirar el dashboard. Se crea recién en
+   la **primera facturación** que lo necesite.
+4. **Riesgo: Medio.** Un render no debería tener efectos secundarios de escritura.
 
 ---
 
@@ -484,22 +567,26 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la **2.3.7**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
-4. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
+2. **Desplegar** e instalar la **2.4.0**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **★★★ Write gates (lo nuevo de la 2.4.0):** kill switch (★★★.a), barrido
+   (★★★.b), botón de nota de crédito (★★★.c), checkboxes (★★★.d), mapeos
+   (★★★.e) y Consumidor Final en el render (★★★.f). **Hacelo primero:** cambia
+   el comportamiento de escritura.
+4. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
+5. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
    inventario (★★.c). Es lo más importante de esta versión.
-5. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
+6. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
    CO+FE (★.c).
-6. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
+7. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
    y errores visibles (★.d).
-7. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
+8. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
    el wizard (★.c).
-8. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
-9. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
-   que la factura se crea en Alegra (en borrador por defecto), vinculada al
-   cliente correcto y con el total correcto.
-10. **Reembolso parcial** del pedido anterior → confirmá que se crea la nota
-    crédito ligada a la factura.
+9. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
+10. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
+    que la factura se crea en Alegra (en borrador por defecto), vinculada al
+    cliente correcto y con el total correcto.
+11. **Reembolso parcial** del pedido anterior → en modo manual, usá el botón
+    **"Emitir nota de crédito"** (★★★.c) para crear la nota ligada a la factura.
 
 ---
 
@@ -510,16 +597,19 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
    exactamente qué campo rechazó.
 2. **Anotá el caso:** pedido, hora, qué hiciste y el mensaje textual. Sin eso,
    no se puede diagnosticar.
-3. **Rollback a 2.3.6** (el procedimiento completo está en
+3. **Rollback a 2.3.11** (el procedimiento completo está en
    `RELEASE_2.3.0_DEPLOY.md` §6):
    - Desactivá **"Alegra Connector"** en **Plugins**.
-   - Reemplazá la carpeta por `releases/alegra-connector-v2.3.6.zip`.
+   - Reemplazá la carpeta por `releases/alegra-connector-v2.3.11.zip`.
    - Reactivá el plugin.
    - **Ojo:** la 2.3.0 migró las columnas `alegra_id` de `BIGINT` a
      `VARCHAR(36)`; eso **no** se revierte. Con IDs numéricos, versiones previas
      siguen funcionando.
-   - **Ojo:** si re-registraste los webhooks con token, la 2.3.6 **sí** entiende
-     ese token (lo introdujo la 2.3.6); no hace falta rehacer nada.
+   - **Ojo:** la 2.4.0 sembró `push_customers_enabled` desde
+     `push_products_enabled`; la 2.3.11 **no** lee esa opción, así que el push de
+     clientes vuelve a depender del gate de productos.
+   - **Ojo:** la 2.4.0 **deshabilitó** la nota de crédito automática en modo
+     manual; al volver a 2.3.11 esa automatización se reactiva.
 4. **Estado de las facturas:** por defecto se crean como **borrador** para que
    las revises antes de emitirlas. Si querés que se creen abiertas, cambialo en
    `Alegra Connector → Configuración → Datos de facturación`.
@@ -534,7 +624,19 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.3.11 instalado y la versión figura como **2.3.11** en **Plugins**.
+- [ ] 2.4.0 instalado y la versión figura como **2.4.0** en **Plugins**.
+
+### Write gates — lo nuevo de la 2.4.0
+- [ ] **★★★.a** Con el plugin desconectado, "Facturar" **no** escribe en Alegra
+      (ni factura ni pago).
+- [ ] **★★★.b** `payment_reconcile_enabled=false` frena el **barrido** y la
+      reconciliación en tiempo real.
+- [ ] **★★★.c** En modo manual, el reembolso **no** emite nota sola; el botón
+      **"Emitir nota de crédito"** emite **exactamente una**.
+- [ ] **★★★.d** Los cuatro checkboxes de "qué sincronizar" coinciden con lo que
+      hace el cron; `push_customers_enabled` respeta la migración.
+- [ ] **★★★.e** Guardar Configuración **conserva** los mapeos de campos/impuestos.
+- [ ] **★★★.f** Abrir el dashboard **no** crea el Consumidor Final en Alegra.
 
 ### Pagos — lo nuevo de la 2.3.11
 - [ ] **★★★.a** "Facturar" un pedido **pagado** → **1 pago** en Alegra y la
