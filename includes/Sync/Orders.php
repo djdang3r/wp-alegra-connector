@@ -343,11 +343,16 @@ class Orders
      *   3. find_existing_payment() pre-search — recover a committed-but-lost response.
      *   4. prepare_payment_data() + POST /payments.
      *
-     * Used by the manual ("Facturar") and automatic payment paths (design §5.3).
+     * A DRAFT invoice is a deliberate merchant decision (`invoice_status = draft`,
+     * e.g. for testing). The AUTOMATIC paths (hourly sweep, real-time reconcile
+     * hooks) must NEVER open it: they skip and tell the merchant. Only an
+     * explicit manual action passes $allow_open_draft = true.
+     *
+     * @param bool $allow_open_draft Manual actions pass true; automatic ones false.
      *
      * @return array|\WP_Error The payment payload, or a WP_Error when the POST failed.
      */
-    private function record_payment_for_invoice(\WC_Order $order, string $invoice_id): array|\WP_Error
+    private function record_payment_for_invoice(\WC_Order $order, string $invoice_id, bool $allow_open_draft = false): array|\WP_Error
     {
         if ($invoice_id === '') {
             return new \WP_Error('missing_invoice', __('No hay una factura de Alegra vinculada.', 'alegra-connector'));
@@ -359,11 +364,26 @@ class Orders
             return ['id' => $existing_payment_id, 'already_exists' => true];
         }
 
-        // 2. Alegra only accepts a payment on an OPEN invoice. A draft invoice
-        //    created earlier (the default, e.g. by the `woocommerce_new_order`
-        //    hook) must be opened before applying the payment.
-        $opened = $this->ensure_invoice_open($invoice_id);
-        if (!is_wp_error($opened)) {
+        // 2. Alegra only accepts a payment on an OPEN invoice. Read the invoice
+        //    and decide: a draft is opened ONLY when the caller is an explicit
+        //    manual action ($allow_open_draft). The automatic reconciliation
+        //    gets a `draft_invoice_not_opened` error and skips it untouched.
+        $opened = $this->ensure_invoice_open($invoice_id, $allow_open_draft);
+        if (is_wp_error($opened)) {
+            if ($opened->get_error_code() === 'draft_invoice_not_opened') {
+                return $this->skip_draft_payment($order, $invoice_id);
+            }
+            // A genuine read/open failure: keep the legacy tolerant behaviour
+            // (log it and let the payment POST surface Alegra's own error)
+            // instead of silently swallowing it.
+            if ($this->logger) {
+                $this->logger->warning('Could not read/open the invoice before paying; trying anyway', [
+                    'order_id'   => $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                    'error'      => $opened->get_error_message(),
+                ]);
+            }
+        } else {
             $this->persist_invoice_status($order, $opened);
         }
 
@@ -442,6 +462,39 @@ class Orders
     }
 
     /**
+     * Skip recording a payment on a DRAFT invoice without touching its state.
+     *
+     * The automatic reconciliation must never open a draft: the merchant left
+     * it in draft on purpose (invoice_status = draft). Report it once per
+     * invoice on the order (the hourly sweep runs repeatedly) and log it, then
+     * let the caller count the order as skipped.
+     *
+     * @return array{skipped:bool,reason:string}
+     */
+    private function skip_draft_payment(\WC_Order $order, string $invoice_id): array
+    {
+        if ($this->logger) {
+            $this->logger->info('Payment reconcile skipped: invoice is a draft (automatic paths never open drafts)', [
+                'order_id'   => $order->get_id(),
+                'invoice_id' => $invoice_id,
+            ]);
+        }
+
+        // One note per invoice, so an hourly sweep does not spam the order.
+        if ((string) $order->get_meta('_alegra_draft_payment_notified', true) !== $invoice_id) {
+            $order->add_order_note(sprintf(
+                /* translators: %s: Alegra invoice id */
+                __('[Alegra] La factura #%s está en BORRADOR. La conciliación automática no la abrió ni registró el pago: si querés cobrarla, abrilo manualmente con "Abrir factura" y luego "Registrar pago".', 'alegra-connector'),
+                $invoice_id
+            ));
+            $order->update_meta_data('_alegra_draft_payment_notified', $invoice_id);
+            $order->save();
+        }
+
+        return ['skipped' => true, 'reason' => 'draft_not_opened'];
+    }
+
+    /**
      * Reconcile the payment of an order whose invoice ALREADY exists in Alegra.
      *
      * This is the payment-only path used by the always-active WC hooks and the
@@ -478,7 +531,9 @@ class Orders
         }
 
         try {
-            return $this->record_payment_for_invoice($order, $invoice_id);
+            // Automatic path: a draft invoice is NEVER opened here. Only the
+            // explicit manual buttons pass $allow_open_draft = true.
+            return $this->record_payment_for_invoice($order, $invoice_id, false);
         } finally {
             Controller::release_lock($lock_key, $token);
         }
@@ -529,7 +584,7 @@ class Orders
             ],
         ]);
 
-        $result = ['checked' => 0, 'reconciled' => 0, 'errors' => 0];
+        $result = ['checked' => 0, 'reconciled' => 0, 'errors' => 0, 'draft_skipped' => 0];
         foreach ((array) $order_ids as $order_id) {
             // Re-check the kill switch and the cancellation transient so an
             // in-flight sweep stops (REQ-REC-4).
@@ -547,6 +602,11 @@ class Orders
             if (is_wp_error($r)) {
                 $result['errors']++;
             } elseif (!empty($r['skipped'])) {
+                // A draft is a deliberate decision: count it separately so the
+                // merchant can see why the sweep did not pay those orders.
+                if (($r['reason'] ?? '') === 'draft_not_opened') {
+                    $result['draft_skipped']++;
+                }
                 continue;
             } else {
                 $result['reconciled']++;
@@ -558,18 +618,31 @@ class Orders
     }
 
     /**
-     * Open a draft invoice in Alegra and return its resulting state.
+     * Open a DRAFT invoice in Alegra and return its resulting state.
      *
-     * No-op when the invoice is already open (returns it unchanged). Used by
-     * the payment paths (a payment requires an OPEN invoice) and by the manual
-     * "Abrir factura" action on the order detail page.
+     * No-op when the invoice is already non-draft (returns it unchanged).
      *
-     * Public because the manual "Registrar pago" AJAX path (BUG 6) must open a
-     * draft invoice before posting the payment, exactly like the auto path.
+     * Alegra documents NO clean draft→open endpoint:
+     *  - `POST /invoices/{id}/open` is "revertir la anulación de una factura"
+     *    (an UN-VOID), not draft→open.
+     *  - `PUT /invoices/{id}` does NOT list `status` in its schema; `status` is
+     *    a CREATION attribute of `POST /invoices`.
+     * The call below is therefore a best effort that VERIFIES the result by
+     * re-reading the invoice, with a fallback. See the inline comment.
+     *
+     * @see https://developer.alegra.com/reference/put_invoices-id.md
+     * @see https://developer.alegra.com/reference/post_invoices-id-open.md
+     *
+     * ONLY explicit manual actions may pass a draft. `record_payment_for_invoice()`
+     * calls this with $allow_draft = false on the automatic reconciliation, so a
+     * deliberate draft is never opened behind the merchant's back.
+     *
+     * @param bool $allow_draft When false, a draft returns a
+     *                         `draft_invoice_not_opened` WP_Error untouched.
      *
      * @return array|\WP_Error The invoice after opening, or the API error.
      */
-    public function ensure_invoice_open(string $invoice_id): array|\WP_Error
+    public function ensure_invoice_open(string $invoice_id, bool $allow_draft = true): array|\WP_Error
     {
         if ($invoice_id === '') {
             return new \WP_Error('missing_invoice', __('No hay una factura de Alegra vinculada.', 'alegra-connector'));
@@ -587,21 +660,51 @@ class Orders
             return $invoice;
         }
 
-        $opened = $this->api->open_invoice($invoice_id);
-        if (is_wp_error($opened)) {
-            if ($this->logger) {
-                $this->logger->warning('Could not open a draft invoice', [
-                    'invoice_id' => $invoice_id,
-                    'error'      => $opened->get_error_message(),
-                ]);
-            }
-            return $opened;
+        if (!$allow_draft) {
+            return new \WP_Error(
+                'draft_invoice_not_opened',
+                __('La factura está en borrador y la conciliación automática no la abre.', 'alegra-connector')
+            );
         }
 
-        // Re-read so the caller gets the final status (the open response may not
-        // carry every field the order detail shows).
+        // Alegra documents NO clean draft→open endpoint:
+        //  - POST /invoices/{id}/open is "revertir la anulación" (an UN-VOID).
+        //  - PUT /invoices/{id} does NOT list `status` in its schema; `status`
+        //    is a CREATION attribute of POST /invoices.
+        // So try, in order, and VERIFY by re-reading the invoice:
+        //  1. PUT /invoices/{id} {"status":"open"} — semantic intent; the POST
+        //     schema names `status` with the same `open`/`draft` enum.
+        //  2. POST /invoices/{id}/open — the legacy call, which empirically
+        //     converted a draft for this merchant. Only reached on a DRAFT, so
+        //     the documented un-void semantics do not apply.
+        //  3. Still a draft → explicit error, never a fake success.
+        $this->api->update_invoice($invoice_id, ['status' => 'open']);
         $fresh = $this->api->get_invoice($invoice_id);
-        return is_wp_error($fresh) ? $opened : $fresh;
+        if (!is_wp_error($fresh) && is_array($fresh) && (string) ($fresh['status'] ?? '') !== 'draft') {
+            return $fresh;
+        }
+
+        if ($this->logger) {
+            $this->logger->warning('PUT status=open did not open the draft; trying POST /open', [
+                'invoice_id' => $invoice_id,
+            ]);
+        }
+        $this->api->open_invoice($invoice_id);
+        $fresh = $this->api->get_invoice($invoice_id);
+        if (!is_wp_error($fresh) && is_array($fresh) && (string) ($fresh['status'] ?? '') !== 'draft') {
+            return $fresh;
+        }
+
+        if ($this->logger) {
+            $this->logger->warning('Could not open a draft invoice with either endpoint', [
+                'invoice_id' => $invoice_id,
+            ]);
+        }
+
+        return new \WP_Error(
+            'invoice_still_draft',
+            __('Alegra no abrió la factura; sigue en borrador. Abrilo desde la interfaz de Alegra.', 'alegra-connector')
+        );
     }
 
     /**

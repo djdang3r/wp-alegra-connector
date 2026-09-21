@@ -326,7 +326,7 @@ TestRunner::test('T3.2 an OPEN invoice status setting is honoured and no stamp i
     TestRunner::assertSame('open', $body['status'] ?? null, 'the open setting must be honoured');
 });
 
-TestRunner::test('T3.3 a payment on an existing DRAFT invoice opens it before paying', function (): void {
+TestRunner::test('T3.3 a pre-existing DRAFT invoice is NEVER opened by the invoice+payment path', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_payment_account_id', 'ba-1');
 
@@ -352,8 +352,11 @@ TestRunner::test('T3.3 a payment on an existing DRAFT invoice opens it before pa
     make_orders()->create_invoice_with_payment($order);
 
     TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'the existing invoice must not be re-created');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/1nv-draft/open'), 'a draft invoice must be opened before the payment');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be recorded');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/1nv-draft'), 'a deliberate draft must NOT be opened by this path');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/1nv-draft/open'), 'the un-void endpoint must never be used for a draft');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be posted on a draft');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('BORRADOR', $notes, 'the order must explain the draft was left untouched');
 });
 
 // ===========================================================================
@@ -944,6 +947,7 @@ TestRunner::test('T9.3 AC-40 the customers count is not the products count when 
 
 TestRunner::test('T9.4 AC-41 a payment-method change after the baseline still syncs', function (): void {
     alegra_test_reset();
+    alegra_mock_seed_invoice('1nv-910', ['status' => 'open', 'total' => 50.0, 'balance' => 50.0]);
     alegra_make_user(7, ['user_email' => 'pm@example.test'], [
         'billing_alegra_idtype'         => 'CC',
         'billing_alegra_identification' => '1234567890',
@@ -2001,6 +2005,9 @@ TestRunner::test('T15.6b ajax_record_payment with dry run OFF persists the payme
 
 TestRunner::test('T15.6c payment-method change with dry run OFF updates Alegra and notes it', function (): void {
     alegra_test_reset();
+    // The linked invoice must exist in Alegra: PUT /invoices/{id} on a missing
+    // invoice is a 404, not a silent success.
+    alegra_mock_seed_invoice('1nv-971', ['status' => 'open', 'total' => 50.0, 'balance' => 50.0]);
     alegra_make_user(7, ['user_email' => 'pm@example.test'], [
         'billing_alegra_idtype'         => 'CC',
         'billing_alegra_identification' => '1234567890',
@@ -2774,27 +2781,32 @@ TestRunner::test('T18.11 BUG 5 a failed payment is logged and surfaced in an ord
     TestRunner::assertStringContains('Payment recording failed', alegra_read_log(), 'the failure must be logged at error level');
 });
 
-TestRunner::test('T18.12 BUG 6 ajax_record_payment opens a DRAFT invoice before paying', function (): void {
+TestRunner::test('T18.12 BUG 6 manual ajax_record_payment opens a DRAFT via PUT before paying', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_payment_account_id', 'acct-1');
     alegra_mock_seed_invoice('1nv-draft2', [
         'status' => 'draft', 'total' => 20.0, 'balance' => 20.0,
         'items' => [['id' => 'x', 'price' => 20, 'quantity' => 1]],
     ]);
-    alegra_make_order(1150, [
+    $order = alegra_make_order(1150, [
         'total' => 20.0, 'currency' => 'COP', 'payment_method' => 'bacs',
-        'meta' => ['_alegra_invoice_id' => '1nv-draft2'],
+        'meta' => ['_alegra_invoice_id' => '1nv-draft2', '_alegra_invoice_status' => 'draft'],
     ]);
 
     $_POST['order_id'] = 1150;
     $logger = make_logger();
     $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
-    $resp = alegra_capture_json(fn() => $admin->ajax_record_payment());
+    $resp = alegra_capture_json(fn () => $admin->ajax_record_payment());
     unset($_POST['order_id']);
 
     TestRunner::assertTrue($resp->success, 'the payment must succeed');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/1nv-draft2/open'), 'a draft invoice must be opened before paying');
+    // The documented draft→open call is PUT /invoices/{id} {"status":"open"},
+    // NOT POST /invoices/{id}/open (that endpoint is an un-void).
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/1nv-draft2'), 'the draft must be opened with PUT');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/1nv-draft2/open'), 'the un-void endpoint must never be used');
     TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be recorded');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('borrador y se abrió', $notes, 'the manual open must be recorded on the order');
 });
 
 TestRunner::test('T18.13 BUG 7 an automatic order sync failure adds an order note', function (): void {
@@ -2951,6 +2963,37 @@ TestRunner::test('T19.3 BUG 2 registration counts the NESTED subscription id', f
     $token = (string) get_option('alegra_connector_webhook_token', '');
     TestRunner::assertTrue($token !== '', 'a token must be generated');
     TestRunner::assertStringContains($token, $url, 'the URL token must match the stored token');
+
+    // BUG: Alegra rejects a webhook URL that includes the scheme
+    // ("La URL ingresada no debe incluir el \"http://\" o \"https://\"").
+    TestRunner::assertStringNotContains('http://', $url, 'the registered URL must NOT include http://');
+    TestRunner::assertStringNotContains('https://', $url, 'the registered URL must NOT include https://');
+    TestRunner::assertSame('example.test/wp-json/alegra-connector/v1/webhook', strtok($url, '?'), 'the URL must be scheme-less host+path');
+});
+
+TestRunner::test('T19.3d BUG 2 every registered event carries a scheme-less URL with the token', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertTrue($response->success, 'registration must succeed');
+    TestRunner::assertSame(0, (int) ($response->payload['errores'] ?? -1), 'the mock rejects scheme URLs, so zero errors proves the fix');
+
+    $reqs = alegra_mock_requests('POST', '/webhooks/subscriptions');
+    TestRunner::assertSame(count(Client::get_webhook_events()), count($reqs), 'every documented event must be registered');
+    $events = [];
+    foreach ($reqs as $req) {
+        $events[] = (string) ($req['body']['event'] ?? '');
+        $url = (string) ($req['body']['url'] ?? '');
+        TestRunner::assertStringNotContains('://', $url, 'every URL must be scheme-less');
+        TestRunner::assertStringContains('token=', $url, 'every URL must carry the token');
+    }
+    sort($events);
+    $expected = Client::get_webhook_events();
+    sort($expected);
+    TestRunner::assertSame($expected, $events, 'exactly the documented 12 events must be registered (no per-event selection)');
 });
 
 TestRunner::test('T19.3b BUG 2 re-registering counts "Ya existe" as already registered, not an error', function (): void {
@@ -3662,7 +3705,37 @@ TestRunner::test('T24.1 ensure_invoice_open opens a draft and returns the open i
 
     TestRunner::assertFalse(is_wp_error($result), 'opening must not error');
     TestRunner::assertSame('open', (string) ($result['status'] ?? ''), 'the returned invoice must be open');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft/open'), 'exactly one open call');
+    // The documented draft→open call is PUT /invoices/{id} {"status":"open"}.
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/inv-draft'), 'exactly one PUT open call');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-draft/open'), 'the un-void endpoint must never be used');
+    TestRunner::assertSame('open', (string) (alegra_mock_last_request('PUT', '/invoices/inv-draft')['body']['status'] ?? ''), 'the PUT body must set status=open');
+});
+
+TestRunner::test('T24.1b ensure_invoice_open(allow_draft:false) refuses to touch a draft', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-draft-no', ['status' => 'draft', 'balance' => 100]);
+
+    $result = make_orders()->ensure_invoice_open('inv-draft-no', false);
+
+    TestRunner::assertTrue(is_wp_error($result), 'a refused draft must be a WP_Error');
+    TestRunner::assertSame('draft_invoice_not_opened', $result->get_error_code(), 'the error code must be explicit');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-draft-no'), 'no write may be attempted');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-draft-no/open'), 'no un-void either');
+});
+
+TestRunner::test('T24.1c ensure_invoice_open falls back to POST /open when PUT does not open', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-fb', ['status' => 'draft', 'balance' => 100]);
+    // The documented PUT schema does not list `status`; simulate an account that
+    // rejects it. The verified fallback must still open the draft.
+    alegra_mock_fail('PUT', '/invoices/inv-fb', 400, ['message' => 'Campo status no permitido']);
+
+    $result = make_orders()->ensure_invoice_open('inv-fb');
+
+    TestRunner::assertFalse(is_wp_error($result), 'the fallback must succeed: ' . (is_wp_error($result) ? $result->get_error_message() : ''));
+    TestRunner::assertSame('open', (string) ($result['status'] ?? ''), 'the invoice must end up open');
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/inv-fb'), 'the PUT is attempted first');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-fb/open'), 'the fallback un-void call is used');
 });
 
 TestRunner::test('T24.2 ensure_invoice_open is a no-op when the invoice is already open', function (): void {
@@ -3673,7 +3746,8 @@ TestRunner::test('T24.2 ensure_invoice_open is a no-op when the invoice is alrea
 
     TestRunner::assertFalse(is_wp_error($result), 'a no-op must not error');
     TestRunner::assertSame('open', (string) ($result['status'] ?? ''), 'the invoice stays open');
-    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open/open'), 'no open call for an already-open invoice');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-open'), 'no open call for an already-open invoice');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open/open'), 'no un-void call either');
 });
 
 TestRunner::test('T24.3 ajax_open_invoice opens the order draft invoice', function (): void {
@@ -3688,7 +3762,8 @@ TestRunner::test('T24.3 ajax_open_invoice opens the order draft invoice', functi
 
     TestRunner::assertTrue($resp->success, 'the handler must succeed');
     TestRunner::assertSame('open', (string) ($resp->payload['status'] ?? ''), 'the payload must report open');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft2/open'), 'the open call must be sent');
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/invoices/inv-draft2'), 'the documented PUT open call must be sent');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-draft2/open'), 'the un-void endpoint must never be used');
     TestRunner::assertSame('open', (string) wc_get_order(800)->get_meta('_alegra_invoice_status', true), 'the cached status must be updated');
 });
 
@@ -4003,7 +4078,7 @@ TestRunner::test('T-PAY-2b an unknown gateway still posts the payment with the t
     TestRunner::assertStringContains('Unknown payment gateway', alegra_read_log(), 'the unmapped gateway must be logged');
 });
 
-TestRunner::test('T-DRAFT-1a a draft invoice is opened before the payment is posted', function (): void {
+TestRunner::test('T-DRAFT-1a the automatic path NEVER opens a draft (skips it, no HTTP write)', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_payment_account_id', '5');
     alegra_mock_seed_invoice('inv-draft-pay', ['status' => 'draft', 'total' => 10.0, 'balance' => 10.0]);
@@ -4012,18 +4087,15 @@ TestRunner::test('T-DRAFT-1a a draft invoice is opened before the payment is pos
         'meta' => ['_alegra_invoice_id' => 'inv-draft-pay', '_billing_alegra_contact_id' => 'c0n-draft'],
     ]);
 
-    make_orders()->create_invoice_with_payment($order);
+    $result = make_orders()->reconcile_payment_only($order);
 
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices/inv-draft-pay/open'), 'the draft must be opened before paying');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must be posted');
-
-    $open_pos = null;
-    $pay_pos = null;
-    foreach (alegra_mock_requests() as $i => $req) {
-        if ($req['method'] === 'POST' && $req['path'] === '/invoices/inv-draft-pay/open') { $open_pos = $i; }
-        if ($req['method'] === 'POST' && $req['path'] === '/payments') { $pay_pos = $i; }
-    }
-    TestRunner::assertTrue($open_pos !== null && $pay_pos !== null && $open_pos < $pay_pos, 'the invoice must be opened before the payment POST');
+    TestRunner::assertTrue(!empty($result['skipped']), 'the reconcile must be skipped');
+    TestRunner::assertSame('draft_not_opened', (string) ($result['reason'] ?? ''), 'the skip reason must be the draft');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-draft-pay'), 'no open write may be attempted');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-draft-pay/open'), 'the un-void endpoint must never be used');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'no payment may be posted on a draft');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('BORRADOR', $notes, 'the order must explain why it was skipped');
 });
 
 TestRunner::test('T-DRAFT-1b an already-open invoice is not re-opened before paying', function (): void {
@@ -4037,8 +4109,69 @@ TestRunner::test('T-DRAFT-1b an already-open invoice is not re-opened before pay
 
     make_orders()->create_invoice_with_payment($order);
 
-    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open-pay/open'), 'an open invoice must not be re-opened');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-open-pay'), 'an open invoice must not be re-opened');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-open-pay/open'), 'the un-void endpoint must never be used');
     TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'the payment must still be posted');
+});
+
+// ===========================================================================
+// T-DRAFT-2 — The hourly sweep must never open a draft (BUG: cron did)
+// ===========================================================================
+echo "\nT-DRAFT-2 — El barrido nunca abre un borrador\n";
+
+TestRunner::test('T-DRAFT-2a the hourly sweep skips a draft, reports it and pays nothing', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-sweep-draft', ['status' => 'draft', 'total' => 10.0, 'balance' => 10.0]);
+    $order = alegra_make_order(7101, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-sweep-draft', '_billing_alegra_contact_id' => 'c0n-sd'],
+    ]);
+
+    $result = make_controller()->run_payment_reconcile();
+
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-sweep-draft'), 'the sweep must never PUT-open a draft');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices/inv-sweep-draft/open'), 'the sweep must never un-void');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'the sweep must never pay a draft');
+    TestRunner::assertSame(1, (int) ($result['draft_skipped'] ?? 0), 'the sweep must report the skipped draft');
+    TestRunner::assertSame(0, (int) ($result['reconciled'] ?? -1), 'nothing may be reconciled');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_payment_id', true), 'no payment id may be stored');
+
+    // The sweep runs hourly: the note must be written once, not every hour.
+    $notes_before = count($order->get_notes());
+    make_controller()->run_payment_reconcile();
+    TestRunner::assertSame($notes_before, count(wc_get_order(7101)->get_notes()), 'the draft note must not be repeated on the next sweep');
+});
+
+TestRunner::test('T-DRAFT-2b the real-time reconcile hook skips a draft', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_public();
+    alegra_mock_seed_invoice('inv-hook-draft', ['status' => 'draft', 'total' => 10.0, 'balance' => 10.0]);
+    alegra_make_order(7102, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-hook-draft', '_billing_alegra_contact_id' => 'c0n-hd'],
+    ]);
+
+    do_action('woocommerce_order_status_processing', 7102);
+
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/invoices/inv-hook-draft'), 'the hook must never open a draft');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'), 'the hook must never pay a draft');
+});
+
+TestRunner::test('T-DRAFT-2c a draft WITH a real payment does not open but reports skipped, not error', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-draft-rec', ['status' => 'draft', 'total' => 10.0, 'balance' => 10.0]);
+    alegra_make_order(7103, [
+        'total' => 10.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-draft-rec'],
+    ]);
+
+    $r = make_orders()->reconcile_payment_only(wc_get_order(7103));
+
+    TestRunner::assertTrue(!empty($r['skipped']), 'a draft must be reported as skipped, not an error');
+    TestRunner::assertFalse(is_wp_error($r), 'a skipped draft must not be a WP_Error');
 });
 
 // ===========================================================================

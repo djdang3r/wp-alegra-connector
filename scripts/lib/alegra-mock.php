@@ -785,6 +785,18 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         }
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'open']);
     }
+    // PUT /invoices/{id} edits an invoice. The documented draft→open call is
+    // {"status":"open"} (post_invoices-id-open is an un-void, not draft→open).
+    // Mutate the stored invoice so a subsequent GET reflects the new status.
+    if ($method === 'PUT' && preg_match('#^/invoices/([^/]+)$#', $path, $m)) {
+        $existing = $GLOBALS['alegra_mock_state']['invoices'][$m[1]] ?? null;
+        if (!$existing) {
+            return alegra_mock_response(404, ['message' => 'Invoice not found']);
+        }
+        $patch = is_array($body) ? $body : [];
+        $GLOBALS['alegra_mock_state']['invoices'][$m[1]] = array_merge($existing, $patch);
+        return alegra_mock_response(200, $GLOBALS['alegra_mock_state']['invoices'][$m[1]]);
+    }
 
     // --- Webhook subscriptions ---
     // POST response shape is documented at
@@ -795,6 +807,12 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         $url = is_array($body) ? (string) ($body['url'] ?? '') : '';
         if ($event === '' || $url === '') {
             return alegra_mock_response(400, ['error' => 'La URL ingresada no es válida']);
+        }
+        // Real API rule (the exact error the merchant saw): the webhook URL
+        // must NOT include the scheme. Mirrored here so a regression in
+        // Receiver::registration_url() fails the harness.
+        if (str_contains($url, '://')) {
+            return alegra_mock_response(400, ['error' => 'La URL ingresada no debe incluir el "http://" o "https://"']);
         }
         foreach ($GLOBALS['alegra_mock_state']['subscriptions'] as $sub) {
             if ($sub['event'] === $event && $sub['url'] === $url) {

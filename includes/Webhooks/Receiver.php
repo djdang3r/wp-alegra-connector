@@ -229,13 +229,29 @@ class Receiver
      * Build the URL to register with Alegra: the REST route plus the shared
      * secret. add_query_arg() keeps the plain-permalink `?rest_route=` form
      * working (a manual '?token=' would produce a second '?').
+     *
+     * Alegra REJECTS a webhook URL that carries the scheme: POSTing
+     * `https://…` returns 400 "La URL ingresada no debe incluir el \"http://\"
+     * o \"https://\"". The URL is therefore sent scheme-less
+     * (`midominio.com/wp-json/…`), which is what the registration UI accepts.
+     *
+     * @see https://developer.alegra.com/reference/post_webhooks-subscriptions.md
      */
     public static function registration_url(): string
     {
-        return add_query_arg(
+        return self::without_scheme(add_query_arg(
             'token',
             self::ensure_token(),
             rest_url('alegra-connector/v1/webhook')
-        );
+        ));
+    }
+
+    /**
+     * Strip a leading `http://` or `https://` from a URL, leaving
+     * `host/path?query` untouched. Idempotent.
+     */
+    public static function without_scheme(string $url): string
+    {
+        return (string) preg_replace('#^https?://#i', '', $url);
     }
 }

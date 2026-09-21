@@ -793,6 +793,17 @@ class Client
     }
 
     // Invoice actions
+    /**
+     * POST /invoices/{id}/open.
+     *
+     * Documented as "revertir la anulación de una factura" (an UN-VOID), NOT as
+     * draft→open. `Orders::ensure_invoice_open()` only uses it as a VERIFIED
+     * fallback on an invoice that is still a draft (where un-void does not
+     * apply), after `PUT /invoices/{id} {"status":"open"}` failed to change the
+     * status. Draft→open has no clean documented endpoint.
+     *
+     * @see https://developer.alegra.com/reference/post_invoices-id-open.md
+     */
     public function open_invoice(string $id): array|\WP_Error
     {
         return $this->post('/invoices/' . $id . '/open', []);

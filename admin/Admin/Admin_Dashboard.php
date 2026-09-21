@@ -2360,11 +2360,21 @@ class Admin_Dashboard
 
         $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
 
-        // BUG 6: a payment requires an OPEN invoice. The invoice may be a draft
-        // (the default), so open it first — exactly like the auto path does.
+        // A payment requires an OPEN invoice. This is an explicit MANUAL action
+        // ("Registrar pago"), so opening a draft here is the merchant's own
+        // decision — the automatic reconciliation never does it (BUG: the cron
+        // used to open drafts). Record the state change on the order so it is
+        // never silent.
+        $was_draft = (string) $order->get_meta('_alegra_invoice_status', true) === 'draft';
         $opened = $orders_sync->ensure_invoice_open($alegra_invoice_id);
         if (!is_wp_error($opened)) {
             $orders_sync->persist_invoice_status($order, $opened);
+            if ($was_draft && (string) ($opened['status'] ?? '') !== 'draft') {
+                $order->add_order_note(__(
+                    '[Alegra] La factura estaba en borrador y se abrió al registrar el pago (acción manual del administrador).',
+                    'alegra-connector'
+                ));
+            }
         }
 
         $payment_data = [
