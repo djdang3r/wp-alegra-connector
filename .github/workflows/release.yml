@@ -1,14 +1,17 @@
 name: Release
 
-# A pushed v* tag publishes the release: gates, build, then a GitHub Release
-# with the ZIP and its SHA256 attached (REQ-REL-3).
+# A pushed v* tag publishes the release (REQ-REL-3). The ZIP is built and
+# committed LOCALLY by the maintainer (scripts/build-release.sh) before the tag;
+# CI only verifies the committed artifact against its .sha256 and publishes it.
+# CI must never rebuild: a rebuild produces different bytes, so the published
+# asset would not match the repo's .sha256 (the v2.4.0 incident).
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (X.Y.Z). Defaults to the ref name without the leading v.'
+        description: 'Version to publish (X.Y.Z). Defaults to the ref name without the leading v.'
         required: false
 
 permissions:
@@ -37,13 +40,30 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Verify committed release artifact
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP="releases/alegra-connector-v${VERSION}.zip"
+          SHA="${ZIP}.sha256"
+          if [[ ! -f "$ZIP" ]]; then
+            echo "::error::Missing committed artifact $ZIP — refusing to publish."
+            echo "::error::Build and commit it locally before tagging:"
+            echo "::error::  bash scripts/build-release.sh ${VERSION}"
+            echo "::error::  git add releases/ && git commit -m 'chore(release): ${VERSION} artifacts'"
+            exit 1
+          fi
+          if [[ ! -f "$SHA" ]]; then
+            echo "::error::Missing checksum sidecar $SHA — refusing to publish."
+            exit 1
+          fi
+          ( cd releases && sha256sum -c "$(basename "$SHA")" )
+          echo "Committed artifact verified against its .sha256."
+
       - name: Gates (smoke + execution tests)
         run: |
           bash scripts/smoke-test.sh
           bash scripts/exec-test.sh
-
-      - name: Build release ZIP
-        run: bash scripts/build-release.sh "${{ steps.version.outputs.version }}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -51,6 +71,7 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Alegra Connector ${{ steps.version.outputs.version }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             releases/alegra-connector-v${{ steps.version.outputs.version }}.zip
             releases/alegra-connector-v${{ steps.version.outputs.version }}.zip.sha256

@@ -231,8 +231,14 @@ if [[ ! -f "$STAGING_DIR/alegra-connector/logger/Logger/Logger.php" ]]; then
     exit 6
 fi
 
-# Build the ZIP
-(cd "$STAGING_DIR" && zip -r "$ZIP_PATH" alegra-connector >/dev/null)
+# Deterministic ZIP: fixed mtimes + C-sorted entry list + `zip -X` so the same
+# tracked inputs always produce byte-identical bytes (do not remove).
+FIXED_MTIME="198001010000"
+find "$STAGING_DIR" -exec touch -t "$FIXED_MTIME" {} +
+FILELIST="$STAGING_DIR/.zip-filelist"
+( cd "$STAGING_DIR" && find alegra-connector | LC_ALL=C sort ) > "$FILELIST"
+(cd "$STAGING_DIR" && zip -X "$ZIP_PATH" -@ < "$FILELIST" >/dev/null)
+rm -f "$FILELIST"
 echo "Wrote $ZIP_PATH"
 
 # SHA256 sidecar

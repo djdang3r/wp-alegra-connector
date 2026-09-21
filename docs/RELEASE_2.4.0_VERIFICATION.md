@@ -38,6 +38,35 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 
 ---
 
+## Política de artefactos de release (el ZIP lo construye el mantenedor)
+
+> **Regla:** el ZIP de release se **construye y commitea localmente**; CI
+> **solo lo publica**. El `.sha256` versionado en `releases/` es la **fuente de
+> verdad** para verificar la descarga.
+
+- **Quién construye:** el mantenedor corre `bash scripts/build-release.sh <X.Y.Z>`
+  y commitea `releases/alegra-connector-v<X.Y.Z>.zip` + `.sha256` **antes** de
+  crear el tag. El tag es el último paso.
+- **Qué hace CI:** ante un push de tag `v*`, `.github/workflows/release.yml`
+  **no recompila**. Verifica que el ZIP commiteado coincida con su `.sha256`
+  (`sha256sum -c`) y recién entonces lo publica con `softprops/action-gh-release`.
+  Si el ZIP no está commiteado o el checksum no coincide, el job **falla** y no
+  publica nada.
+- **Por qué:** la v2.4.0 publicó un asset con los mismos archivos pero **distintos
+  bytes** que el ZIP del repo, porque el workflow lo recompilaba en CI y competía
+  con la subida manual. El `.sha256` del repo no podía verificar la descarga.
+  Con esta política el asset es **byte-idéntico** al artefacto versionado.
+- **Build determinista (bonus):** `build-release.sh` normaliza los mtimes a
+  `1980-01-01` y usa `zip -X` con una lista ordenada (`LC_ALL=C sort`), así los
+  mismos archivos de entrada producen **siempre los mismos bytes**. Es una red de
+  seguridad de reproducibilidad, **no** un permiso para recompilar en CI.
+- **Verificación manual:**
+  ```bash
+  ( cd releases && sha256sum -c alegra-connector-v<X.Y.Z>.zip.sha256 )
+  ```
+
+---
+
 ## ★★★ Write gates — lo nuevo de la 2.4.0 (comportamiento)
 
 > **Leé esto antes de actualizar.** La 2.4.0 cambia el comportamiento de forma
