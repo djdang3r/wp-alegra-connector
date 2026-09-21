@@ -85,6 +85,61 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
 - **Riesgo: Alto.** Era el bug reportado: sin esto, la factura queda "Por Cobrar"
   y la contabilidad no refleja el cobro.
 
+### ★★★.e — Diagnóstico de pagos (solo lectura)
+
+Si un pedido quedó **pagado en WooCommerce** pero **sin pago en Alegra**, hay un
+script que te dice **exactamente por qué**, sin tocar nada. Es **solo lectura**:
+no escribe opciones ni meta, y a Alegra solo le hace **GET** (`/company` y
+`/invoices/{id}`). Es seguro correrlo en producción.
+
+**Opción 1 — WP-CLI (recomendado):**
+
+```bash
+wp eval-file wp-content/plugins/alegra-connector/scripts/diagnose-payments.php -- --order=123
+```
+
+Sin `--order` usa el **pedido pagado más reciente**. También podés correrlo como
+comando: `wp alegra-diagnose --order=123`.
+
+**Opción 2 — Navegador (si no tenés WP-CLI):**
+
+1. Copiá `scripts/diagnose-payments.php` a la **raíz de WordPress** (donde está
+   `wp-load.php`).
+2. Abrí `https://TU-SITIO/diagnose-payments.php?order=123` con tu usuario.
+3. Requiere sesión con permiso **`manage_woocommerce`**; sin eso responde
+   **403**. Borrá el archivo cuando termines.
+
+**Qué te muestra:**
+
+1. La **versión** cargada (header vs constante vs opción) — detecta la clase de
+   bug de la "constante vieja".
+2. La **configuración de pagos**: cuenta de destino (valor crudo y si el plugin
+   la considera configurada), `invoice_status`, `push_orders_enabled`,
+   `dry_run`, `customer_resolution_mode`.
+3. La **conexión**: el flag `connection_tested` y un **GET /company** real.
+4. El **pedido**: estado, `is_paid()`, fecha de pago, total, pasarela, meta
+   (`_alegra_invoice_id`, `_alegra_payment_id`, `_billing_alegra_contact_id`), el
+   **medio de pago mapeado** y el **payload que el plugin enviaría** (no se
+   envía), más el **estado real de la factura** en Alegra (`status`, `total`,
+   `balance`, `totalPaid`).
+5. Un **veredicto** en una línea: falta la cuenta, el pedido no está pagado, la
+   factura es borrador, no hay factura, ya está pagada, o está todo bien.
+6. La **lista de pedidos con factura y sin pago** (la misma consulta del
+   barrido), para ver el alcance.
+
+**Cómo leer el veredicto:**
+
+- `SIN PAGO: falta la cuenta de destino...` → re-elegí y guardá la **Cuenta de
+  destino** en **Configuración → Avanzado**.
+- `SIN PAGO: la factura esta en borrador...` → el barrido debería abrirla y
+  pagarla; revisá el cron `alegra_connector_payment_reconcile`.
+- `SIN PAGO ESPERADO: el pedido no figura pagado...` → no es un bug; el pedido
+  no está pagado en WooCommerce.
+- `OK: el pedido ya tiene pago registrado...` → no hay nada que arreglar.
+
+Copiá y pegá la salida completa al reportar un problema: tiene todo lo que se
+necesita para diagnosticar sin acceso a tu sitio.
+
 ---
 
 ## ★ Webhooks — lo nuevo de la 2.3.7
