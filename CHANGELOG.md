@@ -2,6 +2,44 @@
 
 All notable changes to Alegra Connector.
 
+## [2.4.2] - 2026-09-21
+
+> **Webhooks visibles en el admin (sin cambio de esquema).** La pregunta que
+> bloqueaba el diseño de inventario —¿Alegra manda `edit-item` con
+> `inventory.availableQuantity` al cambiar el stock?— ahora se responde desde
+> `Alegra Connector → Webhooks`, sin scripts de desarrollo (el inspector CLI no
+> viaja en el ZIP de release).
+
+### Added
+
+- **Pantalla "Webhooks" en el admin.** Un submenú nuevo muestra las últimas 50
+  entregas registradas por el receptor: fecha, evento, entidad en una línea
+  (`item 865 — "Camiseta azul"`), IP de origen, veredicto por entrega y el
+  **payload crudo** (JSON) de cada una, plegable. Incluye filtro por evento
+  (GET), un enlace **"Recargar"**, la nota de retención ("se guardan las últimas
+  50 entregas") y un estado vacío explicativo.
+- **Veredicto destacado.** Para `edit-item` muestra **SÍ/NO** sobre
+  `message.item.inventory.availableQuantity` y un banner final ("Alegra SÍ
+  envía inventario en edit-item" / "Alegra NO envía inventario en edit-item —
+  la reconciliación debe ser por poll"). Si no hay ninguna entrega de
+  `edit-item`, avisa y lista los 5 pasos de la prueba en vivo.
+- **Acción "Limpiar"** protegida por nonce y `manage_woocommerce`, vía
+  `admin-post.php` (POST-redirect-GET). Es la única escritura de la pantalla.
+
+### Changed
+
+- La lógica de inspección (veredicto, resumen de entidad,
+  `has_inventory_available_quantity()`, `available_quantity()`) vive en
+  `includes/Webhooks/Recorder.php` y la reusan **tanto** la pantalla de admin
+  como el inspector CLI, para que no puedan divergir.
+
+### Notes
+
+- Sin cambio de esquema (`Schema::SCHEMA_VERSION` sigue en `2.3.1`). No hace
+  falta re-registrar los webhooks.
+- Todo el payload (dato remoto) se escapa con `esc_html()`/`esc_attr()`; el
+  cuerpo ya viene truncado a 20 KB por el receptor y se marca `[TRUNCADO]`.
+
 ## [2.4.1] - 2026-09-21
 
 > **Honesty + reliability patch (no schema change).** Four fixes that made the

@@ -1,18 +1,18 @@
-# Verificación en Producción — Alegra Connector 2.4.1
+# Verificación en Producción — Alegra Connector 2.4.2
 
-Esta guía es la **lista de validación** de la versión **2.4.1**. La 2.4.1 es un
-**patch de honestidad y confiabilidad** (sin cambio de esquema): la
-reconciliación automática **ya no abre un borrador**, una factura **anulada** se
-muestra como **"Anulada en Alegra"** (antes verde "Facturado"), una factura
-**liquidada** se reconoce por `closed` y no solo por `paid`, la **URL del webhook
-viaja sin esquema** (Alegra rechaza `http://`/`https://`), y se suman el
-**selector de eventos** y el **inspector de webhooks**. Lo **nuevo de la 2.4.1**
-está en la sección **★★★ (2.4.1)**.
+Esta guía es la **lista de validación** de la versión **2.4.2**. La 2.4.2 es un
+**patch de visibilidad** (sin cambio de esquema): agrega la pantalla
+**`Alegra Connector → Webhooks`**, que muestra las últimas 50 entregas
+registradas por el receptor con su **payload crudo** y responde —desde el admin,
+sin scripts— si Alegra manda **`edit-item`** con
+**`inventory.availableQuantity`** al cambiar el stock. Lo **nuevo de la 2.4.2**
+está en la sección **★★★ (2.4.2)**.
 
-La 2.4.1 **conserva** las verificaciones de la 2.4.0 (write gates), de la 2.3.11
-(pagos), de la 2.3.7 (webhooks), de la 2.3.6 (stock, categoría comercial,
-clientes, pedidos y orquestación) y de las versiones anteriores: siguen siendo
-válidas y están más abajo.
+La 2.4.2 **conserva** las verificaciones de la 2.4.1 (honestidad y
+confiabilidad), de la 2.4.0 (write gates), de la 2.3.11 (pagos), de la 2.3.7
+(webhooks), de la 2.3.6 (stock, categoría comercial, clientes, pedidos y
+orquestación) y de las versiones anteriores: siguen siendo válidas y están más
+abajo.
 
 **Guía complementaria:** este documento **no** repite cómo instalar ni cómo
 revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
@@ -62,6 +62,54 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
   ```bash
   ( cd releases && sha256sum -c alegra-connector-v<X.Y.Z>.zip.sha256 )
   ```
+
+---
+
+## ★★★ Lo nuevo de la 2.4.2 (webhooks visibles en el admin)
+
+> **Leé esto antes de actualizar.** La 2.4.2 **no cambia el esquema** ni el
+> comportamiento del receptor: solo agrega una pantalla para ver lo que Alegra
+> realmente envía. **No** hace falta re-registrar los webhooks.
+
+### ★★★.a — La pantalla "Webhooks" existe y muestra las entregas
+
+1. Abrí **Alegra Connector → Webhooks** (submenú nuevo, capacidad
+   `manage_woocommerce`).
+2. **Resultado esperado:** si hay entregas, ves la **tabla de resumen** (fecha,
+   evento, entidad en una línea, inventario, IP) y la sección **"Payloads
+   crudos (JSON)"** con un bloque plegable por entrega. Si no hay ninguna, ves
+   un **estado vacío** que explica qué va a aparecer.
+3. **Filtro:** elegí un evento (p. ej. `edit-item`) y **Filtrar**; el filtro
+   viaja por GET. **"Recargar"** vuelve a leer el buffer.
+4. **Retención:** la pantalla aclara **"Se guardan las últimas 50 entregas."**
+5. **Riesgo: Bajo.** Es de solo lectura (salvo "Limpiar").
+
+### ★★★.b — El veredicto de inventario en `edit-item`
+
+1. En **Configuración → Webhooks**, suscribí `edit-item` y **re-registrá** los
+   webhooks. Anotá el stock de un producto, **anulá** una factura que lo haya
+   descontado (o hacé un ajuste de inventario), y recargá **Webhooks**.
+2. **Resultado esperado (SÍ):** aparece el banner
+   **"Alegra SÍ envía inventario en edit-item"** y la fila de `edit-item` marca
+   **SÍ** con el valor de `availableQuantity`.
+3. **Resultado esperado (NO):** si hay `edit-item` pero **sin**
+   `inventory.availableQuantity`, el banner dice
+   **"Alegra NO envía inventario en edit-item — la reconciliación debe ser por
+   poll"**.
+4. **Sin `edit-item`:** el banner avisa que no hay entregas de `edit-item` y
+   lista los **5 pasos** de la prueba en vivo.
+5. **Riesgo: Medio.** El veredicto decide si la reconciliación de stock puede
+   ser por webhook o debe ser por poll.
+
+### ★★★.c — "Limpiar" está protegido y no rompe nada
+
+1. Click en **"Limpiar"** (pide confirmación).
+2. **Resultado esperado:** el buffer queda vacío, volvés a la pantalla con un
+   aviso, y las próximas entregas se siguen registrando con normalidad.
+3. **Seguridad:** la acción exige `manage_woocommerce` y un **nonce**; sin
+   permiso o con un nonce inválido no borra nada.
+4. **Riesgo: Bajo.** Es la única escritura de la pantalla y solo toca el buffer
+   local (`alegra_connector_webhook_recent`).
 
 ---
 
@@ -463,7 +511,14 @@ El receptor ahora guarda un **buffer acotado** de las últimas **50** entregas
 (subject, body crudo, fecha e IP; un body mayor a **20 KB** se trunca). El
 inspector **solo lee** ese buffer: no escribe en Alegra ni cambia estado.
 
-**Opción 1 — WP-CLI (recomendado):**
+**Opción 1 — Admin (recomendado, sin scripts):**
+
+1. Abrí **Alegra Connector → Webhooks**. La tabla, los payloads crudos, el
+   veredicto por entrega y el banner final están ahí.
+2. Usá el filtro por evento para ver solo `edit-item`. La pantalla es parte del
+   plugin (viaja en el ZIP); **no** necesitás subir ningún script.
+
+**Opción 2 — WP-CLI (si tenés acceso al servidor):**
 
 ```bash
 wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php -- --limit=20
@@ -471,9 +526,11 @@ wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php --
 wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php -- --item=865
 ```
 
-También como comando: `wp alegra-inspect-webhooks --event=edit-item`.
+También como comando: `wp alegra-inspect-webhooks --event=edit-item`. Nota: el
+script **no** viaja en el ZIP de release (excluido por `.distignore`); usalo solo
+desde el repo.
 
-**Opción 2 — Navegador (si no tenés WP-CLI):**
+**Opción 3 — Navegador (si no tenés WP-CLI):**
 
 1. Copiá `scripts/inspect-webhooks.php` a la **raíz de WordPress** (donde está
    `wp-load.php`).
@@ -489,8 +546,10 @@ También como comando: `wp alegra-inspect-webhooks --event=edit-item`.
 2. En Alegra, **anotá el stock** de un producto (por ejemplo, 10).
 3. **Anulá una factura** que haya descontado ese producto (o hacé un **ajuste de
    inventario**). Eso cambia el inventario del ítem.
-4. Corré el inspector (opción 1 o 2) y buscá una entrega con `subject=edit-item`.
-5. Leé el **veredicto** de la sección 3.
+4. Abrí **Webhooks** (opción 1) —o corré el inspector (opción 2/3)— y buscá una
+   entrega con `subject=edit-item`.
+5. Leé el **veredicto**: en el admin es el banner de arriba; por CLI, la
+   sección 3.
 
 **Cómo leer la salida:**
 
@@ -700,8 +759,9 @@ que verificarlo.**
      sincronización programada (hasta 15 min) y volvé a mirar.
   4. Para forzarla, usá **Dashboard → "Sincronizar inventario"** (nuevo caller de
      la 2.3.6) o **"Traer productos desde Alegra"**.
-  5. **Más fácil:** corré el **inspector ★.e**, que muestra el payload crudo de
-     cada `edit-item` y da el **veredicto** (SÍ/NO trae inventario).
+  5. **Más fácil:** abrí **`Alegra Connector → Webhooks`** (★★★.e de la 2.4.2),
+     que muestra el payload crudo de cada `edit-item` y da el **veredicto**
+     (SÍ/NO trae inventario). También sirve el inspector CLI (★.e).
 - **Resultado esperado:** el stock de WooCommerce termina actualizado, por
   webhook **o** por poll. Las dos vías son correctas.
 - **Riesgo: Bajo.** No bloquea el release: el poll es la red de seguridad.
@@ -739,29 +799,32 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la **2.4.1**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **★★★ Lo nuevo de la 2.4.1:** URL del webhook sin esquema (★★★.a), selector
+2. **Desplegar** e instalar la **2.4.2**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **★★★ Lo nuevo de la 2.4.2:** la pantalla **Webhooks** (★★★.a), el veredicto
+   de inventario en `edit-item` (★★★.b) y la acción "Limpiar" (★★★.c). Es de
+   solo lectura, así que se puede mirar sin riesgo.
+4. **★★★ Lo nuevo de la 2.4.1:** URL del webhook sin esquema (★★★.a), selector
    de eventos (★★★.b), el borrador no se abre solo (★★★.c), factura anulada
    (★★★.d), pull de inventario independiente (★★★.e), estado `closed` (★★★.f) e
    inspector de webhooks (★★★.g). **Hacelo primero:** cambia el comportamiento
    automático.
-4. **★★★ Write gates (lo nuevo de la 2.4.0):** kill switch (★★★.a), barrido
+5. **★★★ Write gates (lo nuevo de la 2.4.0):** kill switch (★★★.a), barrido
    (★★★.b), botón de nota de crédito (★★★.c), checkboxes (★★★.d), mapeos
    (★★★.e) y Consumidor Final en el render (★★★.f).
-5. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
-6. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
+6. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
+7. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
    inventario (★★.c). Es lo más importante de esta versión.
-7. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
+8. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
    CO+FE (★.c).
-8. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
+9. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
    y errores visibles (★.d).
-9. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
-   el wizard (★.c).
-10. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
-11. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
+10. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
+    el wizard (★.c).
+11. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
+12. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
     que la factura se crea en Alegra (en borrador por defecto), vinculada al
     cliente correcto y con el total correcto.
-12. **Reembolso parcial** del pedido anterior → en modo manual, usá el botón
+13. **Reembolso parcial** del pedido anterior → en modo manual, usá el botón
     **"Emitir nota de crédito"** (★★★.c) para crear la nota ligada a la factura.
 
 ---
@@ -818,8 +881,8 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
       que el pull de inventario corra **sin** "sync products" y escriba
       `_stock_status` (0 → `outofstock`).
 - [ ] **★★★.f** Una factura **liquidada** (`closed`) completa el pedido.
-- [ ] **★★★.g** `php scripts/inspect-webhooks.php` imprime las últimas 50
-      entregas y el veredicto de inventario de `edit-item`.
+- [ ] **★★★.g** `Alegra Connector → Webhooks` muestra las últimas 50 entregas
+      con su payload crudo y el veredicto de inventario de `edit-item`.
 
 ### Write gates — lo nuevo de la 2.4.0
 - [ ] **★★★.a** Con el plugin desconectado, "Facturar" **no** escribe en Alegra
@@ -880,7 +943,7 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 ### Siguen necesitando prueba en vivo
 - [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
       (webhook o poll).
-- [ ] **★.e** El inspector de webhooks confirma si `edit-item` trae
+- [ ] **★.e** La pantalla **Webhooks** confirma si `edit-item` trae
       `inventory.availableQuantity` (veredicto SÍ/NO).
 - [ ] **4.** En Blocks: al elegir NIT aparece el Dígito de verificación (y se
       oculta con los demás tipos); Persona Jurídica muestra Razón social.
