@@ -32,6 +32,9 @@ class Admin_Dashboard
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_init', [$this, 'maybe_redirect_wizard']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_assets']);
+        // The webhook buffer's only write. admin-post.php (POST-redirect-GET) so
+        // the clear is idempotent and cannot be replayed by a page refresh.
+        add_action('admin_post_alegra_clear_webhooks', [$this, 'handle_clear_webhooks']);
 
         add_action('wp_ajax_alegra_test_connection', [$this, 'ajax_test_connection']);
         add_action('wp_ajax_alegra_sync_now', [$this, 'ajax_sync_now']);
@@ -213,6 +216,15 @@ class Admin_Dashboard
             'manage_woocommerce',
             'alegra-connector-logs',
             [$this, 'render_logs_page']
+        );
+
+        add_submenu_page(
+            'alegra-connector',
+            __('Webhooks', 'alegra-connector'),
+            __('Webhooks', 'alegra-connector'),
+            'manage_woocommerce',
+            'alegra-connector-webhooks',
+            [$this, 'render_webhooks_page']
         );
 
         add_submenu_page(
@@ -934,6 +946,87 @@ class Admin_Dashboard
         $header_color = 'purple';
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-logs.php';
+    }
+
+    /**
+     * Admin screen for the webhook deliveries recorded by the receiver.
+     *
+     * Read-only except for the nonce-protected "Limpiar" action below. It
+     * answers, from the raw payloads, whether Alegra emits `edit-item` — and
+     * whether that payload carries `inventory.availableQuantity` — when stock
+     * changes. ALL inspection logic lives in the Recorder, so this screen and
+     * the CLI inspector can never drift.
+     */
+    public function render_webhooks_page(): void
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
+        }
+
+        $recorder = \Alegra\Connector\Webhooks\Recorder::class;
+        $all = $recorder::all();
+
+        // Subject filter (GET only). Unknown values simply match nothing.
+        $selected_subject = isset($_GET['subject'])
+            ? sanitize_text_field(wp_unslash((string) $_GET['subject']))
+            : '';
+
+        $entries = [];
+        foreach ($all as $entry) {
+            if ($selected_subject !== '' && (string) ($entry['subject'] ?? '') !== $selected_subject) {
+                continue;
+            }
+            $entries[] = $entry;
+        }
+        $entries = array_reverse($entries); // newest first
+
+        $subjects = [];
+        foreach ($all as $entry) {
+            $subject = (string) ($entry['subject'] ?? '');
+            if ($subject !== '') {
+                $subjects[$subject] = true;
+            }
+        }
+        $subjects = array_keys($subjects);
+        sort($subjects);
+
+        // The verdict is always GLOBAL (every retained delivery), so a table
+        // filter can never hide the answer to the inventory question.
+        $verdict = $recorder::inventory_verdict($all);
+        $edit_items = [];
+        foreach ($all as $entry) {
+            if ((string) ($entry['subject'] ?? '') === 'edit-item') {
+                $edit_items[] = $entry;
+            }
+        }
+
+        $total = count($all);
+        $shown = count($entries);
+        $retention = $recorder::MAX_ENTRIES;
+        $cleared = isset($_GET['cleared']);
+        $header_color = 'indigo';
+
+        include ALEGRA_CONNECTOR_PATH . 'templates/admin-webhooks.php';
+    }
+
+    /**
+     * Nonce- and capability-gated "Limpiar" action for the webhook buffer.
+     */
+    public function handle_clear_webhooks(): void
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
+        }
+
+        check_admin_referer('alegra_clear_webhooks');
+
+        \Alegra\Connector\Webhooks\Recorder::clear();
+
+        wp_safe_redirect(add_query_arg(
+            ['page' => 'alegra-connector-webhooks', 'cleared' => '1'],
+            admin_url('admin.php')
+        ));
+        exit;
     }
 
     public function render_import_page(): void

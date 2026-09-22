@@ -6186,4 +6186,205 @@ TestRunner::test('T26.5 recording does not change the handshake, the token gate 
     TestRunner::assertCount(1, alegra_recorder()::all(), 'the replay must not be recorded a second time');
 });
 
+// ===========================================================================
+// T27 — Webhook admin screen (submenu + raw deliveries + inventory verdict)
+//
+// The merchant must answer "does edit-item carry inventory?" from wp-admin, not
+// from scripts/inspect-webhooks.php (which is excluded from the release ZIP).
+// The screen is a submenu backed by templates/admin-webhooks.php and reuses the
+// Recorder's inspection helpers verbatim, so it can never drift from the CLI.
+// ===========================================================================
+echo "\nT27 — Webhook admin screen\n";
+
+/**
+ * Render the webhook admin screen the way WordPress would, optionally with a
+ * subject filter / clear notice in $_GET.
+ */
+function alegra_render_webhooks(string $subject = '', bool $cleared = false): string
+{
+    if ($subject === '') {
+        unset($_GET['subject']);
+    } else {
+        $_GET['subject'] = $subject;
+    }
+    if ($cleared) {
+        $_GET['cleared'] = '1';
+    } else {
+        unset($_GET['cleared']);
+    }
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    ob_start();
+    $admin->render_webhooks_page();
+    return (string) ob_get_clean();
+}
+
+TestRunner::test('T27.1 the Webhooks submenu is registered with manage_woocommerce', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $admin->add_admin_menu();
+
+    $found = null;
+    foreach ((array) ($GLOBALS['alegra_test_admin_pages'] ?? []) as $page) {
+        if (($page['slug'] ?? '') === 'alegra-connector-webhooks') {
+            $found = $page;
+            break;
+        }
+    }
+
+    TestRunner::assertTrue($found !== null, 'the Webhooks submenu must be registered');
+    TestRunner::assertSame('submenu', $found['type'] ?? null, 'it must be a submenu of the Alegra menu');
+    TestRunner::assertSame('alegra-connector', $found['parent'] ?? null, 'it must hang off the Alegra Connector menu');
+    TestRunner::assertSame('manage_woocommerce', $found['cap'] ?? null, 'the page must require manage_woocommerce');
+    TestRunner::assertSame('Webhooks', $found['title'] ?? null, 'the label must be Webhooks');
+    TestRunner::assertTrue(is_array($found['callback'] ?? null), 'the callback must be a callable array');
+    TestRunner::assertSame('render_webhooks_page', $found['callback'][1] ?? null, 'the callback must render the webhook screen');
+    TestRunner::assertTrue(has_action('admin_post_alegra_clear_webhooks'), 'the clear action must be registered');
+});
+
+TestRunner::test('T27.2 recorded deliveries render the summary table and the raw payload', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', (string) json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '865', 'name' => 'Camiseta azul']],
+    ]), '203.0.113.9');
+
+    $html = alegra_render_webhooks();
+
+    TestRunner::assertStringContains('Resumen de entregas', $html, 'the summary table must render');
+    TestRunner::assertStringContains('Payloads crudos', $html, 'the raw payloads section must render');
+    TestRunner::assertStringContains('edit-item', $html, 'the subject must render');
+    TestRunner::assertStringContains('item 865 — &quot;Camiseta azul&quot;', $html, 'the one-line entity summary must render (escaped)');
+    TestRunner::assertStringContains('203.0.113.9', $html, 'the source IP must render');
+    TestRunner::assertStringContains('Camiseta azul', $html, 'the raw payload must render');
+    TestRunner::assertStringContains('Se guardan las últimas 50 entregas.', $html, 'the retention note must render');
+});
+
+TestRunner::test('T27.3 an edit-item WITH inventory.availableQuantity shows the SÍ verdict', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', (string) json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '865', 'inventory' => ['availableQuantity' => 7]]],
+    ]));
+
+    $html = alegra_render_webhooks();
+
+    TestRunner::assertStringContains(\Alegra\Connector\Webhooks\Recorder::VERDICT_YES, $html, 'the SÍ verdict must be shown');
+    TestRunner::assertStringNotContains('NO envía inventario', $html, 'the NO verdict must not appear');
+});
+
+TestRunner::test('T27.4 an edit-item WITHOUT inventory.availableQuantity shows the NO verdict', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', (string) json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '866']],
+    ]));
+
+    $html = alegra_render_webhooks();
+
+    TestRunner::assertStringContains(\Alegra\Connector\Webhooks\Recorder::VERDICT_NO, $html, 'the NO verdict must be shown');
+    TestRunner::assertStringNotContains('SÍ envía inventario', $html, 'the SÍ verdict must not appear');
+});
+
+TestRunner::test('T27.5 zero edit-item deliveries show the warning and the 5 test steps', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('new-item', (string) json_encode([
+        'subject' => 'new-item',
+        'message' => ['item' => ['id' => '1']],
+    ]));
+
+    $html = alegra_render_webhooks();
+
+    TestRunner::assertStringContains(\Alegra\Connector\Webhooks\Recorder::VERDICT_NONE, $html, 'the no-edit-item verdict must be shown');
+    TestRunner::assertStringContains('Todavía no hay entregas de edit-item', $html, 'the warning card must render');
+    TestRunner::assertStringContains('suscribí el evento edit-item', $html, 'step 1 must render');
+    TestRunner::assertStringContains('Anotá el stock', $html, 'step 2 must render');
+    TestRunner::assertStringContains('Anulá una factura', $html, 'step 3 must render');
+    TestRunner::assertStringContains('Recargá esta página', $html, 'step 4 must render');
+    TestRunner::assertStringContains('Leé el veredicto', $html, 'step 5 must render');
+});
+
+TestRunner::test('T27.6 the raw remote payload is escaped, never injected as HTML', function (): void {
+    alegra_test_reset();
+    $xss = '<script>alert(1)</script>';
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', (string) json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '865', 'name' => $xss]],
+    ]));
+
+    $html = alegra_render_webhooks();
+
+    TestRunner::assertStringNotContains($xss, $html, 'the raw <script> payload must never appear unescaped');
+    TestRunner::assertStringContains('&lt;script&gt;alert(1)&lt;/script&gt;', $html, 'the payload must be HTML-escaped');
+});
+
+TestRunner::test('T27.7 the clear action is nonce-protected, capability-gated and empties the buffer', function (): void {
+    // Happy path: valid capability + nonce -> buffer emptied and a redirect issued.
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', '{"a":1}');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $redirect = null;
+    try {
+        $admin->handle_clear_webhooks();
+    } catch (Alegra_Test_Redirect $e) {
+        $redirect = $e;
+    }
+    TestRunner::assertTrue($redirect !== null, 'a successful clear must redirect');
+    TestRunner::assertStringContains('cleared=1', (string) ($redirect->location ?? ''), 'the redirect must confirm the clear');
+    TestRunner::assertCount(0, \Alegra\Connector\Webhooks\Recorder::all(), 'the buffer must be emptied');
+
+    // Capability gate: no manage_woocommerce -> wp_die, buffer untouched.
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', '{"a":1}');
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = false;
+    $GLOBALS['alegra_test_wp_die_throws'] = true;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $died = false;
+    try {
+        $admin->handle_clear_webhooks();
+    } catch (Alegra_Test_Die $e) {
+        $died = true;
+    }
+    TestRunner::assertTrue($died, 'without the capability the action must wp_die');
+    TestRunner::assertCount(1, \Alegra\Connector\Webhooks\Recorder::all(), 'the buffer must survive a capability denial');
+
+    // Nonce gate: invalid referer -> wp_die, buffer untouched.
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', '{"a":1}');
+    $GLOBALS['alegra_test_referer_ok'] = false;
+    $GLOBALS['alegra_test_wp_die_throws'] = true;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $died = false;
+    try {
+        $admin->handle_clear_webhooks();
+    } catch (Alegra_Test_Die $e) {
+        $died = true;
+    }
+    TestRunner::assertTrue($died, 'an invalid nonce must wp_die');
+    TestRunner::assertCount(1, \Alegra\Connector\Webhooks\Recorder::all(), 'the buffer must survive a nonce failure');
+
+    // The form actually carries the nonce field and the registered action.
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-webhooks.php');
+    TestRunner::assertStringContains("wp_nonce_field('alegra_clear_webhooks')", $tpl, 'the clear form must render a nonce field');
+    TestRunner::assertStringContains('value="alegra_clear_webhooks"', $tpl, 'the clear form must post the registered action');
+});
+
+TestRunner::test('T27.8 the subject filter narrows the tables without changing the global verdict', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Webhooks\Recorder::record('new-item', (string) json_encode([
+        'subject' => 'new-item', 'message' => ['item' => ['id' => '1']],
+    ]));
+    \Alegra\Connector\Webhooks\Recorder::record('edit-item', (string) json_encode([
+        'subject' => 'edit-item', 'message' => ['item' => ['id' => '865', 'inventory' => ['availableQuantity' => 2]]],
+    ]));
+
+    $html = alegra_render_webhooks('new-item');
+    unset($_GET['subject']);
+
+    TestRunner::assertStringContains('new-item', $html, 'the filtered subject must render');
+    TestRunner::assertStringNotContains('item 865', $html, 'the non-matching edit-item row must be filtered out');
+    TestRunner::assertStringContains(\Alegra\Connector\Webhooks\Recorder::VERDICT_YES, $html, 'the verdict must stay global (SÍ) even when the table is filtered');
+});
+
 exit(TestRunner::summary());

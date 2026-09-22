@@ -168,6 +168,10 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_dbdelta_calls'] = 0;
     $GLOBALS['wp_settings_errors'] = [];
     $GLOBALS['wc_notices'] = [];
+    $GLOBALS['alegra_test_admin_pages'] = [];
+    $GLOBALS['alegra_test_caps'] = [];
+    $GLOBALS['alegra_test_referer_ok'] = true;
+    $GLOBALS['alegra_test_wp_die_throws'] = false;
 
     alegra_mock_reset();
 

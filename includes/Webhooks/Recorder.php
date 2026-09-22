@@ -101,6 +101,18 @@ final class Recorder
     }
 
     /**
+     * Drop every retained delivery.
+     *
+     * This is the ONLY write the admin view performs. The caller is
+     * responsible for capability- and nonce-gating; the receiver is never
+     * touched and the option simply disappears until the next delivery.
+     */
+    public static function clear(): void
+    {
+        delete_option(self::OPTION);
+    }
+
+    /**
      * Decode a stored raw body, or null when it is not a JSON object.
      *
      * @return array<string,mixed>|null

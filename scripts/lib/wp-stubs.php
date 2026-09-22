@@ -327,9 +327,11 @@ function esc_html__($text, $domain = '') { return $text; }
 function esc_attr__($text, $domain = '') { return $text; }
 function esc_html_e($text, $domain = '') { echo $text; }
 function esc_attr_e($text, $domain = '') { echo $text; }
-function esc_html($text) { return (string) $text; }
-function esc_attr($text) { return (string) $text; }
-function esc_textarea($text) { return (string) $text; }
+// Real HTML escaping: the harness must be able to prove a template does NOT
+// emit a raw payload. (WordPress's esc_html()/esc_attr() do exactly this.)
+function esc_html($text) { return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8'); }
+function esc_attr($text) { return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8'); }
+function esc_textarea($text) { return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8'); }
 function esc_url($text) { return (string) $text; }
 function wp_kses_post($text) { return (string) $text; }
 function wp_strip_all_tags($text, $remove_breaks = false) { return strip_tags((string) $text); }
@@ -426,9 +428,62 @@ function is_multisite() { return false; }
 function get_current_blog_id() { return 1; }
 function wp_get_current_user() { return new WP_User(1, ['user_login' => 'tester', 'user_email' => 'tester@example.test']); }
 function get_current_user_id() { return 1; }
-function current_user_can($cap) { return true; }
-function wp_die($message = '', $title = '', $args = []) { return; }
+function current_user_can($cap) { return $GLOBALS['alegra_test_caps'][$cap] ?? true; }
+function wp_die($message = '', $title = '', $args = [])
+{
+    // Emulate WordPress terminating the request, but ONLY when a test opts in;
+    // every existing caller relies on wp_die() returning in the harness.
+    if (!empty($GLOBALS['alegra_test_wp_die_throws'])) {
+        throw new Alegra_Test_Die((string) $message, is_array($args) ? $args : []);
+    }
+    return;
+}
 function wp_raise_memory_limit($context = 'admin') { return ''; }
+
+/**
+ * Admin-menu registration capture (no real menu is built in the harness).
+ */
+function add_menu_page($page_title, $menu_title, $capability, $menu_slug, $callback = '', $icon_url = '', $position = null)
+{
+    $GLOBALS['alegra_test_admin_pages'][] = ['type' => 'menu', 'slug' => $menu_slug, 'cap' => $capability, 'callback' => $callback, 'title' => $menu_title];
+}
+function add_submenu_page($parent_slug, $page_title, $menu_title, $capability, $menu_slug, $callback = '', $position = null)
+{
+    $GLOBALS['alegra_test_admin_pages'][] = ['type' => 'submenu', 'parent' => $parent_slug, 'slug' => $menu_slug, 'cap' => $capability, 'callback' => $callback, 'title' => $menu_title];
+}
+
+/**
+ * Nonce / redirect stubs. A test can make the referer check fail by setting
+ * $GLOBALS['alegra_test_referer_ok'] = false (combined with wp_die throwing).
+ */
+function wp_verify_nonce($nonce, $action = -1)
+{
+    return (($GLOBALS['alegra_test_referer_ok'] ?? true) === false) ? false : 1;
+}
+function check_admin_referer($action = -1, $query_arg = '_wpnonce', $die = true)
+{
+    if (($GLOBALS['alegra_test_referer_ok'] ?? true) === false) {
+        if ($die) {
+            wp_die('Are you sure you want to do this?');
+        }
+        return false;
+    }
+    return 1;
+}
+function wp_nonce_field($action = -1, $name = '_wpnonce', $referer = true, $echo = true)
+{
+    $field = '<input type="hidden" id="' . $name . '" name="' . $name . '" value="nonce" />';
+    if ($echo) { echo $field; }
+    return $field;
+}
+function wp_safe_redirect($location, $status = 302)
+{
+    throw new Alegra_Test_Redirect((string) $location, (int) $status);
+}
+function wp_redirect($location, $status = 302)
+{
+    throw new Alegra_Test_Redirect((string) $location, (int) $status);
+}
 
 /**
  * Thrown by the wp_send_json_* stubs to emulate WordPress's wp_die() exit.
@@ -449,6 +504,38 @@ class Alegra_Test_JSON_Response extends \Exception
         parent::__construct('wp_send_json response');
         $this->success = $success;
         $this->payload = $payload;
+    }
+}
+
+/**
+ * Thrown by wp_die() when a test opts in, to emulate the request ending.
+ */
+class Alegra_Test_Die extends \Exception
+{
+    /** @var array<string, mixed> */
+    public array $args;
+
+    public function __construct(string $message, array $args = [])
+    {
+        parent::__construct($message);
+        $this->args = $args;
+    }
+}
+
+/**
+ * Thrown by wp_safe_redirect()/wp_redirect() so a handler's redirect target is
+ * observable without the harness actually exiting.
+ */
+class Alegra_Test_Redirect extends \Exception
+{
+    public string $location;
+    public int $status;
+
+    public function __construct(string $location, int $status = 302)
+    {
+        parent::__construct('redirect to ' . $location);
+        $this->location = $location;
+        $this->status = $status;
     }
 }
 
