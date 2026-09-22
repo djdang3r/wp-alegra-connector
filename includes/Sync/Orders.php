@@ -2293,7 +2293,7 @@ class Orders
                     continue;
                 }
 
-                if ($status === 'paid' && $balance <= 0 && $should_complete) {
+                if (\Alegra\Connector\Invoice_Status::is_paid($status) && $balance <= 0 && $should_complete) {
                     if ($order->get_status() !== 'completed') {
                         $order->add_order_note(sprintf(
                             __('[Alegra] Factura #%s pagada. Pedido completado automaticamente.', 'alegra-connector'),

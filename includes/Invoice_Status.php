@@ -35,6 +35,20 @@ final class Invoice_Status
         return self::normalize($status) === self::VOID;
     }
 
+    /**
+     * A settled invoice. Alegra reports a fully-paid invoice as `closed`
+     * (https://developer.alegra.com/reference/get_invoices.md — the `status`
+     * enum is `open`, `closed`, `draft` and `void`). `paid` is not a documented
+     * value; it is kept accepted for the cached values written by older
+     * versions and the test mock, so a future doc change is a one-line fix here.
+     */
+    public static function is_paid(string $status): bool
+    {
+        $normalized = self::normalize($status);
+
+        return $normalized === self::PAID || $normalized === self::CLOSED;
+    }
+
     public static function badge_class(string $status): string
     {
         switch (self::normalize($status)) {

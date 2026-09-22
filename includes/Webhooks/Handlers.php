@@ -187,8 +187,8 @@ class Handlers
         $balance = (float) ($fresh['balance'] ?? 0);
         $should_complete = get_option('alegra_connector_auto_complete_order', true);
 
-        // Only a paid or a voided invoice changes the linked order.
-        if ($status !== 'paid' && $status !== 'void') {
+        // Only a settled (paid/closed) or a voided invoice changes the linked order.
+        if (!\Alegra\Connector\Invoice_Status::is_paid($status) && !\Alegra\Connector\Invoice_Status::is_void($status)) {
             return;
         }
 
@@ -212,7 +212,7 @@ class Handlers
         $orders = new Sync\Orders($this->api, $this->logger);
         $orders->persist_invoice_status($order, $fresh);
 
-        if ($status === 'void') {
+        if (\Alegra\Connector\Invoice_Status::is_void($status)) {
             // The order is deliberately NOT cancelled: an Alegra void does not
             // prove the WC order was cancelled, so the merchant decides.
             if ($orders->note_invoice_voided($order, $fresh) && $this->logger) {

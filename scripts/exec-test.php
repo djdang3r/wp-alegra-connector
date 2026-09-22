@@ -5884,6 +5884,108 @@ TestRunner::test('T-VOID-5 the poll notes a void once (idempotent) and covers co
 });
 
 // ===========================================================================
+// T-SETTLED — a settled invoice is `closed`, not `paid`
+//   https://developer.alegra.com/reference/get_invoices.md — the `status`
+//   enum is `open`, `closed`, `draft`, `void`; `paid` is not documented.
+// ===========================================================================
+echo "\nT-SETTLED — settled invoices (paid/closed)\n";
+
+TestRunner::test('T-SETTLED-1 is_paid() accepts paid and closed, rejects every unsettled status', function (): void {
+    $S = \Alegra\Connector\Invoice_Status::class;
+
+    TestRunner::assertTrue($S::is_paid('paid'), 'legacy/mock paid is settled');
+    TestRunner::assertTrue($S::is_paid('closed'), 'closed is the documented settled status');
+    TestRunner::assertTrue($S::is_paid('CLOSED'), 'the status is case-insensitive');
+    TestRunner::assertFalse($S::is_paid('open'), 'open is issued but unpaid');
+    TestRunner::assertFalse($S::is_paid('draft'), 'draft is not settled');
+    TestRunner::assertFalse($S::is_paid('void'), 'void is not settled');
+    TestRunner::assertFalse($S::is_paid('mystery'), 'an unknown status is not settled');
+    TestRunner::assertFalse($S::is_paid(''), 'an empty status is not settled');
+});
+
+TestRunner::test('T-SETTLED-2 the webhook completes the order on a closed invoice', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-closed-wh', ['status' => 'closed', 'balance' => 0, 'total' => 100, 'number' => 'FV-C']);
+    alegra_make_order(9100, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-closed-wh']]);
+
+    $logger = make_logger();
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+    $handlers->process_event('new-invoice', ['invoice' => ['id' => 'inv-closed-wh', 'status' => 'closed', 'balance' => 0]]);
+
+    TestRunner::assertSame('completed', wc_get_order(9100)->get_status(), 'a closed (settled) invoice must complete the order');
+    TestRunner::assertSame('closed', (string) wc_get_order(9100)->get_meta('_alegra_invoice_status', true), 'the closed status must be cached');
+});
+
+TestRunner::test('T-SETTLED-3 the webhook never completes on open/draft/void (even with balance 0)', function (): void {
+    alegra_test_reset();
+    $cases = ['open' => 9201, 'draft' => 9202, 'void' => 9203];
+
+    foreach ($cases as $status => $order_id) {
+        $invoice_id = 'inv-' . $status . '-wh';
+        alegra_mock_seed_invoice($invoice_id, ['status' => $status, 'balance' => 0, 'total' => 100, 'number' => 'FV-X']);
+        alegra_make_order($order_id, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => $invoice_id]]);
+
+        $logger = make_logger();
+        $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+        $handlers->process_event('new-invoice', ['invoice' => ['id' => $invoice_id, 'status' => $status, 'balance' => 0]]);
+
+        TestRunner::assertNotSame('completed', wc_get_order($order_id)->get_status(), "a $status invoice must not complete the order");
+    }
+});
+
+TestRunner::test('T-SETTLED-4 the poll completes a closed invoice and leaves open/draft/void alone', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-closed-poll', ['status' => 'closed', 'balance' => 0, 'total' => 100, 'number' => 'FV-C']);
+    alegra_mock_seed_invoice('inv-open-poll', ['status' => 'open', 'balance' => 0, 'total' => 100, 'number' => 'FV-O']);
+    alegra_mock_seed_invoice('inv-draft-poll', ['status' => 'draft', 'balance' => 0, 'total' => 100, 'number' => 'FV-D']);
+    alegra_mock_seed_invoice('inv-void-poll2', ['status' => 'void', 'balance' => 0, 'total' => 100, 'number' => 'FV-V']);
+    alegra_make_order(9301, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-closed-poll']]);
+    alegra_make_order(9302, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-open-poll']]);
+    alegra_make_order(9303, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-draft-poll']]);
+    alegra_make_order(9304, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-void-poll2']]);
+
+    $result = make_orders()->poll_invoice_statuses();
+
+    TestRunner::assertSame('completed', wc_get_order(9301)->get_status(), 'a closed invoice must complete the order');
+    TestRunner::assertSame('closed', (string) wc_get_order(9301)->get_meta('_alegra_invoice_status', true), 'the poll must cache the closed status');
+    TestRunner::assertSame('processing', wc_get_order(9302)->get_status(), 'open must not complete the order');
+    TestRunner::assertSame('processing', wc_get_order(9303)->get_status(), 'draft must not complete the order');
+    TestRunner::assertSame('processing', wc_get_order(9304)->get_status(), 'void must not complete the order');
+    TestRunner::assertSame(1, (int) ($result['completed'] ?? 0), 'exactly one order must be completed');
+});
+
+TestRunner::test('T-SETTLED-5 paid still completes the order via the poll (no regression)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-paid-poll', ['status' => 'paid', 'balance' => 0, 'total' => 100, 'number' => 'FV-P']);
+    alegra_make_order(9400, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-paid-poll']]);
+
+    $result = make_orders()->poll_invoice_statuses();
+
+    TestRunner::assertSame('completed', wc_get_order(9400)->get_status(), 'the legacy paid value must still complete the order');
+    TestRunner::assertSame(1, (int) ($result['completed'] ?? 0), 'the paid invoice must be counted as completed');
+});
+
+TestRunner::test('T-SETTLED-6 the orders list renders a closed invoice as a green "Pagada" badge', function (): void {
+    alegra_test_reset();
+    $closed = alegra_make_order(9500, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_id' => 'inv-c', '_alegra_invoice_number' => 'FV-20', '_alegra_invoice_status' => 'closed',
+    ]]);
+    $orders = [$closed];
+    $total_orders = 1;
+    $synced_orders = 1;
+    $total_pages = 1;
+    $page = 1;
+    $payment_count = 0;
+
+    ob_start();
+    include $GLOBALS['alegra_plugin_root'] . 'templates/admin-orders.php';
+    $html = (string) ob_get_clean();
+
+    TestRunner::assertStringContains('<span class="ac-badge success">Pagada</span>', $html, 'a closed invoice must render as a green Pagada badge');
+    TestRunner::assertStringNotContains('Sin estado', $html, 'a closed invoice must never render as Sin estado');
+});
+
+// ===========================================================================
 // T-INV-GATE — BUG 2: the inventory pull has its own gate + writes _stock_status
 // ===========================================================================
 echo "\nT-INV-GATE — inventory pull gate + stock status\n";
