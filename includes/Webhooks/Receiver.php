@@ -124,6 +124,23 @@ class Receiver
         $event = sanitize_text_field($payload['subject']);
         $data = $payload['message'] ?? [];
 
+        // Read-only observation for the webhook inspector: keep the last N
+        // authenticated, non-replayed deliveries (raw body, subject, timestamp,
+        // source IP) in a bounded ring buffer. Purely additive — it runs after
+        // the token/HMAC gates and the replay window, and before the selection
+        // gate, so it never changes the response, the handshake, the dedupe, the
+        // selection or the handler dispatch. A failure here must never affect a
+        // delivery, so it is swallowed.
+        try {
+            Recorder::record(
+                $event,
+                $body,
+                isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : ''
+            );
+        } catch (\Throwable $e) {
+            // Recording is best-effort: never let it break a delivery.
+        }
+
         // AC-77: `message` must be an array. A scalar body used to raise a
         // TypeError inside process_event(string, array); ack and ignore it
         // instead of returning a 4xx.

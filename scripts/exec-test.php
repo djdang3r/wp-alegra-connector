@@ -5957,4 +5957,131 @@ TestRunner::test('T-INV-GATE-4 the inventory-sync gate is wired: option, UI, def
     TestRunner::assertStringContains("delete_option('alegra_connector_inventory_sync_enabled')", $uninstall, 'uninstall must delete the option');
 });
 
+// ===========================================================================
+// T26 — Webhook delivery recorder + inspector verdict
+//
+// The inventory design is blocked on whether Alegra emits `edit-item` (with
+// inventory) when stock changes. The receiver keeps a bounded ring buffer of
+// the last deliveries so the read-only inspector can answer it from the raw
+// payloads. These tests lock the buffer's bounds and the verdict logic.
+// ===========================================================================
+echo "\nT26 — Webhook delivery recorder + inspector verdict\n";
+
+/** The recorder class under test. */
+function alegra_recorder(): string
+{
+    return \Alegra\Connector\Webhooks\Recorder::class;
+}
+
+TestRunner::test('T26.1 a webhook delivery is recorded with its subject, raw body and source IP', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $_SERVER['REMOTE_ADDR'] = '203.0.113.7';
+
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '865', 'name' => 'Camiseta azul', 'inventory' => ['availableQuantity' => 12]]],
+    ]);
+
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    unset($_SERVER['REMOTE_ADDR']);
+
+    TestRunner::assertSame(200, $res->get_status(), 'the delivery must be acked');
+
+    $entries = alegra_recorder()::all();
+    TestRunner::assertCount(1, $entries, 'exactly one delivery must be recorded');
+    TestRunner::assertSame('edit-item', $entries[0]['subject'] ?? null, 'the subject must be recorded');
+    TestRunner::assertSame($body, $entries[0]['body'] ?? null, 'the RAW body must be recorded verbatim (no transformation)');
+    TestRunner::assertSame('203.0.113.7', $entries[0]['ip'] ?? null, 'the source IP must be recorded');
+});
+
+TestRunner::test('T26.2 the recorder is bounded: 60 deliveries keep only the last 50', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 60; $i++) {
+        alegra_recorder()::record('edit-item', '{"n":' . $i . '}');
+    }
+
+    $entries = alegra_recorder()::all();
+    TestRunner::assertCount(\Alegra\Connector\Webhooks\Recorder::MAX_ENTRIES, $entries, 'the ring buffer must cap at 50');
+    TestRunner::assertSame('{"n":11}', $entries[0]['body'] ?? null, 'the oldest 10 deliveries must be dropped');
+    TestRunner::assertSame('{"n":60}', $entries[49]['body'] ?? null, 'the newest delivery must be kept');
+});
+
+TestRunner::test('T26.3 a body larger than 20 KB is truncated and flagged', function (): void {
+    alegra_test_reset();
+    $huge = str_repeat('a', \Alegra\Connector\Webhooks\Recorder::MAX_BODY_BYTES + 500);
+
+    alegra_recorder()::record('edit-item', $huge);
+    $entry = alegra_recorder()::all()[0] ?? [];
+
+    TestRunner::assertSame(
+        \Alegra\Connector\Webhooks\Recorder::MAX_BODY_BYTES,
+        strlen((string) ($entry['body'] ?? '')),
+        'the stored body must be capped at MAX_BODY_BYTES'
+    );
+    TestRunner::assertTrue((bool) ($entry['truncated'] ?? false), 'the truncation must be flagged');
+    TestRunner::assertSame(strlen($huge), (int) ($entry['bytes'] ?? 0), 'the original byte size must be kept');
+});
+
+TestRunner::test('T26.4 the inspector verdict is SÍ with availableQuantity and NO without it', function (): void {
+    alegra_test_reset();
+    $with = json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '865', 'inventory' => ['availableQuantity' => 3]]],
+    ]);
+    $without = json_encode([
+        'subject' => 'edit-item',
+        'message' => ['item' => ['id' => '866']],
+    ]);
+
+    TestRunner::assertTrue(
+        alegra_recorder()::has_inventory_available_quantity($with),
+        'a payload WITH inventory.availableQuantity must be detected'
+    );
+    TestRunner::assertFalse(
+        alegra_recorder()::has_inventory_available_quantity($without),
+        'a payload WITHOUT inventory.availableQuantity must not be detected'
+    );
+
+    $yes = alegra_recorder()::inventory_verdict([['subject' => 'edit-item', 'body' => $with]]);
+    TestRunner::assertStringContains('SÍ', $yes, 'the verdict must be SÍ when inventory is present');
+
+    $no = alegra_recorder()::inventory_verdict([['subject' => 'edit-item', 'body' => $without]]);
+    TestRunner::assertStringContains('NO', $no, 'the verdict must be NO when inventory is absent');
+    TestRunner::assertStringContains('poll', $no, 'the NO verdict must point at the poll fallback');
+
+    $none = alegra_recorder()::inventory_verdict([['subject' => 'new-item', 'body' => $with]]);
+    TestRunner::assertStringContains('No hay entregas', $none, 'a set with no edit-item must say so');
+});
+
+TestRunner::test('T26.5 recording does not change the handshake, the token gate or the dedupe', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+
+    // Handshake: empty body, no token, must be acked and NOT recorded.
+    $handshake = $receiver->handle(new WP_REST_Request(''));
+    TestRunner::assertSame(200, $handshake->get_status(), 'the handshake must still be 2XX');
+    TestRunner::assertTrue((bool) (($handshake->get_data())['handshake'] ?? false), 'the handshake flag must remain');
+    TestRunner::assertCount(0, alegra_recorder()::all(), 'the handshake must not be recorded');
+
+    // Token gate: no token -> 401 and nothing recorded.
+    $body = json_encode(['subject' => 'new-bill', 'message' => ['bill' => ['id' => 'b-1']]]);
+    $no_token = $receiver->handle(new WP_REST_Request($body));
+    TestRunner::assertSame(401, $no_token->get_status(), 'the token gate must still reject');
+    TestRunner::assertCount(0, alegra_recorder()::all(), 'a rejected delivery must not be recorded');
+
+    // Dedupe: first accepted + recorded, replay flagged + NOT recorded twice.
+    $first = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    $second = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $first->get_status(), 'the first delivery must be accepted');
+    TestRunner::assertFalse((bool) (($first->get_data())['duplicate'] ?? false), 'the first delivery must not be a duplicate');
+    TestRunner::assertSame(200, $second->get_status(), 'the replay must still be acked');
+    TestRunner::assertTrue((bool) (($second->get_data())['duplicate'] ?? false), 'the replay must still be flagged');
+    TestRunner::assertCount(1, alegra_recorder()::all(), 'the replay must not be recorded a second time');
+});
+
 exit(TestRunner::summary());

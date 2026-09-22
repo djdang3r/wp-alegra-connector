@@ -95,6 +95,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_webhook_subscriptions');
     delete_option('alegra_connector_webhook_selected_events');
     delete_option('alegra_connector_webhook_events_migration_version');
+    delete_option('alegra_connector_webhook_recent');
     delete_option('alegra_connector_cron_disabled');
     delete_option('alegra_connector_schema_version');
     delete_option('alegra_connector_uuid_columns_migrated');

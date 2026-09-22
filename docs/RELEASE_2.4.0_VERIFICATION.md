@@ -366,6 +366,61 @@ seguridad, pero **los webhooks no funcionarían**.
    conserva el query string: para eso hace falta el **evento real**.
 
 
+### ★.e — Inspector de webhooks (solo lectura) y la prueba de `edit-item` con stock
+
+**Pregunta que responde:** ¿Alegra manda `edit-item` cuando cambia **solo el
+inventario** de un ítem, y ese payload trae
+`message.item.inventory.availableQuantity`? Es lo que decide si el stock se
+reconcilia por **webhook** o por **poll**.
+
+El receptor ahora guarda un **buffer acotado** de las últimas **50** entregas
+(subject, body crudo, fecha e IP; un body mayor a **20 KB** se trunca). El
+inspector **solo lee** ese buffer: no escribe en Alegra ni cambia estado.
+
+**Opción 1 — WP-CLI (recomendado):**
+
+```bash
+wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php -- --limit=20
+wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php -- --event=edit-item
+wp eval-file wp-content/plugins/alegra-connector/scripts/inspect-webhooks.php -- --item=865
+```
+
+También como comando: `wp alegra-inspect-webhooks --event=edit-item`.
+
+**Opción 2 — Navegador (si no tenés WP-CLI):**
+
+1. Copiá `scripts/inspect-webhooks.php` a la **raíz de WordPress** (donde está
+   `wp-load.php`).
+2. Abrí `https://TU-SITIO/inspect-webhooks.php?event=edit-item` con tu usuario.
+3. Requiere sesión con permiso **`manage_woocommerce`**; sin eso responde **403**.
+   Borrá el archivo cuando termines.
+
+**Procedimiento de prueba exacto:**
+
+1. En **Configuración → Avanzado → Sincronización en Tiempo Real (Webhooks)**,
+   verificá que el evento **`edit-item`** esté **tildado** (selector de eventos) y
+   **registrá** los webhooks.
+2. En Alegra, **anotá el stock** de un producto (por ejemplo, 10).
+3. **Anulá una factura** que haya descontado ese producto (o hacé un **ajuste de
+   inventario**). Eso cambia el inventario del ítem.
+4. Corré el inspector (opción 1 o 2) y buscá una entrega con `subject=edit-item`.
+5. Leé el **veredicto** de la sección 3.
+
+**Cómo leer la salida:**
+
+- `VEREDICTO: Alegra SÍ envía inventario en edit-item` → el payload trae
+  `availableQuantity`: el stock se puede reconciliar **por webhook**.
+- `VEREDICTO: Alegra NO envía inventario en edit-item — la reconciliación debe
+  ser por poll` → la entrega llegó **sin** inventario: hay que seguir con el
+  **poll** (sincronización programada).
+- `ATENCION: no hay NINGUNA entrega de edit-item...` → no llegó el evento:
+  revisá que esté suscrito, que el webhook responda 2XX y que el token de la URL
+  sea el correcto (ver ★.c y ★.d).
+
+- **Riesgo: Bajo.** No bloquea el release: el poll es la red de seguridad. Pero
+  **define** si la reconciliación de stock en tiempo real es posible.
+
+
 ---
 
 ## ★★ Productos: el stock y la categoría — ⚠️ LO MÁS IMPORTANTE DE LA 2.3.6
@@ -559,6 +614,8 @@ que verificarlo.**
      sincronización programada (hasta 15 min) y volvé a mirar.
   4. Para forzarla, usá **Dashboard → "Sincronizar inventario"** (nuevo caller de
      la 2.3.6) o **"Traer productos desde Alegra"**.
+  5. **Más fácil:** corré el **inspector ★.e**, que muestra el payload crudo de
+     cada `edit-item` y da el **veredicto** (SÍ/NO trae inventario).
 - **Resultado esperado:** el stock de WooCommerce termina actualizado, por
   webhook **o** por poll. Las dos vías son correctas.
 - **Riesgo: Bajo.** No bloquea el release: el poll es la red de seguridad.
@@ -714,6 +771,8 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 ### Siguen necesitando prueba en vivo
 - [ ] **1.** Cambio de stock en Alegra → el stock de WooCommerce se actualiza
       (webhook o poll).
+- [ ] **★.e** El inspector de webhooks confirma si `edit-item` trae
+      `inventory.availableQuantity` (veredicto SÍ/NO).
 - [ ] **4.** En Blocks: al elegir NIT aparece el Dígito de verificación (y se
       oculta con los demás tipos); Persona Jurídica muestra Razón social.
 - [ ] **5.** CO + FE: la factura sale a nombre del **cliente**.
