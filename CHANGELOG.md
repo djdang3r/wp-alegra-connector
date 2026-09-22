@@ -2,6 +2,71 @@
 
 All notable changes to Alegra Connector.
 
+## [2.4.1] - 2026-09-21
+
+> **Honesty + reliability patch (no schema change).** Four fixes that made the
+> merchant see the wrong thing: the automatic reconciliation opened a draft
+> invoice behind their back, a voided invoice rendered as a green "Facturado", a
+> settled invoice (`closed`) could never complete its WooCommerce order, and the
+> webhook URL carried a scheme Alegra rejects. Plus a webhook event selector and
+> a read-only delivery inspector. **Re-register the webhooks after updating**
+> (see the upgrade notes).
+
+### Added
+
+- **Webhook event selector.** All 12 events are still registered by default, so
+  an upgrade changes nothing until the merchant touches it. Deselecting an event
+  **unsubscribes** it in Alegra, and a deselected event delivered by a stale
+  subscription is ignored (200 ACK + log).
+- **Webhook delivery inspector.** The receiver keeps a bounded ring buffer of the
+  last 50 deliveries (subject, raw body, timestamp, source IP) and
+  `scripts/inspect-webhooks.php` prints them with a verdict on whether
+  `edit-item` carries inventory data.
+- A new **`alegra_connector_inventory_sync_enabled`** toggle (default **on**) so
+  the inventory pull no longer depends on `sync_products`.
+
+### Changed
+
+- **The automatic payment reconciliation never opens a draft invoice.** The
+  hourly sweep and the real-time hooks now skip a draft untouched — one order
+  note, an info log and a new `draft_skipped` counter. Only the explicit manual
+  actions ("Abrir factura", "Registrar pago") open a draft.
+- **The inventory pull is decoupled from `sync_products`** and now sets
+  `_stock_status`, so a zero-quantity product becomes `outofstock`.
+- The release workflow **attaches the committed ZIP** (it no longer rebuilds it
+  in CI) and fails if the artifact does not match its committed `.sha256`, so the
+  published asset can be verified against the repo.
+
+### Fixed
+
+- **CRITICAL: the webhook URL is now sent scheme-less.** Alegra rejects a URL
+  that includes `http://`/`https://` ("La URL ingresada no debe incluir el
+  'http://' o 'https://'"), which made the registration fail 12/12. The receiver
+  strips the scheme while keeping the `?token=` shared secret.
+- **Voided invoices are shown honestly.** A void renders as a red **"Anulada en
+  Alegra"** badge (it used to show a green "Facturado"), the order detail warns,
+  and both the webhook and the poll add an order note (once).
+- **A settled invoice is recognised by `closed`, not just `paid`.** Alegra
+  documents the enum as `open/closed/draft/void` (`closed` = settled), so a paid
+  invoice could never complete its WooCommerce order. The check is now
+  centralised in `Invoice_Status::is_paid()` and accepts both.
+
+### Upgrade notes
+
+- **Re-register the webhooks** (Ajustes → desconectar/conectar, or the webhook
+  section) so they point at the **scheme-less** URL and so the new **event
+  selector** takes effect.
+- A draft invoice is **no longer auto-opened** by the automatic reconciliation.
+  Open it manually ("Abrir factura") if you want to charge it.
+- The **inventory pull now runs independently** of "sync products" (new toggle,
+  **on by default**).
+- If you relied on the old behaviour where a **voided invoice showed as
+  "Facturado"**, it now shows **"Anulada en Alegra"**.
+- `Schema::SCHEMA_VERSION` is unchanged (`2.3.1`): this release has **no schema
+  change**.
+- See `docs/RELEASE_2.4.1_VERIFICATION.md` for the step-by-step live verification
+  of the items above.
+
 ## [2.4.0] - 2026-09-21
 
 > **Write-gate release (behavioural, with a migration).** Until now the kill
@@ -659,7 +724,7 @@ consequences. It is removed.
 - **The API token field now masks the stored token.** Re-saving the settings form with the field left empty keeps the stored token; type a new token only to replace it.
 - **Webhook signature verification is now optional.** Alegra does not send a signature; if you had configured a webhook secret, it is only checked when a signature header is present. Replay protection is enforced via a body-hash window. Re-delivering the same webhook body within the window is ignored.
 - **A `.pot` now ships in the ZIP** (`languages/alegra-connector.pot`) — translations can finally be built. There is no `.mo` yet; the plugin still runs in English/Spanish source strings.
-- See `docs/RELEASE_2.4.0_VERIFICATION.md` for the assumptions that still require a live API test (this guide was renamed from `RELEASE_2.3.7_VERIFICATION.md`).
+- See `docs/RELEASE_2.4.1_VERIFICATION.md` for the assumptions that still require a live API test (this guide was renamed from `RELEASE_2.4.0_VERIFICATION.md`, itself renamed from `RELEASE_2.3.7_VERIFICATION.md`).
 
 ---
 

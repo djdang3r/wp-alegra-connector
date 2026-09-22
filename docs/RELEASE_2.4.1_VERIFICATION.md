@@ -1,20 +1,18 @@
-# Verificación en Producción — Alegra Connector 2.4.0
+# Verificación en Producción — Alegra Connector 2.4.1
 
-Esta guía es la **lista de validación** de la versión **2.4.0**. La 2.4.0 es una
-**versión de comportamiento con migración**: el **kill switch** y los **toggles
-por entidad** dejaron de ser decorativos y ahora se aplican en un único punto de
-control (`Write_Gate`, dentro de `Client::request()`), de modo que **ninguna
-escritura llega a Alegra** mientras el plugin está "desconectado" o la entidad
-está deshabilitada. Además: el modo manual ya no emite notas de crédito
-automáticas por reembolso (hay un botón manual **"Emitir nota de crédito"**), el
-barrido/reconciliación respeta `payment_reconcile_enabled`, el dashboard ya no
-crea el Consumidor Final al renderizar, y los cuatro checkboxes de "qué
-sincronizar" muestran el valor real.
+Esta guía es la **lista de validación** de la versión **2.4.1**. La 2.4.1 es un
+**patch de honestidad y confiabilidad** (sin cambio de esquema): la
+reconciliación automática **ya no abre un borrador**, una factura **anulada** se
+muestra como **"Anulada en Alegra"** (antes verde "Facturado"), una factura
+**liquidada** se reconoce por `closed` y no solo por `paid`, la **URL del webhook
+viaja sin esquema** (Alegra rechaza `http://`/`https://`), y se suman el
+**selector de eventos** y el **inspector de webhooks**. Lo **nuevo de la 2.4.1**
+está en la sección **★★★ (2.4.1)**.
 
-La 2.4.0 **conserva** las verificaciones de la 2.3.11 (pagos), de la 2.3.7
-(webhooks), de la 2.3.6 (stock, categoría comercial, clientes, pedidos y
-orquestación) y de las versiones anteriores: siguen siendo válidas y están más
-abajo. Lo **nuevo** es la sección de **write gates (★★★)**.
+La 2.4.1 **conserva** las verificaciones de la 2.4.0 (write gates), de la 2.3.11
+(pagos), de la 2.3.7 (webhooks), de la 2.3.6 (stock, categoría comercial,
+clientes, pedidos y orquestación) y de las versiones anteriores: siguen siendo
+válidas y están más abajo.
 
 **Guía complementaria:** este documento **no** repite cómo instalar ni cómo
 revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
@@ -64,6 +62,94 @@ revertir. Eso está en [`RELEASE_2.3.0_DEPLOY.md`](./RELEASE_2.3.0_DEPLOY.md)
   ```bash
   ( cd releases && sha256sum -c alegra-connector-v<X.Y.Z>.zip.sha256 )
   ```
+
+---
+
+## ★★★ Lo nuevo de la 2.4.1 (honestidad y confiabilidad)
+
+> **Leé esto antes de actualizar.** La 2.4.1 **no cambia el esquema**. Cambia
+> qué ves y qué hace el plugin en cuatro puntos que antes mentían: el borrador
+> ya no se abre solo, la factura anulada se muestra como anulada, la factura
+> liquidada completa el pedido, y la URL del webhook se registra sin esquema.
+
+### ★★★.a — La URL del webhook viaja SIN esquema
+
+1. En **Configuración → Webhooks**, desconectá y volvé a **registrar** los
+   webhooks.
+2. **Resultado esperado:** la registración es aceptada (`12/12`, o "12 ya
+   existían" si ya estaban). En los logs, el `POST /webhooks/subscriptions`
+   **no** devuelve `La URL ingresada no debe incluir el 'http://' o 'https://'`.
+3. **Antes de la 2.4.1** la registración fallaba **12/12** por ese motivo: la URL
+   incluía el esquema. El `?token=` se conserva.
+4. **Verificación en Alegra:** la URL del webhook guardada **no** empieza con
+   `http://` ni `https://`.
+5. **Riesgo: Alto.** Sin esto no hay tiempo real.
+
+### ★★★.b — Selector de eventos del webhook
+
+1. En **Configuración → Webhooks**, destildá **un** evento (p. ej. `edit-item`) y
+   guardá.
+2. **Resultado esperado:** al guardar, el evento se **desuscribe** en Alegra
+   (aparece el `DELETE` en los logs). Los **12 eventos** se registran por
+   defecto, así que una actualización **no** cambia nada hasta que toques el
+   selector.
+3. **Caso borde:** si Alegra entrega igual un evento deseleccionado (suscripción
+   vieja), el receptor responde **200 ACK** y lo **ignora** (queda en el log).
+4. **Riesgo: Medio.** Si desuscribís de más, perdés ese evento.
+
+### ★★★.c — El borrador NO se abre solo
+
+1. Dejá un pedido con factura en **borrador** (`invoice_status = draft`) y un
+   pago en WooCommerce.
+2. Esperá el **barrido horario** (o forzá
+   `alegra_connector_payment_reconcile`), o pasá el pedido a
+   `processing`/`completed` para disparar el hook en tiempo real.
+3. **Resultado esperado:** el borrador **queda como borrador**; el plugin **no**
+   lo abre, **no** registra el pago, deja **una nota** en el pedido, un log info
+   y el contador `draft_skipped`. Para cobrarlo, abrílo **a mano** con
+   **"Abrir factura"**.
+4. **Riesgo: Alto.** Antes de la 2.4.1 la reconciliación automática abría el
+   borrador y registraba el pago sin que lo pidieras.
+
+### ★★★.d — Factura anulada: "Anulada en Alegra"
+
+1. Anulá una factura en Alegra (o usá una ya anulada) vinculada a un pedido.
+2. Mirá la **lista de pedidos**: la insignia debe ser **roja "Anulada en
+   Alegra"** (antes mostraba verde **"Facturado"**).
+3. En el **detalle del pedido** aparece un **aviso**; el **webhook** y el **poll**
+   agregan **una** nota en el pedido (idempotente, no la repiten).
+4. **Riesgo: Alto.** Una factura anulada mostrada como "Facturado" te hace creer
+   que cobraste.
+
+### ★★★.e — Pull de inventario independiente de "sync products"
+
+1. En **Configuración → Sincronización**, verificá el nuevo toggle
+   **`alegra_connector_inventory_sync_enabled`** (por defecto **encendido**).
+2. Con **"sync products" apagado** y este toggle **encendido**, corré el cron:
+   el **pull de inventario igual corre**.
+3. Un producto con cantidad **0** en Alegra queda en **`outofstock`** en
+   WooCommerce (se escribe `_stock_status`).
+4. **Riesgo: Medio.** Antes el pull dependía de "sync products": si no
+   sincronizabas productos, nunca bajaba el stock.
+
+### ★★★.f — Factura liquidada reconocida por `closed`
+
+1. Con una factura **liquidada** en Alegra, esperá el webhook o el poll.
+2. **Resultado esperado:** el pedido de WooCommerce **se completa**. El enum de
+   Alegra es `open/closed/draft/void` (`closed` = liquidada), y antes solo se
+   reconocía el literal `paid`.
+3. La lógica está centralizada en `Invoice_Status::is_paid()` (acepta `paid` y
+   `closed`).
+4. **Riesgo: Alto.** Una factura pagada que nunca completa el pedido.
+
+### ★★★.g — Inspector de webhooks
+
+1. Corré `php scripts/inspect-webhooks.php` en el servidor (o con el runner de
+   PHP). Imprime el **ring buffer** de las últimas **50** entregas (asunto, body
+   crudo, fecha, IP).
+2. **Resultado esperado:** muestra un **veredicto** sobre si `edit-item` trae
+   datos de inventario (`SÍ` con `availableQuantity`, `NO` sin él).
+3. **Riesgo: Bajo.** Herramienta de diagnóstico de solo lectura.
 
 ---
 
@@ -653,25 +739,29 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 
 1. **Pre-vuelo (sin tocar producción):** respaldos, `sha256` del ZIP y smoke
    test. Ver `RELEASE_2.3.0_DEPLOY.md` §2.
-2. **Desplegar** e instalar la **2.4.0**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
-3. **★★★ Write gates (lo nuevo de la 2.4.0):** kill switch (★★★.a), barrido
+2. **Desplegar** e instalar la **2.4.1**. Ver `RELEASE_2.3.0_DEPLOY.md` §3.
+3. **★★★ Lo nuevo de la 2.4.1:** URL del webhook sin esquema (★★★.a), selector
+   de eventos (★★★.b), el borrador no se abre solo (★★★.c), factura anulada
+   (★★★.d), pull de inventario independiente (★★★.e), estado `closed` (★★★.f) e
+   inspector de webhooks (★★★.g). **Hacelo primero:** cambia el comportamiento
+   automático.
+4. **★★★ Write gates (lo nuevo de la 2.4.0):** kill switch (★★★.a), barrido
    (★★★.b), botón de nota de crédito (★★★.c), checkboxes (★★★.d), mapeos
-   (★★★.e) y Consumidor Final en el render (★★★.f). **Hacelo primero:** cambia
-   el comportamiento de escritura.
-4. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
-5. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
+   (★★★.e) y Consumidor Final en el render (★★★.f).
+5. **★ Re-registrar los webhooks (obligatorio).** Sin esto, no hay tiempo real.
+6. **★★ Productos:** stock (★★.a), categoría comercial (★★.b) y pull de
    inventario (★★.c). Es lo más importante de esta versión.
-6. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
+7. **★ Clientes:** importación sin salteos (★.a), Consumidor Final (★.b) y
    CO+FE (★.c).
-7. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
+8. **★ Pedidos:** envío/totales (★.a), reembolso parcial (★.b), impuestos (★.c)
    y errores visibles (★.d).
-8. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
+9. **★ Orquestación:** "Run now"/"Skip" conservan el cron (★.a), "Stop" (★.b) y
    el wizard (★.c).
-9. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
-10. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
+10. **Ítems 1 y 4:** stock por webhook/poll y condicionales de Blocks.
+11. **Pedido real de bajo valor.** Acá empieza lo que toca dinero real: confirmá
     que la factura se crea en Alegra (en borrador por defecto), vinculada al
     cliente correcto y con el total correcto.
-11. **Reembolso parcial** del pedido anterior → en modo manual, usá el botón
+12. **Reembolso parcial** del pedido anterior → en modo manual, usá el botón
     **"Emitir nota de crédito"** (★★★.c) para crear la nota ligada a la factura.
 
 ---
@@ -696,6 +786,9 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
      clientes vuelve a depender del gate de productos.
    - **Ojo:** la 2.4.0 **deshabilitó** la nota de crédito automática en modo
      manual; al volver a 2.3.11 esa automatización se reactiva.
+   - **Desde la 2.4.1:** no hay cambio de esquema, así que revertir a la **2.4.0**
+     es un simple reemplazo de carpeta; volver a 2.3.11 arrastra además los
+     cambios de comportamiento de la 2.4.0 listados arriba.
 4. **Estado de las facturas:** por defecto se crean como **borrador** para que
    las revises antes de emitirlas. Si querés que se creen abiertas, cambialo en
    `Alegra Connector → Configuración → Datos de facturación`.
@@ -710,7 +803,23 @@ silencio: si Alegra rechaza el contacto, la nota del pedido lo dice.
 - [ ] Respaldo de base de datos y de archivos hecho.
 - [ ] `sha256` del ZIP coincide con el `.sha256`.
 - [ ] Smoke test del ZIP termina en `SMOKE OK`.
-- [ ] 2.4.0 instalado y la versión figura como **2.4.0** en **Plugins**.
+- [ ] 2.4.1 instalado y la versión figura como **2.4.1** en **Plugins**.
+
+### Honestidad y confiabilidad — lo nuevo de la 2.4.1
+- [ ] **★★★.a** La URL del webhook se registra **sin esquema** (`12/12` sin el
+      error del `http://`/`https://`); en Alegra la URL no empieza con el esquema.
+- [ ] **★★★.b** Destildar un evento lo **desuscribe** en Alegra; un evento
+      deseleccionado entregado por suscripción vieja se **ignora** (200 ACK).
+- [ ] **★★★.c** Un borrador **no** se abre solo (barrido/hook): queda borrador,
+      con nota y `draft_skipped`; se abre a mano con "Abrir factura".
+- [ ] **★★★.d** Factura anulada → insignia roja **"Anulada en Alegra"** (no
+      "Facturado"), aviso en el detalle y **una** nota en el pedido.
+- [ ] **★★★.e** `alegra_connector_inventory_sync_enabled` (on por defecto) hace
+      que el pull de inventario corra **sin** "sync products" y escriba
+      `_stock_status` (0 → `outofstock`).
+- [ ] **★★★.f** Una factura **liquidada** (`closed`) completa el pedido.
+- [ ] **★★★.g** `php scripts/inspect-webhooks.php` imprime las últimas 50
+      entregas y el veredicto de inventario de `edit-item`.
 
 ### Write gates — lo nuevo de la 2.4.0
 - [ ] **★★★.a** Con el plugin desconectado, "Facturar" **no** escribe en Alegra
