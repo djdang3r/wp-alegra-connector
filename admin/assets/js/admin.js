@@ -450,9 +450,14 @@
                 var hasSavedSecret = String($secretField.data('saved')) === '1';
                 if (!secret && !hasSavedSecret) { showNotice(S.webhookSecretRequired, 'warning'); $btn.prop('disabled', false).text(S.registerWebhooks); return; }
                 $status.html('');
+                // AC-FIX: send the live checkbox state so the merchant does not
+                // need to "Guardar Cambios" before clicking "Registrar webhooks".
+                // The PHP handler falls back to the stored option if no array
+                // is posted, so external callers keep their old behaviour.
+                var checkedEvents = $('.alegra-webhook-event-check:checked').map(function() { return $(this).val(); }).get();
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_register_webhooks', _ajax_nonce: alegraConnector.nonce, webhook_secret: secret },
+                    data: { action: 'alegra_register_webhooks', _ajax_nonce: alegraConnector.nonce, webhook_secret: secret, webhook_selected_events: checkedEvents },
                     success: function(r) {
                         $btn.prop('disabled', false).text(S.registerWebhooks);
                         if (r.success) {

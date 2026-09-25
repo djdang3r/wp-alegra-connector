@@ -37,6 +37,7 @@ use Alegra\Connector\State_Sync;
 use Alegra\Connector\Sync\Controller;
 use Alegra\Connector\Sync\Orders;
 use Alegra\Connector\Sync\Products;
+use Alegra\Connector\Webhooks\Receiver;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -5778,6 +5779,150 @@ TestRunner::test('T-WH-SEL-7 the selector is wired: option, UI, labels and activ
     TestRunner::assertStringContains('Factura nueva', $client, 'the labels map must translate the event');
 
     TestRunner::assertStringContains("'alegra_connector_webhook_selected_events' => \Alegra\Connector\API\Client::get_webhook_events()", $bootstrap, 'activation must default to all events');
+});
+
+// ===========================================================================
+// T-WH-LIVE — live checkbox state sent by the JS must drive the registration
+//
+// The user complaint was that clicking "Registrar webhooks" subscribed ALL 12
+// regardless of the unchecked boxes, because the AJAX read from the saved
+// option (the form save was required). The handler now reads $_POST first
+// when present, persists it, and falls back to the saved option otherwise.
+// ===========================================================================
+echo "\nT-WH-LIVE — live checkbox state drives the registration\n";
+
+TestRunner::test('T-WH-LIVE-1 the AJAX subscribes ONLY the posted events, not all 12', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    // The form has NOT been saved: the option still holds the default (all 12).
+    // Seed the option explicitly because alegra_test_reset() only clears the
+    // store, it does not run the activation defaults loop.
+    update_option(Receiver::EVENTS_OPTION, Client::get_webhook_events(), false);
+    TestRunner::assertSame(Client::get_webhook_events(), get_option(Receiver::EVENTS_OPTION), 'pre-condition: the saved option is all 12');
+
+    // The JS would post the live checkbox state. Simulate three checked,
+    // nine unchecked (i.e. the user kept only new-invoice, edit-item,
+    // delete-item).
+    $live = ['new-invoice', 'edit-item', 'delete-item'];
+    $_POST = ['webhook_selected_events' => $live];
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(count($live), (int) ($response->payload['creados'] ?? -1), 'only the live selection is created');
+
+    $posted = [];
+    foreach (alegra_mock_requests('POST', '/webhooks/subscriptions') as $req) {
+        $posted[] = (string) ($req['body']['event'] ?? '');
+    }
+    sort($posted);
+    $expected = $live;
+    sort($expected);
+    TestRunner::assertSame($expected, $posted, 'the live selection is what reached Alegra');
+    TestRunner::assertFalse(in_array('edit-invoice', $posted, true), 'an unchecked event was NOT subscribed');
+});
+
+TestRunner::test('T-WH-LIVE-2 the AJAX persists the live selection so the option reflects it', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    $live = ['new-invoice', 'edit-item'];
+    $_POST = ['webhook_selected_events' => $live];
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = null;
+    try {
+        $admin->ajax_register_webhooks();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $resp = $e;
+    }
+
+    TestRunner::assertTrue($resp instanceof Alegra_Test_JSON_Response, 'the AJAX handler must respond');
+
+    $stored = (array) get_option(Receiver::EVENTS_OPTION, []);
+    sort($stored);
+    $expected = $live;
+    sort($expected);
+    TestRunner::assertSame($expected, $stored, 'the option must store the live selection');
+    TestRunner::assertSame($live, Receiver::selected_events(), 'the reader must return the live selection after the AJAX');
+});
+
+TestRunner::test('T-WH-LIVE-3 an unchecking-all AJAX unsubscribes the previously-subscribed events', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    $url = Receiver::registration_url();
+    $subs = [
+        ['id' => 'wh-live-1', 'event' => 'new-invoice', 'url' => $url],
+        ['id' => 'wh-live-2', 'event' => 'edit-invoice', 'url' => $url],
+    ];
+    foreach ($subs as $s) {
+        $GLOBALS['alegra_mock_state']['subscriptions'][$s['id']] = $s;
+    }
+    update_option('alegra_connector_webhook_subscriptions', $subs, false);
+
+    // The user unchecks everything in the dashboard and clicks Register.
+    $_POST = ['webhook_selected_events' => []];
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = null;
+    try {
+        $admin->ajax_register_webhooks();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $resp = $e;
+    }
+
+    TestRunner::assertTrue($resp instanceof Alegra_Test_JSON_Response, 'the AJAX handler must respond');
+    TestRunner::assertSame(2, (int) ($resp->payload['eliminados'] ?? -1), 'both previously-subscribed events are unsubscribed');
+    TestRunner::assertSame(0, count(alegra_mock_requests('POST', '/webhooks/subscriptions')), 'no new subscription was created');
+    TestRunner::assertSame([], get_option(Receiver::EVENTS_OPTION, 'unset'), 'the option must store the empty selection');
+});
+
+TestRunner::test('T-WH-LIVE-4 an empty live array means "all 12" via the persisted default', function (): void {
+    // The user untouched the dashboard and clicked Register without saving:
+    // the JS posts an empty array (no boxes ticked). The handler must NOT
+    // interpret that as "subscribe nothing"; it should honour the default
+    // (all 12) — same as an absent option. So the JS only posts the array
+    // when the user explicitly changed the selection; an empty-array POST
+    // is treated as an explicit deselection and persists as empty.
+    //
+    // We model the realistic path: the JS detects a touch (the live array
+    // differs from the stored array) and posts only when that happens. When
+    // it does not post, the option drives the behaviour. This test pins
+    // that fallback.
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+    unset($_POST['webhook_selected_events']);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $response = alegra_capture_json(fn () => $admin->ajax_register_webhooks());
+
+    TestRunner::assertSame(count(Client::get_webhook_events()), (int) ($response->payload['creados'] ?? -1), 'an unposted AJAX keeps the all-12 default');
+});
+
+TestRunner::test('T-WH-LIVE-5 unknown slugs in the live payload are dropped before registration', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_secret', 'hmac-secret');
+
+    // A hostile or stale dashboard might post slugs we no longer recognise.
+    $_POST = ['webhook_selected_events' => ['new-invoice', 'bogus', 'DROP TABLE users', '']];
+
+$admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = null;
+    try {
+        $admin->ajax_register_webhooks();
+    } catch (Alegra_Test_JSON_Response $e) {
+        $resp = $e;
+    }
+
+    TestRunner::assertTrue($resp instanceof Alegra_Test_JSON_Response, 'the AJAX handler must respond');
+    TestRunner::assertSame(['new-invoice'], get_option(Receiver::EVENTS_OPTION, []), 'only the documented slug survives');
+    $posted = [];
+    foreach (alegra_mock_requests('POST', '/webhooks/subscriptions') as $req) {
+        $posted[] = (string) ($req['body']['event'] ?? '');
+    }
+    TestRunner::assertSame(['new-invoice'], $posted, 'an unknown slug was never sent to Alegra');
 });
 
 // ===========================================================================

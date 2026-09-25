@@ -3045,10 +3045,29 @@ class Admin_Dashboard
         // Receiver enforces it with hash_equals().
         $webhook_url = \Alegra\Connector\Webhooks\Receiver::registration_url();
 
-        // Register ONLY the events the merchant selected. An absent option
+        // Register ONLY the events the merchant selected.
+        //
+        // The JS sends the live checkbox state in $_POST['webhook_selected_events']
+        // so the merchant does not need to click "Guardar Cambios" first; that
+        // state is allowlisted through the same sanitizer the settings form
+        // uses, persisted to the option (so subsequent loads render the same
+        // checkboxes), and then used as the registration set.
+        //
+        // When no live state is posted — e.g. an external caller / CLI
+        // inspector — fall back to the stored option. An absent option still
         // means "all events", so an install that never opened the selector
         // keeps subscribing to every documented event (no behaviour change).
-        $selected = \Alegra\Connector\Webhooks\Receiver::selected_events();
+        $posted_selection = $_POST['webhook_selected_events'] ?? null;
+        if (is_array($posted_selection)) {
+            $selected = self::sanitize_webhook_selected_events($posted_selection);
+            update_option(
+                \Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION,
+                $selected,
+                false
+            );
+        } else {
+            $selected = \Alegra\Connector\Webhooks\Receiver::selected_events();
+        }
         $deselected = array_values(array_diff(API\Client::get_webhook_events(), $selected));
 
         $created = [];
