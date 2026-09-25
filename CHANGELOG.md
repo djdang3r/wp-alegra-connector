@@ -2,6 +2,44 @@
 
 All notable changes to Alegra Connector.
 
+## [2.5.0] - 2026-09-25
+
+> **Observabilidad y recuperación del catálogo.** El Monitor ahora muestra los
+> imports manuales y chunked (además del cron), "Detener" funciona, "Limpiar
+> logs" borra TODO con confirmación, la ruta de logs es visible y el logger
+> avisa si no puede escribir. **Cambio de comportamiento intencional:** "Limpiar
+> logs" ya no borra solo los antiguos. Verificación de release:
+> `docs/RELEASE_2.5.0_VERIFICATION.md`.
+
+### Changed
+
+- **"Limpiar logs" ahora borra TODOS los archivos de log** (incluido el del
+  día) y reporta el conteo real. Antes solo borraba los más viejos que la
+  retención, por lo que el botón parecía no funcionar. La retención automática
+  (`alegra_connector_log_retention_days`) **no** se desactiva. La confirmación
+  advierte que es irreversible.
+- La página de **Logs** muestra la **ruta absoluta real** del directorio,
+  siempre (aunque no haya archivos).
+
+### Added
+
+- **Monitor**: etiquetas de origen (`Cron`/`Manual`/`Chunked`/`Webhook`), badge
+  `Abandonado` para runs sin finalizar, y estados vacíos/error honestos (no más
+  "Cargando..." infinito). La sección Cron explica cuando la sincronización
+  periódica está desactivada.
+- **Logger**: si el directorio de logs no es escribible, el admin muestra un
+  aviso con la ruta y el error (antes fallaba en silencio).
+
+### Notes
+
+- Sin cambio de esquema.
+- `alegra_connector_sync_products` **mantiene** su default `false` (decisión G3,
+  rama A): el cron no importa productos salvo toggle; el botón manual y los
+  webhooks siguen funcionando igual.
+- Opciones nuevas: `alegra_connector_chunked_page_budget`,
+  `alegra_connector_allowed_image_hosts_extra`,
+  `alegra_connector_products_import_total`, `alegra_connector_logger_write_failed`.
+
 ## [2.4.2] - 2026-09-21
 
 > **Webhooks visibles en el admin (sin cambio de esquema).** La pregunta que
