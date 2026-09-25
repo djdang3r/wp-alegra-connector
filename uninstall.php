@@ -103,6 +103,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_products_import_cursor');
     delete_option('alegra_connector_products_import_total');
     delete_option('alegra_connector_allowed_image_hosts_extra');
+    delete_option('alegra_connector_restrict_image_hosts');
     delete_option('alegra_connector_import_time_budget');
     delete_option('alegra_connector_import_max_pages');
     delete_option('alegra_connector_chunked_page_budget');

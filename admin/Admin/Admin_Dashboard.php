@@ -514,6 +514,12 @@ class Admin_Dashboard
             'sanitize_callback' => [self::class, 'sanitize_image_hosts'],
             'default' => [],
         ]);
+        // 2.5.1: image downloads are permissive by default (any public host over
+        // http/https). Turning this on enforces `allowed_image_hosts()`.
+        register_setting('alegra_connector_settings', 'alegra_connector_restrict_image_hosts', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_orders_poll_batch', [
             'sanitize_callback' => fn($v) => max(1, min(100, (int) $v)),
             'default' => 20,

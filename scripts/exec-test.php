@@ -7378,8 +7378,8 @@ TestRunner::test('T28.54 image_stats counts blocked and download failures', func
     $p = make_products();
     \Alegra\Connector\Sync\Products::reset_image_stats();
 
-    alegra_call_private($p, 'download_and_attach_image', 1000, 'https://evil.example/x.png');
-    TestRunner::assertSame(1, \Alegra\Connector\Sync\Products::image_stats()['blocked'], 'blocked host counted');
+    alegra_call_private($p, 'download_and_attach_image', 1000, 'http://127.0.0.1/x.png');
+    TestRunner::assertSame(1, \Alegra\Connector\Sync\Products::image_stats()['blocked'], 'SSRF host counted as blocked');
 
     alegra_call_private($p, 'download_and_attach_image', 1000, 'https://cdn3.alegra.com/x.png');
     $s = \Alegra\Connector\Sync\Products::image_stats();
@@ -7421,25 +7421,77 @@ TestRunner::test('T28.56 the allowlist merges the extra hosts and rejects wildca
     $san = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_image_hosts("https://cdn.example.com\n*\nfoo:8080\nfoo/bar\n");
     TestRunner::assertSame(['cdn.example.com'], $san, 'only the valid domain survives');
 
-    update_option('alegra_connector_allowed_image_hosts_extra', ['cdn.example.com'], false);
-    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'extra host allowed over https');
-    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('http://cdn.example.com/x.png'), 'http rejected');
-    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.com/x.png'), 'unknown host rejected');
+    // 2.5.1: default is permissive — any public host, http included, downloads.
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'public host allowed by default');
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.com/x.png'), 'unknown public host allowed by default');
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('http://cdn.example.com/x.png'), 'http allowed by default');
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn3.alegra.com/x.png'), 'alegra CDN allowed by default');
+});
+
+TestRunner::test('T28.510 la descarga flexible permite hosts públicos y siempre bloquea SSRF', function (): void {
+    alegra_test_reset();
+
+    // Default (restriction OFF): permissive over http and https.
+    foreach ([
+        'https://images.example.com/a.png',
+        'https://cdn3.alegra.com/a.png',
+        'https://alegra.com/a.png',
+        'http://images.example.com/a.png',
+    ] as $u) {
+        TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url($u), "permitido por defecto: $u");
+    }
+
+    // Only http/https are valid schemes.
+    foreach ([
+        'ftp://images.example.com/a.png',
+        'javascript:alert(1)',
+        'images.example.com/a.png',
+    ] as $u) {
+        TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url($u), "esquema inválido: $u");
+    }
+
+    // SSRF guard: loopback/private/reserved always blocked, in both modes.
+    $ssrf = [
+        'http://localhost/a.png',
+        'http://127.0.0.1/a.png',
+        'http://192.168.1.1/a.png',
+        'http://10.0.0.5/a.png',
+        'http://169.254.1.1/a.png',
+        'http://foo.local/a.png',
+        'http://svc.internal/a.png',
+        'http://bar.localhost/a.png',
+    ];
+    foreach ($ssrf as $u) {
+        TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url($u), "SSRF bloqueado (default): $u");
+    }
+    update_option('alegra_connector_restrict_image_hosts', true, false);
+    foreach ($ssrf as $u) {
+        TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url($u), "SSRF bloqueado (restringido): $u");
+    }
+
+    // Restriction ON: the allowlist gates hosts; alegra CDN still passes.
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn3.alegra.com/a.png'), 'alegra CDN permitido en modo restringido');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://images.example.com/a.png'), 'host público ajeno bloqueado en modo restringido');
 });
 
 TestRunner::test('T28.57 the extra-host option is registered and cleaned up', function (): void {
     $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
     TestRunner::assertStringContains("'alegra_connector_allowed_image_hosts_extra'", $admin, 'must be registered');
+    TestRunner::assertStringContains("'alegra_connector_restrict_image_hosts'", $admin, 'the restriction switch must be registered');
     $uninstall = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'uninstall.php');
     TestRunner::assertStringContains("delete_option('alegra_connector_allowed_image_hosts_extra')", $uninstall, 'must be cleaned on uninstall');
+    TestRunner::assertStringContains("delete_option('alegra_connector_restrict_image_hosts')", $uninstall, 'the restriction switch must be cleaned on uninstall');
     $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
     TestRunner::assertStringContains("'alegra_connector_allowed_image_hosts_extra' => []", $main, 'must be in $defaults');
+    TestRunner::assertStringContains("'alegra_connector_restrict_image_hosts' => false", $main, 'the switch defaults to false in $defaults');
 });
 
 TestRunner::test('T28.58 the extra-host textarea is rendered in the advanced tab', function (): void {
     $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
     TestRunner::assertStringContains('name="alegra_connector_allowed_image_hosts_extra"', $tpl, 'the textarea must post the option');
     TestRunner::assertStringContains("get_option('alegra_connector_allowed_image_hosts_extra', [])", $tpl, 'the textarea must render the stored hosts');
+    TestRunner::assertStringContains('name="alegra_connector_restrict_image_hosts"', $tpl, 'the restriction checkbox must post the option');
+    TestRunner::assertStringContains("get_option('alegra_connector_restrict_image_hosts',false)", $tpl, 'the checkbox must render the stored value');
 });
 
 TestRunner::test('T28.59 the page payload reflects blocked images (moved from Fase 3 T28.312)', function (): void {
@@ -7451,7 +7503,7 @@ TestRunner::test('T28.59 the page payload reflects blocked images (moved from Fa
     \Alegra\Connector\Entity_Map::map('item', 'itm-blocked', 'product', 10);
     alegra_mock_seed_item('itm-blocked', [
         'name' => 'Con imagen bloqueada', 'type' => 'simple',
-        'images' => [['url' => 'https://evil.example/x.png', 'favorite' => true]],
+        'images' => [['url' => 'http://10.0.0.5/x.png', 'favorite' => true]],
     ]);
     $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
     set_transient('alegra_batch_state', [
@@ -7827,14 +7879,20 @@ TestRunner::test('T28.710 R9 finish no re-finaliza un run ya cerrado (R9)', func
     TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'no debe pisar completed con cancelled');
 });
 
-TestRunner::test('T28.711 R10 la allowlist rechaza comodines y http (R10)', function (): void {
+TestRunner::test('T28.711 R10 la restricción de hosts se activa por opción (R10)', function (): void {
     alegra_test_reset();
     $san = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_image_hosts("https://cdn.example.com\n*\nfoo:8080");
     TestRunner::assertSame(['cdn.example.com'], $san, 'sólo el dominio válido sobrevive');
+
     update_option('alegra_connector_allowed_image_hosts_extra', ['cdn.example.com'], false);
-    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'https + host permitido');
-    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('http://cdn.example.com/x.png'), 'http rechazado');
-    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.example/x.png'), 'host ajeno rechazado');
+    // Default OFF: permissive — any public host passes.
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.example/x.png'), 'sin restricción cualquier host público pasa');
+
+    // Restriction ON: only the allowlist (alegra.com + extra) passes.
+    update_option('alegra_connector_restrict_image_hosts', true, false);
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'host extra permitido en modo restringido');
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn3.alegra.com/x.png'), 'host de Alegra permitido en modo restringido');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.example/x.png'), 'host ajeno rechazado en modo restringido');
 });
 
 TestRunner::test('T28.712 R11 el run_id no filtra contexto fuera del run (R11)', function (): void {
@@ -7907,21 +7965,23 @@ TestRunner::test('T28.716 exists() de tombstones sigue delegando en exists_with_
     TestRunner::assertSame('bulk_wc', \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'itm-e'), 'reason coincide');
 });
 
-TestRunner::test('T28.717 el release 2.5.0 está consistente (uninstall/version/changelog)', function (): void {
+TestRunner::test('T28.717 el release 2.5.1 está consistente (uninstall/version/changelog)', function (): void {
     $root = $GLOBALS['alegra_plugin_root'];
     $uninstall = (string) file_get_contents($root . 'uninstall.php');
     foreach ([
         'alegra_connector_chunked_page_budget',
         'alegra_connector_allowed_image_hosts_extra',
+        'alegra_connector_restrict_image_hosts',
         'alegra_connector_products_import_total',
         'alegra_connector_logger_write_failed',
     ] as $opt) {
         TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse");
     }
     $main = (string) file_get_contents($root . 'alegra-connector.php');
-    TestRunner::assertStringContains('Version: 2.5.0', $main, 'el header dice 2.5.0');
+    TestRunner::assertStringContains('Version: 2.5.1', $main, 'el header dice 2.5.1');
     $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
-    TestRunner::assertStringContains('## [2.5.0]', $changelog, 'el CHANGELOG tiene la sección');
+    TestRunner::assertStringContains('## [2.5.1]', $changelog, 'el CHANGELOG tiene la sección');
+    TestRunner::assertStringContains('## [2.5.0]', $changelog, 'el CHANGELOG conserva 2.5.0');
     TestRunner::assertStringContains('borra TODOS los archivos de log', $changelog, 'documenta el cambio de semántica');
 });
 

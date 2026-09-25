@@ -2,6 +2,38 @@
 
 All notable changes to Alegra Connector.
 
+## [2.5.1] - 2026-09-25
+
+> **Descarga de imágenes flexible.** Por defecto ya no se restringe el host de
+> las imágenes de producto: se acepta cualquier host público por `http` o
+> `https`, de modo que CDNs externos (S3/CloudFront) se descargan. La seguridad
+> queda detrás de un switch.
+
+### Changed
+
+- **`is_allowed_image_url()` ahora es permisivo por defecto.** Se permite
+  cualquier host público sobre `http` o `https` (antes sólo `https` de
+  `alegra.com` y sus subdominios). Se conserva un guard SSRF siempre activo:
+  `localhost`, `*.localhost`, `*.local`, `*.internal` y literales IP
+  privados/reservados/loopback/link-local se rechazan siempre.
+- La validación de mime de la imagen descargada se mantiene: un archivo que no
+  sea imagen se rechaza igual.
+
+### Added
+
+- **Opción `alegra_connector_restrict_image_hosts`** (bool, default `false`).
+  Al activarla se vuelve al comportamiento estricto: sólo se permiten los hosts
+  de `allowed_image_hosts()` (`alegra.com` + lista extra). Checkbox en la
+  pestaña Avanzado, junto a "Hosts de imágenes extra".
+
+### Notes
+
+- Sin cambio de esquema.
+- `allowed_image_hosts()`, `alegra_connector_allowed_image_hosts_extra` y el
+  filtro `alegra_connector_allowed_image_hosts` siguen existiendo: ahora definen
+  la lista de restricción (sólo aplica con el switch activo).
+- Opción nueva: `alegra_connector_restrict_image_hosts`.
+
 ## [2.5.0] - 2026-09-25
 
 > **Observabilidad y recuperación del catálogo.** El Monitor ahora muestra los

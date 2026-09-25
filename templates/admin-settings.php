@@ -326,6 +326,11 @@ $ac_regime_labels = [
 ?></textarea>
 <p class="description"><?php esc_html_e('Un host por línea, sin https:// (ej: cdn.ejemplo.com). Se permiten además de los hosts de Alegra. No se admite "*" ni http.','alegra-connector');?></p></td></tr>
 
+<!-- Restrict image hosts (2.5.1) -->
+<tr><th><?php esc_html_e('Restringir descarga de imágenes:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_restrict_image_hosts" value="1" <?php checked(get_option('alegra_connector_restrict_image_hosts',false));?>> <?php esc_html_e('Restringir la descarga de imágenes a los servidores listados (por defecto se permiten todos los hosts públicos)','alegra-connector');?></label>
+<p class="description"><?php esc_html_e('Solo aplica a la lista de hosts de arriba. Los hosts locales o internos (SSRF) se bloquean siempre.','alegra-connector');?></p></td></tr>
+
 <!-- Preserve WooCommerce fields on update -->
 <tr><th><?php esc_html_e('Al actualizar productos, conservar de WooCommerce:','alegra-connector');?></th><td><fieldset>
 <?php

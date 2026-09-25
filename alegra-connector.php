@@ -3,7 +3,7 @@
  * Plugin Name: Alegra Connector
  * Plugin URI: https://github.com/djdang3r/wp-alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
- * Version: 2.5.0
+ * Version: 2.5.1
  * Author: Script Develop
  * Author URI: https://scriptdevelop.com.co
  * License: GPL v2 or later
@@ -438,6 +438,9 @@ final class Alegra_Connector
             // T3.1.a: wall-clock budget for one chunked page (Traer desde Alegra).
             'alegra_connector_chunked_page_budget' => 20,
             'alegra_connector_allowed_image_hosts_extra' => [],
+            // 2.5.1: permissive by default so images always download. ON enforces
+            // the allowlist above (plus the always-on SSRF guard).
+            'alegra_connector_restrict_image_hosts' => false,
             'alegra_connector_conflict_resolution' => 'alegra_wins',
             'alegra_connector_inventory_source' => 'alegra',
             // Independent gate for the Alegra -> WC stock pull. It no longer
@@ -471,6 +474,7 @@ final class Alegra_Connector
             'alegra_connector_chunked_page_budget',
             // Only read while importing product images (admin/cron).
             'alegra_connector_allowed_image_hosts_extra',
+            'alegra_connector_restrict_image_hosts',
             // Only read in admin/cron context (REQ-CFG-1).
             'alegra_connector_payment_reconcile_enabled',
             'alegra_connector_payment_reconcile_batch',

@@ -2224,12 +2224,17 @@ class Products
     }
 
     /**
-     * Hosts allowed as a source for product images (AC-68).
+     * Hosts allowed as a source for product images when the restriction mode is
+     * ON (AC-68).
      *
      * Alegra serves item images from its own CDN — the documented response
      * example is `https://cdn3.alegra.com/...` — so the base domain plus every
      * subdomain is allowed. Extendable via the
      * `alegra_connector_allowed_image_hosts` filter.
+     *
+     * Since 2.5.1 this is the RESTRICT list: it only applies when
+     * `alegra_connector_restrict_image_hosts` is enabled. By default every
+     * public host is accepted so third-party CDNs (S3/CloudFront) download.
      *
      * @return string[]
      */
@@ -2240,6 +2245,53 @@ class Products
         $hosts = array_values(array_unique(array_merge($base, $extra)));
         $filtered = apply_filters('alegra_connector_allowed_image_hosts', $hosts);
         return is_array($filtered) ? $filtered : $hosts;
+    }
+
+    /**
+     * Whether image downloads are restricted to the allowlist.
+     *
+     * Default false: 2.5.1 makes the default permissive so images always
+     * download. When true, `allowed_image_hosts()` is enforced. The switch
+     * exists so the stricter behavior can be re-enabled without a code change.
+     */
+    public static function image_host_restriction_enabled(): bool
+    {
+        return (bool) get_option('alegra_connector_restrict_image_hosts', false);
+    }
+
+    /**
+     * Always-on SSRF guard: true for loopback / private / reserved targets.
+     *
+     * Independent of the restriction mode — a legitimate public CDN is never
+     * caught here, but an attacker-controlled Alegra image URL cannot make the
+     * server fetch itself or the internal network.
+     */
+    private static function is_blocked_image_host(string $host): bool
+    {
+        $host = strtolower(trim($host, '[]'));
+        if ($host === '') {
+            return true;
+        }
+        if ($host === 'localhost' || str_ends_with($host, '.localhost')) {
+            return true;
+        }
+        if (str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
+            return true;
+        }
+
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            // Private, reserved, loopback and link-local literals fail this
+            // filter (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, ...).
+            if (filter_var(
+                $host,
+                FILTER_VALIDATE_IP,
+                FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+            ) === false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -2261,8 +2313,16 @@ class Products
     }
 
     /**
-     * True only for an https URL whose host is in the image allowlist. Blocks
-     * SSRF via an attacker-controlled Alegra image URL (AC-68).
+     * Whether a URL may be downloaded as a product image.
+     *
+     * 2.5.1 makes the default FLEXIBLE so images always download: any public
+     * host over http/https is accepted. An always-on SSRF guard blocks
+     * loopback / private / reserved targets regardless of the mode. When
+     * `alegra_connector_restrict_image_hosts` is ON, the host must match
+     * `allowed_image_hosts()` (exact or subdomain).
+     *
+     * Security note: the permissive default is intentional and deferred — the
+     * SSRF guard is the minimum bar; the full allowlist is one option away.
      */
     public static function is_allowed_image_url(string $url): bool
     {
@@ -2270,11 +2330,21 @@ class Products
         if (!is_array($parts) || empty($parts['host'])) {
             return false;
         }
-        if (strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+
+        $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+        if ($scheme !== 'http' && $scheme !== 'https') {
             return false;
         }
 
         $host = strtolower((string) $parts['host']);
+        if (self::is_blocked_image_host($host)) {
+            return false;
+        }
+
+        if (!self::image_host_restriction_enabled()) {
+            return true;
+        }
+
         foreach (self::allowed_image_hosts() as $allowed) {
             $allowed = strtolower(ltrim((string) $allowed, '.'));
             if ($allowed === '') {
