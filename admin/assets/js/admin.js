@@ -40,6 +40,9 @@
         // Filters chosen in the Products import modal. Read by initSyncNow when
         // it calls alegra_sync_start. Empty = import everything.
         pendingFilters: {},
+        // D4: set by the import modal (run()) and sent by alegra_sync_start.
+        pendingFromZero: false,
+        pendingRecreateManual: false,
 
         init: function() {
             this.initTabs();
@@ -127,6 +130,9 @@
                 // modal applies, it re-triggers this click with filter-confirmed
                 // set, so the sync proceeds through the normal path.
                 if ($(this).data('requires-filter') && !$(this).data('filter-confirmed')) {
+                    if ($(this).data('from-zero') && !confirm(S.confirmReimport)) {
+                        return; // cancelar no toca nada (ni cursor ni import)
+                    }
                     AlegraConnector.openImportFilterModal($(this));
                     return;
                 }
@@ -213,7 +219,9 @@
                     url: alegraConnector.ajaxUrl, type: 'POST',
                     data: {
                         action: 'alegra_sync_start', _ajax_nonce: alegraConnector.nonce, sync_type: types,
-                        filters: JSON.stringify(AlegraConnector.pendingFilters || {})
+                        filters: JSON.stringify(AlegraConnector.pendingFilters || {}),
+                        from_zero: AlegraConnector.pendingFromZero ? 1 : 0,
+                        recreate_manual: AlegraConnector.pendingRecreateManual ? 1 : 0
                     },
                     success: function(r) {
                         currentRequest = null;
@@ -319,6 +327,9 @@
             $('#ac-filter-inventariable').val('');
             $('#ac-filter-query').val('');
             $('#ac-filter-variant-note').hide();
+            var fromZero = !!($btn && $btn.data('from-zero'));
+            $('#ac-filter-from-zero-block').toggle(fromZero);
+            if (fromZero) { $('#ac-filter-recreate-manual').prop('checked', true); } // default: recrear todo
             $('#alegra-import-filter-modal').show();
             $('body').addClass('ac-modal-open');
             AlegraConnector.loadFilterCategories();
@@ -363,6 +374,8 @@
 
             function run($btn, filters) {
                 AlegraConnector.pendingFilters = filters || {};
+                AlegraConnector.pendingFromZero = !!($btn && $btn.data('from-zero'));
+                AlegraConnector.pendingRecreateManual = $('#ac-filter-recreate-manual').is(':checked');
                 closeModal();
                 if ($btn && $btn.length) {
                     $btn.data('filter-confirmed', true).trigger('click');

@@ -85,6 +85,20 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
     </div>
 </div>
 
+<?php
+$ac_cursor = (int) get_option('alegra_connector_products_import_cursor', 0);
+$ac_import_total = (int) get_option('alegra_connector_products_import_total', 0);
+if ($ac_cursor > 0): ?>
+    <div class="ac-notice warning" style="margin-bottom:14px;">
+        <span class="ac-badge warning"><?php echo esc_html(sprintf(
+            /* translators: %1$s: ítem del cursor, %2$s: total o "?" */
+            __('Pausado en el ítem %1$s de %2$s. "Traer desde Alegra" continúa desde ahí.', 'alegra-connector'),
+            number_format_i18n($ac_cursor),
+            $ac_import_total > 0 ? number_format_i18n($ac_import_total) : '?'
+        )); ?></span>
+    </div>
+<?php endif; ?>
+
 <!-- Actions + Filters -->
 <div class="ac-card" style="margin-bottom:14px;padding:12px 20px;">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -92,6 +106,12 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
         <button type="button" class="ac-btn ac-btn-primary ac-btn-sm alegra-quick-sync" data-type="products" data-requires-filter="1" <?php echo !$connected ? 'disabled' : ''; ?>>
             <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
             <?php esc_html_e('Traer desde Alegra', 'alegra-connector'); ?>
+        </button>
+        <button type="button" class="ac-btn ac-btn-danger ac-btn-sm alegra-quick-sync"
+                data-type="products" data-from-zero="1" data-requires-filter="1"
+                <?php echo !$connected ? 'disabled' : ''; ?>>
+            <span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;"></span>
+            <?php esc_html_e('Reimportar todo desde cero', 'alegra-connector'); ?>
         </button>
         <?php if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') : ?>
         <button type="button" class="ac-btn ac-btn-sm alegra-sync-inventory" title="<?php esc_attr_e('Trae las existencias desde Alegra y actualiza el stock de WooCommerce.', 'alegra-connector'); ?>">
@@ -331,6 +351,16 @@ if ($total_pages > 1) {
             <?php esc_html_e('Con variantes: se recorre todo el catálogo; el total mostrado es aproximado.', 'alegra-connector'); ?>
         </p>
 
+        <div id="ac-filter-from-zero-block" style="display:none;margin-top:12px;padding:10px 12px;border:1px solid var(--ac-warning);border-radius:6px;background:var(--ac-warning-bg);">
+            <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer;">
+                <input type="checkbox" id="ac-filter-recreate-manual" checked>
+                <span id="ac-filter-recreate-manual-label"></span>
+            </label>
+            <p style="margin:6px 0 0;font-size:11px;color:var(--ac-text-muted);">
+                <?php esc_html_e('Si lo destildás, solo se recrean los productos que desaparecieron por un borrado masivo.', 'alegra-connector'); ?>
+            </p>
+        </div>
+
         <div class="ac-modal-actions" style="margin-top:16px;display:flex;gap:10px;align-items:center;justify-content:flex-end;">
             <a href="#" id="ac-filter-all" style="margin-right:auto;font-size:12px;"><?php esc_html_e('Traer todo sin filtros', 'alegra-connector'); ?></a>
             <button type="button" class="ac-btn" id="ac-filter-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
@@ -340,4 +370,13 @@ if ($total_pages > 1) {
 </div>
 
 <?php include __DIR__ . '/footer.php'; ?>
+<script>
+jQuery(function ($) {
+    var S = (window.alegraConnector && window.alegraConnector.strings) || {};
+    var $label = $('#ac-filter-recreate-manual-label');
+    if ($label.length && S.confirmRecreateManual) {
+        $label.text(S.confirmRecreateManual);
+    }
+});
+</script>
 </div>

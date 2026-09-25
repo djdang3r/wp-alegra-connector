@@ -8,6 +8,7 @@
  *
  * Tombstone `reason` values:
  *   - 'manual_wc'      : user deleted the product/customer in WP admin
+ *   - 'bulk_wc'        : deleted through the WP/WC bulk-delete action (2.5.0)
  *   - 'alegra_deleted' : webhook received from Alegra that the item/client
  *                        was deleted in Alegra (added in 2.1.9)
  *
@@ -24,6 +25,51 @@ if (!defined('ABSPATH')) {
 
 class Tombstone_Manager
 {
+    /**
+     * Clasifica best-effort el borrado. Default seguro: manual_wc (WP-CLI, REST y
+     * llamadas programáticas no tienen $_REQUEST). D4, design.md:616-637.
+     *
+     * WordPress NO manda `action=delete_all`: "Empty Trash" es un submit
+     * `name="delete_all"` (top) / `delete_all2` (bottom), y
+     * WP_Posts_List_Table::current_action() devuelve 'delete_all' con
+     * isset($_REQUEST['delete_all']) || isset($_REQUEST['delete_all2']).
+     * Ver wp-admin/includes/class-wp-posts-list-table.php:606 y :625-631.
+     */
+    private static function classify_delete_reason(): string
+    {
+        if (!is_admin()) {
+            return 'manual_wc';
+        }
+
+        // 1) "Empty Trash": señal PRIMARIA, no `action=delete_all` (D5).
+        if (isset($_REQUEST['delete_all']) || isset($_REQUEST['delete_all2'])) {
+            return 'bulk_wc';
+        }
+
+        // 2) La acción viaja en `action` (select de arriba) o `action2` (select de
+        //    abajo). WP ignora `-1`, así que se cae al fallback `action2`.
+        $action = isset($_REQUEST['action'])
+            ? sanitize_key(wp_unslash((string) $_REQUEST['action']))
+            : '';
+        if ($action === '' || $action === '-1') {
+            $action = isset($_REQUEST['action2'])
+                ? sanitize_key(wp_unslash((string) $_REQUEST['action2']))
+                : '';
+        }
+        if ($action === 'delete_all') { // defensivo: algunos plugins lo postean así
+            return 'bulk_wc';
+        }
+
+        // 3) Selección masiva: WP manda `post[]` (array). Un solo ítem (array de
+        //    largo 1) cae en manual_wc (default seguro).
+        $post = $_REQUEST['post'] ?? null;
+        if (is_array($post) && count($post) > 1) {
+            return 'bulk_wc';
+        }
+
+        return 'manual_wc';
+    }
+
     /**
      * Hook: before_delete_post
      *
@@ -51,7 +97,7 @@ class Tombstone_Manager
             'alegra_type' => 'item',
             'wc_post_id' => $post_id,
             'deleted_by' => get_current_user_id(),
-            'reason' => 'manual_wc',
+            'reason' => self::classify_delete_reason(),
         ]);
 
         // AC-60: drop the indexed mapping so it cannot point at a ghost id.
@@ -102,15 +148,16 @@ class Tombstone_Manager
     }
 
     /**
-     * Check if a tombstone exists for the given Alegra ID.
+     * Devuelve el `reason` del tombstone vigente, o null si no hay.
+     * reason: 'manual_wc' | 'bulk_wc' | 'alegra_deleted' (Schema.php:159, VARCHAR(50)).
      */
-    public static function exists(string $alegra_type, string $alegra_id): bool
+    public static function exists_with_reason(string $alegra_type, string $alegra_id): ?string
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_tombstones';
 
-        $found = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM $table
+        $reason = $wpdb->get_var($wpdb->prepare(
+            "SELECT reason FROM $table
              WHERE alegra_type = %s AND alegra_id = %s
              AND resurrected_at IS NULL
              LIMIT 1",
@@ -118,7 +165,17 @@ class Tombstone_Manager
             $alegra_id
         ));
 
-        return (bool) $found;
+        return $reason !== null ? (string) $reason : null;
+    }
+
+    /**
+     * Check if a tombstone exists for the given Alegra ID.
+     *
+     * @deprecated Usar exists_with_reason() cuando haga falta la política (D4).
+     */
+    public static function exists(string $alegra_type, string $alegra_id): bool
+    {
+        return self::exists_with_reason($alegra_type, $alegra_id) !== null;
     }
 
     /**

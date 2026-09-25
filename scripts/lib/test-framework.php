@@ -203,6 +203,11 @@ function alegra_test_reset(): void
     // Explicit write context must never leak between tests (run_explicit's
     // finally normally clears it; this is belt-and-braces isolation).
     \Alegra\Connector\Write_Gate::reset_explicit();
+    // Request-scoped tombstone policy: production relies on PHP reinitializing
+    // the static per request; the harness runs every test in one process.
+    \Alegra\Connector\Run_Context::set_tombstone_policy('respect');
+    \Alegra\Connector\Sync\Products::clear_deadline();
+    \Alegra\Connector\Sync\Products::reset_image_stats();
     $GLOBALS['wp_options']['alegra_connector_auto_complete_order'] = true;
     $GLOBALS['wp_options']['alegra_connector_sync_images'] = false;
 

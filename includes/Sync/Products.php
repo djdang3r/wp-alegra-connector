@@ -1301,6 +1301,7 @@ class Products
         }
 
         $result = ['imported' => 0, 'updated' => 0, 'errors' => 0, 'total_pages' => 0, 'current_page' => 0, 'paused' => false];
+        self::reset_image_stats();
         $cursor_key = 'alegra_connector_products_import_cursor';
 
         // AC-19: resume from the persisted cursor. The old code always started
@@ -1457,8 +1458,28 @@ class Products
 
         $this->logger->info('Products import from Alegra completed', $result);
         $result['total_pages'] = $current_page;
+        $result['images'] = self::image_stats();
 
         return $result;
+    }
+
+    /**
+     * ¿La política vigente permite recrear un producto con este tombstone? (D4)
+     * `alegra_deleted` NUNCA se resucita, en ninguna política.
+     */
+    private static function tombstone_policy_allows(string $reason): bool
+    {
+        if ($reason === 'alegra_deleted') {
+            return false;
+        }
+        $policy = \Alegra\Connector\Run_Context::tombstone_policy();
+        if ($policy === 'ignore_all') {
+            return true; // recrea bulk_wc + manual_wc
+        }
+        if ($policy === 'ignore_bulk') {
+            return $reason === 'bulk_wc';
+        }
+        return false; // respect
     }
 
     /**
@@ -1495,14 +1516,17 @@ class Products
             return 'skipped';
         }
 
-        // TOMBSTONE GUARD: skip if user previously deleted this product in WC.
+        // TOMBSTONE GUARD: skip CREATION unless the active policy overrides it (D4).
         // Only blocks CREATION, not updates of existing products.
-        if (\Alegra\Connector\Tombstone_Manager::exists('item', $alegra_id)) {
+        $tombstone_reason = \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', $alegra_id);
+        if ($tombstone_reason !== null && !self::tombstone_policy_allows($tombstone_reason)) {
             $existing_for_update = $this->get_product_by_alegra_id($alegra_id);
             if (!$existing_for_update) {
-                $this->logger->info('Skipped product import: tombstone exists (user deleted in WC)', [
+                $this->logger->info('Skipped product import: tombstone respected by policy', [
                     'alegra_id' => $alegra_id,
                     'name' => $name,
+                    'reason' => $tombstone_reason,
+                    'policy' => \Alegra\Connector\Run_Context::tombstone_policy(),
                 ]);
                 return 'skipped';
             }
@@ -2211,9 +2235,29 @@ class Products
      */
     public static function allowed_image_hosts(): array
     {
-        $hosts = ['alegra.com'];
+        $base = ['alegra.com'];
+        $extra = (array) get_option('alegra_connector_allowed_image_hosts_extra', []);
+        $hosts = array_values(array_unique(array_merge($base, $extra)));
         $filtered = apply_filters('alegra_connector_allowed_image_hosts', $hosts);
         return is_array($filtered) ? $filtered : $hosts;
+    }
+
+    /**
+     * Extensión de archivo derivada del mime real. Fallback 'jpg' (comportamiento previo).
+     */
+    private static function extension_from_mime(string $mime): string
+    {
+        $map = [
+            'image/jpeg'    => 'jpg',
+            'image/png'     => 'png',
+            'image/gif'     => 'gif',
+            'image/webp'    => 'webp',
+            'image/avif'    => 'avif',
+            'image/bmp'     => 'bmp',
+            'image/tiff'    => 'tiff',
+            'image/svg+xml' => 'svg',
+        ];
+        return $map[strtolower($mime)] ?? 'jpg';
     }
 
     /**
@@ -2255,6 +2299,7 @@ class Products
         if (empty($image_url)) return 0;
 
         if (!self::is_allowed_image_url($image_url)) {
+            self::$image_stats['blocked']++;
             $this->logger->warning('Blocked image download from a non-allowlisted host', [
                 'product_id' => $product_id,
                 'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
@@ -2318,6 +2363,7 @@ class Products
 
             $tmp = download_url($image_url, 15);
             if (is_wp_error($tmp)) {
+                self::$image_stats['download']++;
                 $this->logger->warning('Image download failed', [
                     'product_id' => $product_id,
                     'url' => $image_url,
@@ -2326,13 +2372,16 @@ class Products
                 return 0;
             }
 
-            $file_array = [
-                'name' => 'alegra-' . $product_id . '-' . substr($url_hash, 0, 8) . '.jpg',
-                'tmp_name' => $tmp,
-            ];
+            $fallback = 'alegra-' . $product_id . '-' . substr($url_hash, 0, 8);
+            $check = wp_check_filetype_and_ext($tmp, $fallback . '.jpg');
+            $ext = !empty($check['ext'])
+                ? (string) $check['ext']
+                : self::extension_from_mime((string) (wp_get_image_mime($tmp) ?: mime_content_type($tmp)));
+            $file_array = ['name' => $fallback . '.' . $ext, 'tmp_name' => $tmp];
 
             $attachment_id = media_handle_sideload($file_array, $product_id);
             if (is_wp_error($attachment_id)) {
+                self::$image_stats['sideload']++;
                 @unlink($tmp);
                 $this->logger->warning('Image sideload failed', [
                     'product_id' => $product_id,
@@ -2348,6 +2397,7 @@ class Products
             // AC-23: index the new attachment for O(1) dedup on later imports.
             \Alegra\Connector\Entity_Map::map('image', $url_hash, 'attachment', (int) $attachment_id);
 
+            self::$image_stats['ok']++;
             $this->logger->debug('Image imported', [
                 'product_id' => $product_id,
                 'attachment_id' => $attachment_id,
@@ -2471,6 +2521,7 @@ class Products
         if (empty($image_url)) return;
 
         if (!self::is_allowed_image_url($image_url)) {
+            self::$image_stats['blocked']++;
             $this->logger->warning('Blocked image download from a non-allowlisted host', [
                 'product_id' => $product_id,
                 'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
@@ -2484,19 +2535,24 @@ class Products
 
         $tmp = download_url($image_url, 15);
         if (is_wp_error($tmp)) {
+            self::$image_stats['download']++;
             $this->logger->warning('Image download failed for product ' . $product_id, ['error' => $tmp->get_error_message()]);
             return;
         }
 
-        $file_array = [
-            'name' => 'alegra-' . $product_id . '.jpg',
-            'tmp_name' => $tmp,
-        ];
+        $fallback = 'alegra-' . $product_id;
+        $check = wp_check_filetype_and_ext($tmp, $fallback . '.jpg');
+        $ext = !empty($check['ext'])
+            ? (string) $check['ext']
+            : self::extension_from_mime((string) (wp_get_image_mime($tmp) ?: mime_content_type($tmp)));
+        $file_array = ['name' => $fallback . '.' . $ext, 'tmp_name' => $tmp];
 
         $attachment_id = media_handle_sideload($file_array, $product_id);
         if (!is_wp_error($attachment_id)) {
+            self::$image_stats['ok']++;
             set_post_thumbnail($product_id, $attachment_id);
         } else {
+            self::$image_stats['sideload']++;
             $this->logger->warning('Image sideload failed for product ' . $product_id, ['error' => $attachment_id->get_error_message()]);
         }
     }

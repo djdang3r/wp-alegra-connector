@@ -102,47 +102,6 @@ class Admin_Dashboard
         return $pid ? (int)$pid : null;
     }
 
-    /**
-     * Download and attach image from Alegra to WooCommerce product
-     */
-    private function import_product_image(int $product_id, string $image_url): void
-    {
-        if (empty($image_url)) return;
-
-        // SSRF guard (AC-68): only fetch https URLs from Alegra's CDN.
-        if (!Sync\Products::is_allowed_image_url($image_url)) {
-            $this->log('warning', 'Blocked image download from a non-allowlisted host', [
-                'product_id' => $product_id,
-                'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
-            ]);
-            return;
-        }
-
-        require_once ABSPATH . 'wp-admin/includes/media.php';
-        require_once ABSPATH . 'wp-admin/includes/file.php';
-        require_once ABSPATH . 'wp-admin/includes/image.php';
-
-        $tmp = download_url($image_url, 15);
-        if (is_wp_error($tmp)) {
-            $this->log('warning', 'Image download failed for product ' . $product_id, ['error' => $tmp->get_error_message()]);
-            return;
-        }
-
-        $file_array = [
-            'name' => 'alegra-' . $product_id . '.jpg',
-            'tmp_name' => $tmp,
-        ];
-
-        $attachment_id = media_handle_sideload($file_array, $product_id);
-        if (!is_wp_error($attachment_id)) {
-            set_post_thumbnail($product_id, $attachment_id);
-        } else {
-            $this->log('warning', 'Image sideload failed for product ' . $product_id, ['error' => $attachment_id->get_error_message()]);
-        }
-
-        @unlink($tmp);
-    }
-
     public function add_admin_menu(): void
     {
         add_menu_page(
@@ -549,6 +508,12 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => max(0, (int) $v),
             'default' => 0,
         ]);
+        // D5/T5.3a: extra image hosts the merchant allowlists by hand. Sanitized
+        // (no wildcard/path/port) and merged with the built-in ['alegra.com'].
+        register_setting('alegra_connector_settings', 'alegra_connector_allowed_image_hosts_extra', [
+            'sanitize_callback' => [self::class, 'sanitize_image_hosts'],
+            'default' => [],
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_orders_poll_batch', [
             'sanitize_callback' => fn($v) => max(1, min(100, (int) $v)),
             'default' => 20,
@@ -838,6 +803,8 @@ class Admin_Dashboard
             'confirmReimport'       => __('Esto reimporta TODO el catálogo desde cero y limpia el punto de reanudación. ¿Continuar?', 'alegra-connector'),
             'startingFromZero'      => __('Empezando de cero...', 'alegra-connector'),
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
+            // T5.2b (dueño único): desglose de fallos de imagen en el resumen.
+            'imagesFailed'          => __('%1$s imágenes no se pudieron importar (%2$s host no permitido, %3$s fallo de descarga, %4$s fallo al adjuntar, %5$s diferidas).', 'alegra-connector'),
         ];
     }
 
@@ -1922,6 +1889,54 @@ class Admin_Dashboard
     }
 
     /**
+     * Suma dos desgloses de imagen (por página) preservando las claves. D5.
+     * @param array<string,int> $a @param array<string,int> $b
+     * @return array<string,int>
+     */
+    private static function merge_image_stats(array $a, array $b): array
+    {
+        $out = [];
+        foreach (['ok', 'blocked', 'download', 'sideload', 'deferred'] as $k) {
+            $out[$k] = (int) ($a[$k] ?? 0) + (int) ($b[$k] ?? 0);
+        }
+        $out['failed'] = $out['blocked'] + $out['download'] + $out['sideload'];
+        return $out;
+    }
+
+    /**
+     * Sanitiza la lista de hosts de imagen extra. Un host por línea o por elemento.
+     * Acepta solo dominios válidos; rechaza `*`, `/`, `:` (NFR-07). D5.
+     * @param mixed $value
+     * @return array<int,string>
+     */
+    public static function sanitize_image_hosts($value): array
+    {
+        if (is_string($value)) {
+            $value = preg_split('/\r\n|\r|\n/', $value) ?: [];
+        }
+        if (!is_array($value)) {
+            return [];
+        }
+        $out = [];
+        foreach ($value as $line) {
+            $host = strtolower(trim((string) $line));
+            if ($host === '') {
+                continue;
+            }
+            $host = (string) preg_replace('#^[a-z][a-z0-9+.-]*://#i', '', $host); // quitar esquema
+            $host = rtrim($host, '/');
+            if (preg_match('#[/*:]#', $host)) {
+                continue; // rechaza comodín, path y puerto
+            }
+            if (!preg_match('/^[a-z0-9.-]+\.[a-z]{2,}$/', $host)) {
+                continue; // exige dominio con TLD
+            }
+            $out[] = $host;
+        }
+        return array_values(array_unique($out));
+    }
+
+    /**
      * Sanitize the merchant's webhook event selection.
      *
      * Only slugs from the documented enum survive; anything else (typos,
@@ -2238,6 +2253,10 @@ class Admin_Dashboard
         // El contexto de logger se fija con el run_id AUTORITATIVO.
         \Alegra\Connector\Run_Context::resume($run_id, 'chunked_import');
 
+        // D4: la política de tombstones viaja en el estado y se aplica en cada
+        // página. Cron/manual no la setean → default 'respect' del static.
+        \Alegra\Connector\Run_Context::set_tombstone_policy((string) ($state['policy'] ?? 'respect'));
+
         try {
         $this->api->reload_credentials();
         @set_time_limit(60);        // backstop duro; el corte real es el deadline de T3.1
@@ -2305,6 +2324,13 @@ class Admin_Dashboard
                 $state['offset'] = 0;
                 update_option('alegra_connector_products_import_cursor', $state['start'], false);
             }
+
+            // T5.2b: acumular el desglose de imagen de esta página en el estado
+            // (fuente canónica que T3.4 expone en el payload).
+            $state['images'] = self::merge_image_stats(
+                is_array($state['images'] ?? null) ? $state['images'] : [],
+                Sync\Products::image_stats()
+            );
         } elseif ($type === 'customers') {
             $items = $this->api->get('/contacts', ['start' => $start, 'limit' => $per_page, 'type' => 'client']);
             if (is_wp_error($items)) {

@@ -319,6 +319,13 @@ $ac_regime_labels = [
 <input type="number" name="alegra_connector_import_max_pages" value="<?php echo esc_attr(get_option('alegra_connector_import_max_pages',0));?>" class="small-text" min="0">
 <p class="description"><?php esc_html_e('Limite de paginas por corrida. 0 = sin limite (recomendado: la importacion reanuda desde el cursor).','alegra-connector');?></p></td></tr>
 
+<!-- Extra image hosts (D5) -->
+<tr><th><?php esc_html_e('Hosts de imágenes extra:','alegra-connector');?></th><td>
+<textarea name="alegra_connector_allowed_image_hosts_extra" rows="4" class="large-text code" placeholder="cdn.ejemplo.com"><?php
+    echo esc_textarea(implode("\n", (array) get_option('alegra_connector_allowed_image_hosts_extra', [])));
+?></textarea>
+<p class="description"><?php esc_html_e('Un host por línea, sin https:// (ej: cdn.ejemplo.com). Se permiten además de los hosts de Alegra. No se admite "*" ni http.','alegra-connector');?></p></td></tr>
+
 <!-- Preserve WooCommerce fields on update -->
 <tr><th><?php esc_html_e('Al actualizar productos, conservar de WooCommerce:','alegra-connector');?></th><td><fieldset>
 <?php

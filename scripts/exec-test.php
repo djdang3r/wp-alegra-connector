@@ -7158,7 +7158,8 @@ TestRunner::test('T28.39 get_script_strings tiene las claves de Fase 3', functio
     TestRunner::assertArrayHasKey('pausedResuming', $strings, 'pausedResuming');
     TestRunner::assertArrayHasKey('resumingFrom', $strings, 'resumingFrom');
     TestRunner::assertArrayHasKey('confirmReimport', $strings, 'confirmReimport');
-    TestRunner::assertArrayNotHasKey('imagesFailed', $strings, 'imagesFailed la declara T5.2b, no Fase 3');
+    // T5.2b ya está implementada: la clave la declara su fase dueña.
+    TestRunner::assertArrayHasKey('imagesFailed', $strings, 'imagesFailed la declara T5.2b');
 });
 
 TestRunner::test('T28.310 message siempre', function (): void {
@@ -7200,6 +7201,267 @@ TestRunner::test('T28.311 images en el payload', function (): void {
     $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
     TestRunner::assertArrayHasKey('images', $resp->payload, 'images presente');
     TestRunner::assertSame(0, (int) ($resp->payload['images']['failed'] ?? -1), 'sin fallos → failed 0');
+});
+
+// ---------------------------------------------------------------------------
+// Fase 4 — botones reanudar/reimportar + tombstones (T28.41-T28.47)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T28.41 the products template has the from-zero button and the cursor indicator', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-products.php');
+    TestRunner::assertStringContains('data-from-zero="1"', $tpl, 'the destructive button must be present');
+    TestRunner::assertStringContains('Reimportar todo desde cero', $tpl, 'the destructive label must be present');
+    TestRunner::assertStringContains("get_option('alegra_connector_products_import_cursor', 0)", $tpl, 'the cursor indicator must read the option');
+    TestRunner::assertStringContains("if (\$ac_cursor > 0)", $tpl, 'the badge must be gated on a positive cursor');
+    TestRunner::assertStringContains('ac-filter-recreate-manual', $tpl, 'the recreate-manual checkbox must exist');
+    TestRunner::assertStringContains('ac-filter-recreate-manual" checked', $tpl, 'the checkbox must default to checked');
+    TestRunner::assertStringContains('ac-filter-recreate-manual-label', $tpl, 'the label element must exist (populated from S)');
+    TestRunner::assertStringContains('S.confirmRecreateManual', $tpl, 'the label must consume the canonical JS string');
+    TestRunner::assertStringNotContains('que borré a mano', $tpl, 'the label must not hardcode the copy');
+});
+
+TestRunner::test('T28.42 the start request carries the from-zero and recreate-manual flags', function (): void {
+    $js = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/assets/js/admin.js');
+    TestRunner::assertStringContains('from_zero: AlegraConnector.pendingFromZero ? 1 : 0', $js, 'the start request must send from_zero');
+    TestRunner::assertStringContains('recreate_manual: AlegraConnector.pendingRecreateManual ? 1 : 0', $js, 'the start request must send recreate_manual');
+    TestRunner::assertStringContains('pendingFromZero: false', $js, 'the from-zero flag must default to false');
+    TestRunner::assertStringContains('pendingRecreateManual: false', $js, 'the checkbox flag must default to false');
+});
+
+TestRunner::test('T28.43 exists_with_reason returns the reason and exists() delegates', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Tombstone_Manager::create([
+        'alegra_id' => 'itm-1', 'alegra_type' => 'item', 'wc_post_id' => 10,
+        'deleted_by' => 1, 'reason' => 'bulk_wc',
+    ]);
+    TestRunner::assertSame('bulk_wc', \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'itm-1'), 'reason must round-trip');
+    TestRunner::assertTrue(\Alegra\Connector\Tombstone_Manager::exists('item', 'itm-1'), 'exists() must delegate');
+
+    $GLOBALS['alegra_db']['wp_alegra_tombstones'][0]['resurrected_at'] = '2026-01-01 00:00:00';
+    TestRunner::assertSame(null, \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'itm-1'), 'a resurrected tombstone is gone');
+    TestRunner::assertFalse(\Alegra\Connector\Tombstone_Manager::exists('item', 'itm-1'), 'exists() mirrors the reason query');
+});
+
+TestRunner::test('T28.44 classify_delete_reason distinguishes bulk from individual', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_is_admin'] = true;
+
+    $_REQUEST = ['action' => 'delete', 'post' => ['1', '2']];
+    TestRunner::assertSame('bulk_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'array post[] with >1 items is bulk');
+
+    $_REQUEST = ['action' => 'delete', 'post' => '123'];
+    TestRunner::assertSame('manual_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'scalar post is individual');
+
+    $_REQUEST = ['delete_all' => 'Empty Trash'];
+    TestRunner::assertSame('bulk_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'the delete_all submit (Empty Trash) is bulk');
+
+    $_REQUEST = ['action' => '-1', 'action2' => 'delete', 'post' => ['1', '2']];
+    TestRunner::assertSame('bulk_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'the bottom Apply travels in action2');
+
+    $_REQUEST = ['action' => 'delete', 'post' => ['1']];
+    TestRunner::assertSame('manual_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'a one-item selection is the safe default');
+
+    $_REQUEST = ['action' => 'delete', 'post' => ['1', '2']];
+    $GLOBALS['alegra_test_is_admin'] = false;
+    TestRunner::assertSame('manual_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'outside admin the default is the safe manual_wc');
+
+    $_REQUEST = [];
+    $GLOBALS['alegra_test_is_admin'] = true;
+    TestRunner::assertSame('manual_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'no request context is the safe default');
+});
+
+TestRunner::test('T28.45 on_post_delete records bulk_wc on a bulk delete', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_is_admin'] = true;
+    $GLOBALS['wp_posts'][55] = (object) ['ID' => 55, 'post_type' => 'product'];
+    update_post_meta(55, '_alegra_item_id', 'itm-55');
+    $_REQUEST = ['action' => 'delete', 'post' => ['55', '56']];
+    \Alegra\Connector\Tombstone_Manager::on_post_delete(55);
+    $rows = $GLOBALS['alegra_db']['wp_alegra_tombstones'] ?? [];
+    TestRunner::assertSame('bulk_wc', $rows[0]['reason'] ?? null, 'the tombstone must be bulk_wc');
+
+    $GLOBALS['alegra_db']['wp_alegra_tombstones'] = [];
+    $GLOBALS['wp_posts'][66] = (object) ['ID' => 66, 'post_type' => 'product'];
+    update_post_meta(66, '_alegra_item_id', 'itm-66');
+    $_REQUEST = ['delete_all' => 'Empty Trash', 'post_status' => 'trash'];
+    \Alegra\Connector\Tombstone_Manager::on_post_delete(66);
+    $rows = $GLOBALS['alegra_db']['wp_alegra_tombstones'] ?? [];
+    TestRunner::assertSame('bulk_wc', $rows[0]['reason'] ?? null, 'empty trash must be bulk_wc');
+});
+
+TestRunner::test('T28.46 the tombstone policy matrix is honoured on creation', function (): void {
+    $cases = [
+        ['respect',     'bulk_wc',        false],
+        ['respect',     'manual_wc',      false],
+        ['respect',     'alegra_deleted', false],
+        ['ignore_bulk', 'bulk_wc',        true],
+        ['ignore_bulk', 'manual_wc',      false],
+        ['ignore_bulk', 'alegra_deleted', false],
+        ['ignore_all',  'bulk_wc',        true],
+        ['ignore_all',  'manual_wc',      true],
+        ['ignore_all',  'alegra_deleted', false],
+    ];
+    foreach ($cases as [$policy, $reason, $must_create]) {
+        alegra_test_reset();
+        \Alegra\Connector\Run_Context::set_tombstone_policy($policy);
+        \Alegra\Connector\Tombstone_Manager::create([
+            'alegra_id' => 'itm-x', 'alegra_type' => 'item', 'wc_post_id' => 0,
+            'deleted_by' => 1, 'reason' => $reason,
+        ]);
+        $r = make_products()->import_single_item_public([
+            'id' => 'itm-x', 'name' => 'Producto X', 'type' => 'simple', 'reference' => 'SKU-X',
+        ]);
+        if ($must_create) {
+            TestRunner::assertSame(true, $r, "$policy/$reason must create");
+        } else {
+            TestRunner::assertSame('skipped', $r, "$policy/$reason must skip");
+        }
+    }
+});
+
+TestRunner::test('T28.47 the reimport flow confirms and reads the checkbox', function (): void {
+    $js = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/assets/js/admin.js');
+    TestRunner::assertStringContains('confirm(S.confirmReimport)', $js, 'the destructive button must confirm');
+    TestRunner::assertStringContains('ac-filter-recreate-manual', $js, 'the JS must read the recreate-manual checkbox');
+    TestRunner::assertStringContains('pendingRecreateManual', $js, 'the checkbox state must travel to the start request');
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'confirmReimport'", $admin, 'the string must be localizable');
+});
+
+// ---------------------------------------------------------------------------
+// Fase 5 — imágenes: mime, stats y allowlist (T28.51-T28.59)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T28.51 extension_from_mime maps the documented mimes', function (): void {
+    $f = fn (string $m): string => alegra_call_private_static(
+        \Alegra\Connector\Sync\Products::class, 'extension_from_mime', $m
+    );
+    TestRunner::assertSame('png',  $f('image/png'), 'png');
+    TestRunner::assertSame('jpg',  $f('image/jpeg'), 'jpeg');
+    TestRunner::assertSame('webp', $f('image/webp'), 'webp');
+    TestRunner::assertSame('gif',  $f('image/gif'), 'gif');
+    TestRunner::assertSame('avif', $f('image/avif'), 'avif');
+    TestRunner::assertSame('svg',  $f('image/svg+xml'), 'svg');
+    TestRunner::assertSame('jpg',  $f('application/octet-stream'), 'unknown falls back to jpg');
+});
+
+TestRunner::test('T28.52 no hardcoded .jpg remains in the live import points', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Sync/Products.php');
+    TestRunner::assertStringNotContains("'name' => 'alegra-' . \$product_id . '-' . substr(\$url_hash, 0, 8) . '.jpg'", $src, 'point 1 must not hardcode .jpg');
+    TestRunner::assertStringNotContains("'name' => 'alegra-' . \$product_id . '.jpg'", $src, 'point 2 must not hardcode .jpg');
+    TestRunner::assertStringContains('wp_check_filetype_and_ext', $src, 'the mime check must be used');
+});
+
+TestRunner::test('T28.53 the dead Admin_Dashboard::import_product_image is gone', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains('function import_product_image', $src, 'the dead method must be deleted');
+    TestRunner::assertStringNotContains("'alegra-' . \$product_id . '.jpg'", $src, 'the third hardcoded .jpg must be gone');
+});
+
+TestRunner::test('T28.54 image_stats counts blocked and download failures', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    $p = make_products();
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+
+    alegra_call_private($p, 'download_and_attach_image', 1000, 'https://evil.example/x.png');
+    TestRunner::assertSame(1, \Alegra\Connector\Sync\Products::image_stats()['blocked'], 'blocked host counted');
+
+    alegra_call_private($p, 'download_and_attach_image', 1000, 'https://cdn3.alegra.com/x.png');
+    $s = \Alegra\Connector\Sync\Products::image_stats();
+    TestRunner::assertSame(1, $s['download'], 'download failure counted');
+    TestRunner::assertSame(2, $s['failed'], 'failed = blocked + download + sideload (1 blocked + 1 download)');
+});
+
+TestRunner::test('T28.55 import_from_alegra exposes image stats and the page payload merges them', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    // El harness sólo importa imágenes en el update path (wc_get_product no
+    // conoce el post creado por wp_insert_post): se pre-vincula el producto.
+    alegra_make_product(10, ['name' => 'Con imagen']);
+    update_post_meta(10, '_alegra_item_id', 'itm-img');
+    \Alegra\Connector\Entity_Map::map('item', 'itm-img', 'product', 10);
+    alegra_mock_seed_item('itm-img', [
+        'name' => 'Con imagen', 'type' => 'simple',
+        'images' => [['url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true]],
+    ]);
+    $result = make_products()->import_from_alegra(1, 30, 0);
+    TestRunner::assertArrayHasKey('images', $result, 'the result must carry image stats');
+    TestRunner::assertTrue(($result['images']['download'] ?? 0) >= 1, 'the failed download must be counted');
+
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'page' => 0, 'per_page' => 30, 'total_pages' => 1, 'total_items' => 1,
+        'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0, 'filters' => [],
+        'run_id' => 0, 'start' => 0, 'offset' => 0, 'policy' => 'respect', 'images' => [],
+    ], 600);
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertArrayHasKey('images', $resp->payload, 'the page payload must include images');
+});
+
+TestRunner::test('T28.56 the allowlist merges the extra hosts and rejects wildcards', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame(['alegra.com'], \Alegra\Connector\Sync\Products::allowed_image_hosts(), 'no regression without the option');
+
+    $san = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_image_hosts("https://cdn.example.com\n*\nfoo:8080\nfoo/bar\n");
+    TestRunner::assertSame(['cdn.example.com'], $san, 'only the valid domain survives');
+
+    update_option('alegra_connector_allowed_image_hosts_extra', ['cdn.example.com'], false);
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'extra host allowed over https');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('http://cdn.example.com/x.png'), 'http rejected');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.com/x.png'), 'unknown host rejected');
+});
+
+TestRunner::test('T28.57 the extra-host option is registered and cleaned up', function (): void {
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'alegra_connector_allowed_image_hosts_extra'", $admin, 'must be registered');
+    $uninstall = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'uninstall.php');
+    TestRunner::assertStringContains("delete_option('alegra_connector_allowed_image_hosts_extra')", $uninstall, 'must be cleaned on uninstall');
+    $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
+    TestRunner::assertStringContains("'alegra_connector_allowed_image_hosts_extra' => []", $main, 'must be in $defaults');
+});
+
+TestRunner::test('T28.58 the extra-host textarea is rendered in the advanced tab', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('name="alegra_connector_allowed_image_hosts_extra"', $tpl, 'the textarea must post the option');
+    TestRunner::assertStringContains("get_option('alegra_connector_allowed_image_hosts_extra', [])", $tpl, 'the textarea must render the stored hosts');
+});
+
+TestRunner::test('T28.59 the page payload reflects blocked images (moved from Fase 3 T28.312)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    // El harness sólo importa imágenes en el update path: pre-vinculado.
+    alegra_make_product(10, ['name' => 'Con imagen bloqueada']);
+    update_post_meta(10, '_alegra_item_id', 'itm-blocked');
+    \Alegra\Connector\Entity_Map::map('item', 'itm-blocked', 'product', 10);
+    alegra_mock_seed_item('itm-blocked', [
+        'name' => 'Con imagen bloqueada', 'type' => 'simple',
+        'images' => [['url' => 'https://evil.example/x.png', 'favorite' => true]],
+    ]);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'page' => 0, 'per_page' => 30, 'total_pages' => 1, 'total_items' => 1,
+        'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0, 'filters' => [],
+        'run_id' => 0, 'start' => 0, 'offset' => 0, 'policy' => 'respect', 'images' => [],
+    ], 600);
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertTrue(($resp->payload['images']['blocked'] ?? 0) > 0, 'the blocked host must be reflected in the payload');
+    TestRunner::assertTrue(($resp->payload['images']['failed'] ?? 0) > 0, 'blocked counts as failed');
 });
 
 exit(TestRunner::summary());
