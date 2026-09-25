@@ -1722,7 +1722,15 @@ class Alegra_Mock_Wpdb
         return null;
     }
 
-    public function get_row($query, $output = null, $y = null) { return null; }
+    public function get_row($query, $output = null, $y = null)
+    {
+        // T7.1.a: el modelo de wp_alegra_runs es de T1.1a; esta rama sólo lo
+        // expone vía get_row() delegando en el get_results() ya implementado.
+        if (strpos((string) $query, 'alegra_runs') !== false) {
+            return $this->get_results($query)[0] ?? null;
+        }
+        return null;
+    }
 
     public function get_col($query, $x = 0)
     {

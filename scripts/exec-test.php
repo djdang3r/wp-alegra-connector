@@ -7644,4 +7644,314 @@ TestRunner::test('T28.615 the monitor partitions recent webhooks out of the hist
     TestRunner::assertStringContains('d.recent_webhooks', $mon, 'el monitor renderiza la sección de webhooks');
 });
 
+// ===========================================================================
+// === logs-monitor-import (2.5.0) — Fase 7: regresión R1–R15 + release ===
+// ===========================================================================
+
+TestRunner::test('T28.71 el modelo de runs expone get_row() además de get_var (T7.1.a)', function (): void {
+    alegra_test_reset();
+    $id = \Alegra\Connector\Runs::start('cron_sync_all', 'cron');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($id), 'la fila debe leerse running');
+    \Alegra\Connector\Runs::finish($id, 'completed', 'ok');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($id), 'finish debe actualizar status');
+    TestRunner::assertCount(1, \Alegra\Connector\Runs::recent(10), 'recent debe leer la fila');
+
+    // T7.1.a: get_row() debe delegar en el get_results() del modelo de T1.1a.
+    $row = $GLOBALS['wpdb']->get_row("SELECT * FROM {$GLOBALS['wpdb']->prefix}alegra_runs WHERE id = {$id}");
+    TestRunner::assertTrue($row !== null, 'get_row debe devolver la fila de runs');
+    TestRunner::assertSame('completed', (string) ($row->status ?? ''), 'la fila trae el status final');
+});
+
+TestRunner::test('T28.72 R1 el cron deja un run cron_sync_all completed con traza (R1)', function (): void {
+    alegra_test_reset();
+    foreach (['sync_products', 'sync_customers', 'sync_categories', 'sync_orders'] as $opt) {
+        update_option('alegra_connector_' . $opt, true);
+    }
+    alegra_clear_log();
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status(1), 'el cron debe cerrar completed');
+    TestRunner::assertSame('cron_sync_all', (string) ($GLOBALS['alegra_db']['wp_alegra_runs'][0]['run_type'] ?? ''), 'run_type canónico');
+    TestRunner::assertSame(null, \Alegra\Connector\Heartbeat::get(1), 'el heartbeat debe limpiarse al cerrar');
+    TestRunner::assertStringContains('Cron synchronization completed', alegra_read_log(), 'el log registra el cierre');
+});
+
+TestRunner::test('T28.73 R2 un handler de webhook que lanza responde 200 y deja failed (R2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $throwing = new class($logger) extends Client {
+        public function get_item(string $id): array|\WP_Error
+        {
+            throw new \RuntimeException('boom handler');
+        }
+    };
+    $receiver = new \Alegra\Connector\Webhooks\Receiver($throwing, $logger);
+    $body = json_encode(['subject' => 'new-item', 'message' => ['item' => ['id' => 'it-r2']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $res->get_status(), 'el webhook debe ACKear 200 aunque falle');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status(1), 'la fila debe quedar failed');
+    TestRunner::assertSame('webhook_item', (string) ($GLOBALS['alegra_db']['wp_alegra_runs'][0]['run_type'] ?? ''), 'run_type webhook_item');
+});
+
+TestRunner::test('T28.74 R3 el lock se libera ANTES del wp_send_json_error (observer H1.b)', function (): void {
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/items', 500, ['error' => 'boom']);
+
+    $run_id = \Alegra\Connector\Runs::start('chunked_import', 'tester');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $run_id, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0,
+        'errors' => 0, 'policy' => 'respect',
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0],
+        'filters' => [],
+    ], 600);
+
+    // H1.b: el observer corre JUSTO antes del throw del stub (el instante en
+    // que WP haría wp_die()->die()). Fotografía el lock CRUDO (el option).
+    $lock_at_send = 'unset';
+    $GLOBALS['alegra_test_json_observer'] = function (bool $success, array $payload) use (&$lock_at_send): void {
+        $lock_at_send = get_option('alegra_lock_alegra_sync_running_products', null);
+    };
+
+    $resp = alegra_capture_json(fn () => (new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger()))->ajax_sync_page());
+    $GLOBALS['alegra_test_json_observer'] = null;
+
+    TestRunner::assertFalse($resp->success, 'un WP_Error de /items debe responder error');
+    TestRunner::assertSame(null, $lock_at_send, 'el lock debe estar LIBRE en el instante del send');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($run_id), 'la fila debe cerrarse failed');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'el lock no debe quedar tomado');
+});
+
+TestRunner::test('T28.75 R4 reanudar por presupuesto no duplica ni saltea ítems (R4)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_chunked_page_budget', 10, false);
+    foreach (['a', 'b', 'c'] as $k) {
+        alegra_mock_seed_item('it-' . $k, ['name' => strtoupper($k), 'reference' => 'S' . $k, 'status' => 'active']);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 3,
+        'total_pages' => 1, 'total_items' => 3, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+
+    $GLOBALS['alegra_test_fake_microtime'] = 1000.0;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 6.0;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    $GLOBALS['alegra_test_fake_microtime'] = null;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
+
+    TestRunner::assertSame(true, $resp->payload['paused'] ?? null, 'la página debe pausar por presupuesto');
+    TestRunner::assertSame(1, (int) ($resp->payload['processed'] ?? -1), 'sólo el ítem 0 debe procesarse antes de pausar');
+
+    // Reanudar: el offset persistido evita reprocesar el prefijo.
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp2->payload['done'] ?? null, 'la segunda página debe completar');
+    TestRunner::assertSame(3, (int) ($resp2->payload['processed'] ?? -1), 'processed final === N (sin duplicar ni saltear)');
+    foreach (['a', 'b', 'c'] as $k) {
+        TestRunner::assertTrue((bool) \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-' . $k, 'product'), 'it-' . $k . ' debe quedar mapeado');
+    }
+});
+
+TestRunner::test('T28.76 R5 classify_delete_reason distingue bulk de individual (R5)', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_is_admin'] = true;
+    $_REQUEST = ['action' => 'delete', 'post' => ['1', '2']];
+    TestRunner::assertSame('bulk_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'post[] con >1 es bulk');
+    $_REQUEST = ['action' => 'delete', 'post' => '123'];
+    TestRunner::assertSame('manual_wc', alegra_call_private_static(
+        \Alegra\Connector\Tombstone_Manager::class, 'classify_delete_reason'
+    ), 'post escalar es individual');
+    $_REQUEST = [];
+});
+
+TestRunner::test('T28.77 R6 la política de tombstones respeta manual_wc y recrea bulk_wc (R6)', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Run_Context::set_tombstone_policy('respect');
+    \Alegra\Connector\Tombstone_Manager::create(['alegra_id' => 'itm-r6', 'alegra_type' => 'item', 'wc_post_id' => 0, 'deleted_by' => 1, 'reason' => 'bulk_wc']);
+    TestRunner::assertSame('skipped', make_products()->import_single_item_public(['id' => 'itm-r6', 'name' => 'R6', 'type' => 'simple', 'reference' => 'SR6']), 'respect skipea bulk_wc');
+
+    alegra_test_reset();
+    \Alegra\Connector\Run_Context::set_tombstone_policy('ignore_bulk');
+    \Alegra\Connector\Tombstone_Manager::create(['alegra_id' => 'itm-r6b', 'alegra_type' => 'item', 'wc_post_id' => 0, 'deleted_by' => 1, 'reason' => 'bulk_wc']);
+    TestRunner::assertSame(true, make_products()->import_single_item_public(['id' => 'itm-r6b', 'name' => 'R6b', 'type' => 'simple', 'reference' => 'SR6b']), 'ignore_bulk recrea bulk_wc');
+
+    alegra_test_reset();
+    \Alegra\Connector\Run_Context::set_tombstone_policy('ignore_bulk');
+    \Alegra\Connector\Tombstone_Manager::create(['alegra_id' => 'itm-r6c', 'alegra_type' => 'item', 'wc_post_id' => 0, 'deleted_by' => 1, 'reason' => 'manual_wc']);
+    TestRunner::assertSame('skipped', make_products()->import_single_item_public(['id' => 'itm-r6c', 'name' => 'R6c', 'type' => 'simple', 'reference' => 'SR6c']), 'ignore_bulk respeta manual_wc');
+});
+
+TestRunner::test('T28.78 R7 una página hace 1 GET y un solo Heartbeat::set (R7)', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_mock_seed_item('it-io-' . $i, ['name' => 'IO' . $i, 'reference' => 'SIO' . $i, 'status' => 'active']);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 5, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'una página = 1 GET /items, no N');
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_sync_page');
+    TestRunner::assertSame(1, substr_count($src, 'Heartbeat::set'), 'un solo Heartbeat::set por página (no por ítem)');
+});
+
+TestRunner::test('T28.79 R8 limpiar logs borra todo y no toca la retención (R8)', function (): void {
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains('TODOS los logs', $admin, 'el confirm advierte el alcance');
+    TestRunner::assertStringContains('No se puede deshacer', $admin, 'el confirm advierte lo irreversible');
+    alegra_test_reset();
+    $logger = make_logger();
+    $dir = $logger->get_log_dir();
+    @mkdir($dir, 0777, true);
+    foreach (glob($dir . '/*.log') ?: [] as $f) { @unlink($f); }
+    file_put_contents($dir . '/old.log', 'x');
+    $res = $logger->clear_all_logs();
+    TestRunner::assertSame(1, $res['files'], 'borra el archivo existente');
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_log_retention_days', 30), 'la retención sigue en 30');
+});
+
+TestRunner::test('T28.710 R9 finish no re-finaliza un run ya cerrado (R9)', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'completed', 'started_at' => current_time('mysql')]);
+    $run_id = (int) $wpdb->insert_id;
+    \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Detenido');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'no debe pisar completed con cancelled');
+});
+
+TestRunner::test('T28.711 R10 la allowlist rechaza comodines y http (R10)', function (): void {
+    alegra_test_reset();
+    $san = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_image_hosts("https://cdn.example.com\n*\nfoo:8080");
+    TestRunner::assertSame(['cdn.example.com'], $san, 'sólo el dominio válido sobrevive');
+    update_option('alegra_connector_allowed_image_hosts_extra', ['cdn.example.com'], false);
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://cdn.example.com/x.png'), 'https + host permitido');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('http://cdn.example.com/x.png'), 'http rechazado');
+    TestRunner::assertFalse(\Alegra\Connector\Sync\Products::is_allowed_image_url('https://evil.example/x.png'), 'host ajeno rechazado');
+});
+
+TestRunner::test('T28.712 R11 el run_id no filtra contexto fuera del run (R11)', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    $id = \Alegra\Connector\Runs::start('chunked_import', 'tester');
+    \Alegra\Connector\Run_Context::resume($id, 'chunked_import');
+    (new Logger())->info('dentro del run');
+    \Alegra\Connector\Run_Context::finish($id, 'completed');
+    (new Logger())->info('fuera del run');
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('"run_id":' . $id, $log, 'la línea de dentro lleva run_id');
+    $outside = '';
+    foreach (explode("\n", $log) as $line) {
+        if (str_contains($line, 'fuera del run')) { $outside = $line; }
+    }
+    TestRunner::assertStringNotContains('run_id', $outside, 'la línea posterior no lleva run_id');
+});
+
+TestRunner::test('T28.713 R13 clientes siguen funcionando sin tocar productos (R13)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('c-r13', ['name' => 'Cliente R13', 'email' => 'r13@example.test']);
+    update_option('alegra_connector_sync_customers', true);
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_inventory_sync_enabled', false);
+    alegra_clear_log();
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status(1), 'el cron completa');
+    TestRunner::assertTrue((bool) email_exists('r13@example.test'), 'el cliente se importó');
+    TestRunner::assertStringContains('products skipped by configuration', alegra_read_log(), 'el catálogo no se tocó');
+});
+
+TestRunner::test('T28.714 filas viejas del Monitor se incluyen con tipo crudo y error', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', [
+        'run_type' => 'cron_sync_all', 'status' => 'completed', 'started_at' => current_time('mysql'),
+        'finished_at' => current_time('mysql'), 'items_done' => 3, 'total_items' => 5, 'items_failed' => 0,
+        'memory_peak_mb' => 0, 'error_summary' => 'parcial',
+    ]);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+    TestRunner::assertTrue($resp->success, 'monitor responde success');
+    $found = null;
+    foreach (($resp->payload['recent'] ?? []) as $r) {
+        if (($r['type'] ?? '') === 'cron_sync_all') { $found = $r; }
+    }
+    TestRunner::assertTrue($found !== null, 'la fila vieja debe aparecer en recent');
+    TestRunner::assertSame('parcial', $found['error'] ?? null, 'el error_summary se expone');
+});
+
+TestRunner::test('T28.715 el Monitor expone el kill switch activo y su motivo', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Kill_Switch::activate('test_reason');
+    \Alegra\Connector\Kill_Switch::reset_cache();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+    TestRunner::assertSame(true, $resp->payload['kill_switch_active'] ?? null, 'kill_switch_active true');
+    TestRunner::assertSame('test_reason', $resp->payload['kill_switch_reason'] ?? null, 'el motivo se expone');
+    \Alegra\Connector\Kill_Switch::deactivate();
+    \Alegra\Connector\Kill_Switch::reset_cache();
+});
+
+TestRunner::test('T28.716 exists() de tombstones sigue delegando en exists_with_reason()', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Tombstone_Manager::create([
+        'alegra_id' => 'itm-e', 'alegra_type' => 'item', 'wc_post_id' => 0, 'deleted_by' => 1, 'reason' => 'bulk_wc',
+    ]);
+    TestRunner::assertTrue(\Alegra\Connector\Tombstone_Manager::exists('item', 'itm-e'), 'exists() delega');
+    TestRunner::assertSame('bulk_wc', \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'itm-e'), 'reason coincide');
+});
+
+TestRunner::test('T28.717 el release 2.5.0 está consistente (uninstall/version/changelog)', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $uninstall = (string) file_get_contents($root . 'uninstall.php');
+    foreach ([
+        'alegra_connector_chunked_page_budget',
+        'alegra_connector_allowed_image_hosts_extra',
+        'alegra_connector_products_import_total',
+        'alegra_connector_logger_write_failed',
+    ] as $opt) {
+        TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse");
+    }
+    $main = (string) file_get_contents($root . 'alegra-connector.php');
+    TestRunner::assertStringContains('Version: 2.5.0', $main, 'el header dice 2.5.0');
+    $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
+    TestRunner::assertStringContains('## [2.5.0]', $changelog, 'el CHANGELOG tiene la sección');
+    TestRunner::assertStringContains('borra TODOS los archivos de log', $changelog, 'documenta el cambio de semántica');
+});
+
+TestRunner::test('T28.718 R14 el cierre del chunked borra el cursor por tipo (R14)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    alegra_mock_seed_contact('c-r14', ['name' => 'R14', 'email' => 'r14@example.test']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'customers', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'customers completa');
+    TestRunner::assertSame(1500, (int) get_option('alegra_connector_products_import_cursor', 0), 'customers NO borra el cursor de products');
+
+    alegra_test_reset();
+    alegra_mock_seed_item('it-r14', ['name' => 'R14', 'reference' => 'SR14', 'status' => 'active']);
+    $rid2 = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid2, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin2 = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp2 = alegra_capture_json(fn () => $admin2->ajax_sync_page());
+    TestRunner::assertSame(true, $resp2->payload['done'] ?? null, 'products completa');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'products SÍ borra su cursor');
+});
+
 exit(TestRunner::summary());
