@@ -40,6 +40,7 @@ class Write_Gate
         'payment'     => 'alegra_connector_payment_reconcile_enabled',
         'contact'     => 'alegra_connector_push_customers_enabled',
         'item'        => 'alegra_connector_push_products_enabled',
+        'inventory'   => 'alegra_connector_push_inventory_enabled',
         'category'    => 'alegra_connector_push_products_enabled',
         'webhook'     => null,
         'other'       => null,
@@ -50,7 +51,11 @@ class Write_Gate
      * (the hourly sweep must keep working on an install that never toggled it).
      */
     private const ENTITY_DEFAULTS = [
-        'payment' => true,
+        'payment'   => true,
+        // 2.6.0: el ajuste WC→Alegra debe poder correr en una instalación existente
+        // que aún no tiene la opción (default true en alegra-connector.php). Sin
+        // esto block_reason() devolvería entity_disabled y lo bloquearía (R15).
+        'inventory' => true,
     ];
 
     /**
@@ -71,6 +76,7 @@ class Write_Gate
         ['contact',     '#^/contacts(/|$)#'],
         ['category',    '#^/item-categories(/|$)#'],
         ['item',        '#^/items(/|$)#'],
+        ['inventory',   '#^/inventory-adjustments(/|$)#'],
         ['item',        '#^/taxes(/|$)#'],
         ['item',        '#^/variant-attributes(/|$)#'],
         ['webhook',     '#^/webhooks/subscriptions(/|$)#'],

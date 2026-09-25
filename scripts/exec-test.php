@@ -27,6 +27,7 @@ if (!is_file($plugin_root . 'alegra-connector.php')) {
 
 require __DIR__ . '/lib/wp-stubs.php';
 require __DIR__ . '/lib/ns-microtime.php';
+require __DIR__ . '/lib/ns-shutdown.php';
 require __DIR__ . '/lib/alegra-mock.php';
 require __DIR__ . '/lib/test-framework.php';
 
@@ -5547,21 +5548,23 @@ TestRunner::test('T-HYG-1 the dead option writes are gone and their legacy clean
     TestRunner::assertStringContains("delete_option('alegra_connector_disconnected_at')", $uninstall, 'uninstall must still clean the legacy disconnected_at');
 });
 
-TestRunner::test('T-HYG-2 the 14 uncalled Client methods are kept and marked @deprecated (branch B)', function (): void {
+TestRunner::test('T-HYG-2 the 13 uncalled Client methods are kept and marked @deprecated (branch B)', function (): void {
     $client = cfg2_source('includes/API/Client.php');
     $methods = [
         'delete_item_category', 'void_credit_note', 'update_credit_note', 'delete_credit_note',
         'update_payment', 'delete_payment', 'void_payment', 'open_payment',
         'create_price_list', 'update_price_list', 'delete_price_list',
-        'create_inventory_adjustment', 'create_estimate', 'update_invoice_retentions',
+        'create_estimate', 'update_invoice_retentions',
     ];
     foreach ($methods as $m) {
         TestRunner::assertStringContains('function ' . $m . '(', $client, "$m must still exist (public API)");
     }
-    TestRunner::assertSame(14, substr_count($client, '@deprecated 2.4.0'), 'all 14 uncalled methods must be marked @deprecated 2.4.0');
+    TestRunner::assertSame(13, substr_count($client, '@deprecated 2.4.0'), 'all 13 uncalled methods must be marked @deprecated 2.4.0');
 
-    // The two methods that ARE called must NOT be deprecated.
-    foreach (['delete_contact', 'update_item_category'] as $called) {
+    // The methods that ARE called must NOT be deprecated.
+    // 2.6.0 (T1.9): create_inventory_adjustment now has a production caller
+    // (Inventory_Pusher::push_delta), so it joins the called list.
+    foreach (['delete_contact', 'update_item_category', 'create_inventory_adjustment'] as $called) {
         $pos = strpos($client, 'function ' . $called . '(');
         TestRunner::assertTrue($pos !== false, "$called must still exist");
         $before = substr($client, max(0, $pos - 260), 260);
@@ -8012,6 +8015,177 @@ TestRunner::test('T28.718 R14 el cierre del chunked borra el cursor por tipo (R1
     $resp2 = alegra_capture_json(fn () => $admin2->ajax_sync_page());
     TestRunner::assertSame(true, $resp2->payload['done'] ?? null, 'products completa');
     TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'products SÍ borra su cursor');
+});
+
+// ===========================================================================
+// === sync-reliability (2.6.0) ===
+// Fase 1 — cimientos + harness (H1–H8), opciones nuevas y Write_Gate inventory.
+// IDs: T29.1{n} (T29.11…T29.18, T29.110). Fases 2..9 agregan T29.2x..T29.9x.
+// ===========================================================================
+
+TestRunner::test('T29.11 wc_update_product_stock deriva stock_status y dispara hooks', function (): void {
+    alegra_test_reset();
+    $p = alegra_make_product(900, ['manage_stock' => true, 'stock' => 5, 'backorders' => 'no']);
+    $ret = wc_update_product_stock($p, 0, 'set', false);
+    TestRunner::assertSame(0, $ret, 'devuelve la cantidad nueva');
+    TestRunner::assertSame('outofstock', $p->get_stock_status(), 'qty 0 + backorders no => outofstock');
+    TestRunner::assertTrue(($GLOBALS['wp_did_action']['woocommerce_product_set_stock'] ?? 0) >= 1, 'dispara woocommerce_product_set_stock');
+});
+
+TestRunner::test('T29.12 WC_Product::save deriva stock_status con backorders', function (): void {
+    alegra_test_reset();
+    $yes = alegra_make_product(901, ['manage_stock' => true, 'stock' => 0, 'backorders' => 'yes']);
+    $yes->save();
+    TestRunner::assertSame('onbackorder', $yes->get_stock_status(), 'backorders yes + 0 => onbackorder');
+
+    $no = alegra_make_product(902, ['manage_stock' => true, 'stock' => 0, 'backorders' => 'no']);
+    $no->save();
+    TestRunner::assertSame('outofstock', $no->get_stock_status(), 'backorders no + 0 => outofstock');
+
+    $off = alegra_make_product(903, ['manage_stock' => false, 'stock_status' => 'instock']);
+    $off->save();
+    TestRunner::assertSame('instock', $off->get_stock_status(), 'sin manage_stock no deriva');
+});
+
+TestRunner::test('T29.13 el mock soporta CONTAINS y pagina contactos e items', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('cf-real', ['identificationObject' => ['type' => 'CC', 'number' => '222222222222']]);
+    alegra_mock_seed_contact('falso-1', ['identificationObject' => ['type' => 'CC', 'number' => '9999222222222222']]);
+
+    $exact = alegra_mock_filter_contacts(['identification' => '222222222222']);
+    TestRunner::assertSame(1, count($exact), 'el default exacto no matchea el prefijo');
+
+    alegra_mock_set_contact_identification_mode('contains');
+    $contains = alegra_mock_filter_contacts(['identification' => '222222222222']);
+    TestRunner::assertSame(2, count($contains), 'CONTAINS matchea ambos');
+
+    $page1 = alegra_mock_filter_contacts(['identification' => '222222222222', 'start' => 0, 'limit' => 1]);
+    $page2 = alegra_mock_filter_contacts(['identification' => '222222222222', 'start' => 1, 'limit' => 1]);
+    TestRunner::assertSame(1, count($page1), 'page 1 devuelve 1');
+    TestRunner::assertSame(1, count($page2), 'page 2 devuelve 1');
+    TestRunner::assertNotSame($page1[0]['id'] ?? null, $page2[0]['id'] ?? null, 'páginas distintas');
+
+    // FIX-13: GET /items pagina SIN metadata=true (el poll llama sin metadata).
+    foreach ([1, 2, 3] as $n) {
+        alegra_mock_seed_item('it-page-' . $n, ['name' => 'Item ' . $n, 'reference' => 'S' . $n, 'status' => 'active']);
+    }
+    $api = make_api();
+    $items1 = $api->get_items(['start' => 0, 'limit' => 2]);
+    TestRunner::assertSame(2, count($items1), 'GET /items sin metadata respeta limit=2');
+    $items2 = $api->get_items(['start' => 2, 'limit' => 2]);
+    TestRunner::assertSame(1, count($items2), 'la segunda página trae el resto');
+    TestRunner::assertNotSame($items1[0]['id'] ?? null, $items2[0]['id'] ?? null, 'páginas de items distintas');
+
+    $meta = $api->get_items(['start' => 0, 'limit' => 2, 'metadata' => 'true']);
+    TestRunner::assertSame(3, (int) ($meta['metadata']['total'] ?? 0), 'metadata.total = total filtrado');
+    TestRunner::assertSame(2, count($meta['data'] ?? []), 'metadata.data sigue paginado');
+});
+
+TestRunner::test('T29.14 POST /inventory-adjustments aplica el delta al stock del item', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-adj', ['name' => 'Adj', 'inventory' => ['availableQuantity' => 10]]);
+    $api = make_api();
+
+    $out = $api->create_inventory_adjustment([
+        'date' => '2026-09-25', 'type' => 'out', 'quantity' => 3, 'item' => ['id' => 'it-adj'],
+    ]);
+    TestRunner::assertFalse(is_wp_error($out), 'el ajuste out debe aceptarse');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-adj']['inventory']['availableQuantity'], 'out resta');
+
+    $in = $api->create_inventory_adjustment([
+        'date' => '2026-09-25', 'type' => 'in', 'quantity' => 2, 'item' => ['id' => 'it-adj'],
+    ]);
+    TestRunner::assertFalse(is_wp_error($in), 'el ajuste in debe aceptarse');
+    TestRunner::assertSame(9, (int) $GLOBALS['alegra_mock_state']['items']['it-adj']['inventory']['availableQuantity'], 'in suma');
+
+    $bad = $api->create_inventory_adjustment(['type' => 'out', 'quantity' => 0, 'item' => ['id' => 'it-adj']]);
+    TestRunner::assertTrue(is_wp_error($bad), 'quantity 0 => 400 (quantity debe ser > 0)');
+});
+
+TestRunner::test('T29.15 POST /invoices rechaza un client inexistente (opt-in)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_invoice_client_check(true);
+    alegra_mock_seed_item('it-inv', ['name' => 'Inv', 'inventory' => ['availableQuantity' => 1]]);
+    $res = make_api()->create_invoice([
+        'client' => ['id' => 'dead'], 'items' => [['id' => 'it-inv']],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    TestRunner::assertTrue(is_wp_error($res), 'client muerto => WP_Error');
+    TestRunner::assertSame(400, (int) ($res->get_error_data()['code'] ?? 0), 'code 400');
+
+    // Default OFF: un client sin seed sigue aceptándose (baseline intacto).
+    alegra_test_reset();
+    alegra_mock_seed_item('it-inv2', ['name' => 'Inv2', 'inventory' => ['availableQuantity' => 1]]);
+    $ok = make_api()->create_invoice([
+        'client' => ['id' => 'c1'], 'items' => [['id' => 'it-inv2']],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    TestRunner::assertFalse(is_wp_error($ok), 'con el flag OFF no se rechaza (baseline)');
+});
+
+TestRunner::test('T29.16 set_syncing(true) es observable por el transient de import', function (): void {
+    alegra_test_reset();
+    TestRunner::assertFalse(get_transient('alegra_import_in_progress'), 'sin syncing no hay transient');
+
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    TestRunner::assertTrue((bool) get_transient('alegra_import_in_progress'), 'set_syncing(true) escribe el transient');
+
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+    TestRunner::assertFalse(get_transient('alegra_import_in_progress'), 'set_syncing(false) lo borra');
+});
+
+TestRunner::test('T29.17 las 9 opciones nuevas se siembran y se limpian', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $boot = (string) file_get_contents($root . 'alegra-connector.php');
+    $uninstall = (string) file_get_contents($root . 'uninstall.php');
+
+    $seed = [
+        'alegra_connector_push_inventory_enabled' => 'true',
+        'alegra_connector_inventory_manage_stock_enabled' => 'false',
+        'alegra_connector_inventory_poll_budget' => '60',
+        'alegra_connector_inventory_poll_max_pages' => '0',
+        'alegra_connector_cron_run_budget' => '540',
+        'alegra_connector_open_invoice_on_paid' => 'true',
+    ];
+    foreach ($seed as $opt => $default) {
+        TestRunner::assertStringContains("'$opt' => $default", $boot, "$opt debe estar en \$defaults con default $default");
+    }
+    foreach ([
+        'alegra_connector_push_inventory_enabled', 'alegra_connector_inventory_manage_stock_enabled',
+        'alegra_connector_inventory_poll_budget', 'alegra_connector_inventory_poll_max_pages',
+        'alegra_connector_cron_run_budget', 'alegra_connector_open_invoice_on_paid',
+        'alegra_connector_inventory_pull_cursor',
+        'alegra_connector_inventory_pull_total', 'alegra_connector_consumidor_final_probe',
+    ] as $opt) {
+        TestRunner::assertStringContains($opt, $boot, "$opt debe estar en \$non_autoload");
+        TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse en uninstall");
+    }
+});
+
+TestRunner::test('T29.18 Write_Gate reconoce inventory y no lo bloquea por default', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame('inventory', \Alegra\Connector\Write_Gate::entity_for('POST', '/inventory-adjustments'), 'entity_for');
+    TestRunner::assertSame('inventory', \Alegra\Connector\Write_Gate::entity_for('POST', '/inventory-adjustments/'), 'con slash final');
+
+    unset($GLOBALS['wp_options']['alegra_connector_push_inventory_enabled']);
+    TestRunner::assertSame(null, \Alegra\Connector\Write_Gate::block_reason('inventory'), 'opción ausente => ENTITY_DEFAULTS true => no bloquea');
+
+    update_option('alegra_connector_push_inventory_enabled', false);
+    TestRunner::assertSame('entity_disabled', \Alegra\Connector\Write_Gate::block_reason('inventory'), 'false => entity_disabled');
+});
+
+TestRunner::test('T29.110 los helpers del ledger leen/escriben las metas de stock', function (): void {
+    alegra_test_reset();
+    alegra_make_product(910, ['name' => 'Ledger']);
+
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::synced(910), 'sin meta => ""');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(910, 10);
+    TestRunner::assertSame(10, \Alegra\Connector\Sync\Inventory_Pusher::synced(910), 'round-trip synced');
+
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(910, 7);
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::pending(910), 'round-trip pending');
+    \Alegra\Connector\Sync\Inventory_Pusher::clear_pending(910);
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(910), 'clear_pending borra');
 });
 
 exit(TestRunner::summary());

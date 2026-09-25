@@ -74,6 +74,15 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_sync_categories');
     delete_option('alegra_connector_inventory_source');
     delete_option('alegra_connector_inventory_sync_enabled');
+    delete_option('alegra_connector_push_inventory_enabled');
+    delete_option('alegra_connector_inventory_manage_stock_enabled');
+    delete_option('alegra_connector_inventory_poll_budget');
+    delete_option('alegra_connector_inventory_poll_max_pages');
+    delete_option('alegra_connector_cron_run_budget');
+    delete_option('alegra_connector_open_invoice_on_paid');
+    delete_option('alegra_connector_inventory_pull_cursor');
+    delete_option('alegra_connector_inventory_pull_total');
+    delete_option('alegra_connector_consumidor_final_probe');
     delete_option('alegra_connector_warehouse_id');
     delete_option('alegra_connector_payment_account_id');
     delete_option('alegra_connector_payment_term_id');

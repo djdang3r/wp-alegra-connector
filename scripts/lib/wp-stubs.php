@@ -1281,7 +1281,15 @@ class WC_Product
     public function set_stock_status($s) { $this->data['stock_status'] = $s; return $this; }
     public function set_backorders($b) { $this->data['backorders'] = $b; return $this; }
     public function set_sku($s) { $this->data['sku'] = $s; return $this; }
-    public function save() { return $this->id; }
+    public function save()
+    {
+        // Replica WC_Product::validate_props() (WC >= 3.0): el estado se deriva
+        // de cantidad + backorders, no se fuerza desde el plugin (D5).
+        if (function_exists('alegra_mock_derive_stock_status')) {
+            alegra_mock_derive_stock_status($this);
+        }
+        return $this->id;
+    }
 }
 
 class WC_Product_Simple extends WC_Product {}
@@ -1441,6 +1449,49 @@ function wc_get_product($product_id)
 {
     $product_id = (int) $product_id;
     return $GLOBALS['wc_products'][$product_id] ?? false;
+}
+
+/**
+ * Deriva `stock_status` desde `manage_stock` + cantidad + backorders,
+ * replicando WC_Product::validate_props() (WC >= 3.0). Compartido por
+ * `wc_update_product_stock()` (T1.1) y `WC_Product::save()` (T1.2).
+ */
+function alegra_mock_derive_stock_status($product): void
+{
+    if (!$product instanceof WC_Product) { return; }
+    if (!$product->get_manage_stock()) { return; }
+    $qty = $product->get_stock_quantity();
+    if ($qty === null) { return; }
+    if ($qty > 0) {
+        $product->set_stock_status('instock');
+    } elseif ($product->get_backorders() !== 'no') {
+        $product->set_stock_status('onbackorder');
+    } else {
+        $product->set_stock_status('outofstock');
+    }
+}
+
+/**
+ * Harness stub of the WC core API. Sets the quantity, derives the status and
+ * fires the stock hooks the pusher listens to (T3.3).
+ *
+ * @return int|null New quantity, or null when the product cannot manage stock.
+ */
+function wc_update_product_stock($product, $qty = null, $operation = 'set', $updating = false)
+{
+    if (!$product instanceof WC_Product) { return null; }
+    if ($qty !== null && $operation === 'set') {
+        $product->set_stock_quantity((int) $qty);
+    }
+    alegra_mock_derive_stock_status($product);
+    if (!$updating) {
+        $product->save();
+    }
+    do_action('woocommerce_product_set_stock', $product);
+    if ($product->is_type('variation')) {
+        do_action('woocommerce_variation_set_stock', $product);
+    }
+    return $product->get_stock_quantity();
 }
 
 /**

@@ -764,8 +764,8 @@ class Client
     }
 
     /**
-     * @deprecated 2.4.0 No production caller; kept as public API of the
-     *             distributed plugin for backward compatibility.
+     * POST /inventory-adjustments. Owner of the WC → Alegra stock movement when
+     * `push_orders_enabled=false` (D2). Called by Inventory_Pusher::push_delta().
      */
     public function create_inventory_adjustment(array $data): array|\WP_Error
     {

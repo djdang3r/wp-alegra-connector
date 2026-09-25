@@ -33,6 +33,7 @@ $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' =
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
+$GLOBALS['alegra_mock_contact_identification_mode'] = 'exact';
 
 function alegra_mock_reset(): void
 {
@@ -42,6 +43,9 @@ function alegra_mock_reset(): void
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
     $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
+    $GLOBALS['alegra_mock_contact_identification_mode'] = 'exact';
+    $GLOBALS['alegra_mock_invoice_client_check'] = false;
+    $GLOBALS['alegra_mock_shutdown_callbacks'] = [];
     // Default Alegra tax catalog: one IVA 19% tax, as a CO account has.
     alegra_mock_seed_tax('22222222-0000-0000-0000-000000000001', ['name' => 'IVA 19%', 'percentage' => 19]);
 }
@@ -54,6 +58,25 @@ function alegra_mock_reset(): void
 function alegra_mock_set_contact_fiscal_required(bool $required): void
 {
     $GLOBALS['alegra_mock_contact_fiscal_required'] = $required;
+}
+
+/**
+ * Model the documented CONTAINS semantics of `identification`. The default
+ * ('exact') mirrors the old mock so existing tests are untouched.
+ */
+function alegra_mock_set_contact_identification_mode(string $mode): void
+{
+    $GLOBALS['alegra_mock_contact_identification_mode'] = $mode === 'contains' ? 'contains' : 'exact';
+}
+
+/**
+ * Opt-in: when ON, POST /invoices rejects a `client.id` that is not present in
+ * the mock's contacts. OFF by default so the existing invoice tests (which use
+ * placeholder client ids) keep passing.
+ */
+function alegra_mock_set_invoice_client_check(bool $on): void
+{
+    $GLOBALS['alegra_mock_invoice_client_check'] = $on;
 }
 
 function alegra_mock_uuid(string $prefix = 'aaaaaaaa'): string
@@ -292,6 +315,7 @@ function alegra_mock_write_validators(): array
         ['method' => 'PUT',  'pattern' => '#^/variant-attributes/[^/]+$#',  'validator' => 'alegra_mock_validate_variant_attribute'],
         ['method' => 'POST', 'pattern' => '#^/contacts$#',     'validator' => 'alegra_mock_validate_contact'],
         ['method' => 'POST', 'pattern' => '#^/invoices$#',     'validator' => 'alegra_mock_validate_invoice'],
+        ['method' => 'POST', 'pattern' => '#^/inventory-adjustments$#', 'validator' => 'alegra_mock_validate_inventory_adjustment'],
         ['method' => 'POST', 'pattern' => '#^/credit-notes$#', 'validator' => 'alegra_mock_validate_credit_note'],
     ];
 }
@@ -537,6 +561,12 @@ function alegra_mock_validate_invoice(array $body): ?array
     if (empty($body['client']) || !is_array($body['client']) || empty($body['client']['id'])) {
         return alegra_mock_validation_error('El campo client es obligatorio');
     }
+    if (!empty($GLOBALS['alegra_mock_invoice_client_check'])) {
+        $client_id = (string) ($body['client']['id'] ?? '');
+        if ($client_id !== '' && !isset($GLOBALS['alegra_mock_state']['contacts'][$client_id])) {
+            return alegra_mock_validation_error('El cliente no existe');
+        }
+    }
     if (empty($body['items']) || !is_array($body['items'])) {
         return alegra_mock_validation_error('El campo items es obligatorio y no puede estar vacio');
     }
@@ -552,6 +582,23 @@ function alegra_mock_validate_invoice(array $body): ?array
         return alegra_mock_validation_error('El campo dueDate es obligatorio');
     }
 
+    return null;
+}
+
+/**
+ * POST /inventory-adjustments. Required: item.id, type in|out, quantity > 0.
+ */
+function alegra_mock_validate_inventory_adjustment(array $body): ?array
+{
+    if (empty($body['item']) || !is_array($body['item']) || empty($body['item']['id'])) {
+        return alegra_mock_validation_error('El campo item.id es obligatorio');
+    }
+    if (($body['type'] ?? '') !== 'in' && ($body['type'] ?? '') !== 'out') {
+        return alegra_mock_validation_error('El campo type debe ser in u out');
+    }
+    if (!isset($body['quantity']) || !is_numeric($body['quantity']) || (int) $body['quantity'] <= 0) {
+        return alegra_mock_validation_error('El campo quantity debe ser numerico y mayor a cero');
+    }
     return null;
 }
 
@@ -658,17 +705,19 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     }
     if ($method === 'GET' && $path === '/items') {
         $filtered = alegra_mock_filter_items($query);
+        $start = (int) ($query['start'] ?? 0);
+        $limit = (int) ($query['limit'] ?? 30);
         // `metadata=true` wraps the list as {metadata:{total}, data:[]}, as the
         // documented endpoint does. Used by ajax_sync_start for the exact total.
+        // FIX-13: the inventory poll calls GET /items WITHOUT metadata, so
+        // start/limit must slice the plain list too.
         if (filter_var($query['metadata'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
-            $start = (int) ($query['start'] ?? 0);
-            $limit = (int) ($query['limit'] ?? 30);
             return alegra_mock_response(200, [
                 'metadata' => ['total' => count($filtered)],
                 'data'     => array_slice($filtered, $start, $limit),
             ]);
         }
-        return alegra_mock_response(200, $filtered);
+        return alegra_mock_response(200, array_slice($filtered, $start, $limit));
     }
     if ($method === 'GET' && $path === '/invoices') {
         return alegra_mock_response(200, alegra_mock_filter_invoices($query));
@@ -776,6 +825,25 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         $GLOBALS['alegra_mock_state']['payments'][$id] = $stored;
         return alegra_mock_response(200, $stored);
     }
+    if ($method === 'POST' && $path === '/inventory-adjustments') {
+        $item_id = (string) ($body['item']['id'] ?? '');
+        $qty     = (int) ($body['quantity'] ?? 0);
+        $type    = (string) ($body['type'] ?? 'in');
+        $item    = $GLOBALS['alegra_mock_state']['items'][$item_id] ?? null;
+        if ($item === null) {
+            return alegra_mock_response(400, ['code' => 400, 'message' => 'El item no existe']);
+        }
+        $current = (int) ($item['inventory']['availableQuantity'] ?? 0);
+        $delta   = $type === 'out' ? -$qty : $qty;
+        $GLOBALS['alegra_mock_state']['items'][$item_id]['inventory']['availableQuantity'] = max(0, $current + $delta);
+        return alegra_mock_response(200, [
+            'id'       => alegra_mock_uuid('a9a9a9a9'),
+            'date'     => (string) ($body['date'] ?? ''),
+            'type'     => $type,
+            'quantity' => $qty,
+            'item'     => ['id' => $item_id],
+        ]);
+    }
     if ($method === 'POST' && preg_match('#^/invoices/([^/]+)/void$#', $path, $m)) {
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'void']);
     }
@@ -857,13 +925,17 @@ function alegra_mock_filter_contacts(array $query): array
     }
     if (!empty($query['identification'])) {
         $ident = (string) $query['identification'];
-        $contacts = array_values(array_filter($contacts, static function ($c) use ($ident) {
-            $obj = $c['identificationObject'] ?? null;
-            $num = is_array($obj) ? (string) ($obj['number'] ?? '') : (string) ($c['identification'] ?? '');
-            return $num === $ident;
+        $mode  = (string) ($GLOBALS['alegra_mock_contact_identification_mode'] ?? 'exact');
+        $contacts = array_values(array_filter($contacts, static function ($c) use ($ident, $mode) {
+            $obj = is_array($c['identificationObject'] ?? null) ? $c['identificationObject'] : null;
+            $num = $obj !== null ? (string) ($obj['number'] ?? '') : (string) ($c['identification'] ?? '');
+            return $mode === 'contains' ? str_contains($num, $ident) : $num === $ident;
         }));
     }
-    return $contacts;
+    // Alegra paginates: apply start/limit like GET /items does.
+    $start = (int) ($query['start'] ?? 0);
+    $limit = (int) ($query['limit'] ?? 30);
+    return array_slice($contacts, $start, $limit);
 }
 
 function alegra_mock_filter_items(array $query): array

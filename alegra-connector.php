@@ -447,6 +447,17 @@ final class Alegra_Connector
             // rides on sync_products: a merchant who uses Alegra as the
             // inventory source but does not import products still gets stock.
             'alegra_connector_inventory_sync_enabled' => true,
+            // 2.6.0: WC → Alegra inventory push (owner=adjustment). Default true salvo G3.
+            'alegra_connector_push_inventory_enabled' => true,
+            // 2.6.0: legacy manage_stock=no migration opt-in (D3.4).
+            'alegra_connector_inventory_manage_stock_enabled' => false,
+            // 2.6.0: poll budget (D6).
+            'alegra_connector_inventory_poll_budget' => 60,
+            'alegra_connector_inventory_poll_max_pages' => 0,
+            // 2.6.0: global cron run budget (D7).
+            'alegra_connector_cron_run_budget' => 540,
+            // 2.6.0 (Fase 3 C4): con dueño invoice, un pedido pagado nace `open`.
+            'alegra_connector_open_invoice_on_paid' => true,
             'alegra_connector_customer_resolution_mode' => 'auto',
             'alegra_connector_invoice_status' => 'draft',
             'alegra_connector_payment_account_id' => '',
@@ -470,6 +481,16 @@ final class Alegra_Connector
             'alegra_connector_inventory_sync_enabled',
             'alegra_connector_log_retention_days',
             'alegra_connector_sync_inactive_products',
+            // 2.6.0: inventory push / poll / cron budgets and the CF probe.
+            'alegra_connector_push_inventory_enabled',
+            'alegra_connector_inventory_manage_stock_enabled',
+            'alegra_connector_inventory_poll_budget',
+            'alegra_connector_inventory_poll_max_pages',
+            'alegra_connector_cron_run_budget',
+            'alegra_connector_open_invoice_on_paid',
+            'alegra_connector_inventory_pull_cursor',
+            'alegra_connector_inventory_pull_total',
+            'alegra_connector_consumidor_final_probe',
             // Only read by the chunked import handler (admin/AJAX).
             'alegra_connector_chunked_page_budget',
             // Only read while importing product images (admin/cron).
