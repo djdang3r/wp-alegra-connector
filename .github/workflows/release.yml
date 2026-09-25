@@ -71,6 +71,7 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Alegra Connector ${{ steps.version.outputs.version }}
           generate_release_notes: true
+          make_latest: "true"
           fail_on_unmatched_files: true
           files: |
             releases/alegra-connector-v${{ steps.version.outputs.version }}.zip
