@@ -6,6 +6,7 @@ namespace Alegra\Connector\Webhooks;
 
 use Alegra\Connector\API;
 use Alegra\Connector\Logger;
+use Alegra\Connector\Run_Context;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -42,6 +43,18 @@ class Receiver
                 'permission_callback' => '__return_true',
             ]);
         });
+    }
+
+    /**
+     * run_type del Monitor para un evento despachado. Devuelve null para
+     * eventos no manejados por Handlers::process_event (no inflar wp_alegra_runs).
+     */
+    private static function run_type_for_event(string $event): ?string
+    {
+        if (str_contains($event, 'item'))    { return 'webhook_item'; }
+        if (str_contains($event, 'client'))  { return 'webhook_client'; }
+        if (str_contains($event, 'invoice')) { return 'webhook_invoice'; }
+        return null;
     }
 
     public function handle(\WP_REST_Request $request): \WP_REST_Response
@@ -170,10 +183,18 @@ class Receiver
 
         try {
             $handlers = new Handlers($this->api, $this->logger);
-            $handlers->process_event($event, $data);
+            $run_type = self::run_type_for_event($event);
+            if ($run_type !== null) {
+                Run_Context::wrap($run_type, function () use ($handlers, $event, $data) {
+                    $handlers->process_event($event, $data);
+                }, 'webhook_alegra');
+            } else {
+                $handlers->process_event($event, $data);
+            }
         } catch (\Throwable $e) {
             // ACK anyway: the failure is logged and the periodic sync reconciles.
             // A 5xx would push the subscription toward automatic deletion.
+            // R2/NFR-02: el wrap ya dejó la fila en 'failed'.
             if ($this->logger) {
                 $this->logger->error('Webhook processing failed', [
                     'event' => $event,

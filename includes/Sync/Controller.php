@@ -14,6 +14,7 @@ use Alegra\Connector\Heartbeat;
 use Alegra\Connector\Kill_Switch;
 use Alegra\Connector\Logger;
 use Alegra\Connector\Runs;
+use Alegra\Connector\Run_Context;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -146,8 +147,10 @@ class Controller
         $this->logger->info('Starting cron synchronization (Alegra → WC only)');
 
         try {
-            // Wrap entire run in Runs::track for the Monitor
-            Runs::track('cron_sync_all', function ($run_id) {
+            // D1: mismo contrato que Runs::track (start → fn → completed /
+            // failed+rethrow), pero centralizado en Run_Context (Runs + Heartbeat
+            // + Logger). El global lock se libera en el finally.
+            Run_Context::wrap('cron_sync_all', function ($run_id) {
                 $this->run_cron_sync_inner($run_id);
             }, 'cron');
         } finally {
@@ -174,6 +177,7 @@ class Controller
             Runs::update_progress($run_id, $step, $total_steps);
             if (Runs::should_stop($run_id)) {
                 $this->logger->info('Cron sync stopped by user during products');
+                Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
                 return;
             }
             $lock = $this->acquire_sync_lock('products');
@@ -191,6 +195,9 @@ class Controller
             } elseif (isset($products_result) && is_wp_error($products_result)) {
                 $result['errors']['products'] = $products_result->get_error_message();
             }
+        } else {
+            $this->logger->info('Cron sync: products skipped by configuration (sync_products=false)');
+            $result['products_skipped'] = 'config';
         }
 
         // Inventory pull (Alegra → WC stock). Its own gate, independent of
@@ -213,6 +220,7 @@ class Controller
             Runs::update_progress($run_id, $step, $total_steps);
             if (Runs::should_stop($run_id)) {
                 $this->logger->info('Cron sync stopped by user during customers');
+                Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
                 return;
             }
             $lock = $this->acquire_sync_lock('customers');
@@ -241,6 +249,7 @@ class Controller
             Runs::update_progress($run_id, $step, $total_steps);
             if (Runs::should_stop($run_id)) {
                 $this->logger->info('Cron sync stopped by user during categories');
+                Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
                 return;
             }
             $lock = $this->acquire_sync_lock('categories');
@@ -376,15 +385,15 @@ class Controller
         }
     }
 
-    public function import_from_alegra(string $type): array|\WP_Error
+    public function import_from_alegra(string $type, int $run_id = 0): array|\WP_Error
     {
         switch ($type) {
             case 'products':
-                return $this->products->import_from_alegra();
+                return $this->products->import_from_alegra(1, 30, $run_id);
             case 'customers':
-                return $this->customers->import_from_alegra();
+                return $this->customers->import_from_alegra(1, 30, $run_id);
             case 'categories':
-                return $this->categories->import_from_alegra();
+                return $this->categories->import_from_alegra($run_id);
             default:
                 return new \WP_Error('unknown_type', 'Unknown import type: ' . $type);
         }

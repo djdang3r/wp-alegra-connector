@@ -309,6 +309,11 @@ $ac_regime_labels = [
 <input type="number" name="alegra_connector_import_time_budget" value="<?php echo esc_attr(get_option('alegra_connector_import_time_budget',240));?>" class="small-text" min="30" max="600"> <?php esc_html_e('segundos','alegra-connector');?>
 <p class="description"><?php esc_html_e('Tiempo maximo que una importacion de productos usa por corrida. Al agotarse, la importacion se pausa y continua en la siguiente ejecucion.','alegra-connector');?></p></td></tr>
 
+<!-- Chunked page budget -->
+<tr><th><?php esc_html_e('Presupuesto por pagina del boton Traer desde Alegra (segundos):','alegra-connector');?></th><td>
+<input type="number" name="alegra_connector_chunked_page_budget" value="<?php echo esc_attr(get_option('alegra_connector_chunked_page_budget',20));?>" class="small-text" min="10" max="40"> <?php esc_html_e('segundos','alegra-connector');?>
+<p class="description"><?php esc_html_e('Segundos de trabajo por pagina del boton Traer desde Alegra. Al agotarse, la pagina se pausa y continua en la siguiente.','alegra-connector');?></p></td></tr>
+
 <!-- Import max pages -->
 <tr><th><?php esc_html_e('Paginas maximas por importacion:','alegra-connector');?></th><td>
 <input type="number" name="alegra_connector_import_max_pages" value="<?php echo esc_attr(get_option('alegra_connector_import_max_pages',0));?>" class="small-text" min="0">

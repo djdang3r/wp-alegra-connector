@@ -26,6 +26,7 @@ if (!is_file($plugin_root . 'alegra-connector.php')) {
 }
 
 require __DIR__ . '/lib/wp-stubs.php';
+require __DIR__ . '/lib/ns-microtime.php';
 require __DIR__ . '/lib/alegra-mock.php';
 require __DIR__ . '/lib/test-framework.php';
 
@@ -249,13 +250,10 @@ TestRunner::test('T2.1 cron sync completes, reaches the done heartbeat and sets 
 
     TestRunner::assertTrue(get_transient('alegra_connector_last_sync') !== false, 'alegra_connector_last_sync must be set');
 
-    $done = false;
-    foreach ($GLOBALS['wp_transients'] as $key => $value) {
-        if (strpos((string) $key, 'alegra_run_') === 0 && is_array($value) && ($value['step'] ?? '') === 'done') {
-            $done = true;
-        }
-    }
-    TestRunner::assertTrue($done, 'cron sync must reach the "done" heartbeat');
+    // logs-monitor-import: Run_Context::finish tears the display heartbeat down
+    // (design §2.4); the completed state now lives on the run row.
+    $runs = \Alegra\Connector\Runs::recent(1);
+    TestRunner::assertSame('completed', (string) ($runs[0]->status ?? ''), 'the cron run must be recorded as completed');
     TestRunner::assertTrue(alegra_mock_count('GET', '/items') >= 1, 'cron sync must have pulled items');
 });
 
@@ -932,16 +930,16 @@ TestRunner::test('T9.3 AC-40 the customers count is not the products count when 
     // Hold the customers lock so its block never assigns $customers_result.
     Controller::acquire_lock('alegra_sync_running_customers', 300);
 
+    // logs-monitor-import: Run_Context::finish forgets the heartbeat, so the
+    // final counts are observed on the "Cron synchronization completed" log line.
+    alegra_clear_log();
     make_controller()->run_cron_sync();
 
-    $message = '';
-    foreach ($GLOBALS['wp_transients'] as $key => $value) {
-        if (strpos((string) $key, 'alegra_run_') === 0 && is_array($value) && ($value['step'] ?? '') === 'done') {
-            $message = (string) ($value['message'] ?? '');
-        }
-    }
-
-    TestRunner::assertTrue(preg_match('/Completado: (\d+) productos, (\d+) clientes/', $message, $m) === 1, 'the done heartbeat must carry the counts: ' . $message);
+    $log = alegra_read_log();
+    TestRunner::assertTrue(
+        preg_match('/"products":(\d+),"customers":(\d+)/', $log, $m) === 1,
+        'the cron completion must log the counts: ' . $log
+    );
     TestRunner::assertTrue((int) ($m[1] ?? 0) > 0, 'products must have been imported');
     TestRunner::assertSame(0, (int) ($m[2] ?? -1), 'the customers count must be 0 when the lock is held (not the products count)');
 });
@@ -3502,6 +3500,7 @@ TestRunner::test('T21.3 invalid filter input degrades to defaults', function ():
 
 TestRunner::test('T21.4 ajax_sync_start totals only the filtered category', function (): void {
     alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
     $cat = ['id' => 'cat-9', 'name' => 'Ropa'];
     for ($i = 1; $i <= 5; $i++) {
         alegra_mock_seed_item('in-' . $i, ['name' => 'In ' . $i, 'itemCategory' => $cat, 'status' => 'active']);
@@ -6677,6 +6676,530 @@ TestRunner::test('T28.111 Run_Context::finish no re-finaliza un run ya cerrado',
     \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
 
     TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'no debe pisar completed con cancelled');
+});
+
+// ===========================================================================
+// === logs-monitor-import (2.5.0) — Fase 2: instrumentación de los 4 caminos ===
+// ===========================================================================
+
+TestRunner::test('T28.21 cron wrap crea run completed', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status(1), 'el cron debe dejar la fila completed');
+});
+
+TestRunner::test('T28.22 skip logueado', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    alegra_clear_log();
+    make_controller()->run_cron_sync();
+    TestRunner::assertStringContains('products skipped by configuration', alegra_read_log(), 'el gate debe loguear el skip');
+});
+
+TestRunner::test('T28.23 propaga run_id', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_mock_seed_item('it-p-' . $i, ['name' => 'I' . $i, 'reference' => 'S' . $i, 'status' => 'active']);
+    }
+    \Alegra\Connector\Runs::request_stop(7);
+    $r = make_controller()->import_from_alegra('products', 7);
+    TestRunner::assertTrue(is_array($r), 'el import debe devolver un array');
+    TestRunner::assertSame(false, (bool) ($r['paused'] ?? true), 'un stop no es una pausa por presupuesto');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'el stop debe cortar antes del fetch');
+});
+
+TestRunner::test('T28.24 stop del cron cierra cancelled', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    \Alegra\Connector\Runs::request_stop(1);
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status(1), 'el stop del cron debe dejar cancelled');
+});
+
+TestRunner::test('T28.25 lock ocupado cierra failed y libera (manual)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'x', 'expires' => time() + 300], '', 'no');
+    $_POST['import_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_import_from_api());
+    unset($_POST['import_type']);
+    TestRunner::assertFalse($resp->success, 'el lock ocupado debe responder error');
+    TestRunner::assertStringContains('Another sync', (string) ($resp->payload['message'] ?? ''), 'mensaje de lock');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status(1), 'la fila debe cerrarse failed');
+});
+
+TestRunner::test('T28.26 conexión no testeada deja rastro (manual)', function (): void {
+    alegra_test_reset();
+    delete_option('alegra_connector_connection_tested');
+    alegra_clear_log();
+    $_POST['import_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_import_from_api());
+    unset($_POST['import_type']);
+    $log = alegra_read_log();
+    TestRunner::assertFalse($resp->success, 'sin conexión debe responder error');
+    TestRunner::assertStringContains('connection_not_tested', $log, 'el log debe llevar el motivo');
+    TestRunner::assertStringContains('"run_type":"manual_import"', $log, 'el run_type canónico');
+});
+
+TestRunner::test('T28.27 stop manual cierra cancelled', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    \Alegra\Connector\Runs::request_stop(1);
+    $_POST['import_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_import_from_api());
+    unset($_POST['import_type']);
+    TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status(1), 'el stop debe cerrar cancelled');
+    TestRunner::assertStringContains('detenida por el usuario', (string) ($resp->payload['message'] ?? ''), 'mensaje honesto de stop');
+});
+
+TestRunner::test('T28.28 start crea run chunked running', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('it-1', ['name' => 'One', 'reference' => 'S1', 'status' => 'active']);
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+    TestRunner::assertTrue($resp->success, 'start debe responder success');
+    $run_id = (int) ($resp->payload['run_id'] ?? 0);
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($run_id), 'la fila debe quedar running');
+    TestRunner::assertSame($run_id, (int) (get_transient('alegra_batch_state')['run_id'] ?? 0), 'el state debe llevar el run_id');
+});
+
+TestRunner::test('T28.29 from_zero limpia cursor', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    $_POST['sync_type'] = 'products';
+    $_POST['from_zero'] = '1';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type'], $_POST['from_zero']);
+    TestRunner::assertSame(0, (int) ($resp->payload['start'] ?? -1), 'from_zero arranca en 0');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'el cursor debe borrarse');
+});
+
+TestRunner::test('T28.210 sin conexión fail_early (chunked)', function (): void {
+    alegra_test_reset();
+    delete_option('alegra_connector_connection_tested');
+    alegra_clear_log();
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+    $log = alegra_read_log();
+    TestRunner::assertFalse($resp->success, 'sin conexión debe fallar');
+    TestRunner::assertStringContains('connection_not_tested', $log, 'el log lleva el motivo');
+    TestRunner::assertStringContains('"run_type":"chunked_import"', $log, 'run_type canónico');
+});
+
+TestRunner::test('T28.211 segundo start rechazado (D3)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Heartbeat::set($rid, ['step' => 'products', 'message' => 'vivo']);
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30, 'total_pages' => 1, 'total_items' => 0], 600);
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    TestRunner::assertFalse($resp->success, 'un segundo start con run vivo debe rechazarse');
+    TestRunner::assertStringContains('importación en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje de rechazo');
+
+    \Alegra\Connector\Heartbeat::forget($rid);
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+    TestRunner::assertTrue($resp2->success, 'sin heartbeat vivo debe permitir reanudar');
+});
+
+TestRunner::test('T28.212 WP_Error cierra failed y libera lock', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    alegra_mock_fail('GET', '/items', 500, ['error' => 'boom']);
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertFalse($resp->success, 'el WP_Error debe responder error');
+    TestRunner::assertStringContains('boom', (string) ($resp->payload['message'] ?? ''), 'el mensaje lleva la causa');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($rid), 'la fila debe quedar failed');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'el lock debe quedar libre');
+});
+
+TestRunner::test('T28.213 lock ocupado cierra failed (chunked)', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'other', 'expires' => time() + 300], '', 'no');
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30, 'total_pages' => 1, 'total_items' => 0], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertFalse($resp->success, 'el lock ocupado debe fallar');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($rid), 'la fila debe quedar failed');
+});
+
+TestRunner::test('T28.214 stop cierra cancelled (chunked)', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Runs::request_stop($rid);
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30, 'total_pages' => 1, 'total_items' => 0], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status($rid), 'el stop debe cerrar cancelled');
+    TestRunner::assertSame(true, $resp->payload['cancelled'] ?? null, 'la respuesta debe flag cancelled');
+});
+
+TestRunner::test('T28.215 cancel del botón cierra cancelled (D1)', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => $rid], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_cancel_sync());
+    TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status($rid), 'cancel debe cerrar cancelled');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'el state debe borrarse');
+    TestRunner::assertTrue((bool) get_transient('alegra_sync_cancelled'), 'el flag debe quedar');
+});
+
+TestRunner::test('T28.216 customers avanza el cursor (D2)', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 30; $i++) {
+        alegra_mock_seed_contact('c-' . $i, ['name' => 'C' . $i, 'email' => 'c' . $i . '@example.test']);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'customers', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(30, (int) (get_transient('alegra_batch_state')['start'] ?? -1), 'el cursor debe avanzar a 30');
+    TestRunner::assertSame(false, $resp->payload['done'] ?? true, 'no debe estar done');
+});
+
+TestRunner::test('T28.217 categorías avanzan el cursor (D2)', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 30; $i++) {
+        alegra_mock_seed_category('cat-' . $i, ['name' => 'Cat ' . $i]);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'categories', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(30, (int) (get_transient('alegra_batch_state')['start'] ?? -1), 'el cursor debe avanzar a 30');
+    TestRunner::assertSame(false, $resp->payload['done'] ?? true, 'no debe estar done');
+});
+
+TestRunner::test('T28.218 el lock se toma antes de la lectura autoritativa (D3)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_sync_page');
+    $first = strpos($src, "get_transient('alegra_batch_state')");
+    $lock = strpos($src, 'acquire_sync_lock_public');
+    $second = strpos($src, "get_transient('alegra_batch_state')", (int) $first + 1);
+    TestRunner::assertTrue($first !== false && $lock !== false && $second !== false, 'deben existir las dos lecturas y el lock');
+    TestRunner::assertTrue($lock > $first, 'el lock va después de la lectura provisional');
+    TestRunner::assertTrue($second > $lock, 'la lectura autoritativa va después del lock');
+});
+
+TestRunner::test('T28.219 webhook new-item deja fila completed', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    alegra_mock_seed_item('it-web-1', ['name' => 'Web', 'reference' => 'SW', 'type' => 'product', 'status' => 'active']);
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = json_encode(['subject' => 'new-item', 'message' => ['item' => ['id' => 'it-web-1']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $res->get_status(), 'el webhook debe ACKear 200');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status(1), 'la fila debe quedar completed');
+    TestRunner::assertSame('webhook_item', (string) ($GLOBALS['alegra_db']['wp_alegra_runs'][0]['run_type'] ?? ''), 'run_type webhook_item');
+    TestRunner::assertTrue((bool) \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-web-1', 'product'), 'el ítem debe importarse');
+});
+
+TestRunner::test('T28.220 handler que falla deja failed y 200', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    $logger = make_logger();
+    $throwing = new class($logger) extends Client {
+        public function get_item(string $id): array|\WP_Error
+        {
+            throw new \RuntimeException('boom handler');
+        }
+    };
+    $receiver = new \Alegra\Connector\Webhooks\Receiver($throwing, $logger);
+    $body = json_encode(['subject' => 'new-item', 'message' => ['item' => ['id' => 'it-web-x']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+    TestRunner::assertSame(200, $res->get_status(), 'el webhook debe ACKear 200 aunque falle');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status(1), 'la fila debe quedar failed');
+});
+
+TestRunner::test('T28.221 pausa por presupuesto cierra paused (H1)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_import_from_api');
+    $stop = strpos($src, "should_stop(\$run_id)");
+    $paused = strpos($src, "!empty(\$result['paused'])");
+    TestRunner::assertTrue($stop !== false, 'rama should_stop presente');
+    TestRunner::assertTrue($paused !== false, 'rama paused presente');
+    TestRunner::assertTrue(strpos($src, "Run_Context::finish(\$run_id, 'paused'") !== false, 'la pausa cierra paused');
+    $stop_branch = substr($src, (int) $stop, (int) $paused - (int) $stop);
+    TestRunner::assertStringNotContains("result['paused']", $stop_branch, 'la rama stop no confla paused');
+});
+
+TestRunner::test('T28.222 customers done NO borra el cursor de products (B-A)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    alegra_mock_seed_contact('c-1', ['name' => 'Cliente', 'email' => 'c1@example.test']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'customers', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertTrue($resp->success, 'debe responder success');
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'debe estar done');
+    TestRunner::assertSame(1500, (int) get_option('alegra_connector_products_import_cursor', 0), 'un chunked de customers NO debe borrar el cursor de products');
+});
+
+TestRunner::test('T28.223 start concurrente rechazado por el lock (D-D)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'other', 'expires' => time() + 300], '', 'no');
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+    TestRunner::assertFalse($resp->success, 'el lock de otro proceso debe rechazar');
+    TestRunner::assertStringContains('importación en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'no debe crear state');
+
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_sync_start');
+    $acquire = strpos($src, 'acquire_sync_lock_public');
+    $read = strpos($src, "get_transient('alegra_batch_state')");
+    $begin = strpos($src, "Run_Context::begin('chunked_import')");
+    TestRunner::assertTrue($acquire !== false && $acquire < $read, 'acquire antes del read-check');
+    TestRunner::assertTrue($acquire < $begin, 'acquire antes del begin');
+});
+
+TestRunner::test('T28.224 el lock se libera ANTES del wp_send_json (observer)', function (): void {
+    // Camino de ÉXITO (el leak real del bug: :2216 dejaba el lock tomado).
+    alegra_test_reset();
+    alegra_mock_seed_item('it-obs', ['name' => 'Obs', 'reference' => 'SO', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $snapshot = 'unset';
+    $GLOBALS['alegra_test_json_observer'] = function ($ok, $payload) use (&$snapshot) {
+        $snapshot = get_option('alegra_lock_alegra_sync_running_products', null);
+    };
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    $GLOBALS['alegra_test_json_observer'] = null;
+    TestRunner::assertTrue($resp->success, 'debe responder success');
+    TestRunner::assertSame(null, $snapshot, 'el lock debe estar libre en el instante del send de éxito');
+
+    // Camino de WP_Error.
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/items', 500, ['error' => 'boom']);
+    $rid2 = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid2, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 0, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $snapshot2 = 'unset';
+    $GLOBALS['alegra_test_json_observer'] = function ($ok, $payload) use (&$snapshot2) {
+        $snapshot2 = get_option('alegra_lock_alegra_sync_running_products', null);
+    };
+    $admin2 = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp2 = alegra_capture_json(fn () => $admin2->ajax_sync_page());
+    $GLOBALS['alegra_test_json_observer'] = null;
+    TestRunner::assertFalse($resp2->success, 'el WP_Error responde error');
+    TestRunner::assertSame(null, $snapshot2, 'el lock debe estar libre en el instante del send de error');
+});
+
+// ===========================================================================
+// === logs-monitor-import (2.5.0) — Fase 3: chunked con presupuesto propio ===
+// ===========================================================================
+
+TestRunner::test('T28.31 pausa con offset', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_chunked_page_budget', 10, false);
+    for ($i = 0; $i < 40; $i++) {
+        alegra_mock_seed_item('it-p-' . $i, ['name' => 'P' . $i, 'reference' => 'SP' . $i, 'status' => 'active']);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 40, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    // Reloj falso: deadline 1010; ítem 0 (1006) pasa, ítem 1 (1012) pausa.
+    $GLOBALS['alegra_test_fake_microtime'] = 1000.0;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 6.0;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    $GLOBALS['alegra_test_fake_microtime'] = null;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
+    TestRunner::assertSame(true, $resp->payload['paused'] ?? null, 'debe pausar');
+    TestRunner::assertTrue((int) ($resp->payload['offset'] ?? 0) > 0, 'offset > 0');
+    TestRunner::assertSame(1, (int) (get_transient('alegra_batch_state')['offset'] ?? -1), 'el offset debe persistirse');
+});
+
+TestRunner::test('T28.32 reanuda sin repetir', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-r0', ['name' => 'R0', 'reference' => 'SR0', 'status' => 'active']);
+    alegra_mock_seed_item('it-r1', ['name' => 'R1', 'reference' => 'SR1', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 1, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 2, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    $req = alegra_mock_last_request('GET', '/items');
+    TestRunner::assertSame(0, (int) ($req['query']['start'] ?? -1), 're-fetch la misma página');
+    TestRunner::assertFalse((bool) \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-r0', 'product'), 'el ítem 0 ya procesado no debe reimportarse');
+    TestRunner::assertTrue((bool) \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-r1', 'product'), 'el ítem 1 debe importarse');
+    TestRunner::assertTrue($resp->success, 'debe responder success');
+});
+
+TestRunner::test('T28.33 completa y borra cursor', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-c1', ['name' => 'C1', 'reference' => 'SC1', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'debe estar done');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'el cursor de products debe borrarse');
+});
+
+TestRunner::test('T28.34 stopped', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Runs::request_stop(7);
+    $item = ['id' => 'it-stop', 'name' => 'Stop', 'reference' => 'SS', 'type' => 'product'];
+    TestRunner::assertSame('stopped', make_products()->import_single_item_public($item, 7), 'el stop por ítem devuelve stopped');
+});
+
+TestRunner::test('T28.35 run_id en el log', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    \Alegra\Connector\Run_Context::resume(7, 'chunked_import');
+    $item = ['id' => 'it-log', 'name' => 'Log', 'reference' => 'SL', 'type' => 'product'];
+    make_products()->import_single_item_public($item, 7);
+    \Alegra\Connector\Logger\Logger::clear_run_context();
+    TestRunner::assertStringContains('"run_id":7', alegra_read_log(), 'la línea debe llevar run_id=7');
+});
+
+TestRunner::test('T28.36 resumen paused', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_import_time_budget', 30, false);
+    for ($i = 0; $i < 40; $i++) {
+        alegra_mock_seed_item('it-pause-' . $i, ['name' => 'PP' . $i, 'reference' => 'SPP' . $i, 'status' => 'active']);
+    }
+    // Reloj falso: deadline 1030; iter1 (1020) procesa, iter2 (1040) pausa.
+    $GLOBALS['alegra_test_fake_microtime'] = 1000.0;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 20.0;
+    make_products()->import_from_alegra();
+    $GLOBALS['alegra_test_fake_microtime'] = null;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
+    $progress = get_transient('alegra_sync_progress');
+    TestRunner::assertSame(true, $progress['paused'] ?? null, 'debe reportar paused');
+    TestRunner::assertSame(false, $progress['done'] ?? null, 'done debe ser false');
+    TestRunner::assertTrue((int) ($progress['cursor'] ?? 0) > 0, 'cursor > 0');
+});
+
+TestRunner::test('T28.37 imagen diferida', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    // Producto YA vinculado: el update path es el que importa imágenes.
+    alegra_make_product(10, ['name' => 'Img']);
+    update_post_meta(10, '_alegra_item_id', 'it-img');
+    \Alegra\Connector\Entity_Map::map('item', 'it-img', 'product', 10);
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+    \Alegra\Connector\Sync\Products::set_deadline(microtime(true) - 1);
+    $item = [
+        'id' => 'it-img', 'name' => 'Img', 'reference' => 'SI', 'type' => 'product',
+        'images' => [['url' => 'https://cdn3.alegra.com/a.jpg', 'favorite' => true]],
+    ];
+    make_products()->import_single_item_public($item);
+    $stats = \Alegra\Connector\Sync\Products::image_stats();
+    \Alegra\Connector\Sync\Products::clear_deadline();
+    TestRunner::assertTrue(($stats['deferred'] ?? 0) > 0, 'la imagen diferida debe contarse');
+    TestRunner::assertSame(0, (int) ($stats['failed'] ?? -1), 'una diferida no es un fallo');
+});
+
+TestRunner::test('T28.38 admin.js no cierra mudo', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/assets/js/admin.js');
+    TestRunner::assertStringNotContains('if (!r.success || cancelled) { cleanup(); return; }', $src, 'la rama muda del start debe irse');
+    TestRunner::assertStringNotContains("cleanup(); \$btn.prop('disabled',false).text(S.retry);", $src, 'no debe haber cierre mudo');
+    TestRunner::assertStringContains('showNotice(S.connectionError', $src, 'la rama terminal debe avisar');
+});
+
+TestRunner::test('T28.39 get_script_strings tiene las claves de Fase 3', function (): void {
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    TestRunner::assertArrayHasKey('pausedResuming', $strings, 'pausedResuming');
+    TestRunner::assertArrayHasKey('resumingFrom', $strings, 'resumingFrom');
+    TestRunner::assertArrayHasKey('confirmReimport', $strings, 'confirmReimport');
+    TestRunner::assertArrayNotHasKey('imagesFailed', $strings, 'imagesFailed la declara T5.2b, no Fase 3');
+});
+
+TestRunner::test('T28.310 message siempre', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-msg', ['name' => 'M', 'reference' => 'SM', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertArrayHasKey('message', $resp->payload, 'éxito debe llevar message');
+
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/items', 500, ['error' => 'boom']);
+    $rid2 = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid2, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 0, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin2 = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp2 = alegra_capture_json(fn () => $admin2->ajax_sync_page());
+    TestRunner::assertArrayHasKey('message', $resp2->payload, 'error debe llevar message');
+});
+
+TestRunner::test('T28.311 images en el payload', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-imgp', ['name' => 'IP', 'reference' => 'SIP', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertArrayHasKey('images', $resp->payload, 'images presente');
+    TestRunner::assertSame(0, (int) ($resp->payload['images']['failed'] ?? -1), 'sin fallos → failed 0');
 });
 
 exit(TestRunner::summary());

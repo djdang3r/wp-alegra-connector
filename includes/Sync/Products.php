@@ -61,6 +61,53 @@ class Products
      */
     private ?array $variant_attribute_index = null;
 
+    /**
+     * Wall-clock deadline for the current chunked page (T3.2.b/C8). 0 means
+     * "no budget": the deadline is only enforced while a chunked page is in
+     * flight. Shared with the page loop via the static so image downloads
+     * honour the same budget as the item loop (NFR-04/NFR-05).
+     */
+    private static float $deadline = 0.0;
+
+    /**
+     * Per-page image counters. The owner is this class (T3.2.b); the chunked
+     * page resets them before the products loop and T5.2a adds the remaining
+     * increments.
+     *
+     * @var array<string,int>
+     */
+    private static array $image_stats = ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0];
+
+    public static function set_deadline(float $deadline): void
+    {
+        self::$deadline = $deadline;
+    }
+
+    public static function clear_deadline(): void
+    {
+        self::$deadline = 0.0;
+    }
+
+    public static function deadline_exhausted(): bool
+    {
+        return self::$deadline > 0.0 && microtime(true) >= self::$deadline;
+    }
+
+    public static function reset_image_stats(): void
+    {
+        self::$image_stats = ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0];
+    }
+
+    /**
+     * @return array{ok:int,blocked:int,download:int,sideload:int,deferred:int,failed:int}
+     */
+    public static function image_stats(): array
+    {
+        $s = self::$image_stats;
+        $s['failed'] = $s['blocked'] + $s['download'] + $s['sideload'];
+        return $s;
+    }
+
     public function __construct(?API\Client $api, ?Logger\Logger $logger)
     {
         $this->api = $api;
@@ -1324,6 +1371,17 @@ class Products
                     'updated' => $result['updated'],
                     'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $current_page),
                 ], 600);
+                if ($run_id > 0) {
+                    \Alegra\Connector\Heartbeat::set($run_id, [
+                        'step' => 'products',
+                        'message' => sprintf(__('Procesando productos... Página %d', 'alegra-connector'), $current_page),
+                    ]);
+                    \Alegra\Connector\Runs::update_progress(
+                        $run_id,
+                        $result['imported'] + $result['updated'] + $result['errors'],
+                        0
+                    );
+                }
             }
 
             $api_params = [
@@ -1354,7 +1412,8 @@ class Products
                     $this->logger->info('Products import stopped by user mid-page');
                     break 2;
                 }
-                $r = $this->import_single_item_from_alegra($item);
+                $r = $this->import_single_item_from_alegra($item, $run_id);
+                if ($r === 'stopped') { $result['paused'] = true; break 2; }
                 if ($r === true) $result['imported']++;
                 elseif ($r === 'updated') $result['updated']++;
                 else $result['errors']++;
@@ -1381,15 +1440,19 @@ class Products
             update_option($cursor_key, $start, false);
         }
 
-        // Final progress
+        // Final progress (T3.2.a: a pause is reported as paused, not done)
         set_transient('alegra_sync_progress', [
             'type' => 'products',
             'current_page' => $current_page,
             'items_processed' => $result['imported'] + $result['updated'] + $result['errors'],
             'imported' => $result['imported'],
             'updated' => $result['updated'],
-            'done' => true,
-            'message' => sprintf(__('Completado: %d importados, %d actualizados', 'alegra-connector'), $result['imported'], $result['updated']),
+            'done' => !$result['paused'],
+            'paused' => $result['paused'],
+            'cursor' => $start,
+            'message' => $result['paused']
+                ? sprintf(__('Pausado en el ítem %d; continúa en la próxima ejecución', 'alegra-connector'), $start)
+                : sprintf(__('Completado: %d importados, %d actualizados', 'alegra-connector'), $result['imported'], $result['updated']),
         ], 60);
 
         $this->logger->info('Products import from Alegra completed', $result);
@@ -1401,7 +1464,7 @@ class Products
     /**
      * Sync a single item by Alegra ID (used by webhooks)
      */
-    private function import_single_item_from_alegra(array $item): bool|string
+    private function import_single_item_from_alegra(array $item, int $run_id = 0): bool|string
     {
         // REQ-RB-2: the per-item importer must honour the kill switch and the
         // cancellation flag, exactly like import_from_alegra(). The return type
@@ -1412,6 +1475,14 @@ class Products
                 'alegra_id' => (string) ($item['id'] ?? ''),
             ]);
             return 'skipped';
+        }
+
+        // REQ-MON-05: parada pedida desde el Monitor. A diferencia de kill
+        // switch/cancel (que devuelven 'skipped'), 'stopped' hace que el loop
+        // corte y cuente el ítem como no-procesado.
+        if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+            $this->logger->info('Item import stopped by user', ['alegra_id' => (string) ($item['id'] ?? '')]);
+            return 'stopped';
         }
 
         $alegra_id = (string) ($item['id'] ?? '');
@@ -2038,6 +2109,11 @@ class Products
                 }
             }
             if ($url) {
+                // T3.2.b: honour the page budget before downloading.
+                if (self::deadline_exhausted()) {
+                    self::$image_stats['deferred']++;
+                    return;
+                }
                 $this->import_product_image($product_id, $url);
             }
             return;
@@ -2065,6 +2141,12 @@ class Products
             }
             $seen_urls[$img['url']] = true;
 
+            // T3.2.b: stop the gallery loop once the page budget is spent.
+            if (self::deadline_exhausted()) {
+                self::$image_stats['deferred']++;
+                break;
+            }
+
             $attachment_id = $this->download_and_attach_image($product_id, $img['url']);
             if (!$attachment_id) continue;
 
@@ -2087,6 +2169,11 @@ class Products
                 if (empty($img['url'])) continue;
                 if (isset($seen_urls[$img['url']])) continue;
                 $seen_urls[$img['url']] = true;
+                // T3.2.b: stop the fallback loop once the page budget is spent.
+                if (self::deadline_exhausted()) {
+                    self::$image_stats['deferred']++;
+                    break;
+                }
                 $attachment_id = $this->download_and_attach_image($product_id, $img['url']);
                 if (!$attachment_id) continue;
                 if (!$featured_set) {
@@ -2171,6 +2258,18 @@ class Products
             $this->logger->warning('Blocked image download from a non-allowlisted host', [
                 'product_id' => $product_id,
                 'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
+            ]);
+            return 0;
+        }
+
+        // T3.2.b/C8: the page budget covers image downloads too. A deferred
+        // image is retried by a future run (dedup by URL hash), never counted
+        // as a hard failure.
+        if (self::deadline_exhausted()) {
+            self::$image_stats['deferred']++;
+            $this->logger->info('Image download deferred to next run (page budget exhausted)', [
+                'product_id' => $product_id,
+                'url' => $image_url,
             ]);
             return 0;
         }
@@ -2362,9 +2461,9 @@ class Products
         return $attachment_id;
     }
 
-    public function import_single_item_public(array $item): bool|string
+    public function import_single_item_public(array $item, int $run_id = 0): bool|string
     {
-        return $this->import_single_item_from_alegra($item);
+        return $this->import_single_item_from_alegra($item, $run_id);
     }
 
     private function import_product_image(int $product_id, string $image_url): void

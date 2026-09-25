@@ -538,6 +538,13 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => max(30, min(600, (int) $v)),
             'default' => 240,
         ]);
+        // T3.1.a: wall-clock budget for one chunked page ("Traer desde Alegra").
+        // Distinct from the 240s import budget: the chunked page pauses and
+        // resumes by start+offset instead of relying on set_time_limit.
+        register_setting('alegra_connector_settings', 'alegra_connector_chunked_page_budget', [
+            'sanitize_callback' => fn($v) => max(10, min(40, (int) $v)),
+            'default' => 20,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_import_max_pages', [
             'sanitize_callback' => fn($v) => max(0, (int) $v),
             'default' => 0,
@@ -822,6 +829,15 @@ class Admin_Dashboard
             'importFilterLoading'   => __('Cargando categorías...', 'alegra-connector'),
             'importFilterNoCats'    => __('No se encontraron categorías en Alegra.', 'alegra-connector'),
             'importFilterCatError'  => __('No se pudieron cargar las categorías.', 'alegra-connector'),
+
+            // Chunked import (T3.3.e). Fase 3 es dueña de estas claves; las
+            // compartidas (imagesFailed/monitorError/statusAbandoned) las declara
+            // su fase dueña (T5.2b/T6.4b/T6.4a) y acá sólo se consumen.
+            'pausedResuming'        => __('Pausado por tiempo; continúa con la próxima página...', 'alegra-connector'),
+            'resumingFrom'          => __('Reanudando desde el ítem %s...', 'alegra-connector'),
+            'confirmReimport'       => __('Esto reimporta TODO el catálogo desde cero y limpia el punto de reanudación. ¿Continuar?', 'alegra-connector'),
+            'startingFromZero'      => __('Empezando de cero...', 'alegra-connector'),
+            'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
         ];
     }
 
@@ -2021,50 +2037,142 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
         $type = sanitize_text_field($_POST['sync_type'] ?? 'products');
-        $this->api->reload_credentials();
+        $from_zero       = !empty($_POST['from_zero']);
+        $recreate_manual = !empty($_POST['recreate_manual']);
 
-        // Product-import filters (empty for the other entity types / legacy calls).
-        $raw_filters = $_POST['filters'] ?? '';
-        if (is_string($raw_filters) && $raw_filters !== '') {
-            $decoded = json_decode(wp_unslash($raw_filters), true);
-        } elseif (is_array($raw_filters)) {
-            $decoded = $raw_filters;
-        } else {
-            $decoded = [];
-        }
-        $filters = $this->sanitize_item_filters(is_array($decoded) ? $decoded : []);
-
-        // Get exact total via metadata=true (single API call!)
-        $total = 0;
-        if ($type === 'customers') {
-            $resp = $this->api->get('/contacts', ['metadata' => 'true', 'limit' => 1, 'type' => 'client']);
-            if (!is_wp_error($resp) && isset($resp['metadata']['total'])) {
-                $total = (int) $resp['metadata']['total'];
-            }
-        } else {
-            // The metadata total must reflect the explicit filters, but NOT the
-            // implicit default status, to preserve the historical total.
-            $params = ['metadata' => 'true', 'limit' => 1] + $this->build_item_filter_params($filters, false);
-            $resp = $this->api->get('/items', $params);
-            if (!is_wp_error($resp) && isset($resp['metadata']['total'])) {
-                $total = (int) $resp['metadata']['total'];
-            }
+        if (!get_option('alegra_connector_connection_tested')) {
+            // K1: run_type canónico, no el alias `chunked`.
+            \Alegra\Connector\Run_Context::fail_early('chunked_import', 'connection_not_tested');
+            wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
         }
 
-        $per_page = 30;
-        $total_pages = $total > 0 ? (int) ceil($total / $per_page) : 1;
+        // D7 (Oracle): el botón Cancelar deja `alegra_sync_cancelled` con TTL 120 s.
+        // Sin limpiarlo acá, un import nuevo arrancado dentro de esa ventana es
+        // cancelado al instante por la rama de cancel de `ajax_sync_page`.
+        delete_transient('alegra_sync_cancelled');
 
-        $state = [
-            'type' => $type, 'page' => 0, 'per_page' => $per_page,
-            'total_pages' => $total_pages, 'total_items' => $total,
-            'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
-            'filters' => $filters,
-        ];
-        set_transient('alegra_batch_state', $state, 600);
+        // D-D (Oracle): `ajax_sync_start` debe ser ATÓMICO. Sin lock, dos arranques
+        // concurrentes (doble clic / dos pestañas) pasan AMBOS el read-check de
+        // abajo y llaman `Run_Context::begin()` + `set_transient()`: el segundo
+        // pisa el `run_id`/`start` del primero y deja un run `running` huérfano.
+        // Se toma el MISMO lock per-type que usa `ajax_sync_page` y se mantiene
+        // durante: lectura del estado + begin() + set_transient().
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($type);
+        if ($lock === false) {
+            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+        }
 
-        wp_send_json_success([
-            'total_pages' => $total_pages, 'total_items' => $total, 'per_page' => $per_page,
-        ]);
+        try {
+            // D3 (Oracle): DENTRO del lock, rechazar un segundo arranque sólo si el
+            // run del estado sigue VIVO (running + heartbeat vigente, mismo criterio
+            // que `mark_abandoned`). Un estado huérfano (run stale/cerrado o
+            // heartbeat vencido) se limpia y se permite reanudar (REQ-RES-01).
+            $existing = get_transient('alegra_batch_state');
+            if (is_array($existing)) {
+                $existing_run   = (int) ($existing['run_id'] ?? 0);
+                $existing_alive = $existing_run > 0
+                    && \Alegra\Connector\Runs::status($existing_run) === 'running'
+                    && \Alegra\Connector\Heartbeat::get($existing_run) !== null;
+                if ($existing_alive) {
+                    \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                    wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+                }
+                delete_transient('alegra_batch_state');
+            }
+
+            $this->api->reload_credentials();
+
+            // Product-import filters (empty for the other entity types / legacy calls).
+            $raw_filters = $_POST['filters'] ?? '';
+            if (is_string($raw_filters) && $raw_filters !== '') {
+                $decoded = json_decode(wp_unslash($raw_filters), true);
+            } elseif (is_array($raw_filters)) {
+                $decoded = $raw_filters;
+            } else {
+                $decoded = [];
+            }
+            $filters = $this->sanitize_item_filters(is_array($decoded) ? $decoded : []);
+
+            // D1 §2.3: la fila existe desde el arranque; ajax_sync_page la cierra.
+            $run_id = \Alegra\Connector\Run_Context::begin('chunked_import');
+
+            // Get exact total via metadata=true (single API call!)
+            $total = 0;
+            if ($type === 'customers') {
+                $resp = $this->api->get('/contacts', ['metadata' => 'true', 'limit' => 1, 'type' => 'client']);
+                if (is_wp_error($resp)) {
+                    \Alegra\Connector\Run_Context::finish($run_id, 'failed', $resp->get_error_message());
+                    \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                    wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $resp->get_error_message())]);
+                }
+                if (isset($resp['metadata']['total'])) { $total = (int) $resp['metadata']['total']; }
+            } else {
+                // The metadata total must reflect the explicit filters, but NOT the
+                // implicit default status, to preserve the historical total.
+                $params = ['metadata' => 'true', 'limit' => 1] + $this->build_item_filter_params($filters, false);
+                $resp = $this->api->get('/items', $params);
+                if (is_wp_error($resp)) {
+                    \Alegra\Connector\Run_Context::finish($run_id, 'failed', $resp->get_error_message());
+                    \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                    wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $resp->get_error_message())]);
+                }
+                if (isset($resp['metadata']['total'])) { $total = (int) $resp['metadata']['total']; }
+            }
+
+            $per_page = 30;
+            $total_pages = $total > 0 ? (int) ceil($total / $per_page) : 1;
+            $cursor_key = 'alegra_connector_products_import_cursor';
+
+            // D4 §5.3: "desde cero" solo toca el cursor si es products. Se hace en
+            // `start` (no en page 1) para que un cron concurrente no reanude el cursor viejo.
+            $start = 0;
+            if ($type === 'products') {
+                if ($from_zero) {
+                    delete_option($cursor_key);
+                    delete_option('alegra_connector_products_import_total');
+                    $start = 0;
+                } else {
+                    $start = max(0, (int) get_option($cursor_key, 0));
+                }
+            }
+            $resuming = ($start > 0);
+
+            $policy = 'respect';
+            if ($from_zero) {
+                $policy = $recreate_manual ? 'ignore_all' : 'ignore_bulk';
+            }
+
+            // K2: shape canónico de `alegra_batch_state`. Este bloque es el DUEÑO
+            // único; Fases 4/5 sólo leen/mutan claves existentes (nunca lo re-listan).
+            // `page` NO se escribe (sólo se lee como fallback del estado viejo, C5).
+            $state = [
+                'type' => $type, 'run_id' => $run_id,
+                'start' => $start, 'offset' => 0, 'per_page' => $per_page,
+                'total_pages' => $total_pages, 'total_items' => $total,
+                'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+                'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0],
+                'from_zero' => $from_zero, 'policy' => $policy,
+                'filters' => $filters,
+            ];
+            set_transient('alegra_batch_state', $state, 600);
+
+            if ($type === 'products' && $total > 0) {
+                update_option('alegra_connector_products_import_total', $total, false);
+            }
+
+            // D-D: liberar el lock per-type ANTES de responder (die() no corre finally).
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+
+            wp_send_json_success([
+                'total_pages' => $total_pages, 'total_items' => $total, 'per_page' => $per_page,
+                'run_id' => $run_id, 'start' => $start, 'resuming' => $resuming,
+                'message' => $resuming
+                    ? sprintf(__('Reanudando desde el ítem %1$d de %2$d.', 'alegra-connector'), $start, $total)
+                    : sprintf(__('Importando %1$d ítems desde el inicio.', 'alegra-connector'), $total),
+            ]);
+        } finally {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+        }
     }
 
     /**
@@ -2075,52 +2183,99 @@ class Admin_Dashboard
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
-        $state = get_transient('alegra_batch_state');
-        if (!$state) wp_send_json_error(['message' => __('No hay un proceso de sincronización en curso.', 'alegra-connector')]);
+        // D1: leer el state con default [] para poder chequear cancel/stop ANTES
+        // del guard de "no_batch_state" (el botón Cancelar setea el flag).
+        $state  = get_transient('alegra_batch_state');
+        $state  = is_array($state) ? $state : [];
+        $run_id = (int) ($state['run_id'] ?? 0);
 
-        // REQ-RB-2: honour the cancellation flag at the START of every batch so
-        // the chunked flow stops in the next batch instead of running to the
-        // end. (Per-item cancellation is also enforced by the importers.)
-        if (get_transient('alegra_sync_cancelled')) {
+        // REQ-MON-05 / D1: cancel (botón) o stop (Monitor) cierran el run ANTES
+        // de cualquier otro guard. `should_stop` sólo se evalúa si hay run_id.
+        if (get_transient('alegra_sync_cancelled') || ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id))) {
+            if ($run_id > 0) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Cancelado por el usuario');
+            }
             delete_transient('alegra_sync_progress');
             delete_transient('alegra_batch_state');
             wp_send_json_success([
-                'done'      => true,
-                'cancelled' => true,
-                'message'   => __('Sincronización cancelada.', 'alegra-connector'),
+                'done' => true, 'cancelled' => true,
+                'message' => __('Sincronización cancelada.', 'alegra-connector'),
             ]);
         }
 
-        $page = ((int) ($state['page'] ?? 0)) + 1;
-        $type = $state['type'];
-        $per_page = 30; // Max allowed by Alegra API
+        if (!$state) {
+            \Alegra\Connector\Run_Context::fail_early('chunked_import', 'no_batch_state');
+            wp_send_json_error(['message' => __('No hay un proceso de sincronización en curso.', 'alegra-connector')]);
+        }
 
-        // Lock the per-type sync so cron + this chunked AJAX can't both pull.
+        // D3: el lock se toma ANTES de la lectura autoritativa del estado. El
+        // `get_transient` de arriba fue sólo para conocer `type`/`run_id`.
+        $type = (string) $state['type'];
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($type);
         if ($lock === false) {
+            \Alegra\Connector\Run_Context::finish($run_id, 'failed', 'Ya hay una sincronización en curso');
+            delete_transient('alegra_batch_state');
             wp_send_json_error(['message' => __('Another sync is in progress. Please wait.', 'alegra-connector')]);
         }
+
+        $state = get_transient('alegra_batch_state');
+        if (!is_array($state)) {
+            \Alegra\Connector\Run_Context::fail_early('chunked_import', 'no_batch_state');
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+            wp_send_json_error(['message' => __('No hay un proceso de sincronización en curso.', 'alegra-connector')]);
+        }
+        $run_id = (int) ($state['run_id'] ?? $run_id);
+
+        // K2 + C5: el cursor se resuelve desde el estado AUTORITATIVO (re-leído
+        // bajo el lock). `start` es el cursor absoluto; `offset` la reanudación
+        // intra-página (sólo products). `page` es fallback de lectura, no se
+        // escribe. `$page` se deriva para el payload y la API de categorías.
+        $per_page = (int) ($state['per_page'] ?? 30);
+        $start    = (int) ($state['start'] ?? (((int) ($state['page'] ?? 0)) * $per_page));
+        $offset   = (int) ($state['offset'] ?? 0);
+        $page     = (int) floor($start / $per_page) + 1;
+
+        // El contexto de logger se fija con el run_id AUTORITATIVO.
+        \Alegra\Connector\Run_Context::resume($run_id, 'chunked_import');
+
         try {
         $this->api->reload_credentials();
-        @set_time_limit(60);
+        @set_time_limit(60);        // backstop duro; el corte real es el deadline de T3.1
         wp_raise_memory_limit();
 
+        $paused = false;
         if ($type === 'products') {
-            $start = ($page - 1) * $per_page;
             $filters = is_array($state['filters'] ?? null) ? $state['filters'] : [];
-            // Build API params. With no filters this is exactly the historical
-            // ['start','limit','mode'] + implicit status=active.
+            // C5: `$start`/`$offset`/`$per_page` ya vienen resueltos arriba desde
+            // el estado. El fetch trae la página COMPLETA y el loop saltea los
+            // primeros $offset (reanudación honesta).
             $api_params = ['start' => $start, 'limit' => $per_page, 'mode' => 'advanced']
                 + $this->build_item_filter_params($filters, true);
             $items = $this->api->get('/items', $api_params);
-            if (is_wp_error($items)) { wp_send_json_error(['message' => $items->get_error_message()]); }
+            if (is_wp_error($items)) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'failed', $items->get_error_message());
+                delete_transient('alegra_batch_state');
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                wp_send_json_error(['message' => $items->get_error_message()]);
+            }
 
+            // D3 §4.1: presupuesto propio por página. NO es set_time_limit; el
+            // backstop de 60 s sólo cubre el margen.
+            $budget   = max(10, min(40, (int) get_option('alegra_connector_chunked_page_budget', 20)));
+            $deadline = microtime(true) + $budget;
+            Sync\Products::set_deadline($deadline);        // C8/T3.2.b: deadline para imágenes
+            Sync\Products::reset_image_stats();            // C8/T3.2.b (dueño)
+
+            $is_last = count($items) < $per_page;          // plenitud sobre la página completa
+            $index   = -1;
             $products_sync = new Sync\Products($this->api, $this->logger);
-            foreach ($items as $item) {
-                // UUID string — never cast an Alegra id to int.
-                $alegra_id = (string) ($item['id'] ?? '');
-                $item_type = $item['type'] ?? 'simple';
 
+            foreach ($items as $item) {
+                $index++;
+                if ($index < $offset) { continue; }        // C6: saltear sin tocar contadores
+                if (microtime(true) >= $deadline) { $paused = true; break; }  // ANTES de cada ítem
+
+                $item_type = $item['type'] ?? 'simple';
                 // Skip variants - imported with their parent
                 if ($item_type === 'variant') { continue; }
 
@@ -2132,20 +2287,32 @@ class Admin_Dashboard
                     continue;
                 }
 
-                // Use Products class for proper import (handles variable, images, etc.)
-                // Already-linked products will be updated, new ones created. The
-                // field exclusion (Ajustes) applies only to existing products.
-                $r = $products_sync->import_single_item_public($item);
+                $r = $products_sync->import_single_item_public($item, $run_id);   // T3.2: run_id + 'stopped'
+                if ($r === 'stopped') { $paused = true; break; }
                 if ($r === true) { $state['imported']++; }
                 elseif ($r === 'updated') { $state['updated']++; }
-                elseif ($r === 'skipped') { continue; }
+                elseif ($r === 'skipped') { $state['skipped'] = ($state['skipped'] ?? 0) + 1; }  // D-C: contar
                 else { $state['errors']++; }
             }
-            $is_last = count($items) < $per_page;
+            Sync\Products::clear_deadline();               // C8/T3.2
+
+            // Reanudación: pausado ⇒ persistir offset sin avanzar start; completo ⇒
+            // avanzar start, resetear offset y persistir el cursor compartido.
+            if ($paused) {
+                $state['offset'] = max(0, $index);         // siguiente índice no procesado
+            } else {
+                $state['start']  = $start + $per_page;
+                $state['offset'] = 0;
+                update_option('alegra_connector_products_import_cursor', $state['start'], false);
+            }
         } elseif ($type === 'customers') {
-            $contacts_start = ($page - 1) * $per_page;
-            $items = $this->api->get('/contacts', ['start' => $contacts_start, 'limit' => $per_page, 'type' => 'client']);
-            if (is_wp_error($items)) { wp_send_json_error(['message' => $items->get_error_message()]); }
+            $items = $this->api->get('/contacts', ['start' => $start, 'limit' => $per_page, 'type' => 'client']);
+            if (is_wp_error($items)) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'failed', $items->get_error_message());
+                delete_transient('alegra_batch_state');
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                wp_send_json_error(['message' => $items->get_error_message()]);
+            }
 
             $customers_sync = new Sync\Customers($this->api, $this->logger);
             foreach ($items as $item) {
@@ -2178,10 +2345,17 @@ class Admin_Dashboard
                     } else { $state['errors']++; }
                 }
             }
+            $state['start'] = $start + $per_page;   // D2: el cursor avanza
             $is_last = count($items) < $per_page;
         } else {
+            // La API de categorías pagina por `page`, derivada de `start`.
             $items = $this->api->get_item_categories(['page' => $page, 'limit' => $per_page]);
-            if (is_wp_error($items)) { wp_send_json_error(['message' => $items->get_error_message()]); }
+            if (is_wp_error($items)) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'failed', $items->get_error_message());
+                delete_transient('alegra_batch_state');
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+                wp_send_json_error(['message' => $items->get_error_message()]);
+            }
             foreach ($items as $item) {
                 $t = wp_insert_term($item['name'] ?? '', 'product_cat', ['description' => $item['description'] ?? '']);
                 if (!is_wp_error($t)) {
@@ -2190,10 +2364,11 @@ class Admin_Dashboard
                     $state['imported']++;
                 } else { $state['errors']++; }
             }
+            $state['start'] = $start + $per_page;   // D2: el cursor avanza
             $is_last = count($items) < $per_page;
         }
 
-        $state['page'] = $page;
+        // Si la página fue la última, ajustar el total observado (compat).
         $item_count = is_array($items) ? count($items) : 0;
         if ($is_last) {
             $state['total_pages'] = $page;
@@ -2201,25 +2376,78 @@ class Admin_Dashboard
         }
 
         $processed = $state['imported'] + $state['updated'] + $state['errors'] + ($state['skipped'] ?? 0);
-        $tp = (int)($state['total_pages'] ?? 0);
-        $done = $is_last || ($tp > 0 && $page >= $tp) || empty($items);
+        $tp        = (int) ($state['total_pages'] ?? 0);
+        $total_items = (int) ($state['total_items'] ?? 0);
+        $next_start  = (int) ($state['start'] ?? 0);
+        $done = !$paused && ($is_last || ($tp > 0 && $next_start >= $tp * $per_page) || empty($items));
+        // percent por ítems procesados (no por página): con offset, page/tp miente.
+        $pct = $total_items > 0
+            ? min(100, (int) round(($processed / $total_items) * 100))
+            : ($tp > 0 ? min(100, (int) round((($next_start) / ($tp * $per_page)) * 100)) : 0);
 
-        // Clear the batch state when the run is done; otherwise persist it so
-        // the next page can resume.
+        // D1 §2.4: heartbeat + progreso por PÁGINA (nunca por ítem, NFR-04).
+        if ($run_id > 0) {
+            \Alegra\Connector\Heartbeat::set($run_id, [
+                'step' => $type,
+                'message' => sprintf(__('Procesando... Página %d/%d', 'alegra-connector'), $page, max(1, $tp)),
+                'step_num' => $page, 'total_steps' => max(1, $tp),
+            ]);
+            \Alegra\Connector\Runs::update_progress($run_id, $processed, $total_items);
+        }
+
         if ($done) {
+            \Alegra\Connector\Run_Context::finish($run_id, 'completed');
+            // B-A (Oracle): `alegra_connector_products_import_cursor` es un
+            // option GLOBAL de products. Sólo se borra cuando la entidad que
+            // terminó es `products`.
+            if ($type === 'products') {
+                delete_option('alegra_connector_products_import_cursor');
+            }
             delete_transient('alegra_batch_state');
         } else {
             set_transient('alegra_batch_state', $state, 600);
         }
 
-        $pct = $tp > 0 ? min(100, round(($page / $tp) * 100)) : 0;
+        // Cierre + release ANTES del send (die() no corre finally).
+        \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+
+        // T3.4: el payload expone `images` con `failed` siempre presente (la
+        // fuente canónica del acumulado es `$state['images']`; el merge de
+        // `image_stats()` es T5.2b).
+        $images = is_array($state['images'] ?? null)
+            ? $state['images']
+            : ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0];
+        if (!isset($images['failed'])) {
+            $images['failed'] = (int) ($images['blocked'] ?? 0) + (int) ($images['download'] ?? 0) + (int) ($images['sideload'] ?? 0);
+        }
+
         wp_send_json_success([
-            'page' => $page, 'total_pages' => $tp, 'total_items' => (int)($state['total_items'] ?? 0),
-            'imported' => $state['imported'], 'updated' => $state['updated'], 'skipped' => $state['skipped'] ?? 0, 'errors' => $state['errors'],
-            'processed' => $processed, 'percent' => $pct, 'done' => $done,
-            'message' => sprintf(__('%d/%d items — Pág. %d/%d', 'alegra-connector'), $processed, (int)($state['total_items'] ?? 0), $page, $tp),
+            'page'        => (int) floor(($state['start'] ?? 0) / $per_page) + 1,
+            'total_pages' => $tp,
+            'total_items' => $total_items,
+            'imported'    => (int) $state['imported'],
+            'updated'     => (int) $state['updated'],
+            'skipped'     => (int) ($state['skipped'] ?? 0),
+            'errors'      => (int) $state['errors'],
+            'processed'   => $processed,
+            'percent'     => $pct,
+            'paused'      => $paused,
+            'offset'      => (int) ($state['offset'] ?? 0),
+            'done'        => $done,
+            'images'      => $images,
+            'message'     => sprintf(
+                __('%1$d/%2$d items — Pág. %3$d/%4$d', 'alegra-connector'),
+                $processed, $total_items,
+                (int) floor(($state['start'] ?? 0) / $per_page) + 1, $tp
+            ),
         ]);
+        } catch (\Throwable $e) {
+            // Solo excepciones reales. En el harness también atrapa el throw de
+            // wp_send_json_*; Run_Context::finish (T1.5) no re-finaliza si ya cerró.
+            \Alegra\Connector\Run_Context::finish($run_id, 'failed', $e->getMessage());
+            throw $e;
         } finally {
+            // Solo para excepciones: los sends ya liberaron antes.
             \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
         }
     }
@@ -3012,7 +3240,17 @@ class Admin_Dashboard
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
+        // D1: leer el run_id ANTES de borrar el estado y cerrar la fila
+        // `cancelled`. El JS aborta el request en vuelo, así que "la próxima
+        // página lo cierra" NO alcanza: este handler es el dueño del cierre.
+        $state  = get_transient('alegra_batch_state');
+        $run_id = is_array($state) ? (int) ($state['run_id'] ?? 0) : 0;
+        if ($run_id > 0) {
+            \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Cancelado por el usuario');
+        }
+
         set_transient('alegra_sync_cancelled', 1, 120);
+        delete_transient('alegra_sync_progress');
         delete_transient('alegra_batch_state');
         wp_send_json_success(['message' => __('Sincronización cancelada', 'alegra-connector')]);
     }
@@ -4080,14 +4318,22 @@ class Admin_Dashboard
         @set_time_limit(300);
         wp_raise_memory_limit();
 
+        // REQ-LOG-01: salida temprana con rastro (sin fila: el run no existe aún).
+        // K1: el run_type es el canónico `manual_import`, no el alias corto `manual`.
         if (!get_option('alegra_connector_connection_tested')) {
+            \Alegra\Connector\Run_Context::fail_early('manual_import', 'connection_not_tested');
             wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
         }
 
         $import_type = sanitize_text_field($_POST['import_type'] ?? '');
-        if (!in_array($import_type, ['products', 'customers', 'categories'])) {
+        if (!in_array($import_type, ['products', 'customers', 'categories'], true)) {
+            \Alegra\Connector\Run_Context::fail_early('manual_import', 'invalid_type', ['import_type' => $import_type]);
             wp_send_json_error(['message' => __('Tipo de importacion invalido.', 'alegra-connector')]);
         }
+
+        // D1 §2.2: el run se abre ANTES del lock para que el lock ocupado cierre
+        // la fila con causa (REQ-MON-01 escenario borde).
+        $run_id = \Alegra\Connector\Run_Context::begin('manual_import');
 
         // Lock the per-type sync so cron + this AJAX import can't both pull.
         // Customers::import_from_alegra has its own internal lock too; this
@@ -4095,23 +4341,69 @@ class Admin_Dashboard
         // gives consistent UX (single error message) across all types.
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($import_type);
         if ($lock === false) {
+            \Alegra\Connector\Run_Context::finish($run_id, 'failed', 'Ya hay una sincronización en curso');
             wp_send_json_error(['message' => __('Another sync is in progress. Please wait.', 'alegra-connector')]);
         }
         try {
             $sync_controller = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
-            $result = $sync_controller->import_from_alegra($import_type);
+            $result = $sync_controller->import_from_alegra($import_type, $run_id);
 
             if (is_wp_error($result)) {
-                wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+                $msg = sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message());
+                \Alegra\Connector\Run_Context::finish($run_id, 'failed', $result->get_error_message());
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
+                wp_send_json_error(['message' => $msg]);
+            }
+
+            // K3 (Oracle D6 + H1): DOS señales distintas, no una.
+            //  - stop del usuario (Monitor): Products.php:1298-1301 (por página)
+            //    y :1353-1356 (por ítem) hacen `break`/`break 2` SIN tocar `paused`.
+            //  - pausa por presupuesto de 240 s: Products.php:1304-1309 setea
+            //    `$result['paused']=true`.
+            if (\Alegra\Connector\Runs::should_stop($run_id)) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
+                wp_send_json_success([
+                    'message' => __('Importación detenida por el usuario.', 'alegra-connector'),
+                    'data' => $result,
+                    'images' => $result['images'] ?? [],
+                ]);
+            }
+
+            // REQ-RES-04 (H1): la pausa por presupuesto se reporta como pausa
+            // HONESTA (el cursor ya quedó persistido), NO como cancelación ni
+            // como "Completado".
+            if (!empty($result['paused'])) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'paused', 'Pausado por presupuesto; reanudable');
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
+                wp_send_json_success([
+                    'message' => sprintf(
+                        __('Importación pausada por presupuesto: %1$d nuevos, %2$d actualizados. Reanudá para continuar.', 'alegra-connector'),
+                        (int) ($result['imported'] ?? 0),
+                        (int) ($result['updated'] ?? 0)
+                    ),
+                    'paused' => true,
+                    'data' => $result,
+                    'images' => $result['images'] ?? [],
+                ]);
             }
 
             $imported = (int) ($result['imported'] ?? 0);
             $updated = (int) ($result['updated'] ?? 0);
 
+            // D1 §2.3: cierre + release ANTES del send (die() no corre finally).
+            \Alegra\Connector\Run_Context::finish($run_id, 'completed');
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
+
             wp_send_json_success([
                 'message' => sprintf(__('Importación completada: %d nuevos, %d actualizados.', 'alegra-connector'), $imported, $updated),
                 'data' => $result,
+                'images' => $result['images'] ?? [],   // T5.2 (payload), placeholder tolerante
             ]);
+        } catch (\Throwable $e) {
+            // Solo excepciones reales: el run se cierra failed y el finally libera.
+            \Alegra\Connector\Run_Context::finish($run_id, 'failed', $e->getMessage());
+            throw $e;
         } finally {
             \Alegra\Connector\Sync\Controller::release_sync_lock_public($import_type, $lock);
         }

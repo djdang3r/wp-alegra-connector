@@ -430,6 +430,8 @@ final class Alegra_Connector
             'alegra_connector_sync_inactive_products' => false,
             'alegra_connector_currency' => 'COP',
             'alegra_connector_log_retention_days' => 30,
+            // T3.1.a: wall-clock budget for one chunked page (Traer desde Alegra).
+            'alegra_connector_chunked_page_budget' => 20,
             'alegra_connector_conflict_resolution' => 'alegra_wins',
             'alegra_connector_inventory_source' => 'alegra',
             // Independent gate for the Alegra -> WC stock pull. It no longer
@@ -459,6 +461,8 @@ final class Alegra_Connector
             'alegra_connector_inventory_sync_enabled',
             'alegra_connector_log_retention_days',
             'alegra_connector_sync_inactive_products',
+            // Only read by the chunked import handler (admin/AJAX).
+            'alegra_connector_chunked_page_budget',
             // Only read in admin/cron context (REQ-CFG-1).
             'alegra_connector_payment_reconcile_enabled',
             'alegra_connector_payment_reconcile_batch',

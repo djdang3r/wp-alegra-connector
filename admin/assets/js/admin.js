@@ -217,16 +217,22 @@
                     },
                     success: function(r) {
                         currentRequest = null;
-                        if (!r.success || cancelled) { cleanup(); return; }
+                        if (cancelled) { cleanup(); return; }        // el botón Cancelar ya avisó
+                        if (!r.success) {
+                            cleanup();
+                            showNotice(safeMsg(r, S.startError), 'error');
+                            $btn.prop('disabled', false).text(S.retry);   // hoy quedaba deshabilitado
+                            return;
+                        }
                         var d = r.data || {};
                         $label.text(fmt(S.phase1Total, (d.total_items || '?'), (d.total_pages || '?')));
-                        $counters.text(S.processing);
-                        processPage(1);
+                        $counters.text(d.resuming ? fmt(S.resumingFrom, (d.start || 0)) : S.processing);
+                        processPage();
                     },
                     error: function() { cleanup(); showNotice(S.startError,'error'); $btn.prop('disabled',false).text(S.retry); }
                 });
 
-                var processPage = function(page) {
+                var processPage = function() {
                     if (cancelled) { cleanup(); return; }
 
                     currentRequest = $.ajax({
@@ -235,14 +241,22 @@
                         success: function(r) {
                             currentRequest = null;
                             retries = 0;
-                            if (!r.success || cancelled) { cleanup(); $btn.prop('disabled',false).text(S.retry); return; }
+                            if (cancelled) { cleanup(); return; }
+                            if (!r.success) {
+                                cleanup();
+                                showNotice(safeMsg(r, S.error), 'error');
+                                $btn.prop('disabled', false).text(S.retry);
+                                return;
+                            }
                             var d = r.data;
-                            var pct = d.percent || Math.min(95, 5 + (page * 2));
-                            $fill.css('width', pct + '%');
+                            $fill.css('width', (d.percent || 0) + '%');
                             $label.text(fmt(S.phase1, d.message));
                             $counters.text(d.imported + ' ' + S.importedLabel + ' | ' + d.updated + ' ' + S.updatedLabel + ' | ' + (d.skipped || 0) + ' ' + S.skippedLabel + ' | ' + d.errors + ' ' + S.errorsLabel);
 
-                            if (d.done) {
+                            if (d.paused) {
+                                $label.text(S.pausedResuming);
+                                processPage();                       // el servidor es dueño del cursor
+                            } else if (d.done) {
                                 $fill.css('width', '100%');
                                 var hasErrors = d.errors > 0;
                                 $label.text(hasErrors ? S.phase2CompletedErrors : S.phase2Completed);
@@ -250,6 +264,9 @@
                                     fmt(S.syncSummary, d.processed, d.imported, d.updated, (d.skipped || 0)) +
                                     (hasErrors ? fmt(S.syncSummaryErrors, d.errors) : '')
                                 ).css('color', hasErrors ? 'var(--ac-warning)' : '');
+                                if (d.images && Number(d.images.failed) > 0) {
+                                    showNotice(fmt(S.imagesFailed, d.images.failed, d.images.blocked, d.images.download, d.images.sideload, d.images.deferred), 'warning');
+                                }
                                 setTimeout(function() {
                                     cleanup();
                                     if (hasErrors) {
@@ -266,16 +283,18 @@
                                     setTimeout(function(){ location.reload(); }, 2000);
                                 }, 1500);
                             } else {
-                                processPage(page + 1);
+                                processPage();
                             }
                         },
                         error: function() {
                             retries++;
                             if (retries <= maxRetries) {
                                 $counters.text(fmt(S.retrying, retries, maxRetries));
-                                setTimeout(function() { processPage(page); }, 2000);
+                                setTimeout(function() { processPage(); }, 2000);
                             } else {
-                                cleanup(); $btn.prop('disabled',false).text(S.retry);
+                                cleanup();
+                                showNotice(S.connectionError, 'error');   // rama terminal antes muda (:278)
+                                $btn.prop('disabled', false).text(S.retry);
                             }
                         }
                     });

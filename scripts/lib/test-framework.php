@@ -173,6 +173,8 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_test_referer_ok'] = true;
     $GLOBALS['alegra_test_wp_die_throws'] = false;
     $GLOBALS['alegra_test_json_observer'] = null;
+    $GLOBALS['alegra_test_fake_microtime'] = null;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
     $GLOBALS['alegra_test_is_admin'] = false;
     $GLOBALS['alegra_test_gmt_offset'] = 0;
 
@@ -323,4 +325,23 @@ function alegra_capture_json(callable $fn): Alegra_Test_JSON_Response
         return $e;
     }
     throw new \RuntimeException('the handler emitted no wp_send_json_* response');
+}
+
+/**
+ * Verbatim source of a method (works for private methods too). Used by
+ * source-scan assertions that fix branching contracts.
+ */
+function alegra_method_source(string $class, string $method): string
+{
+    $ref = new ReflectionMethod($class, $method);
+    $file = $ref->getFileName();
+    if ($file === false || !is_file($file)) {
+        return '';
+    }
+    $lines = file($file);
+    if (!is_array($lines)) {
+        return '';
+    }
+    $length = $ref->getEndLine() - $ref->getStartLine() + 1;
+    return implode('', array_slice($lines, $ref->getStartLine() - 1, $length));
 }

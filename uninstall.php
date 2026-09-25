@@ -100,8 +100,10 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_schema_version');
     delete_option('alegra_connector_uuid_columns_migrated');
     delete_option('alegra_connector_products_import_cursor');
+    delete_option('alegra_connector_products_import_total');
     delete_option('alegra_connector_import_time_budget');
     delete_option('alegra_connector_import_max_pages');
+    delete_option('alegra_connector_chunked_page_budget');
     delete_option('alegra_connector_orders_poll_batch');
     delete_option('alegra_connector_rate_window');
     delete_option('alegra_connector_billing_field_catalog_enabled');

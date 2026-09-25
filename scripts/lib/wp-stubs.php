@@ -37,6 +37,29 @@ if (!defined('ABSPATH')) {
     define('ABSPATH', $alegra_abspath . '/');
 }
 
+// ---------------------------------------------------------------------------
+// Test clock seam (T3.1/T3.2 harness).
+//
+// Production code calls the global `microtime()`. The harness also declares a
+// namespaced `microtime()` in Alegra\Connector\Admin and Alegra\Connector\Sync
+// (scripts/lib/ns-microtime.php) that delegates here, so a test can make the
+// wall-clock budget deterministic without sleeping. When the fake is null the
+// namespaced functions fall back to the real `\microtime()`.
+// ---------------------------------------------------------------------------
+
+$GLOBALS['alegra_test_fake_microtime'] = null;
+$GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
+
+function alegra_test_microtime(bool $as_float = false): string|float
+{
+    if ($GLOBALS['alegra_test_fake_microtime'] !== null) {
+        $now = (float) $GLOBALS['alegra_test_fake_microtime'];
+        $GLOBALS['alegra_test_fake_microtime'] = $now + (float) ($GLOBALS['alegra_test_fake_microtime_step'] ?? 0.0);
+        return $as_float ? $now : (string) $now;
+    }
+    return \microtime($as_float);
+}
+
 /**
  * dbDelta stub. Schema::migrate() is the only caller. Counting the calls is
  * how the AC-06 test proves a second migrate() does zero schema work.
