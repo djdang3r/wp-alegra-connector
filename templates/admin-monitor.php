@@ -43,7 +43,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     </div>
     <div id="ac-monitor-running-list">
         <div class="ac-empty-state">
-            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Cargando...', 'alegra-connector'); ?></p>
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('No hay procesos activos.', 'alegra-connector'); ?></p>
         </div>
     </div>
 </div>
@@ -55,7 +55,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     </div>
     <div id="ac-monitor-cron-list">
         <div class="ac-empty-state">
-            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Cargando...', 'alegra-connector'); ?></p>
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('No hay tareas cron programadas.', 'alegra-connector'); ?></p>
         </div>
     </div>
 </div>
@@ -67,7 +67,19 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     </div>
     <div id="ac-monitor-recent-list">
         <div class="ac-empty-state">
-            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Cargando...', 'alegra-connector'); ?></p>
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Sin historial reciente.', 'alegra-connector'); ?></p>
+        </div>
+    </div>
+</div>
+
+<!-- Recent webhooks (D10): partitioned so they never evict cron/manual runs -->
+<div class="ac-card" style="margin-top:16px;">
+    <div class="ac-card-header">
+        <h2><?php esc_html_e('Webhooks recientes', 'alegra-connector'); ?></h2>
+    </div>
+    <div id="ac-monitor-webhooks-list">
+        <div class="ac-empty-state">
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Sin historial reciente.', 'alegra-connector'); ?></p>
         </div>
     </div>
 </div>
@@ -80,6 +92,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     'use strict';
 
     var pollInterval = null;
+    var monitorErrorShown = false;
     var monitorNonce = <?php echo json_encode($monitor_nonce); ?>;
     // Populated on DOM ready: alegraConnector is printed with the footer scripts.
     var S = {};
@@ -94,6 +107,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             case 'failed':    cls = 'danger';  label = S.statusFailed;    break;
             case 'cancelled': cls = 'neutral'; label = S.statusCancelled; break;
             case 'killed':    cls = 'danger';  label = S.statusKilled;    break;
+            case 'stale':     cls = 'neutral'; label = S.statusAbandoned; break;
         }
         return '<span class="ac-badge ' + cls + '">' + label + '</span>';
     }
@@ -103,6 +117,22 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         return String(s).replace(/[&<>"']/g, function(c) {
             return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
         });
+    }
+
+    // admin-monitor.php had no fmt: the one in admin.js lives private inside its
+    // IIFE and is not exposed. Same pattern as templates/admin-import.php.
+    function fmt(tpl, arg) {
+        return String(tpl == null ? '' : tpl).replace('%s', arg);
+    }
+
+    // Map a raw run_type to its origin label (REQ-MON-04).
+    function runTypeLabel(type) {
+        var t = String(type || '');
+        if (t.indexOf('cron') === 0) return S.originCron;
+        if (t === 'manual_import') return S.originManual;
+        if (t === 'chunked_import') return S.originChunked;
+        if (t.indexOf('webhook') === 0) return S.originWebhook;
+        return t; // old/unknown rows: raw value
     }
 
     function renderRunning(running) {
@@ -116,7 +146,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             html += '<div class="ac-running-item" data-run-id="' + r.id + '" style="padding:12px;border-bottom:1px solid var(--ac-border-light);">';
             html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">';
             html += statusBadge('running');
-            html += '<strong>' + escapeHtml(r.type) + '</strong>';
+            html += '<strong>' + escapeHtml(runTypeLabel(r.type)) + '</strong>';
             html += '<span style="color:var(--ac-text-muted);font-size:12px;margin-left:auto;">' + escapeHtml(r.started_at) + '</span>';
             html += '</div>';
             html += '<div style="margin-bottom:6px;font-size:13px;color:var(--ac-text);">' + escapeHtml(r.message || '') + '</div>';
@@ -135,8 +165,12 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         return html;
     }
 
-    function renderCron(cron) {
+    function renderCron(cron, syncMethod) {
         if (!cron || cron.length === 0) {
+            if (syncMethod === 'real-time' || syncMethod === 'disabled') {
+                return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">' +
+                    escapeHtml(fmt(S.cronDisabled, syncMethod)) + '</p></div>';
+            }
             return '<div class="ac-empty-state"><p style="color:var(--ac-text-muted);">' + escapeHtml(S.noCronTasks) + '</p></div>';
         }
         var html = '<table class="widefat striped"><thead><tr>' +
@@ -177,7 +211,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             var r = recent[i];
             html += '<tr>';
             html += '<td>' + r.id + '</td>';
-            html += '<td>' + escapeHtml(r.type) + '</td>';
+            html += '<td>' + escapeHtml(runTypeLabel(r.type)) + '</td>';
             html += '<td>' + statusBadge(r.status) + '</td>';
             html += '<td style="font-size:11px;">' + escapeHtml(r.started_at) + '</td>';
             html += '<td style="font-size:11px;">' + escapeHtml(r.finished_at || '-') + '</td>';
@@ -197,14 +231,21 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             data: { action: 'alegra_monitor_status', _ajax_nonce: monitorNonce },
             success: function(r) {
                 if (!r || !r.success) return;
+                monitorErrorShown = false;
                 var d = r.data;
                 $('#ac-monitor-running-list').html(renderRunning(d.running));
                 $('#ac-monitor-running-count').text(d.running.length);
-                $('#ac-monitor-cron-list').html(renderCron(d.cron));
+                $('#ac-monitor-cron-list').html(renderCron(d.cron, d.sync_method));
                 $('#ac-monitor-recent-list').html(renderRecent(d.recent));
+                $('#ac-monitor-webhooks-list').html(renderRecent(d.recent_webhooks));
             },
             error: function() {
-                // Silent fail - retry next poll
+                // Show the failure once per streak so a flaky request does not
+                // spam a notice every 5 seconds.
+                if (!monitorErrorShown) {
+                    monitorErrorShown = true;
+                    showNotice(S.monitorError, 'error');
+                }
             }
         });
     }

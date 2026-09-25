@@ -192,13 +192,52 @@ class Logger
                     error_log('[Alegra Logger] flock failed: ' . $log_entry);
                 }
             }
+
+            // REQ-LOG-06: a successful write means the directory is healthy
+            // again, so clear any persisted failure flag (self-healing).
+            if (get_option('alegra_connector_logger_write_failed') !== false) {
+                delete_option('alegra_connector_logger_write_failed');
+            }
         } catch (\Throwable $e) {
+            // REQ-LOG-06: persist the failure so the admin sees it even when it
+            // happens in cron/AJAX (where admin_notices is not rendered).
+            update_option('alegra_connector_logger_write_failed', [
+                'at'    => time(),
+                'path'  => $this->log_dir,
+                'error' => $e->getMessage(),
+            ], false); // autoload = false
+
             // Fallback: never let a logging failure break the import flow.
             // Gated by WP_DEBUG so an unwritable uploads dir cannot flood logs.
             if (defined('WP_DEBUG') && WP_DEBUG) {
                 error_log('[Alegra Logger] ' . $e->getMessage() . ' | ' . trim($log_entry));
             }
         }
+    }
+
+    /**
+     * Show an admin notice when the last write failed (REQ-LOG-06).
+     *
+     * Registered on `admin_notices` in alegra-connector.php. Only users who can
+     * manage the site see it; without a persisted failure nothing is rendered.
+     */
+    public static function render_write_failure_notice(): void
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+        $failure = get_option('alegra_connector_logger_write_failed');
+        if (!is_array($failure) || empty($failure['path'])) {
+            return;
+        }
+        echo '<div class="notice notice-error is-dismissible"><p>';
+        echo esc_html(sprintf(
+            /* translators: 1: log directory path, 2: error message */
+            __('Alegra Connector: no se pudo escribir en el directorio de logs (%1$s). Error: %2$s. El plugin sigue funcionando, pero los eventos no se registran.', 'alegra-connector'),
+            (string) $failure['path'],
+            (string) ($failure['error'] ?? '')
+        ));
+        echo '</p></div>';
     }
 
     public function info(string $message, array $context = []): void
@@ -252,6 +291,59 @@ class Logger
         $this->info('Cleared old logs', ['count' => $count, 'retention_days' => $retention_days]);
 
         return $count;
+    }
+
+    /**
+     * Delete EVERY *.log file in the log directory (leaving .htaccess/index.php
+     * untouched) and return the real count.
+     *
+     * Deliberately does NOT write a log entry of its own: doing so would
+     * immediately recreate a file and the Logs screen would never look empty
+     * (REQ-LOG-07). The audit trail for the action is the admin success notice.
+     *
+     * @return array{files:int,bytes:int}
+     */
+    public function clear_all_logs(): array
+    {
+        $this->ensure_dir();
+        $files = glob($this->log_dir . '/*.log') ?: [];
+        $deleted = 0;
+        $bytes = 0;
+        foreach ($files as $file) {
+            if (!is_file($file)) {
+                continue;
+            }
+            $size = (int) @filesize($file);
+            if (@unlink($file)) {
+                $deleted++;
+                $bytes += $size;
+            }
+        }
+        return ['files' => $deleted, 'bytes' => $bytes];
+    }
+
+    /**
+     * Absolute real path of the log directory (REQ-LOG-05).
+     */
+    public function get_log_dir(): string
+    {
+        $this->ensure_dir();
+        return $this->log_dir;
+    }
+
+    /**
+     * Whether the logger can actually write (REQ-LOG-06).
+     */
+    public function is_writable(): bool
+    {
+        $this->ensure_dir();
+        if (!is_dir($this->log_dir) || !is_writable($this->log_dir)) {
+            return false;
+        }
+        if (file_exists($this->log_file) && !is_writable($this->log_file)) {
+            return false;
+        }
+        return true;
     }
 
     public function get_logs(int $limit = 100, string $level = '', string $type = ''): array

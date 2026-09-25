@@ -674,7 +674,7 @@ class Admin_Dashboard
             'selectOneType'         => __('Selecciona al menos un tipo', 'alegra-connector'),
 
             // Logs / token / connection management
-            'confirmClearLogs'      => __('¿Eliminar logs antiguos?', 'alegra-connector'),
+            'confirmClearLogs'      => __('Esto borrará TODOS los logs, incluido el de hoy. No se puede deshacer. ¿Continuar?', 'alegra-connector'),
             'logsDeleted'           => __('Logs eliminados', 'alegra-connector'),
             'hideToken'             => __('Ocultar token', 'alegra-connector'),
             'showToken'             => __('Mostrar token', 'alegra-connector'),
@@ -774,6 +774,15 @@ class Admin_Dashboard
             'taskSkipped'           => __('Tarea saltada', 'alegra-connector'),
             'taskRemoved'           => __('Tarea eliminada', 'alegra-connector'),
             'hookExecuted'          => __('Hook ejecutado', 'alegra-connector'),
+            // T6.4.a (dueño único): estado abandonado + origen de cada run.
+            'statusAbandoned'       => __('Abandonado', 'alegra-connector'),
+            'originCron'            => __('Cron', 'alegra-connector'),
+            'originManual'          => __('Manual', 'alegra-connector'),
+            'originChunked'         => __('Chunked', 'alegra-connector'),
+            'originWebhook'         => __('Webhook', 'alegra-connector'),
+            // T6.4.b (dueño único): error del poll + cron deshabilitado.
+            'monitorError'          => __('No se pudo cargar el monitor. Reintentando...', 'alegra-connector'),
+            'cronDisabled'          => __('La sincronización periódica está desactivada (método: %s).', 'alegra-connector'),
 
             // Wizard
             'wizardError'           => __('Error al guardar progreso', 'alegra-connector'),
@@ -916,6 +925,8 @@ class Admin_Dashboard
         $log_files = $this->logger ? $this->logger->get_log_files() : [];
         $log_entries = $this->logger ? $this->logger->get_logs(200) : [];
         $system_logs = $this->logger ? $this->logger->get_system_logs(50) : [];
+        // REQ-LOG-05: absolute real path, always rendered (even with no files).
+        $logger_dir = $this->logger ? $this->logger->get_log_dir() : '';
 
         // Log Statistics
         $log_stats = ['total' => 0, 'info' => 0, 'warning' => 0, 'error' => 0, 'critical' => 0, 'today' => 0, 'system' => count($system_logs)];
@@ -2585,10 +2596,17 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Logger no inicializado.', 'alegra-connector')]);
         }
 
-        $retention = (int) get_option('alegra_connector_log_retention_days', 30);
-        $count = $this->logger->clear_old_logs($retention);
+        $res = $this->logger->clear_all_logs();
 
-        wp_send_json_success(['message' => sprintf(__('%d logs eliminados.', 'alegra-connector'), $count)]);
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: %s: number of deleted log files */
+                _n('%s archivo de log eliminado.', '%s archivos de log eliminados.', $res['files'], 'alegra-connector'),
+                number_format_i18n($res['files'])
+            ),
+            'files' => $res['files'],
+            'bytes' => $res['bytes'],
+        ]);
     }
 
     public function ajax_download_logs(): void
@@ -3958,7 +3976,9 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
         $running = \Alegra\Connector\Runs::currently_running();
-        $recent = \Alegra\Connector\Runs::recent(15);
+        // D10: pull a wider window and partition webhooks out, otherwise a busy
+        // webhook stream evicts cron/manual runs from the history.
+        $recent_all = \Alegra\Connector\Runs::recent(25);
         $cron_events = \Alegra\Connector\Runs::get_cron_events();
         $heartbeats = \Alegra\Connector\Heartbeat::get_batch(array_column((array) $running, 'id'));
 
@@ -3979,9 +3999,35 @@ class Admin_Dashboard
             ];
         }
 
+        $recent = [];
+        $recent_wh = [];
+        foreach ($recent_all as $r) {
+            if (strpos((string) $r->run_type, 'webhook') === 0) {
+                if (count($recent_wh) < 5) { $recent_wh[] = $r; }
+            } elseif (count($recent) < 15) {
+                $recent[] = $r;
+            }
+        }
+
         $recent_data = [];
         foreach ($recent as $run) {
             $recent_data[] = [
+                'id' => (int) $run->id,
+                'type' => $run->run_type,
+                'status' => $run->status,
+                'started_at' => $run->started_at,
+                'finished_at' => $run->finished_at,
+                'items_done' => (int) $run->items_done,
+                'total_items' => (int) $run->total_items,
+                'items_failed' => (int) $run->items_failed,
+                'memory_mb' => $run->memory_peak_mb ? (float) $run->memory_peak_mb : null,
+                'error' => $run->error_summary,
+            ];
+        }
+
+        $recent_wh_data = [];
+        foreach ($recent_wh as $run) {
+            $recent_wh_data[] = [
                 'id' => (int) $run->id,
                 'type' => $run->run_type,
                 'status' => $run->status,
@@ -4009,6 +4055,8 @@ class Admin_Dashboard
             'running' => $running_data,
             'cron' => $cron_data,
             'recent' => $recent_data,
+            'recent_webhooks' => $recent_wh_data,
+            'sync_method' => (string) get_option('alegra_connector_sync_method', 'cron'),
             'kill_switch_active' => \Alegra\Connector\Kill_Switch::is_active(),
             'kill_switch_reason' => \Alegra\Connector\Kill_Switch::reason(),
         ]);

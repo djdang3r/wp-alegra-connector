@@ -283,6 +283,11 @@ final class Alegra_Connector
         // priority-999 self-check below would wrongly deactivate the plugin).
         $this->init_logger();
 
+        // REQ-LOG-06: surface a logger write failure to the admin. Registered
+        // before the WooCommerce guard, like the logger itself, so the notice
+        // appears even when WC is missing.
+        add_action('admin_notices', [Logger\Logger::class, 'render_write_failure_notice']);
+
         // Daily retention pruning + entity-map reconciliation (AC-22/AC-60).
         // No WooCommerce dependency; always registered.
         Maintenance::register_hooks();

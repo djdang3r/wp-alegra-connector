@@ -33,7 +33,7 @@ include __DIR__.'/header.php';
         <div style="flex:1;"></div>
         <button class="ac-btn ac-btn-sm" id="alegra-refresh-logs"><span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;"></span> <?php esc_html_e('Actualizar','alegra-connector');?></button>
         <button class="ac-btn ac-btn-sm" id="alegra-download-logs"><span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span> <?php esc_html_e('Descargar','alegra-connector');?></button>
-        <button class="ac-btn ac-btn-sm" id="alegra-clear-logs" style="color:var(--ac-danger);"><span class="dashicons dashicons-trash" style="font-size:14px;width:14px;height:14px;"></span> <?php esc_html_e('Limpiar antiguos','alegra-connector');?></button>
+        <button class="ac-btn ac-btn-sm" id="alegra-clear-logs" style="color:var(--ac-danger);"><span class="dashicons dashicons-trash" style="font-size:14px;width:14px;height:14px;"></span> <?php esc_html_e('Limpiar logs','alegra-connector');?></button>
     </div>
 </div>
 
@@ -76,6 +76,14 @@ include __DIR__.'/header.php';
 </div>
 <?php endif;?>
 
+<!-- Ruta del directorio de logs (REQ-LOG-05): absoluta y copiable, siempre -->
+<div class="ac-card" style="margin-bottom:16px;padding:10px 20px;">
+    <span style="font-size:12px;color:var(--ac-text-muted);">
+        <?php esc_html_e('Los logs se almacenan en:','alegra-connector');?>
+    </span>
+    <code style="font-size:12px;user-select:all;"><?php echo esc_html($logger_dir);?></code>
+</div>
+
 <!-- Log Files -->
 <?php if(!empty($log_files)):?>
 <div class="ac-card" style="margin-top:16px;">
@@ -94,9 +102,6 @@ include __DIR__.'/header.php';
                 <?php endforeach;?>
             </tbody>
         </table>
-    </div>
-    <div style="margin-top:12px;font-size:11px;color:var(--ac-text-muted);">
-        <?php esc_html_e('Los logs se almacenan en:','alegra-connector');?> <code style="font-size:11px;">wp-content/uploads/alegra-logs/</code>
     </div>
 </div>
 <?php endif;?>

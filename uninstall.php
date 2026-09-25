@@ -66,6 +66,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_currency');
     delete_option('alegra_connector_log_retention_days');
     delete_option('alegra_connector_log_suffix');
+    delete_option('alegra_connector_logger_write_failed');
     delete_option('alegra_connector_conflict_resolution');
     delete_option('alegra_connector_sync_products');
     delete_option('alegra_connector_sync_customers');

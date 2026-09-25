@@ -7464,4 +7464,184 @@ TestRunner::test('T28.59 the page payload reflects blocked images (moved from Fa
     TestRunner::assertTrue(($resp->payload['images']['failed'] ?? 0) > 0, 'blocked counts as failed');
 });
 
+// ---------------------------------------------------------------------------
+// Fase 6 — logs (borrado total + ruta absoluta) y Monitor (T28.61-T28.615)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T28.61 clear_all_logs deletes every .log (today included) and recreates none', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $dir = $logger->get_log_dir();
+    @mkdir($dir, 0777, true);
+    foreach (glob($dir . '/*.log') ?: [] as $pre) {
+        @unlink($pre);
+    }
+    foreach (['2026-01-01', '2026-01-02', date('Y-m-d')] as $d) {
+        file_put_contents($dir . '/alegra-sync-test-' . $d . '.log', "x\n");
+    }
+    $res = $logger->clear_all_logs();
+    TestRunner::assertSame(3, $res['files'], 'debe borrar los 3 archivos, incluido el de hoy');
+    TestRunner::assertTrue($res['bytes'] > 0, 'debe reportar bytes liberados');
+    TestRunner::assertSame([], glob($dir . '/*.log') ?: [], 'el directorio debe quedar sin .log');
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_log_retention_days', 30), 'la retención no se toca');
+});
+
+TestRunner::test('T28.62 ajax_clear_logs responds with the real count and singular copy', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $dir = $logger->get_log_dir();
+    @mkdir($dir, 0777, true);
+    foreach (glob($dir . '/*.log') ?: [] as $pre) {
+        @unlink($pre);
+    }
+    file_put_contents($dir . '/a.log', 'x');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), $logger);
+    $resp = alegra_capture_json(static fn () => $admin->ajax_clear_logs());
+    TestRunner::assertTrue($resp->success, 'debe responder success');
+    TestRunner::assertSame(1, $resp->payload['files'], 'files debe ser 1');
+    TestRunner::assertStringContains('archivo de log eliminado', $resp->payload['message'], 'plural/singular correcto');
+});
+
+TestRunner::test('T28.63 the clear handler uses clear_all_logs, not the retention path', function (): void {
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains('clear_all_logs()', $admin, 'el handler usa el borrado total');
+    TestRunner::assertStringNotContains('clear_old_logs($retention)', $admin, 'el handler ya no usa la retención');
+    $logger_src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'logger/Logger/Logger.php');
+    TestRunner::assertStringContains('function clear_all_logs', $logger_src, 'el método existe');
+});
+
+TestRunner::test('T28.64 the button and confirm copy say delete ALL', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-logs.php');
+    TestRunner::assertStringContains('Limpiar logs', $tpl, 'el botón dice limpiar logs');
+    TestRunner::assertStringNotContains('Limpiar antiguos', $tpl, 'el copy viejo desaparece');
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains('Esto borrará TODOS los logs', $admin, 'el confirm es destructivo');
+});
+
+TestRunner::test('T28.65 a failed write persists the failure option', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $bogus = sys_get_temp_dir() . '/alegra-not-a-dir-' . uniqid();
+    @unlink($bogus);
+    file_put_contents($bogus, 'x'); // un ARCHIVO donde se espera un dir
+    $ref = new ReflectionClass($logger);
+    foreach (['log_dir' => $bogus, 'log_file' => $bogus . '/x.log', 'dir_ready' => true] as $p => $v) {
+        $prop = $ref->getProperty($p);
+        $prop->setAccessible(true);
+        $prop->setValue($logger, $v);
+    }
+    $logger->info('boom');
+    $failure = get_option('alegra_connector_logger_write_failed');
+    TestRunner::assertTrue(is_array($failure), 'el fallo debe persistirse');
+    TestRunner::assertSame($bogus, $failure['path'] ?? null, 'la opción debe llevar el path');
+    @unlink($bogus);
+});
+
+TestRunner::test('T28.66 a successful write self-heals the failure option', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_logger_write_failed', ['at' => 1, 'path' => '/x', 'error' => 'x'], false);
+    make_logger()->info('ok');
+    TestRunner::assertFalse(get_option('alegra_connector_logger_write_failed'), 'un write exitoso debe limpiar la opción');
+    TestRunner::assertSame(sys_get_temp_dir() . '/alegra-exec-uploads/alegra-logs', make_logger()->get_log_dir(), 'get_log_dir absoluta');
+});
+
+TestRunner::test('T28.67 render_write_failure_notice shows the path once and nothing without it', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_logger_write_failed', ['at' => time(), 'path' => '/var/www/uploads/alegra-logs', 'error' => 'Permission denied'], false);
+    ob_start();
+    \Alegra\Connector\Logger\Logger::render_write_failure_notice();
+    $html = ob_get_clean();
+    TestRunner::assertStringContains('/var/www/uploads/alegra-logs', $html, 'el aviso muestra la ruta');
+    TestRunner::assertStringContains('notice-error', $html, 'es un notice de error');
+    TestRunner::assertStringContains('is-dismissible', $html, 'es descartable');
+    alegra_test_reset();
+    ob_start();
+    \Alegra\Connector\Logger\Logger::render_write_failure_notice();
+    $empty = ob_get_clean();
+    TestRunner::assertSame('', $empty, 'sin opción no hay aviso (escenario negativo)');
+});
+
+TestRunner::test('T28.68 the failure notice is registered before the WooCommerce guard', function (): void {
+    $main = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'alegra-connector.php');
+    TestRunner::assertStringContains('render_write_failure_notice', $main, 'el renderer debe registrarse');
+    $hook = strpos($main, "add_action('admin_notices', [Logger\\Logger::class, 'render_write_failure_notice'])");
+    $guard = strpos($main, "class_exists('WooCommerce')");
+    TestRunner::assertTrue($hook !== false, 'el add_action exacto debe existir');
+    TestRunner::assertTrue($guard !== false, 'el guard de WooCommerce debe existir');
+    TestRunner::assertTrue($hook < $guard, 'el aviso corre aunque WC no esté');
+});
+
+TestRunner::test('T28.69 the logs page always renders the absolute path', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), $logger);
+    ob_start();
+    $admin->render_logs_page();
+    $html = ob_get_clean();
+    TestRunner::assertStringContains($logger->get_log_dir(), $html, 'debe renderizar la ruta absoluta');
+    TestRunner::assertStringNotContains('wp-content/uploads/alegra-logs/', $html, 'no debe quedar la ruta relativa hardcodeada');
+});
+
+TestRunner::test('T28.610 the logs template and controller use the absolute dir helper', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-logs.php');
+    TestRunner::assertStringContains('esc_html($logger_dir)', $tpl, 'el template escapa la ruta del controller');
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains('$this->logger->get_log_dir()', $admin, 'el controller resuelve la ruta absoluta');
+});
+
+TestRunner::test('T28.611 the monitor labels run origins and shows the stale badge', function (): void {
+    $mon = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-monitor.php');
+    TestRunner::assertStringContains('function runTypeLabel', $mon, 'debe existir el mapeo de origen');
+    TestRunner::assertSame(2, substr_count($mon, 'runTypeLabel(r.type)'), 'debe usarse en running y recent');
+    TestRunner::assertStringContains("case 'stale'", $mon, 'el badge abandonado debe existir');
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'statusAbandoned'", $admin, 'string dueña T6.4.a');
+    TestRunner::assertStringContains("'originChunked'", $admin, 'string dueña T6.4.a');
+    TestRunner::assertStringContains("'originWebhook'", $admin, 'string dueña T6.4.a');
+});
+
+TestRunner::test('T28.612 the monitor payload exposes sync_method', function (): void {
+    alegra_test_reset();
+    $GLOBALS['wp_options']['alegra_connector_sync_method'] = 'real-time';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(static fn () => $admin->ajax_monitor_status());
+    TestRunner::assertTrue($resp->success, 'monitor responde success');
+    TestRunner::assertSame('real-time', $resp->payload['sync_method'] ?? null, 'el payload expone sync_method');
+});
+
+TestRunner::test('T28.613 the monitor renders honest empty/error states with a local fmt', function (): void {
+    $mon = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-monitor.php');
+    TestRunner::assertStringNotContains('// Silent fail - retry next poll', $mon, 'el error ya no es silencioso');
+    TestRunner::assertStringContains('function fmt', $mon, 'helper local fmt (evita ReferenceError)');
+    TestRunner::assertStringContains('monitorError', $mon, 'consume la string de error');
+    TestRunner::assertStringContains('sync_method', $mon, 'pasa el método al render de cron');
+    TestRunner::assertStringContains('cronDisabled', $mon, 'consume la string de cron deshabilitado');
+    TestRunner::assertStringContains('escapeHtml(fmt(S.cronDisabled', $mon, 'escapa el método antes de inyectar');
+    TestRunner::assertStringContains('renderCron(d.cron, d.sync_method)', $mon, 'renderCron recibe sync_method');
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'sync_method' => (string) get_option('alegra_connector_sync_method'", $admin, 'el payload expone sync_method');
+});
+
+TestRunner::test('T28.614 sync_products queda false en las tres fuentes de verdad', function (): void {
+    alegra_test_reset();
+    $root = $GLOBALS['alegra_plugin_root'];
+    $main = (string) file_get_contents($root . 'alegra-connector.php');
+    $ctrl = (string) file_get_contents($root . 'includes/Sync/Controller.php');
+    $ui   = (string) file_get_contents($root . 'templates/admin-settings.php');
+    TestRunner::assertStringContains("'alegra_connector_sync_products' => false", $main, 'default del activador = false');
+    TestRunner::assertStringContains("get_option('alegra_connector_sync_products', false)", $ctrl, 'runtime del cron = false');
+    TestRunner::assertStringContains("get_option('alegra_connector_sync_products',false)", $ui, 'UI = false');
+    TestRunner::assertStringNotContains("alegra_connector_sync_products',true", $ui, 'la UI no debe usar true');
+    TestRunner::assertSame(false, get_option('alegra_connector_sync_products', false), 'sin opción, el runtime cae a false');
+});
+
+TestRunner::test('T28.615 the monitor partitions recent webhooks out of the history', function (): void {
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'recent_webhooks'", $admin, 'el payload separa webhooks');
+    TestRunner::assertStringContains('$recent_wh_data[]', $admin, 'el array se construye (gap L1)');
+    TestRunner::assertStringContains("strpos((string) \$r->run_type, 'webhook')", $admin, 'el filtro por origen');
+    $mon = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-monitor.php');
+    TestRunner::assertStringContains('d.recent_webhooks', $mon, 'el monitor renderiza la sección de webhooks');
+});
+
 exit(TestRunner::summary());
