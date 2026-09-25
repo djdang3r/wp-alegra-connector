@@ -82,11 +82,47 @@ class Orders
             $alegra_id = (string) $order->get_meta('_alegra_invoice_id', true);
 
             if ($alegra_id !== '') {
+                // FIX-3 (D1): con owner=invoice, un pedido que pasa a pagado
+                // debe ABRIR el borrador pre-existente. Hoy se retorna sin
+                // abrirlo ⇒ la factura queda draft y no mueve stock.
+                if (Inventory_Pusher::owner() === 'invoice'
+                    && (bool) get_option('alegra_connector_open_invoice_on_paid', true)
+                    && $order->is_paid()) {
+                    $opened = $this->ensure_invoice_open($alegra_id, true);
+                    if (!is_wp_error($opened)) {
+                        $this->persist_invoice_status($order, $opened);
+                    } elseif ($this->logger) {
+                        $this->logger->warning('No se pudo abrir el borrador pre-existente (owner=invoice)', [
+                            'order_id'   => $order_id,
+                            'invoice_id' => $alegra_id,
+                            'error'      => $opened->get_error_message(),
+                        ]);
+                    }
+                }
                 $this->logger->info('Order already has Alegra invoice', [
-                    'order_id' => $order_id,
+                    'order_id'  => $order_id,
                     'alegra_id' => $alegra_id,
                 ]);
                 return ['id' => $alegra_id, 'already_exists' => true];
+            }
+
+            // FIX-3: no crear una segunda factura si el pedido ya tiene una
+            // `open` (p. ej. abierta manualmente desde el dashboard).
+            if (Inventory_Pusher::owner() === 'invoice') {
+                $open_invoice = $this->find_open_invoice_for_order($order);
+                if ($open_invoice !== null) {
+                    $this->persist_invoice_result($order, (string) $open_invoice['id'], $open_invoice);
+                    return ['id' => (string) $open_invoice['id'], 'already_exists' => true];
+                }
+            }
+
+            // D2 (REQ-INV-01 rama b): con la factura como dueña, un pedido pagado
+            // nace `open` para que Alegra descuente stock nativo. El borrador no
+            // mueve stock (G1). Sólo aplica cuando el dueño es `invoice`.
+            if ($status_override === null
+                && Inventory_Pusher::owner() === 'invoice'
+                && $order->is_paid()) {
+                $status_override = 'open';
             }
 
             $data = $this->prepare_invoice_data($order, $status_override);
@@ -293,6 +329,25 @@ class Orders
             }
         }
 
+        return null;
+    }
+
+    /**
+     * FIX-3: factura `open` existente del pedido (evita doble conteo).
+     *
+     * @return array<string,mixed>|null
+     */
+    private function find_open_invoice_for_order(\WC_Order $order): ?array
+    {
+        $linked = (string) $order->get_meta('_alegra_invoice_id', true);
+        if ($linked !== '' && (string) $order->get_meta('_alegra_invoice_status', true) === 'open') {
+            return ['id' => $linked, 'status' => 'open'];
+        }
+        $client_id = (string) $order->get_meta('_billing_alegra_contact_id', true);
+        $existing = $this->find_existing_invoice($order, $client_id);
+        if ($existing !== null && (string) ($existing['status'] ?? '') === 'open') {
+            return $existing;
+        }
         return null;
     }
 

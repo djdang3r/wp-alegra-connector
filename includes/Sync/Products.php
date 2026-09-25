@@ -1141,7 +1141,8 @@ class Products
      */
     public function sync_inventory_from_alegra(int $run_id = 0): array
     {
-        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false];
+        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false,
+                   'skipped_not_manageable' => 0];
 
         // Kill switch guard: the pull is a sync entry point like any other and
         // must abort when the plugin is disconnected/deactivated. This was the
@@ -1221,10 +1222,6 @@ class Products
                         $this->logger->info('Inventory sync stopped by user mid-page');
                         break 2;
                     }
-                    if (!isset($item['inventory']['availableQuantity'])) {
-                        continue;
-                    }
-
                     $product_id = $this->get_product_by_alegra_id((string) $item['id']);
                     if (!$product_id) {
                         continue;
@@ -1235,38 +1232,71 @@ class Products
                         continue;
                     }
 
-                    $new_qty = (int) $item['inventory']['availableQuantity'];
-                    if ($new_qty < 0) {
-                        // Alegra permits negative stock; WooCommerce does not.
-                        // Mirror apply_inventory_to_product() and clamp to 0.
-                        $this->logger->warning('Clamping negative Alegra stock to 0', [
-                            'product_id' => $product_id,
-                            'alegra_id'  => $item['id'],
-                            'original'   => $new_qty,
-                        ]);
-                        $new_qty = 0;
-                    }
-                    if (!$product->get_manage_stock()) {
-                        continue;
+                    // D2/D6/FIX-8 (REQ-INV-01, NFR-07): el poll NUNCA re-infla
+                    // y TAMPOCO se muere de hambre.
+                    $synced  = Inventory_Pusher::synced($product_id);
+                    $pending = Inventory_Pusher::pending($product_id);
+
+                    $needs_reconcile = $product->get_manage_stock()
+                        && ($pending !== ''
+                            || ($synced !== '' && (int) $product->get_stock_quantity() !== (int) $synced));
+
+                    if ($needs_reconcile) {
+                        // (a) push fallido en vuelo, (b) delta local sin empujar,
+                        // (c) baseline pendiente (FIX-1): reconciliar WC→Alegra.
+                        // `from_poll=true` bypassa `is_syncing()` (FIX-2): el poll
+                        // es el que corre con set_syncing(true) (T7.3).
+                        $push = (new Inventory_Pusher($this->api, $this->logger))
+                            ->push_delta($product, (int) $product->get_stock_quantity(), true);
+
+                        // FIX-8: sólo se salta WC cuando el push REALMENTE maneja
+                        // el ítem. Si el pusher no es el dueño (disabled/
+                        // invoice_owner/not_linked/not_manageable), cae al writer:
+                        // el poll es el dueño de la escritura WC y no se congela.
+                        $handled = ['ok', 'already_applied', 'in_sync', 'api_error',
+                                    'blocked', 'locked', 'baseline_unverified'];
+                        if (in_array($push['reason'], $handled, true)) {
+                            continue;
+                        }
                     }
 
+                    $old_qty = $product->get_stock_quantity();
                     try {
-                        $old_qty = $product->get_stock_quantity();
-                        $product->set_stock_quantity($new_qty);
-                        // WC does not derive _stock_status from the quantity on
-                        // save(); it must be set explicitly so a 0 becomes
-                        // outofstock instead of keeping a stale instock.
-                        $product->set_stock_status($new_qty > 0 ? 'instock' : 'outofstock');
-                        $product->save();
-                        $result['updated']++;
+                        // C7: suprimir la cascada del propio wc_update_product_stock
+                        // (set_syncing del poll es T7.3; acá el guard por producto).
+                        set_transient('alegra_updating_product_' . $product_id, 1, 30);
 
-                        if ($old_qty !== $new_qty) {
-                            $this->logger->info('Inventory updated from Alegra', [
-                                'product_id' => $product_id,
-                                'alegra_id' => $item['id'],
-                                'old_qty' => $old_qty,
-                                'new_qty' => $new_qty,
-                            ]);
+                        // D3 (REQ-INV-02): un solo escritor. El writer decide
+                        // fuente/preserve/nulo/negativo/servicio/manage_stock y
+                        // deriva _stock_status con wc_update_product_stock (D5).
+                        $status = (new Inventory_Writer($this->logger))->apply($product, $item, [
+                            'source'       => 'alegra',
+                            'preserve'     => in_array('inventory', $this->resolve_preserve_fields(), true),
+                            'manage_stock' => get_option('alegra_connector_inventory_manage_stock_enabled', false)
+                                ? 'enable'
+                                : 'respect',
+                            'dry_run'      => (bool) get_option('alegra_connector_dry_run', false),
+                            'warehouse_id' => $this->resolve_warehouse_id(),
+                        ]);
+
+                        if ($status === 'updated' || $status === 'clamped_negative') {
+                            // FIX-1: éste es el ÚNICO camino del poll que fija
+                            // `synced` sin push: el poll escribió el valor de
+                            // Alegra en WC, así que WC y Alegra acuerdan.
+                            Inventory_Pusher::set_synced($product_id, (int) $product->get_stock_quantity());
+                            Inventory_Pusher::clear_pending($product_id);
+                            $result['updated']++;
+                            $new_qty = $product->get_stock_quantity();
+                            if ($old_qty !== $new_qty) {
+                                $this->logger->info('Inventory updated from Alegra', [
+                                    'product_id' => $product_id,
+                                    'alegra_id'  => $item['id'],
+                                    'old_qty'    => $old_qty,
+                                    'new_qty'    => $new_qty,
+                                ]);
+                            }
+                        } elseif ($status === 'skipped_not_manageable') {
+                            $result['skipped_not_manageable']++;
                         }
                     } catch (\Exception $e) {
                         $result['errors']++;
@@ -1274,6 +1304,8 @@ class Products
                             'product_id' => $product_id,
                             'error' => $e->getMessage(),
                         ]);
+                    } finally {
+                        delete_transient('alegra_updating_product_' . $product_id);
                     }
                 }
 
@@ -1282,6 +1314,15 @@ class Products
                 if (count($items) < 30) {
                     break;
                 }
+            }
+
+            // D3.4 (T2.5): report the legacy manage_stock=no backlog so the
+            // merchant can decide whether to flip the opt-in.
+            if ($result['skipped_not_manageable'] > 0) {
+                $this->logger->info('Inventory sync: products skipped because WC does not manage stock', [
+                    'count'  => $result['skipped_not_manageable'],
+                    'opt_in' => (bool) get_option('alegra_connector_inventory_manage_stock_enabled', false),
+                ]);
             }
 
             $this->logger->info('Inventory sync from Alegra completed', $result);
@@ -1998,15 +2039,9 @@ class Products
                 $product->set_description($item['description']);
             }
 
-            // Inventory. The setting was ignored here before: a merchant who
-            // chose WooCommerce as the source still had stock overwritten on
-            // every import. When WooCommerce owns inventory the plugin must not
-            // touch stock at all. A variable PARENT never manages stock in WC
-            // (its variations do), so it is skipped too.
-            if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce'
-                && !in_array('inventory', $preserve, true)) {
-                $this->apply_inventory_to_product($product, $item);
-            }
+            // D3 (REQ-INV-02): la compuerta (fuente + preserve) vive en
+            // Inventory_Writer; acá sólo se arma el contexto. Un solo escritor.
+            $this->apply_inventory_to_product($product, $item, $preserve);
 
             if (!empty($item['reference']) && !in_array('sku', $preserve, true)) {
                 $product->set_sku($item['reference']);
@@ -2026,77 +2061,37 @@ class Products
     }
 
     /**
-     * Land Alegra inventory on the WooCommerce entity that manages stock.
+     * W1 — el import delega en el escritor único (D3).
      *
-     * WooCommerce ignores `_stock` unless `_manage_stock` is enabled, and it
-     * does NOT derive `_stock_status` from `set_stock_quantity()`+`save()`, so
-     * all three fields must be written explicitly. Without this the stock value
-     * was written but never shown — the root cause of "no trae la existencia".
+     * WooCommerce ignores `_stock` unless `_manage_stock` is enabled. The
+     * `_stock_status` is DERIVED by WC on save(): `WC_Product::save()` calls
+     * `validate_props()` (WC >= 3.0), which computes instock/onbackorder/
+     * outofstock from quantity + `_backorders` + the no-stock threshold. The
+     * old claim that WC does not derive it was FALSE. The write goes through
+     * `wc_update_product_stock()` (the recommended API, which fires the stock
+     * hooks) and never forces the status; `_backorders` is respected untouched.
      *
      * The presence of the `inventory` object is what marks an Alegra item as
      * inventariable ("Si este objeto está presente indica que el artículo es
-     * inventariable, si no lo está se asume como servicio").
+     * inventariable, si no lo está se asume como servicio"). All the gates
+     * (source/preserve/service/parent/null/negative/manage_stock/dry_run) live
+     * in `Inventory_Writer`, the single writer (D3/REQ-INV-02/05).
      *
-     *  - inventariable                    → `_manage_stock=yes` + `_stock` + `_stock_status`
-     *  - servicio (no `inventory`)        → `_manage_stock=no`, stock untouched
-     *  - `availableQuantity` null/absent  → manage_stock only, NEVER write 0
-     *  - `availableQuantity` negative     → clamp to 0 + WARN (Alegra allows it, WC does not)
-     *
-     * `_backorders` is not exposed by Alegra and is deliberately left untouched.
-     * A variable PARENT is forced to `_manage_stock=no` and its stock left
-     * alone; simple products and variations receive the three fields, so the
-     * data lands on the entity that actually owns stock.
+     * @param array<int,string> $preserve `resolve_preserve_fields()` del update.
      *
      * @see https://developer.alegra.com/reference/get_items.md
      */
-    private function apply_inventory_to_product(\WC_Product $product, array $item): void
+    private function apply_inventory_to_product(\WC_Product $product, array $item, array $preserve = []): void
     {
-        // A variable PARENT never manages stock in WC: its variations do.
-        // Writing stock on the parent is silently ignored and leaves
-        // inconsistent data, so the parent is forced to `_manage_stock=no`
-        // while each variation receives its own quantity below.
-        if ($product->is_type('variable')) {
-            $product->set_manage_stock(false);
-            return;
-        }
-
-        $inventory = $item['inventory'] ?? null;
-
-        if (!is_array($inventory)) {
-            // Service: WC must not manage stock for it. Stock is left as-is.
-            $product->set_manage_stock(false);
-            return;
-        }
-
-        // Inventariable: WC only honors `_stock` when `_manage_stock` is on.
-        $product->set_manage_stock(true);
-
-        $qty = $inventory['availableQuantity'] ?? null;
-        if ($qty === null || $qty === '' || !is_numeric($qty)) {
-            // "No sé" is not "cero": leave quantity/status untouched instead of
-            // marking the product out of stock.
-            $this->logger->warning('Skipping stock update: Alegra returned no usable availableQuantity', [
-                'product_id' => $product->get_id(),
-                'alegra_id'  => (string) ($item['id'] ?? ''),
-            ]);
-            return;
-        }
-
-        $qty = (int) $qty;
-        if ($qty < 0) {
-            // Alegra permits negative stock; WooCommerce does not. Clamping is
-            // always reversible, propagating a negative is not.
-            $this->logger->warning('Clamping negative Alegra stock to 0', [
-                'product_id' => $product->get_id(),
-                'alegra_id'  => (string) ($item['id'] ?? ''),
-                'original'   => $qty,
-            ]);
-            $qty = 0;
-        }
-
-        $product->set_stock_quantity($qty);
-        // WC does not recompute the status on save(); it must be set explicitly.
-        $product->set_stock_status($qty > 0 ? 'instock' : 'outofstock');
+        (new Inventory_Writer($this->logger))->apply($product, $item, [
+            'source'       => (string) get_option('alegra_connector_inventory_source', 'alegra'),
+            'preserve'     => in_array('inventory', $preserve, true),
+            // El import SIEMPRE habilitó manage_stock (comportamiento HEAD, W1
+            // `:2072`): se conserva con 'enable' para no cambiar el import.
+            'manage_stock' => 'enable',
+            'dry_run'      => (bool) get_option('alegra_connector_dry_run', false),
+            'warehouse_id' => $this->resolve_warehouse_id(),
+        ]);
     }
 
     /**

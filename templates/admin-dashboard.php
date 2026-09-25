@@ -159,6 +159,22 @@ include __DIR__ . '/header.php';
                 <?php endif; ?>
             </span>
         </div>
+        <?php if (!empty($divergence['count'])): ?>
+        <div class="alegra-health-row is-danger">
+            <span class="alegra-health-dot is-amber"></span>
+            <span class="alegra-health-label"><?php esc_html_e('Ventas sin factura', 'alegra-connector'); ?></span>
+            <span class="alegra-health-status">
+                <?php echo esc_html(sprintf(
+                    /* translators: %d: number of sold orders without a linked Alegra invoice. */
+                    __('%d pedidos vendidos no tienen factura en Alegra', 'alegra-connector'),
+                    (int) $divergence['count']
+                )); ?>
+            </span>
+            <span class="alegra-health-action">
+                <?php esc_html_e('El stock de Alegra puede no reflejar esas ventas.', 'alegra-connector'); ?>
+            </span>
+        </div>
+        <?php endif; ?>
     </div>
 </div>
 

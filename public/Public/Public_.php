@@ -74,6 +74,13 @@ class Public_
             add_action('woocommerce_delete_product', [$this, 'on_delete_product'], 10, 1);
         }
 
+        // D2 (REQ-INV-01): empuje de stock WC→Alegra. Sólo si el push de
+        // inventario está activo. El dueño (adjustment/invoice) lo decide
+        // push_delta() en runtime, así que el hook se registra igual.
+        if (get_option('alegra_connector_push_inventory_enabled', true)) {
+            Sync\Inventory_Pusher::register_hooks($this->api, $this->logger);
+        }
+
         // Customer hooks: an INDEPENDENT toggle (REQ-CFG-4). Enabling products
         // must never enable customers on its own.
         if (get_option('alegra_connector_push_customers_enabled', false)) {

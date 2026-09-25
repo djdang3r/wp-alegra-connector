@@ -382,6 +382,17 @@ class Admin_Dashboard
             'default' => false,
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_push_products_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
+        // D2 (T3.5): WC → Alegra stock push switch (owner=adjustment).
+        register_setting('alegra_connector_settings', 'alegra_connector_push_inventory_enabled', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => true,
+        ]);
+        // D2/FIX-3 (T3.5): with owner=invoice, a paid order opens its invoice so
+        // Alegra moves stock natively. Inert unless push_orders_enabled=true.
+        register_setting('alegra_connector_settings', 'alegra_connector_open_invoice_on_paid', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => true,
+        ]);
         // Independent customer toggle (REQ-CFG-4): enabling products must never
         // enable customers on its own.
         register_setting('alegra_connector_settings', 'alegra_connector_push_customers_enabled', [
@@ -421,6 +432,12 @@ class Admin_Dashboard
         register_setting('alegra_connector_settings', 'alegra_connector_sync_categories', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_inventory_source', ['sanitize_callback' => 'sanitize_text_field']);
         register_setting('alegra_connector_settings', 'alegra_connector_inventory_sync_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
+        // D3.4 (T2.5): opt-in legacy manage_stock=no migration. Default false.
+        register_setting('alegra_connector_settings', 'alegra_connector_inventory_manage_stock_enabled', [
+            'type'              => 'boolean',
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default'           => false,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_warehouse_id', [
             'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_warehouse_id'),
         ]);
@@ -823,6 +840,38 @@ class Admin_Dashboard
         ];
     }
 
+    /**
+     * REQ-INV-07: ventas sin factura vinculada. Sólo lectura.
+     *
+     * @return array{count:int, orders:array<int,array{id:int,status:string,total:float,date:string}>}
+     */
+    public function get_unjournaled_sales(int $limit = 20): array
+    {
+        $ids = wc_get_orders([
+            'status'     => ['processing', 'completed'],
+            'limit'      => $limit,
+            'return'     => 'ids',
+            'orderby'    => 'date',
+            'order'      => 'DESC',
+            'meta_query' => [[ 'key' => '_alegra_invoice_id', 'compare' => 'NOT EXISTS' ]],
+        ]);
+        $orders = [];
+        foreach ($ids as $id) {
+            $order = wc_get_order($id);
+            if (!$order) {
+                continue;
+            }
+            $created = $order->get_date_created();
+            $orders[] = [
+                'id'     => (int) $id,
+                'status' => (string) $order->get_status(),
+                'total'  => (float) $order->get_total(),
+                'date'   => $created instanceof \DateTimeInterface ? $created->format('Y-m-d H:i:s') : '',
+            ];
+        }
+        return ['count' => count($orders), 'orders' => $orders];
+    }
+
     public function render_dashboard(): void
     {
         if (!current_user_can('manage_woocommerce')) {
@@ -834,6 +883,12 @@ class Admin_Dashboard
         $last_sync = get_transient('alegra_connector_last_sync');
         $stats = $this->get_sync_stats();
         $header_color = 'indigo';
+
+        // REQ-INV-07: honest visibility. With owner=adjustment the sales ARE
+        // reflected via adjustments; only the manual-invoice mode can diverge.
+        $divergence = (!get_option('alegra_connector_push_orders_enabled', false))
+            ? $this->get_unjournaled_sales()
+            : ['count' => 0, 'orders' => []];
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-dashboard.php';
     }

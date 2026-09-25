@@ -29,7 +29,7 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
 
 $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
@@ -38,7 +38,7 @@ $GLOBALS['alegra_mock_contact_identification_mode'] = 'exact';
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
@@ -586,18 +586,33 @@ function alegra_mock_validate_invoice(array $body): ?array
 }
 
 /**
- * POST /inventory-adjustments. Required: item.id, type in|out, quantity > 0.
+ * POST /inventory-adjustments. Documented schema (OpenAPI, G3):
+ * required top-level: `date` (string) and `items` (non-empty array); each line
+ * requires `id` (string), `type` (in|out), `quantity` (number) and `unitCost`
+ * (number). `warehouse` is optional. The old `item:{id}` + top-level
+ * `type`/`quantity` shape was WRONG (fase-1 K-H4); G3 confirmed the real one.
  */
 function alegra_mock_validate_inventory_adjustment(array $body): ?array
 {
-    if (empty($body['item']) || !is_array($body['item']) || empty($body['item']['id'])) {
-        return alegra_mock_validation_error('El campo item.id es obligatorio');
+    if (empty($body['date']) || !is_string($body['date'])) {
+        return alegra_mock_validation_error('El campo date es obligatorio');
     }
-    if (($body['type'] ?? '') !== 'in' && ($body['type'] ?? '') !== 'out') {
-        return alegra_mock_validation_error('El campo type debe ser in u out');
+    if (empty($body['items']) || !is_array($body['items'])) {
+        return alegra_mock_validation_error('El campo items es obligatorio');
     }
-    if (!isset($body['quantity']) || !is_numeric($body['quantity']) || (int) $body['quantity'] <= 0) {
-        return alegra_mock_validation_error('El campo quantity debe ser numerico y mayor a cero');
+    foreach ($body['items'] as $line) {
+        if (!is_array($line) || empty($line['id'])) {
+            return alegra_mock_validation_error('El campo items[].id es obligatorio');
+        }
+        if (($line['type'] ?? '') !== 'in' && ($line['type'] ?? '') !== 'out') {
+            return alegra_mock_validation_error('El campo items[].type debe ser in u out');
+        }
+        if (!isset($line['quantity']) || !is_numeric($line['quantity']) || (int) $line['quantity'] <= 0) {
+            return alegra_mock_validation_error('El campo items[].quantity debe ser numerico y mayor a cero');
+        }
+        if (!isset($line['unitCost']) || !is_numeric($line['unitCost'])) {
+            return alegra_mock_validation_error('El campo items[].unitCost es obligatorio');
+        }
     }
     return null;
 }
@@ -728,6 +743,24 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     if ($method === 'GET' && $path === '/credit-notes') {
         return alegra_mock_response(200, array_values($GLOBALS['alegra_mock_state']['credit_notes']));
     }
+    if ($method === 'GET' && $path === '/inventory-adjustments') {
+        $all = array_values($GLOBALS['alegra_mock_state']['inventory_adjustments']);
+        // FIX-4: the pusher pre-searches by item to avoid re-emitting a delta.
+        if (!empty($query['item_id'])) {
+            $item_id = (string) $query['item_id'];
+            $all = array_values(array_filter($all, static function ($adj) use ($item_id) {
+                foreach ((array) ($adj['items'] ?? []) as $line) {
+                    if (is_array($line) && (string) ($line['id'] ?? '') === $item_id) {
+                        return true;
+                    }
+                }
+                return false;
+            }));
+        }
+        $start = (int) ($query['start'] ?? 0);
+        $limit = (int) ($query['limit'] ?? 30);
+        return alegra_mock_response(200, array_slice($all, $start, $limit));
+    }
 
     // --- GET /terms/{id} ---
     if ($method === 'GET' && preg_match('#^/terms/([^/]+)$#', $path, $m)) {
@@ -826,23 +859,40 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         return alegra_mock_response(200, $stored);
     }
     if ($method === 'POST' && $path === '/inventory-adjustments') {
-        $item_id = (string) ($body['item']['id'] ?? '');
-        $qty     = (int) ($body['quantity'] ?? 0);
-        $type    = (string) ($body['type'] ?? 'in');
-        $item    = $GLOBALS['alegra_mock_state']['items'][$item_id] ?? null;
-        if ($item === null) {
-            return alegra_mock_response(400, ['code' => 400, 'message' => 'El item no existe']);
+        // Documented shape (G3): {date, items:[{id,type,quantity,unitCost}], warehouse?}.
+        $stored_items = [];
+        foreach ((array) ($body['items'] ?? []) as $line) {
+            if (!is_array($line)) {
+                continue;
+            }
+            $item_id = (string) ($line['id'] ?? '');
+            $item    = $GLOBALS['alegra_mock_state']['items'][$item_id] ?? null;
+            if ($item === null) {
+                return alegra_mock_response(400, ['code' => 400, 'message' => 'El item no existe']);
+            }
+            $qty     = (int) ($line['quantity'] ?? 0);
+            $type    = (string) ($line['type'] ?? 'in');
+            $delta   = $type === 'out' ? -$qty : $qty;
+            $current = (int) ($item['inventory']['availableQuantity'] ?? 0);
+            $GLOBALS['alegra_mock_state']['items'][$item_id]['inventory']['availableQuantity'] = max(0, $current + $delta);
+            $stored_items[] = [
+                'id'        => $item_id,
+                'name'      => (string) ($item['name'] ?? ''),
+                'quantity'  => $qty,
+                'type'      => $type,
+                'unitCost'  => (float) ($line['unitCost'] ?? 0),
+                'reference' => (string) ($item['reference'] ?? ''),
+            ];
         }
-        $current = (int) ($item['inventory']['availableQuantity'] ?? 0);
-        $delta   = $type === 'out' ? -$qty : $qty;
-        $GLOBALS['alegra_mock_state']['items'][$item_id]['inventory']['availableQuantity'] = max(0, $current + $delta);
-        return alegra_mock_response(200, [
-            'id'       => alegra_mock_uuid('a9a9a9a9'),
-            'date'     => (string) ($body['date'] ?? ''),
-            'type'     => $type,
-            'quantity' => $qty,
-            'item'     => ['id' => $item_id],
-        ]);
+        $stored = [
+            'id'           => alegra_mock_uuid('a9a9a9a9'),
+            'date'         => (string) ($body['date'] ?? ''),
+            'observations' => (string) ($body['observations'] ?? ''),
+            'warehouse'    => $body['warehouse'] ?? null,
+            'items'        => $stored_items,
+        ];
+        $GLOBALS['alegra_mock_state']['inventory_adjustments'][$stored['id']] = $stored;
+        return alegra_mock_response(200, $stored);
     }
     if ($method === 'POST' && preg_match('#^/invoices/([^/]+)/void$#', $path, $m)) {
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'void']);

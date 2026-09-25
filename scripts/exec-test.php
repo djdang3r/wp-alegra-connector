@@ -265,6 +265,9 @@ echo "\nT3 — Invoice creation (Orders::create_invoice)\n";
 
 TestRunner::test('T3.1 CO invoice payload is complete and is created as a DRAFT', function (): void {
     alegra_test_reset();
+    // D2/FIX-3: pin the adjustment owner so the configured draft default is the
+    // one under test. With owner=invoice a paid order's invoice opens (T29.37*).
+    update_option('alegra_connector_open_invoice_on_paid', false);
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '119']);
     update_post_meta(10, '_alegra_item_id', '1t3m-co');
 
@@ -328,6 +331,10 @@ TestRunner::test('T3.2 an OPEN invoice status setting is honoured and no stamp i
 
 TestRunner::test('T3.3 a pre-existing DRAFT invoice is NEVER opened by the invoice+payment path', function (): void {
     alegra_test_reset();
+    // D2/FIX-3: this contract holds for the ADJUSTMENT owner. With owner=invoice
+    // a paid order DOES open its pre-existing draft (T29.37b); that is the
+    // deliberate D2 behavior, so pin the owner here to test the other branch.
+    update_option('alegra_connector_open_invoice_on_paid', false);
     update_option('alegra_connector_payment_account_id', 'ba-1');
 
     // The invoice was created earlier (e.g. by woocommerce_new_order) as a draft.
@@ -2835,6 +2842,9 @@ TestRunner::test('T18.13 BUG 7 an automatic order sync failure adds an order not
 
 TestRunner::test('T18.14 BUG 8 a payment account of "0" is treated as unconfigured', function (): void {
     alegra_test_reset();
+    // D2/FIX-3: pin the adjustment owner so the configured draft default is the
+    // one under test (owner=invoice opens a paid order's invoice; T29.37*).
+    update_option('alegra_connector_open_invoice_on_paid', false);
     update_option('alegra_connector_payment_account_id', '0');
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '10']);
     update_post_meta(10, '_alegra_item_id', '1t3m-zero');
@@ -8086,20 +8096,35 @@ TestRunner::test('T29.14 POST /inventory-adjustments aplica el delta al stock de
     alegra_mock_seed_item('it-adj', ['name' => 'Adj', 'inventory' => ['availableQuantity' => 10]]);
     $api = make_api();
 
+    // Documented schema (G3): {date, items:[{id,type,quantity,unitCost}], warehouse?}.
     $out = $api->create_inventory_adjustment([
-        'date' => '2026-09-25', 'type' => 'out', 'quantity' => 3, 'item' => ['id' => 'it-adj'],
+        'date' => '2026-09-25',
+        'items' => [['id' => 'it-adj', 'type' => 'out', 'quantity' => 3, 'unitCost' => 1.5]],
     ]);
     TestRunner::assertFalse(is_wp_error($out), 'el ajuste out debe aceptarse');
     TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-adj']['inventory']['availableQuantity'], 'out resta');
 
     $in = $api->create_inventory_adjustment([
-        'date' => '2026-09-25', 'type' => 'in', 'quantity' => 2, 'item' => ['id' => 'it-adj'],
+        'date' => '2026-09-25',
+        'items' => [['id' => 'it-adj', 'type' => 'in', 'quantity' => 2, 'unitCost' => 1.5]],
     ]);
     TestRunner::assertFalse(is_wp_error($in), 'el ajuste in debe aceptarse');
     TestRunner::assertSame(9, (int) $GLOBALS['alegra_mock_state']['items']['it-adj']['inventory']['availableQuantity'], 'in suma');
 
-    $bad = $api->create_inventory_adjustment(['type' => 'out', 'quantity' => 0, 'item' => ['id' => 'it-adj']]);
+    // FIX-4: the mock supports GET /inventory-adjustments (item_id filter).
+    $listed = $api->get_inventory_adjustments(['item_id' => 'it-adj']);
+    TestRunner::assertFalse(is_wp_error($listed), 'GET /inventory-adjustments debe responder');
+    TestRunner::assertSame(2, count($listed), 'el mock conserva los ajustes del item');
+
+    $bad = $api->create_inventory_adjustment([
+        'date' => '2026-09-25',
+        'items' => [['id' => 'it-adj', 'type' => 'out', 'quantity' => 0, 'unitCost' => 1.5]],
+    ]);
     TestRunner::assertTrue(is_wp_error($bad), 'quantity 0 => 400 (quantity debe ser > 0)');
+
+    // The old K-H4 shape (item singular, no items[]/unitCost) is invalid.
+    $old = $api->create_inventory_adjustment(['date' => '2026-09-25', 'type' => 'out', 'quantity' => 1, 'item' => ['id' => 'it-adj']]);
+    TestRunner::assertTrue(is_wp_error($old), 'el shape viejo item:{id} sin items[]/unitCost => 400');
 });
 
 TestRunner::test('T29.15 POST /invoices rechaza un client inexistente (opt-in)', function (): void {
@@ -8186,6 +8211,558 @@ TestRunner::test('T29.110 los helpers del ledger leen/escriben las metas de stoc
     TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::pending(910), 'round-trip pending');
     \Alegra\Connector\Sync\Inventory_Pusher::clear_pending(910);
     TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(910), 'clear_pending borra');
+});
+
+// ---------------------------------------------------------------------------
+// Fase 2 — Inventory_Writer (D3/D5): el escritor único
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T29.21 el writer dispara hooks y deriva stock_status', function (): void {
+    alegra_test_reset();
+    $p = alegra_make_product(920, ['manage_stock' => true, 'stock' => 5, 'backorders' => 'yes']);
+    $GLOBALS['hook_hits'] = 0;
+    add_action('woocommerce_product_set_stock', function ($product): void {
+        $GLOBALS['hook_hits']++;
+    }, 10, 1);
+
+    $r = (new \Alegra\Connector\Sync\Inventory_Writer())->apply(
+        $p,
+        ['inventory' => ['availableQuantity' => 0]],
+        ['manage_stock' => 'enable']
+    );
+    TestRunner::assertSame('updated', $r, 'el writer reporta updated');
+    TestRunner::assertSame('onbackorder', $p->get_stock_status(), 'backorders=yes + qty 0 => onbackorder');
+    TestRunner::assertSame(1, $GLOBALS['hook_hits'], 'wc_update_product_stock dispara el hook una vez');
+});
+
+TestRunner::test('T29.22 las compuertas del writer', function (): void {
+    alegra_test_reset();
+    $writer = new \Alegra\Connector\Sync\Inventory_Writer();
+
+    // 1) Fuente
+    $p = alegra_make_product(930, ['manage_stock' => true, 'stock' => 5]);
+    TestRunner::assertSame('skipped_source', $writer->apply($p, ['inventory' => ['availableQuantity' => 99]], ['source' => 'woocommerce', 'manage_stock' => 'enable']), 'source=woocommerce');
+    TestRunner::assertSame(5, $p->get_stock_quantity(), 'source no escribe');
+
+    // 2) Preserve
+    $p = alegra_make_product(931, ['manage_stock' => true, 'stock' => 5]);
+    TestRunner::assertSame('skipped_preserve', $writer->apply($p, ['inventory' => ['availableQuantity' => 99]], ['preserve' => true, 'manage_stock' => 'enable']), 'preserve');
+    TestRunner::assertSame(5, $p->get_stock_quantity(), 'preserve no escribe');
+
+    // 3) Variable padre
+    $parent = alegra_make_product(932, ['type' => 'variable', 'manage_stock' => true, 'stock' => 5]);
+    TestRunner::assertSame('skipped_parent', $writer->apply($parent, ['inventory' => ['availableQuantity' => 99]], ['manage_stock' => 'enable']), 'variable padre');
+    TestRunner::assertFalse($parent->get_manage_stock(), 'el padre no maneja stock');
+
+    // 4) Servicio (sin inventory)
+    $p = alegra_make_product(933, ['manage_stock' => true, 'stock' => 5]);
+    TestRunner::assertSame('skipped_service', $writer->apply($p, ['id' => 'svc'], ['manage_stock' => 'enable']), 'servicio');
+    TestRunner::assertFalse($p->get_manage_stock(), 'servicio no maneja stock');
+
+    // 5) manage_stock=respect + producto no gestionable
+    $p = alegra_make_product(934, ['manage_stock' => false, 'stock' => 5]);
+    TestRunner::assertSame('skipped_not_manageable', $writer->apply($p, ['inventory' => ['availableQuantity' => 99]]), 'respect');
+    TestRunner::assertSame(5, $p->get_stock_quantity(), 'respect no escribe');
+
+    // 6a) Nulo: nunca 0
+    $p = alegra_make_product(935, ['manage_stock' => true, 'stock' => 7]);
+    TestRunner::assertSame('skipped_no_qty', $writer->apply($p, ['inventory' => ['availableQuantity' => null]], ['manage_stock' => 'enable']), 'nulo');
+    TestRunner::assertSame(7, $p->get_stock_quantity(), 'nulo no escribe 0');
+
+    // 6b) Negativo: clamp 0
+    $p = alegra_make_product(936, ['manage_stock' => true, 'stock' => 7, 'backorders' => 'no']);
+    TestRunner::assertSame('clamped_negative', $writer->apply($p, ['inventory' => ['availableQuantity' => -3]], ['manage_stock' => 'enable']), 'negativo');
+    TestRunner::assertSame(0, $p->get_stock_quantity(), 'negativo clampea a 0');
+
+    // 7) Dry-run
+    $p = alegra_make_product(937, ['manage_stock' => true, 'stock' => 5]);
+    TestRunner::assertSame('dry_run', $writer->apply($p, ['inventory' => ['availableQuantity' => 99]], ['manage_stock' => 'enable', 'dry_run' => true]), 'dry_run');
+    TestRunner::assertSame(5, $p->get_stock_quantity(), 'dry_run no escribe');
+});
+
+TestRunner::test('T29.23 backorders=no idéntico a HEAD', function (): void {
+    alegra_test_reset();
+    $p = alegra_make_product(938, ['manage_stock' => true, 'stock' => 5, 'backorders' => 'no']);
+    $r = (new \Alegra\Connector\Sync\Inventory_Writer())->apply(
+        $p,
+        ['inventory' => ['availableQuantity' => 0]],
+        ['manage_stock' => 'enable']
+    );
+    TestRunner::assertSame('updated', $r, 'updated');
+    TestRunner::assertSame('outofstock', $p->get_stock_status(), 'backorders=no + qty 0 => outofstock');
+});
+
+TestRunner::test('T29.24 W1 delega en el writer y respeta source/preserve', function (): void {
+    alegra_test_reset();
+    $products = make_products();
+    $item = ['id' => 'it-w1', 'inventory' => ['availableQuantity' => 99]];
+
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    $p = alegra_make_product(940, ['manage_stock' => true, 'stock' => 5]);
+    alegra_call_private($products, 'apply_inventory_to_product', $p, $item, []);
+    TestRunner::assertSame(5, $p->get_stock_quantity(), 'source=woocommerce no escribe');
+
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_call_private($products, 'apply_inventory_to_product', $p, $item, []);
+    TestRunner::assertSame(99, $p->get_stock_quantity(), 'source=alegra escribe vía el writer');
+
+    $p2 = alegra_make_product(941, ['manage_stock' => true, 'stock' => 5]);
+    alegra_call_private($products, 'apply_inventory_to_product', $p2, $item, ['inventory']);
+    TestRunner::assertSame(5, $p2->get_stock_quantity(), 'preserve=inventory no escribe');
+
+    $r = (new \Alegra\Connector\Sync\Inventory_Writer())->apply(
+        alegra_make_product(942, ['manage_stock' => true, 'stock' => 1]),
+        $item,
+        ['source' => 'woocommerce', 'manage_stock' => 'enable']
+    );
+    TestRunner::assertSame('skipped_source', $r, 'el writer confirma skipped_source');
+});
+
+TestRunner::test('T29.25 W2 (poll) respeta preserve_fields', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(950, ['name' => 'Poll', 'sku' => 'P1', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(950, '_alegra_item_id', 'it-poll');
+    alegra_mock_seed_item('it-poll', ['name' => 'Poll', 'reference' => 'P1', 'inventory' => ['availableQuantity' => 10]]);
+
+    update_option('alegra_connector_import_preserve_fields', ['inventory']);
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(7, wc_get_product(950)->get_stock_quantity(), 'preserve no toca el stock');
+    TestRunner::assertSame(0, $result['updated'], 'preserve no cuenta updated');
+
+    update_option('alegra_connector_import_preserve_fields', []);
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(10, wc_get_product(950)->get_stock_quantity(), 'sin preserve escribe el valor de Alegra');
+    TestRunner::assertSame(1, $result['updated'], 'sin preserve cuenta updated');
+});
+
+TestRunner::test('T29.26 W2 no escribe servicios', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(951, ['name' => 'Svc', 'sku' => 'S1', 'stock' => 4, 'manage_stock' => true]);
+    update_post_meta(951, '_alegra_item_id', 'it-svc');
+    // Servicio: sin objeto `inventory`.
+    alegra_mock_seed_item('it-svc', ['name' => 'Svc', 'reference' => 'S1']);
+
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(4, wc_get_product(951)->get_stock_quantity(), 'un servicio no recibe cantidad');
+    TestRunner::assertSame(0, $result['updated'], 'un servicio no cuenta updated');
+});
+
+TestRunner::test('T29.27 opt-in manage_stock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_manage_stock_enabled', false);
+    alegra_make_product(952, ['name' => 'Legacy', 'sku' => 'L1', 'stock' => 3, 'manage_stock' => false]);
+    update_post_meta(952, '_alegra_item_id', 'it-legacy');
+    alegra_mock_seed_item('it-legacy', ['name' => 'Legacy', 'reference' => 'L1', 'inventory' => ['availableQuantity' => 8]]);
+
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(3, wc_get_product(952)->get_stock_quantity(), 'default respeta el manage_stock=no de WC');
+    TestRunner::assertSame(1, $result['skipped_not_manageable'], 'cuenta el skip del opt-in');
+    TestRunner::assertFalse(wc_get_product(952)->get_manage_stock(), 'no habilita manage_stock con el opt-in apagado');
+
+    update_option('alegra_connector_inventory_manage_stock_enabled', true);
+    $result = make_products()->sync_inventory_from_alegra();
+    TestRunner::assertTrue(wc_get_product(952)->get_manage_stock(), 'el opt-in habilita manage_stock');
+    TestRunner::assertSame(8, wc_get_product(952)->get_stock_quantity(), 'el opt-in escribe la cantidad');
+});
+
+TestRunner::test('T29.28 el docblock refutado está corregido (source-scan)', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Sync/Products.php');
+    TestRunner::assertStringNotContains('does NOT derive', $src, 'el claim refutado ya no está');
+    TestRunner::assertStringContains('validate_props', $src, 'el docblock cita validate_props');
+});
+
+TestRunner::test('T29.29 un solo escritor de stock (grep invariante)', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $violations = [];
+    foreach (['includes/', 'public/', 'admin/'] as $dir) {
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root . $dir));
+        foreach ($it as $file) {
+            if (!$file->isFile() || $file->getExtension() !== 'php') {
+                continue;
+            }
+            $path = $file->getPathname();
+            if (str_ends_with($path, 'includes/Sync/Inventory_Writer.php')) {
+                continue;
+            }
+            $src = (string) file_get_contents($path);
+            // Los comentarios no cuentan: sólo llamadas reales.
+            $src = (string) preg_replace('!/\*.*?\*/!s', '', $src);
+            $src = (string) preg_replace('![ \t]*//.*$!m', '', $src);
+            if (preg_match('/set_manage_stock|set_stock_quantity|set_stock_status|wc_update_product_stock/', $src)) {
+                $violations[] = str_replace($root, '', $path);
+            }
+        }
+    }
+    TestRunner::assertSame([], $violations, 'solo Inventory_Writer.php llama a los setters de stock');
+});
+
+// ---------------------------------------------------------------------------
+// Fase 3 — Inventory_Pusher (D2): el dueño híbrido y el delta tracking
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T29.31 owner y payload documentado', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    TestRunner::assertSame('adjustment', \Alegra\Connector\Sync\Inventory_Pusher::owner(), 'push_orders=false => adjustment');
+
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    TestRunner::assertSame('invoice', \Alegra\Connector\Sync\Inventory_Pusher::owner(), 'push_orders && open_invoice_on_paid => invoice');
+
+    update_option('alegra_connector_open_invoice_on_paid', false);
+    TestRunner::assertSame('adjustment', \Alegra\Connector\Sync\Inventory_Pusher::owner(), 'push_orders && !open_invoice_on_paid => adjustment');
+
+    $p = alegra_make_product(1000, ['regular_price' => '0']);
+    $pusher = new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger());
+    $payload = alegra_call_private($pusher, 'build_adjustment_payload', '4', -3, $p);
+    TestRunner::assertSame('out', $payload['items'][0]['type'] ?? null, 'type out');
+    TestRunner::assertSame(3, $payload['items'][0]['quantity'] ?? null, 'quantity abs(delta)');
+    TestRunner::assertSame('4', $payload['items'][0]['id'] ?? null, 'id string');
+    TestRunner::assertTrue(($payload['items'][0]['unitCost'] ?? 0) > 0, 'unitCost > 0 (FIX-12)');
+});
+
+TestRunner::test('T29.32 ledger del pusher', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-p', ['name' => 'P', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1010, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1010, '_alegra_item_id', 'it-p');
+    $pusher = new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger());
+
+    // (a) hook sin baseline: pending, synced vacío, sin POST
+    $r = $pusher->push_delta($p, 7, false);
+    TestRunner::assertSame('baseline_pending', $r['reason'], 'hook sin baseline');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::synced(1010), 'synced NO se fija desde WC');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::pending(1010), 'pending = new_qty');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'no POST en baseline_pending');
+
+    // (b) in_sync: no POST
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1010, 7);
+    \Alegra\Connector\Sync\Inventory_Pusher::clear_pending(1010);
+    $r = $pusher->push_delta($p, 7, true);
+    TestRunner::assertSame('in_sync', $r['reason'], 'delta 0');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'in_sync no POSTea');
+
+    // (c) delta out aplicado en el mock
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1010, 10);
+    $r = $pusher->push_delta($p, 7, true);
+    TestRunner::assertSame('ok', $r['reason'], 'delta aplicado');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-p']['inventory']['availableQuantity'], 'el mock resta 3');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1010), 'synced=7 tras el OK');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(1010), 'pending limpio');
+
+    // (d) api_error deja pending y synced viejo
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1010, 7);
+    alegra_mock_fail('POST', '/inventory-adjustments', 500, ['message' => 'boom'], 1);
+    $r = $pusher->push_delta($p, 5, true);
+    TestRunner::assertSame('api_error', $r['reason'], 'el POST falla');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1010), 'synced NO avanza con el POST fallido');
+    TestRunner::assertSame(5, \Alegra\Connector\Sync\Inventory_Pusher::pending(1010), 'pending queda para reintentar');
+});
+
+TestRunner::test('T29.32b baseline desde Alegra (FIX-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-b', ['name' => 'B', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1020, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1020, '_alegra_item_id', 'it-b');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(1020, 7);   // venta antes del primer baseline
+
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, true);
+    TestRunner::assertSame('ok', $r['reason'], 'reconcilió y empujó');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items/it-b'), 'el baseline sale de Alegra (GET /items/{id})');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'un POST out 3');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-b']['inventory']['availableQuantity'], 'Alegra queda en 7');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1020), 'synced acuerda en 7');
+});
+
+TestRunner::test('T29.32c pre-búsqueda obligatoria (FIX-4)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-c', ['name' => 'C', 'inventory' => ['availableQuantity' => 10]]);
+    // Un ajuste out 3 ya aplicado (la respuesta del POST se perdió).
+    make_api()->create_inventory_adjustment([
+        'date' => '2026-09-25',
+        'items' => [['id' => 'it-c', 'type' => 'out', 'quantity' => 3, 'unitCost' => 1.0]],
+    ]);
+    $p = alegra_make_product(1030, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1030, '_alegra_item_id', 'it-c');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1030, 10);
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(1030, 7);
+    $before = alegra_mock_count('POST', '/inventory-adjustments');
+
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, true);
+    TestRunner::assertSame('already_applied', $r['reason'], 'el ajuste ya existe');
+    TestRunner::assertSame($before, alegra_mock_count('POST', '/inventory-adjustments'), 'cero POST nuevo (no doble descuento)');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1030), 'synced=new_qty');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(1030), 'pending limpio');
+});
+
+TestRunner::test('T29.33 idempotencia con lock', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-l', ['name' => 'L', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1040, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1040, '_alegra_item_id', 'it-l');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1040, 10);
+
+    $token = Controller::acquire_lock('alegra_inventory_push_1040', 30);
+    TestRunner::assertTrue($token !== false, 'lock tomado');
+    $before = alegra_mock_count('POST', '/inventory-adjustments');
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, true);
+    TestRunner::assertSame('locked', $r['reason'], 'lock por producto');
+    TestRunner::assertSame($before, alegra_mock_count('POST', '/inventory-adjustments'), 'sin POST con el lock tomado');
+    Controller::release_lock('alegra_inventory_push_1040', $token);
+});
+
+TestRunner::test('T29.34 EL TITULAR: vender 3 -> poll -> WC no sube', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-34', ['name' => 'T', 'reference' => 'T34', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1050, ['name' => 'T', 'sku' => 'T34', 'stock' => 10, 'manage_stock' => true]);
+    update_post_meta(1050, '_alegra_item_id', 'it-34');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1050, 10);
+
+    // FIX-11: el stub save() no dispara hooks; se dispara explícitamente.
+    \Alegra\Connector\Sync\Inventory_Pusher::register_hooks(make_api(), make_logger());
+
+    // La venta ocurre durante un import/sync (FIX-2: el hook no empuja). El
+    // poll es el que reconcilia: si T3.4 se revierte a una escritura
+    // incondicional, el poll pisa WC con el valor viejo de Alegra (10) y el
+    // test falla — ése es el prove-it-catch del titular.
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    $p->set_stock_quantity(7);
+    do_action('woocommerce_product_set_stock', $p);
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'FIX-2: el hook no empuja durante el sync');
+    TestRunner::assertSame(10, (int) $GLOBALS['alegra_mock_state']['items']['it-34']['inventory']['availableQuantity'], 'Alegra sigue en 10');
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+
+    make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'el poll reconcilia y empuja out 3');
+    TestRunner::assertSame(7, wc_get_product(1050)->get_stock_quantity(), 'WC NO se re-infla a 10');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-34']['inventory']['availableQuantity'], 'Alegra queda en 7');
+});
+
+TestRunner::test('T29.34b venta antes del primer poll no se re-infla (FIX-1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-34b', ['name' => 'B', 'reference' => 'B34', 'inventory' => ['availableQuantity' => 10]]);
+    alegra_make_product(1060, ['name' => 'B', 'sku' => 'B34', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(1060, '_alegra_item_id', 'it-34b');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(1060, 7);   // venta antes del baseline
+
+    make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertSame(7, wc_get_product(1060)->get_stock_quantity(), 'WC no se re-infla');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-34b']['inventory']['availableQuantity'], 'Alegra se reconcilia a 7');
+});
+
+TestRunner::test('T29.34c el poll no se muere de hambre (FIX-8)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_push_inventory_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-34c', ['name' => 'C', 'reference' => 'C34', 'inventory' => ['availableQuantity' => 5]]);
+    alegra_make_product(1070, ['name' => 'C', 'sku' => 'C34', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(1070, '_alegra_item_id', 'it-34c');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1070, 10);   // WC 7 != synced 10 => needs_reconcile
+
+    make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertSame(5, wc_get_product(1070)->get_stock_quantity(), 'con disabled el poll escribe WC con el valor de Alegra');
+});
+
+TestRunner::test('T29.35 hooks de stock e is_syncing corta en el hook (FIX-2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-35', ['name' => 'H', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1080, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1080, '_alegra_item_id', 'it-35');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1080, 10);
+
+    \Alegra\Connector\Sync\Inventory_Pusher::register_hooks(make_api(), make_logger());
+
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    do_action('woocommerce_product_set_stock', $p);
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'is_syncing corta en el hook');
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+
+    do_action('woocommerce_product_set_stock', $p);
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'sin syncing el hook empuja');
+    $body = alegra_mock_last_request('POST', '/inventory-adjustments')['body'] ?? [];
+    TestRunner::assertSame('out', $body['items'][0]['type'] ?? null, 'empuja out');
+});
+
+TestRunner::test('T29.36 push fallido no re-infla', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-36', ['name' => 'F', 'reference' => 'F36', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1090, ['name' => 'F', 'sku' => 'F36', 'stock' => 10, 'manage_stock' => true]);
+    update_post_meta(1090, '_alegra_item_id', 'it-36');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1090, 10);
+
+    alegra_mock_fail('POST', '/inventory-adjustments', 500, ['message' => 'boom']);
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, false);
+    TestRunner::assertSame('api_error', $r['reason'], 'el push falla');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::pending(1090), 'pending queda');
+
+    // El poll corre con el mock OK.
+    alegra_mock_clear_failures();
+    $p->set_stock_quantity(7);
+    make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertSame(7, wc_get_product(1090)->get_stock_quantity(), 'el poll reintenta y WC queda 7');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(1090), 'pending limpio');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-36']['inventory']['availableQuantity'], 'Alegra 7');
+});
+
+TestRunner::test('T29.36b el poll reintenta con set_syncing activo (FIX-2, cross-fase)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-36b', ['name' => 'S', 'reference' => 'S36', 'inventory' => ['availableQuantity' => 10]]);
+    alegra_make_product(1100, ['name' => 'S', 'sku' => 'S36', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(1100, '_alegra_item_id', 'it-36b');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1100, 10);
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(1100, 7);
+
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    make_products()->sync_inventory_from_alegra();
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'from_poll bypassa is_syncing');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(1100), 'pending limpio');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-36b']['inventory']['availableQuantity'], 'Alegra 7');
+});
+
+TestRunner::test('T29.37 dueño invoice: factura open y 0 ajustes', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '119']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-inv');
+    $order = alegra_make_order(1200, [
+        'total' => 119.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'inv@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-inv'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 119, 'total' => 119])],
+    ]);
+    make_orders()->create_invoice($order);
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame('open', $body['status'] ?? null, 'un pedido pagado nace open con owner=invoice');
+
+    $p = alegra_make_product(1201, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1201, '_alegra_item_id', 'it-inv');
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, true);
+    TestRunner::assertSame('invoice_owner', $r['reason'], 'con owner=invoice no se emite ajuste');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'cero ajustes');
+});
+
+TestRunner::test('T29.37b abre el borrador pre-existente (FIX-3/D1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_payment_account_id', 'ba-1');
+    alegra_mock_seed_invoice('1nv-draft-b', [
+        'status' => 'draft', 'total' => 10.0, 'balance' => 10.0,
+        'items' => [['id' => '1t3m-db', 'name' => 'Widget', 'price' => 10, 'quantity' => 1]],
+    ]);
+    $order = alegra_make_order(1210, [
+        'total' => 10.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'draftb@example.test'],
+        'meta' => ['_alegra_invoice_id' => '1nv-draft-b', '_billing_alegra_contact_id' => 'c0n-draftb'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame('open', $GLOBALS['alegra_mock_state']['invoices']['1nv-draft-b']['status'] ?? null, 'el borrador pre-existente se abre');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'cero ajustes');
+    TestRunner::assertSame('1nv-draft-b', (string) $order->get_meta('_alegra_invoice_id', true), 'no se crea una segunda factura');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no se crea una segunda factura');
+});
+
+TestRunner::test('T29.37c reusa una factura open existente (FIX-3)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    alegra_mock_seed_invoice('1nv-open-c', [
+        'status' => 'open', 'total' => 10.0, 'balance' => 0.0,
+        'client' => ['id' => 'c0n-openc'],
+        'observations' => 'Pedido WooCommerce #1220',
+        'items' => [['id' => '1t3m-oc', 'name' => 'Widget', 'price' => 10, 'quantity' => 1]],
+    ]);
+    $order = alegra_make_order(1220, [
+        'total' => 10.0, 'currency' => 'COP', 'payment_method' => 'bacs', 'status' => 'processing',
+        'billing' => ['country' => 'CO', 'email' => 'openc@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-openc'],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertSame('1nv-open-c', (string) ($result['id'] ?? ''), 'reusa la factura open');
+    TestRunner::assertTrue(!empty($result['already_exists']), 'already_exists');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no crea una segunda factura');
+});
+
+TestRunner::test('T29.38 un solo dueño por movimiento', function (): void {
+    // owner=adjustment (default): 1 POST
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-38', ['name' => 'X', 'inventory' => ['availableQuantity' => 10]]);
+    $p = alegra_make_product(1230, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1230, '_alegra_item_id', 'it-38');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1230, 10);
+    (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p, 7, true);
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'adjustment emite 1 ajuste');
+
+    // push_orders=true + open_invoice_on_paid=false => adjustment: 1 POST
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', false);
+    alegra_mock_seed_item('it-38b', ['name' => 'Y', 'inventory' => ['availableQuantity' => 10]]);
+    $p2 = alegra_make_product(1231, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1231, '_alegra_item_id', 'it-38b');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1231, 10);
+    (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p2, 7, true);
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'push_orders sin abrir factura => adjustment');
+
+    // owner=invoice real: 0 POST
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    alegra_mock_seed_item('it-38c', ['name' => 'Z', 'inventory' => ['availableQuantity' => 10]]);
+    $p3 = alegra_make_product(1232, ['manage_stock' => true, 'stock' => 7]);
+    update_post_meta(1232, '_alegra_item_id', 'it-38c');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1232, 10);
+    $r = (new \Alegra\Connector\Sync\Inventory_Pusher(make_api(), make_logger()))->push_delta($p3, 7, true);
+    TestRunner::assertSame('invoice_owner', $r['reason'], 'owner=invoice no emite ajuste');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'owner=invoice => 0 ajustes');
+});
+
+TestRunner::test('T29.39 informe de divergencia (REQ-INV-07)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_make_order(1300, ['status' => 'processing', 'total' => 10.0]);
+    alegra_make_order(1301, ['status' => 'completed', 'total' => 20.0]);
+    alegra_make_order(1302, ['status' => 'processing', 'total' => 30.0]);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    TestRunner::assertSame(3, $admin->get_unjournaled_sales()['count'], 'cuenta los vendidos sin factura');
+
+    foreach ([1300, 1301, 1302] as $id) {
+        $o = wc_get_order($id);
+        $o->update_meta_data('_alegra_invoice_id', '1nv-' . $id);
+        $o->save();
+    }
+    TestRunner::assertSame(0, $admin->get_unjournaled_sales()['count'], 'con factura no hay divergencia');
 });
 
 exit(TestRunner::summary());
