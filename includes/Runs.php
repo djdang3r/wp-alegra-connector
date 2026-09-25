@@ -118,6 +118,23 @@ class Runs
     }
 
     /**
+     * Current status of a run, or null if the row does not exist.
+     *
+     * Used as the re-finish guard by Run_Context::finish() (R9): a run that is
+     * already completed/failed/cancelled must not be overwritten.
+     */
+    public static function status(int $run_id): ?string
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_runs';
+        $status = $wpdb->get_var($wpdb->prepare(
+            "SELECT status FROM $table WHERE id = %d",
+            $run_id
+        ));
+        return $status !== null ? (string) $status : null;
+    }
+
+    /**
      * Request a running process to stop.
      */
     public static function request_stop(int $run_id): void
@@ -177,6 +194,7 @@ class Runs
         $table = $wpdb->prefix . 'alegra_runs';
 
         self::mark_stale();
+        self::mark_abandoned();
 
         return $wpdb->get_results($wpdb->prepare(
             "SELECT * FROM $table WHERE status = 'running' ORDER BY started_at DESC LIMIT %d",
@@ -192,7 +210,9 @@ class Runs
     {
         global $wpdb;
         $table = $wpdb->prefix . 'alegra_runs';
-        $cutoff = gmdate('Y-m-d H:i:s', time() - self::STALE_AFTER_SECONDS);
+        // Mismo reloj con que Runs::start() guardó started_at (current_time('mysql')).
+        // `time()` es UTC y desalineaba el cutoff en sitios con offset ≠ 0.
+        $cutoff = gmdate('Y-m-d H:i:s', current_time('timestamp') - self::STALE_AFTER_SECONDS);
 
         $wpdb->query($wpdb->prepare(
             "UPDATE $table
@@ -203,6 +223,38 @@ class Runs
             __('Proceso abandonado (sin finalizar)', 'alegra-connector'),
             $cutoff
         ));
+    }
+
+    /**
+     * Close chunked runs that were abandoned (browser closed / request killed).
+     *
+     * The chunked import is multi-request: if the browser closes, no further
+     * request arrives and the row stays `running` until mark_stale()'s 1h TTL.
+     * A live cron/manual is a live request; if it dies, mark_stale() covers it.
+     */
+    public static function mark_abandoned(int $grace_seconds = 180): void
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_runs';
+        // Mismo reloj con que Runs::start() guardó started_at (current_time('mysql')).
+        $cutoff = gmdate('Y-m-d H:i:s', current_time('timestamp') - $grace_seconds);
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM $table
+             WHERE status = 'running' AND run_type = 'chunked_import' AND started_at < %s
+             LIMIT 50",
+            $cutoff
+        ));
+
+        foreach ($rows as $row) {
+            if (Heartbeat::get((int) $row->id) === null) {   // heartbeat TTL 120 s vencido
+                $wpdb->update($table, [
+                    'status' => 'stale',
+                    'finished_at' => current_time('mysql'),
+                    'error_summary' => __('Proceso abandonado (pestaña cerrada o request interrumpido)', 'alegra-connector'),
+                ], ['id' => (int) $row->id]);
+            }
+        }
     }
 
     /**

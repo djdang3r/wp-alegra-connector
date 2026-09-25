@@ -6532,4 +6532,151 @@ TestRunner::test('T27.8 the subject filter narrows the tables without changing t
     TestRunner::assertStringContains(\Alegra\Connector\Webhooks\Recorder::VERDICT_YES, $html, 'the verdict must stay global (SÍ) even when the table is filtered');
 });
 
+// ===========================================================================
+// === logs-monitor-import (2.5.0) ===
+// T28.{fase}{n} — Fase 1: Run_Context + Runs/Heartbeat/Logger foundations
+// ===========================================================================
+
+TestRunner::test('T28.11 el stub wpdb emula wp_alegra_runs (insert/update/get_var)', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'x', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    TestRunner::assertSame('running', $wpdb->get_var("SELECT status FROM wp_alegra_runs WHERE id = 1"), 'la fila insertada debe leerse running');
+    $wpdb->update($wpdb->prefix . 'alegra_runs', ['status' => 'completed'], ['id' => 1]);
+    TestRunner::assertSame('completed', $wpdb->get_var("SELECT status FROM wp_alegra_runs WHERE id = 1"), 'el update debe persistir el status');
+});
+
+TestRunner::test('T28.12 Run_Context::begin crea fila running y current() la expone', function (): void {
+    alegra_test_reset();
+    $id = \Alegra\Connector\Run_Context::begin('manual_import', 'tester');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($id), 'begin debe crear la fila running');
+    TestRunner::assertSame($id, \Alegra\Connector\Run_Context::current(), 'current() debe devolver el run activo');
+    \Alegra\Connector\Run_Context::finish($id, 'completed');
+    TestRunner::assertSame(0, \Alegra\Connector\Run_Context::current(), 'fuera del run current() debe ser 0');
+});
+
+TestRunner::test('T28.13 Run_Context::wrap completa y propaga excepciones', function (): void {
+    alegra_test_reset();
+    $out = \Alegra\Connector\Run_Context::wrap('manual_import', fn ($rid) => 7, 'tester');
+    TestRunner::assertSame(7, $out, 'wrap debe devolver el resultado del closure');
+    TestRunner::assertSame('completed', $GLOBALS['alegra_db']['wp_alegra_runs'][0]['status'] ?? null, 'wrap debe dejar el run completed');
+
+    alegra_test_reset();
+    $threw = false;
+    try {
+        \Alegra\Connector\Run_Context::wrap('manual_import', function (): void { throw new \RuntimeException('boom'); }, 'tester');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+    }
+    TestRunner::assertTrue($threw, 'wrap debe re-lanzar la excepción');
+    TestRunner::assertSame('failed', $GLOBALS['alegra_db']['wp_alegra_runs'][0]['status'] ?? null, 'wrap debe dejar el run failed');
+});
+
+TestRunner::test('T28.14 Run_Context::current es 0 fuera de un run', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame(0, \Alegra\Connector\Run_Context::current(), 'sin begin/resume current() es 0');
+});
+
+TestRunner::test('T28.15 Logger inyecta run_id/run_type y respeta el run_id explícito', function (): void {
+    alegra_test_reset();
+    alegra_clear_log();
+    $logger = make_logger();
+
+    \Alegra\Connector\Logger\Logger::set_run_context(42, 'manual_import');
+    $logger->info('linea con contexto');
+    \Alegra\Connector\Logger\Logger::clear_run_context();
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('"run_id":42', $log, 'la línea debe llevar run_id=42');
+    TestRunner::assertStringContains('"run_type":"manual_import"', $log, 'la línea debe llevar run_type');
+
+    alegra_clear_log();
+    \Alegra\Connector\Logger\Logger::set_run_context(42, 'manual_import');
+    $logger->info('explicito', ['run_id' => 7]);
+    \Alegra\Connector\Logger\Logger::clear_run_context();
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('"run_id":7', $log, 'el run_id explícito debe conservarse');
+    TestRunner::assertStringNotContains('"run_id":42', $log, 'no debe pisar el explícito');
+});
+
+TestRunner::test('T28.16 mark_abandoned cierra el chunked huérfano pero no el manual', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $old = gmdate('Y-m-d H:i:s', current_time('timestamp') - 300);
+
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => $old]);
+    $chunked = (int) $wpdb->insert_id;
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'manual_import', 'status' => 'running', 'started_at' => $old]);
+    $manual = (int) $wpdb->insert_id;
+
+    $running = \Alegra\Connector\Runs::currently_running();
+
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($chunked), 'el chunked huérfano debe quedar stale');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($manual), 'el manual no lo cubre mark_abandoned');
+    foreach ($running as $r) {
+        TestRunner::assertNotSame($chunked, (int) $r->id, 'el chunked stale no debe listarse como running');
+    }
+});
+
+TestRunner::test('T28.17 un chunked con heartbeat vivo no se marca abandonado', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $old = gmdate('Y-m-d H:i:s', current_time('timestamp') - 300);
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => $old]);
+    $id = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::set($id, ['step' => 'products', 'message' => 'vivo']);
+    \Alegra\Connector\Runs::currently_running();
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($id), 'con heartbeat vivo no debe marcarse');
+});
+
+TestRunner::test('T28.18 mark_stale no marca stale un run recién arrancado (offset no-UTC)', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_gmt_offset'] = -5;   // America/Bogota (UTC-5)
+
+    $id = \Alegra\Connector\Runs::start('manual_import', 'tester');   // started_at = hora LOCAL
+    \Alegra\Connector\Runs::currently_running();                       // dispara mark_stale()
+
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($id), 'un run recién arrancado no debe quedar stale');
+
+    $GLOBALS['alegra_test_gmt_offset'] = 0;
+});
+
+TestRunner::test('T28.19 clear() no borra el stop; forget() borra sólo el display', function (): void {
+    alegra_test_reset();
+    \Alegra\Connector\Runs::request_stop(9);
+    \Alegra\Connector\Heartbeat::set(9, ['step' => 'products', 'message' => 'x']);
+
+    \Alegra\Connector\Heartbeat::clear(9);
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop(9), 'clear() NO debe borrar el pedido de stop');
+
+    \Alegra\Connector\Heartbeat::forget(9);
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop(9), 'forget() NO debe borrar el stop');
+    TestRunner::assertSame(null, \Alegra\Connector\Heartbeat::get(9), 'forget() debe borrar el display');
+});
+
+TestRunner::test('T28.110 ajax_kill_run pide el stop y NO limpia el heartbeat', function (): void {
+    alegra_test_reset();
+    $run_id = 55;
+    \Alegra\Connector\Heartbeat::set($run_id, ['step' => 'products', 'message' => 'corriendo']);
+
+    $_POST['run_id'] = $run_id;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_kill_run());
+    unset($_POST['run_id']);
+
+    TestRunner::assertTrue($resp->success, 'kill_run debe responder success');
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop($run_id), 'el stop debe quedar pedido');
+    TestRunner::assertTrue(\Alegra\Connector\Heartbeat::get($run_id) !== null, 'el heartbeat NO debe limpiarse');
+});
+
+TestRunner::test('T28.111 Run_Context::finish no re-finaliza un run ya cerrado', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'completed', 'started_at' => current_time('mysql')]);
+    $run_id = (int) $wpdb->insert_id;
+
+    \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
+
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'no debe pisar completed con cancelled');
+});
+
 exit(TestRunner::summary());

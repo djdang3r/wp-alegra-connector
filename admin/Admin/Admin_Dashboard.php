@@ -3762,8 +3762,10 @@ class Admin_Dashboard
         if ($run_id <= 0) wp_send_json_error(['message' => __('ID invalido.', 'alegra-connector')]);
 
         \Alegra\Connector\Runs::request_stop($run_id);
-        \Alegra\Connector\Heartbeat::clear($run_id);
 
+        // Do NOT clear the heartbeat: the run is still alive until the running flow
+        // observes Runs::should_stop() and calls Run_Context::finish(). Clearing the
+        // display here would make the live run disappear from the Monitor.
         $this->log('info', 'Run stop requested by user', ['run_id' => $run_id]);
         wp_send_json_success(['message' => __('El proceso se detendra en su siguiente verificacion.', 'alegra-connector')]);
     }

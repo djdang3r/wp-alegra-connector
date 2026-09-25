@@ -523,4 +523,16 @@ class Controller
     {
         (new self(null, null))->release_sync_lock($type, $token);
     }
+
+    /**
+     * Test-only: clear the re-entrant lock registry between tests.
+     *
+     * The registry is request-scoped in production, but the harness runs many
+     * "requests" in one process; without this, a lock held by one test makes the
+     * next test see a phantom "sync in progress".
+     */
+    public static function reset_locks_for_testing(): void
+    {
+        self::$held_sync_locks = [];
+    }
 }

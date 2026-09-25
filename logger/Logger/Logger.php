@@ -20,6 +20,10 @@ class Logger
     private int $retention_days = 30;
     private bool $dir_ready = false;
 
+    /** Run context injected into every entry of the current request (REQ-LOG-04). */
+    private static int $run_id = 0;
+    private static string $run_type = '';
+
     /**
      * Logs live under wp-content/uploads/alegra-logs/ and contain customer PII.
      *
@@ -109,11 +113,40 @@ class Logger
         return $suffix;
     }
 
+    /**
+     * Set the run context injected into every log entry of this request.
+     *
+     * @param int $run_id  Run id, or 0 when the run did not exist yet.
+     * @param string $run_type Canonical run type (e.g. 'manual_import').
+     */
+    public static function set_run_context(int $run_id, string $run_type = ''): void
+    {
+        self::$run_id = $run_id;
+        self::$run_type = $run_type;
+    }
+
+    /**
+     * Stop injecting the run context (called on run teardown).
+     */
+    public static function clear_run_context(): void
+    {
+        self::$run_id = 0;
+        self::$run_type = '';
+    }
+
     private function write(string $level, string $message, array $context = []): void
     {
         $this->ensure_dir();
 
         $timestamp = current_time('Y-m-d H:i:s');
+        if (!isset($context['run_id'])) {
+            if (self::$run_id > 0) {
+                $context = ['run_id' => self::$run_id] + $context;
+            }
+            if (self::$run_type !== '') {
+                $context = ['run_type' => self::$run_type] + $context;
+            }
+        }
         $context_str = !empty($context) ? ' ' . wp_json_encode($context) : '';
         $log_entry = sprintf(
             "[%s] [%s] %s%s\n",

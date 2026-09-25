@@ -62,12 +62,24 @@ class Heartbeat
 
     /**
      * Delete heartbeat (when run finishes).
+     *
+     * Backwards-compatible alias. Since 2.5.0 it does NOT delete
+     * alegra_run_stop_{id}: that transient is the "Detener" request, owned by
+     * Run_Context::finish()/TTL, not by the display cleanup.
      */
     public static function clear(int $run_id): void
     {
+        self::forget($run_id);
+    }
+
+    /**
+     * Delete ONLY the display heartbeat (alegra_run_{id}). The stop request
+     * (alegra_run_stop_{id}) is intentionally left intact.
+     */
+    public static function forget(int $run_id): void
+    {
         unset(self::$cache[$run_id]);
         delete_transient('alegra_run_' . $run_id);
-        delete_transient('alegra_run_stop_' . $run_id);
     }
 
     /**

@@ -193,6 +193,12 @@ check(
     '— the autoloader MUST resolve this class without an explicit require_once'
 );
 
+check(
+    'Run_Context class loads',
+    class_exists(\Alegra\Connector\Run_Context::class),
+    '— la clase nueva debe resolver por el autoloader PSR-4'
+);
+
 // ---- Assertion 4: critical main class is reachable ----
 echo "\n[4] Autoloader reachability: Alegra\\Connector\\Alegra_Connector\n";
 $main_class_exists = class_exists('Alegra\\Connector\\Alegra_Connector');

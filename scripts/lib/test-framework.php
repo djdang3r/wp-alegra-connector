@@ -172,6 +172,13 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_test_caps'] = [];
     $GLOBALS['alegra_test_referer_ok'] = true;
     $GLOBALS['alegra_test_wp_die_throws'] = false;
+    $GLOBALS['alegra_test_json_observer'] = null;
+    $GLOBALS['alegra_test_is_admin'] = false;
+    $GLOBALS['alegra_test_gmt_offset'] = 0;
+
+    // Re-entrant sync-lock registry is request-scoped in production; clear it so
+    // a test that leaves a lock held cannot contaminate the next test.
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
 
     alegra_mock_reset();
 

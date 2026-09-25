@@ -88,6 +88,17 @@ $GLOBALS['wp_cron']       = [];
  */
 $GLOBALS['alegra_race'] = null;
 
+/**
+ * Optional observer invoked by the wp_send_json_* stubs JUST BEFORE they throw.
+ *
+ * Real WordPress terminates the request (wp_die() -> die()), and die() does NOT
+ * run finally blocks. The harness emulates the send by throwing an exception —
+ * and exceptions DO run finally. This seam lets a test photograph the world at
+ * the exact instant of the send (e.g. is the sync lock still held?), which is
+ * what makes the "release before send" contract a real prove-it-catch.
+ */
+$GLOBALS['alegra_test_json_observer'] = null;
+
 function alegra_stub_race_fire(): void
 {
     if (!is_array($GLOBALS['alegra_race']) || !empty($GLOBALS['alegra_race']['fired'])) {
@@ -323,6 +334,7 @@ function update_term_meta($term_id, $key, $value)
 
 function __($text, $domain = '') { return $text; }
 function _e($text, $domain = '') { echo $text; }
+function _n($single, $plural, $number, $domain = '') { return ((int) $number === 1) ? $single : $plural; }
 function esc_html__($text, $domain = '') { return $text; }
 function esc_attr__($text, $domain = '') { return $text; }
 function esc_html_e($text, $domain = '') { echo $text; }
@@ -394,7 +406,15 @@ function wp_generate_password($length = 12, $special_chars = true, $extra_specia
 
 function current_time($type = 'mysql', $gmt = 0)
 {
-    return $type === 'timestamp' ? time() : date('Y-m-d H:i:s');
+    if ($gmt) {
+        return $type === 'timestamp' ? time() : gmdate('Y-m-d H:i:s');
+    }
+    $offset = (int) ($GLOBALS['alegra_test_gmt_offset'] ?? 0);
+    if ($offset === 0) {
+        return $type === 'timestamp' ? time() : date('Y-m-d H:i:s');
+    }
+    $ts = time() + $offset * 3600;
+    return $type === 'timestamp' ? $ts : gmdate('Y-m-d H:i:s', $ts);
 }
 function home_url($path = '') { return 'https://example.test' . $path; }
 function admin_url($path = '') { return 'https://example.test/wp-admin/' . $path; }
@@ -423,7 +443,7 @@ function wp_upload_dir() { return ['basedir' => sys_get_temp_dir() . '/alegra-ex
 function wp_mkdir_p($dir) { return is_dir($dir) || @mkdir($dir, 0777, true); }
 function wp_create_nonce($action = -1) { return 'nonce'; }
 function check_ajax_referer($action = -1, $query_arg = false, $die = true) { return true; }
-function is_admin() { return false; }
+function is_admin() { return (bool) ($GLOBALS['alegra_test_is_admin'] ?? false); }
 function is_multisite() { return false; }
 function get_current_blog_id() { return 1; }
 function wp_get_current_user() { return new WP_User(1, ['user_login' => 'tester', 'user_email' => 'tester@example.test']); }
@@ -541,15 +561,27 @@ class Alegra_Test_Redirect extends \Exception
 
 function wp_send_json_success($data = null, $status_code = null)
 {
-    throw new Alegra_Test_JSON_Response(true, is_array($data) ? $data : ['data' => $data]);
+    $payload = is_array($data) ? $data : ['data' => $data];
+    if (is_callable($GLOBALS['alegra_test_json_observer'] ?? null)) {
+        ($GLOBALS['alegra_test_json_observer'])(true, $payload);
+    }
+    throw new Alegra_Test_JSON_Response(true, $payload);
 }
 function wp_send_json_error($data = null, $status_code = null)
 {
-    throw new Alegra_Test_JSON_Response(false, is_array($data) ? $data : ['data' => $data]);
+    $payload = is_array($data) ? $data : ['data' => $data];
+    if (is_callable($GLOBALS['alegra_test_json_observer'] ?? null)) {
+        ($GLOBALS['alegra_test_json_observer'])(false, $payload);
+    }
+    throw new Alegra_Test_JSON_Response(false, $payload);
 }
 function wp_send_json($data, $status_code = null)
 {
-    throw new Alegra_Test_JSON_Response(true, is_array($data) ? $data : ['data' => $data]);
+    $payload = is_array($data) ? $data : ['data' => $data];
+    if (is_callable($GLOBALS['alegra_test_json_observer'] ?? null)) {
+        ($GLOBALS['alegra_test_json_observer'])(true, $payload);
+    }
+    throw new Alegra_Test_JSON_Response(true, $payload);
 }
 function deactivate_plugins($plugin) { return; }
 function flush_rewrite_rules($hard = true) { return; }
@@ -1622,6 +1654,34 @@ class Alegra_Mock_Wpdb
             return $this->scan_meta('wp_usermeta', $query);
         }
 
+        // wp_alegra_runs: `SELECT status FROM … WHERE id = N` (Runs::status).
+        if (strpos($query, 'alegra_runs') !== false
+            && preg_match('/SELECT\s+status/i', $query)
+            && preg_match('/WHERE\s+id\s*=\s*(\d+)/i', $query, $m)) {
+            foreach (($GLOBALS['alegra_db']['wp_alegra_runs'] ?? []) as $row) {
+                if ((int) ($row['id'] ?? 0) === (int) $m[1]) {
+                    return isset($row['status']) ? (string) $row['status'] : null;
+                }
+            }
+            return null;
+        }
+
+        // wp_alegra_tombstones: `SELECT reason … WHERE alegra_type='…' AND
+        // alegra_id='…' AND resurrected_at IS NULL` (Tombstone_Manager::exists_with_reason).
+        if (strpos($query, 'alegra_tombstones') !== false
+            && preg_match("/alegra_type\s*=\s*'([^']*)'/", $query, $mt)
+            && preg_match("/alegra_id\s*=\s*'([^']*)'/", $query, $mi)) {
+            $table = $this->prefix . 'alegra_tombstones';
+            foreach (($GLOBALS['alegra_db'][$table] ?? []) as $row) {
+                $resurrected = $row['resurrected_at'] ?? null;
+                if ($resurrected !== null) { continue; }
+                if (($row['alegra_type'] ?? '') === $mt[1] && (string) ($row['alegra_id'] ?? '') === $mi[1]) {
+                    return (string) ($row['reason'] ?? 'manual_wc');
+                }
+            }
+            return null;
+        }
+
         return null;
     }
 
@@ -1667,12 +1727,54 @@ class Alegra_Mock_Wpdb
             return $rows;
         }
 
+        // wp_alegra_runs: supports status / run_type / started_at< filters and LIMIT
+        // (currently_running, recent, mark_abandoned).
+        if (strpos($query, 'alegra_runs') !== false) {
+            $rows = $GLOBALS['alegra_db']['wp_alegra_runs'] ?? [];
+            if (preg_match("/status\s*=\s*'([^']+)'/", $query, $m)) {
+                $rows = array_values(array_filter($rows, fn ($r) => ($r['status'] ?? '') === $m[1]));
+            }
+            if (preg_match("/run_type\s*=\s*'([^']+)'/", $query, $m)) {
+                $rows = array_values(array_filter($rows, fn ($r) => ($r['run_type'] ?? '') === $m[1]));
+            }
+            if (preg_match("/started_at\s*<\s*'([^']+)'/", $query, $m)) {
+                $rows = array_values(array_filter($rows, fn ($r) => ($r['started_at'] ?? '') < $m[1]));
+            }
+            if (preg_match('/LIMIT\s+(\d+)/i', $query, $m)) {
+                $rows = array_slice($rows, 0, (int) $m[1]);
+            }
+            return array_map(static fn ($r) => (object) $r, $rows);
+        }
+
         return [];
     }
 
     public function query($query)
     {
         $query = (string) $query;
+
+        // wp_alegra_runs: `UPDATE … SET status='stale' … WHERE status='running'
+        // AND started_at < cutoff LIMIT N` (Runs::mark_stale). Must honour the
+        // cutoff, otherwise it would mark freshly-started runs stale.
+        if (stripos($query, 'alegra_runs') !== false && stripos($query, 'UPDATE') !== false) {
+            $set_status = null;
+            if (preg_match("/SET\s+status\s*=\s*'([^']+)'/i", $query, $m)) { $set_status = $m[1]; }
+            $cutoff = null;
+            if (preg_match("/started_at\s*<\s*'([^']+)'/", $query, $m)) { $cutoff = $m[1]; }
+            $limit = 50;
+            if (preg_match('/LIMIT\s+(\d+)/i', $query, $m)) { $limit = (int) $m[1]; }
+
+            $n = 0;
+            foreach (($GLOBALS['alegra_db']['wp_alegra_runs'] ?? []) as $i => $row) {
+                if (($row['status'] ?? '') !== 'running') { continue; }
+                if ($cutoff !== null && !(($row['started_at'] ?? '') < $cutoff)) { continue; }
+                if ($set_status !== null) {
+                    $GLOBALS['alegra_db']['wp_alegra_runs'][$i]['status'] = $set_status;
+                }
+                if (++$n >= $limit) { break; }
+            }
+            return $n;
+        }
 
         if (stripos($query, 'alegra_entity_map') !== false) {
             if (stripos($query, 'insert into') !== false && preg_match('/VALUES\s*\((.*?)\)\s*ON DUPLICATE/is', $query, $m)) {
@@ -1725,13 +1827,30 @@ class Alegra_Mock_Wpdb
     public function insert($table, $data = [], $format = null)
     {
         $table = (string) $table;
+        $next_id = count($GLOBALS['alegra_db'][$table] ?? []) + 1;
+        if (str_ends_with($table, 'alegra_runs')) {
+            $data['id'] = $next_id;
+        }
         $GLOBALS['alegra_db'][$table][] = $data;
-        $this->insert_id = count($GLOBALS['alegra_db'][$table]);
+        $this->insert_id = $next_id;
         return 1;
     }
 
     public function update($table, $data = [], $where = [], $format = null, $where_format = null)
     {
+        $table = (string) $table;
+        if (empty($GLOBALS['alegra_db'][$table]) || !is_array($GLOBALS['alegra_db'][$table])) {
+            return 1;
+        }
+        foreach ($GLOBALS['alegra_db'][$table] as $i => $row) {
+            $match = true;
+            foreach ((array) $where as $k => $v) {
+                if ((string) ($row[$k] ?? '') !== (string) $v) { $match = false; break; }
+            }
+            if ($match) {
+                $GLOBALS['alegra_db'][$table][$i] = array_merge((array) $row, $data);
+            }
+        }
         return 1;
     }
 }
