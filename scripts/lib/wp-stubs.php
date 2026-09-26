@@ -1467,7 +1467,11 @@ function alegra_mock_derive_stock_status($product): void
     if (!$product->get_manage_stock()) { return; }
     $qty = $product->get_stock_quantity();
     if ($qty === null) { return; }
-    if ($qty > 0) {
+    // R19 / Oracle D10: WC deriva el estado contra el umbral de no-stock
+    // (`woocommerce_notify_no_stock_amount`). Con el default 0 el resultado es
+    // idéntico al HEAD; con umbral > 0 un qty en el umbral cae a outofstock.
+    $threshold = (int) get_option('woocommerce_notify_no_stock_amount', 0);
+    if ($qty > $threshold) {
         $product->set_stock_status('instock');
     } elseif ($product->get_backorders() !== 'no') {
         $product->set_stock_status('onbackorder');

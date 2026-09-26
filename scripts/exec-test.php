@@ -7978,7 +7978,7 @@ TestRunner::test('T28.716 exists() de tombstones sigue delegando en exists_with_
     TestRunner::assertSame('bulk_wc', \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'itm-e'), 'reason coincide');
 });
 
-TestRunner::test('T28.717 el release 2.5.1 está consistente (uninstall/version/changelog)', function (): void {
+TestRunner::test('T28.717 el release 2.6.0 está consistente (uninstall/version/changelog)', function (): void {
     $root = $GLOBALS['alegra_plugin_root'];
     $uninstall = (string) file_get_contents($root . 'uninstall.php');
     foreach ([
@@ -7991,7 +7991,7 @@ TestRunner::test('T28.717 el release 2.5.1 está consistente (uninstall/version/
         TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse");
     }
     $main = (string) file_get_contents($root . 'alegra-connector.php');
-    TestRunner::assertStringContains('Version: 2.5.1', $main, 'el header dice 2.5.1');
+    TestRunner::assertStringContains('Version: 2.6.0', $main, 'el header dice 2.6.0');
     $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
     TestRunner::assertStringContains('## [2.5.1]', $changelog, 'el CHANGELOG tiene la sección');
     TestRunner::assertStringContains('## [2.5.0]', $changelog, 'el CHANGELOG conserva 2.5.0');
@@ -8233,6 +8233,14 @@ TestRunner::test('T29.21 el writer dispara hooks y deriva stock_status', functio
     TestRunner::assertSame('updated', $r, 'el writer reporta updated');
     TestRunner::assertSame('onbackorder', $p->get_stock_status(), 'backorders=yes + qty 0 => onbackorder');
     TestRunner::assertSame(1, $GLOBALS['hook_hits'], 'wc_update_product_stock dispara el hook una vez');
+
+    // R14: la rama B (WC < 3.0, sin `wc_update_product_stock`) queda como
+    // fallback defensivo. No es simulable sin des-definir una función global,
+    // así que el guard es source-scan: ambas ramas deben existir en apply_stock().
+    $src = alegra_method_source(\Alegra\Connector\Sync\Inventory_Writer::class, 'apply_stock');
+    TestRunner::assertStringContains("function_exists('wc_update_product_stock')", $src, 'rama A: API recomendada de WC');
+    TestRunner::assertStringContains('set_stock_quantity', $src, 'rama B: fallback set_stock_quantity()');
+    TestRunner::assertStringContains('$p->save()', $src, 'rama B: el fallback persiste con save()');
 });
 
 TestRunner::test('T29.22 las compuertas del writer', function (): void {
@@ -8290,6 +8298,20 @@ TestRunner::test('T29.23 backorders=no idéntico a HEAD', function (): void {
     );
     TestRunner::assertSame('updated', $r, 'updated');
     TestRunner::assertSame('outofstock', $p->get_stock_status(), 'backorders=no + qty 0 => outofstock');
+
+    // R19 / FIX-19 / Oracle D10: con `woocommerce_notify_no_stock_amount > 0`
+    // WC deriva en el umbral. HEAD forzaba `qty > 0 ? instock : outofstock`, así
+    // que este caso documenta el cambio INTENCIONAL (ver CHANGELOG 2.6.0).
+    update_option('woocommerce_notify_no_stock_amount', 2);
+    $p2 = alegra_make_product(939, ['manage_stock' => true, 'stock' => 1, 'backorders' => 'no']);
+    $r2 = (new \Alegra\Connector\Sync\Inventory_Writer())->apply(
+        $p2,
+        ['inventory' => ['availableQuantity' => 1]],
+        ['manage_stock' => 'enable']
+    );
+    TestRunner::assertSame('updated', $r2, 'updated en el umbral');
+    TestRunner::assertSame('outofstock', $p2->get_stock_status(), 'qty 1 <= umbral 2 + backorders=no => outofstock (R19)');
+    update_option('woocommerce_notify_no_stock_amount', 0);
 });
 
 TestRunner::test('T29.24 W1 delega en el writer y respeta source/preserve', function (): void {
@@ -9627,6 +9649,110 @@ TestRunner::test('T29.85 el poll/cron no dependen de Action Scheduler (source-sc
             TestRunner::assertStringNotContains($needle, $src, "$rel no debe usar $needle");
         }
     }
+});
+
+// ===========================================================================
+// Fase 9 — regresión R18 (end-to-end) + release 2.6.0 (source-scan).
+// IDs: T29.91–T29.95. La matriz R1–R19 mapea a los T29.x de las fases 1–8.
+// ===========================================================================
+
+TestRunner::test('T29.91 factura normal intacta: mismo flujo/payload, sin requests por CF (R18)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    make_payable_user();
+    $order = make_payable_order(9100, 1, 'pay@example.test', 150.0, [
+        'payment_method' => 'mercadopago',
+        'date_paid' => new \DateTime('2026-09-20'),
+        // Contacto ya resuelto: el flujo normal no debe escanear /contacts.
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-normal-91'],
+    ]);
+
+    $resp = click_facturar(9100);
+
+    TestRunner::assertTrue($resp->success, 'el flujo AJAX de facturación debe seguir funcionando');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'exactamente una factura, sin self-heal');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'exactamente un pago, como HEAD');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'la resolución del CF no agrega requests en un pedido normal');
+    $invoice = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame('c0n-normal-91', (string) ($invoice['client']['id'] ?? ''), 'el payload conserva client.id');
+    TestRunner::assertSame('1t3m-5', (string) ($invoice['items'][0]['id'] ?? ''), 'el payload conserva el item id');
+    TestRunner::assertStringNotContains('auto-sanado', implode("\n", $order->get_notes()), 'sin nota de self-heal en una factura normal');
+});
+
+TestRunner::test('T29.92 webhook new-item intacto: importa con run + _alegra_item_id (R18)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'tok');
+    alegra_mock_seed_item('it-92', ['name' => 'Web 92', 'reference' => 'S92', 'type' => 'product', 'status' => 'active']);
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = json_encode(['subject' => 'new-item', 'message' => ['item' => ['id' => 'it-92']]]);
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'tok']));
+
+    TestRunner::assertSame(200, $res->get_status(), 'el webhook debe ACKear 200');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status(1), 'la corrida debe quedar completed');
+    $wc_id = (int) \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-92', 'product');
+    TestRunner::assertTrue($wc_id > 0, 'el ítem debe importarse y mapearse');
+    TestRunner::assertSame('it-92', (string) get_post_meta($wc_id, '_alegra_item_id', true), '_alegra_item_id debe persistir');
+});
+
+TestRunner::test('T29.93 pago intacto: un pedido con factura vinculada registra el pago (R18)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-93', ['status' => 'open', 'balance' => 100.0, 'total' => 100.0]);
+    $order = alegra_make_order(9300, [
+        'total' => 100.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'date_paid' => new \DateTime('2026-09-20'),
+        'meta' => ['_alegra_invoice_id' => 'inv-93', '_billing_alegra_contact_id' => 'c0n-93'],
+    ]);
+
+    $r = make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertFalse(is_wp_error($r), 'el pago debe registrarse');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'la factura existente no se re-crea');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'exactamente un pago');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_payment_id', true) !== '', '_alegra_payment_id debe persistir');
+});
+
+TestRunner::test('T29.94 inventory_source=woocommerce sigue sin escribir stock (R18)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    alegra_make_product(9400, ['name' => 'W', 'sku' => 'W94', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(9400, '_alegra_item_id', 'it-94');
+    alegra_mock_seed_item('it-94', ['name' => 'W', 'reference' => 'W94', 'inventory' => ['availableQuantity' => 99]]);
+
+    $result = make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertTrue(!empty($result['skipped']), 'el poll debe reportar skipped');
+    TestRunner::assertSame(7, wc_get_product(9400)->get_stock_quantity(), 'no debe tocar _stock');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'no debe fetchear items');
+});
+
+TestRunner::test('T29.95 release 2.6.0: versión, uninstall (9 opciones) y CHANGELOG (source-scan)', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+
+    $uninstall = (string) file_get_contents($root . 'uninstall.php');
+    foreach ([
+        'alegra_connector_push_inventory_enabled',
+        'alegra_connector_inventory_manage_stock_enabled',
+        'alegra_connector_inventory_poll_budget',
+        'alegra_connector_inventory_poll_max_pages',
+        'alegra_connector_cron_run_budget',
+        'alegra_connector_open_invoice_on_paid',
+        'alegra_connector_inventory_pull_cursor',
+        'alegra_connector_inventory_pull_total',
+        'alegra_connector_consumidor_final_probe',
+    ] as $opt) {
+        TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "uninstall.php debe borrar $opt");
+    }
+
+    TestRunner::assertStringContains('Version: 2.6.0', (string) file_get_contents($root . 'alegra-connector.php'), 'el header debe declarar 2.6.0');
+    TestRunner::assertStringContains('Version: 2.6.0', (string) file_get_contents($root . 'README.md'), 'el README debe declarar 2.6.0');
+    TestRunner::assertStringContains("'2.6.0'", (string) file_get_contents($root . 'scripts/make-pot.php'), 'make-pot debe declarar 2.6.0');
+
+    $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
+    TestRunner::assertStringContains('## [2.6.0]', $changelog, 'el CHANGELOG debe tener la sección 2.6.0');
+    TestRunner::assertStringContains('inventory-adjustments', $changelog, 'el CHANGELOG debe mencionar inventory-adjustments');
+    TestRunner::assertStringContains('DD-8', $changelog, 'el CHANGELOG debe documentar D2 vs DD-8');
 });
 
 exit(TestRunner::summary());

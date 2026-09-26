@@ -199,6 +199,18 @@ check(
     '— la clase nueva debe resolver por el autoloader PSR-4'
 );
 
+check(
+    'Inventory_Writer class loads',
+    class_exists(\Alegra\Connector\Sync\Inventory_Writer::class),
+    '— el escritor único debe resolver por el autoloader PSR-4'
+);
+
+check(
+    'Inventory_Pusher class loads',
+    class_exists(\Alegra\Connector\Sync\Inventory_Pusher::class),
+    '— el pusher de inventario debe resolver por el autoloader PSR-4'
+);
+
 // ---- Assertion 4: critical main class is reachable ----
 echo "\n[4] Autoloader reachability: Alegra\\Connector\\Alegra_Connector\n";
 $main_class_exists = class_exists('Alegra\\Connector\\Alegra_Connector');
