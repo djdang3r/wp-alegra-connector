@@ -157,6 +157,79 @@ final class Stock_Divergence
         return '';
     }
 
+    /**
+     * T7.4 / REQ-RECON-03: detección READ-ONLY del doble decremento heredado
+     * (corrupción de 2.6.0). Por producto: el plugin emitió un ajuste
+     * (`_alegra_stock_adjusted_at` > 0) Y existe un pedido pagado con factura
+     * vinculada (`_alegra_invoice_id`) que contiene el producto ⇒ Alegra descontó
+     * dos veces. `qty_doble` = Σ cantidades facturadas.
+     *
+     * NO escribe nada. `available` se mide (GET /items/{id}) SÓLO para los
+     * productos detectados y acotado por `$limit` (NFR-04). Si no hay API o no se
+     * puede verificar, queda `null` (la UI lo dice: "no verificado", NFR-02).
+     *
+     * @return array{items:array<int,array{product_id:int,item_id:string,qty_doble:int,orders:array<int,int>,available:?int}>,total:int}
+     */
+    public static function detect_legacy_double_discount(?\Alegra\Connector\API\Client $api = null, int $limit = 20): array
+    {
+        $order_ids = wc_get_orders([
+            'status'  => ['processing', 'completed'],
+            'limit'   => 200,
+            'return'  => 'ids',
+            'orderby' => 'date',
+            'order'   => 'DESC',
+        ]);
+
+        $by_product = [];   // product_id => ['qty' => int, 'orders' => int[]]
+        foreach ($order_ids as $oid) {
+            $order = wc_get_order($oid);
+            if (!$order instanceof \WC_Order || !$order->is_paid()) {
+                continue;
+            }
+            if ((string) $order->get_meta('_alegra_invoice_id', true) === '') {
+                continue;
+            }
+            foreach ($order->get_items() as $item) {
+                $pid = (int) $item->get_product_id();
+                if ($pid <= 0 || Inventory_Pusher::adjusted_at($pid) <= 0) {
+                    continue;
+                }
+                if (!isset($by_product[$pid])) {
+                    $by_product[$pid] = ['qty' => 0, 'orders' => []];
+                }
+                $by_product[$pid]['qty'] += (int) $item->get_quantity();
+                $by_product[$pid]['orders'][] = (int) $order->get_id();
+            }
+        }
+
+        $items = [];
+        foreach ($by_product as $pid => $data) {
+            if ($data['qty'] <= 0) {
+                continue;
+            }
+            $item_id   = (string) get_post_meta((int) $pid, '_alegra_item_id', true);
+            $available = null;
+            if ($api !== null && $item_id !== '') {
+                $res = $api->get_item($item_id);
+                if (!is_wp_error($res) && isset($res['inventory']['availableQuantity'])) {
+                    $available = (int) $res['inventory']['availableQuantity'];
+                }
+            }
+            $items[] = [
+                'product_id' => (int) $pid,
+                'item_id'    => $item_id,
+                'qty_doble'  => (int) $data['qty'],
+                'orders'     => array_values(array_unique($data['orders'])),
+                'available'  => $available,
+            ];
+            if (count($items) >= $limit) {
+                break;
+            }
+        }
+
+        return ['items' => $items, 'total' => count($items)];
+    }
+
     /** @return array<string,array{w:int,a:int,s:int|string,cause:string,at:int}> */
     private static function all(): array
     {

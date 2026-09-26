@@ -98,6 +98,8 @@
 <?php esc_html_e('Gestionar stock en WooCommerce para productos que Alegra marca inventariables', 'alegra-connector'); ?>
 </label>
 <p class="description"><?php esc_html_e('Si lo activás, el poll habilita la gestión de stock en WC para los productos con inventario en Alegra. Si lo dejás apagado, los productos con "Gestionar stock" desactivado en WC no se tocan (comportamiento actual).', 'alegra-connector'); ?></p></td></tr>
+<?php $ac_owner = (string) get_option('alegra_connector_stock_owner', 'auto'); $ac_owner_eff = \Alegra\Connector\Sync\Inventory_Pusher::owner(); ?>
+<tr><th><label for="alegra_connector_stock_owner"><?php esc_html_e('Dueño del stock:','alegra-connector');?></label></th><td><select id="alegra_connector_stock_owner" name="alegra_connector_stock_owner"><option value="auto" <?php selected($ac_owner,'auto');?>><?php esc_html_e('Automático (recomendado)','alegra-connector');?></option><option value="invoice" <?php selected($ac_owner,'invoice');?>><?php esc_html_e('Factura','alegra-connector');?></option><option value="adjustment" <?php selected($ac_owner,'adjustment');?>><?php esc_html_e('Ajuste','alegra-connector');?></option></select><p class="description"><?php esc_html_e('Elegí UNO solo. Si elegís los dos, el stock se descuenta dos veces.','alegra-connector');?><br><em><?php echo esc_html(sprintf(__('Dueño efectivo ahora: %s.','alegra-connector'), $ac_owner_eff === 'invoice' ? __('Factura','alegra-connector') : __('Ajuste','alegra-connector')));?></em></p></td></tr>
 <tr><th><?php esc_html_e('Enviar stock a Alegra:','alegra-connector');?></th><td><label>
 <input type="checkbox" name="alegra_connector_push_inventory_enabled" value="1" <?php checked(get_option('alegra_connector_push_inventory_enabled', true)); ?>>
 <?php esc_html_e('Empujar los cambios de stock de WooCommerce a Alegra', 'alegra-connector'); ?>
@@ -106,9 +108,23 @@
 <tr><th><?php esc_html_e('Subir pedidos a Alegra:','alegra-connector');?></th><td><fieldset>
 <label><input type="checkbox" name="alegra_connector_push_orders_enabled" value="1" <?php checked(get_option('alegra_connector_push_orders_enabled',false));?>> <strong><?php esc_html_e('Automatico: subir la factura a Alegra al crear o pagar el pedido','alegra-connector');?></strong></label>
 <p class="description" style="margin:2px 0 6px 24px;"><?php esc_html_e('Por defecto esta DESACTIVADO (modo manual). Desmarcado: ninguna venta se sube sola; tu decides cuando facturar desde "Pedidos" con los botones "Facturar", "Facturar seleccionados" o "Facturar pendientes". Marcado: cada pedido nuevo se sube a Alegra como factura y, al completarse el pago, se registra el pago automaticamente. Esta opcion es independiente del metodo de sincronizacion de arriba.','alegra-connector');?></p>
+<?php $ac_owner_ui = (string) get_option('alegra_connector_stock_owner', 'auto'); ?>
 <?php if (get_option('alegra_connector_push_orders_enabled', false)): ?>
+<?php if ($ac_owner_ui === 'invoice'): ?>
+<label><input type="checkbox" name="alegra_connector_open_invoice_on_paid" value="1" checked disabled> <strong><?php esc_html_e('Abrir la factura al pagarse (Alegra descuenta stock)','alegra-connector');?></strong></label>
+<input type="hidden" name="alegra_connector_open_invoice_on_paid" value="1">
+<?php else: ?>
 <label><input type="checkbox" name="alegra_connector_open_invoice_on_paid" value="1" <?php checked(get_option('alegra_connector_open_invoice_on_paid', true)); ?>> <strong><?php esc_html_e('Abrir la factura al pagarse (Alegra descuenta stock)','alegra-connector');?></strong></label>
+<?php endif; ?>
 <p class="description" style="margin:2px 0 6px 24px;"><?php esc_html_e('Con la factura como dueña del stock, un pedido pagado abre su factura en Alegra para que descuente existencias nativamente; el plugin NO emite ajustes. Si lo desactivás, el plugin emite un ajuste de inventario por cada cambio de stock (la factura queda en borrador y no mueve stock).','alegra-connector');?></p>
+<?php endif; ?>
+<?php if ($ac_owner_ui === 'invoice'): ?>
+<p class="description" style="margin:2px 0 6px 24px;"><strong><?php esc_html_e('Con "Factura", la factura es la única que mueve el stock: el plugin no emite ajustes.','alegra-connector');?></strong></p>
+<?php elseif ($ac_owner_ui === 'adjustment'): ?>
+<p class="description" style="margin:2px 0 6px 24px;"><?php esc_html_e('Con "Ajuste", la factura queda en borrador; abrirla a mano descuenta dos veces.','alegra-connector');?></p>
+<?php endif; ?>
+<?php if (get_option('alegra_connector_invoice_status','draft') === 'open'): ?>
+<p class="description" style="margin:2px 0 6px 24px;color:var(--ac-danger);"><?php esc_html_e('Ojo: con las facturas en "Abierta", un pedido impago crea una factura que mueve stock antes del pago.','alegra-connector');?></p>
 <?php endif; ?>
 </fieldset></td></tr>
 <tr><th><?php esc_html_e('Subir productos a Alegra:','alegra-connector');?></th><td><fieldset>

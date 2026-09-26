@@ -58,6 +58,49 @@
             this.initOpenInvoice();
             this.initEmitCreditNote();
             this.initCleanupDuplicateImages();
+            this.initRetryInvoice();
+            this.initIgnoreInvoice();
+            this.initRepairDivergence();
+            this.initInvoiceNoticeDismiss();
+        },
+
+        /**
+         * T6.8: POST de una acción de factura con confirmación server-enforced.
+         * Si el server responde `double_discount_confirm_required`, se pide un
+         * segundo confirm y se reenvía con `confirm_double_discount=1`. Cancelar
+         * NO vuelve a llamar a la API.
+         */
+        postInvoiceAction: function(action, orderId, $btn, busyText, idleText, successMsg) {
+            function send(confirmed) {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: {
+                        action: action, _ajax_nonce: alegraConnector.nonce,
+                        order_id: orderId, confirm_double_discount: confirmed ? 1 : 0
+                    },
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, successMsg), 'success');
+                            setTimeout(function(){ location.reload(); }, 1200);
+                            return;
+                        }
+                        var code = r.data && r.data.code;
+                        if (code === 'double_discount_confirm_required') {
+                            if (confirm(S.confirmDoubleDiscount)) { send(true); }
+                            else if ($btn) { $btn.prop('disabled', false); if (idleText) { $btn.text(idleText); } }
+                            return;
+                        }
+                        showNotice(safeMsg(r, S.error), 'error');
+                        if ($btn) { $btn.prop('disabled', false); if (idleText) { $btn.text(idleText); } }
+                    },
+                    error: function() {
+                        showNotice(S.connectionError, 'error');
+                        if ($btn) { $btn.prop('disabled', false); if (idleText) { $btn.text(idleText); } }
+                    }
+                });
+            }
+            if ($btn) { $btn.prop('disabled', true); if (busyText) { $btn.text(busyText); } }
+            send(false);
         },
 
         initTabs: function() {
@@ -631,30 +674,55 @@
         },
 
         initRecordPayment: function() {
+            var self = this;
             $('.alegra-record-payment').on('click', function() {
                 var $btn = $(this);
                 if(!confirm(S.confirmRecordPayment)) return;
-                $btn.prop('disabled', true).text(S.registering);
-                $.ajax({
-                    url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_record_payment', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
-                    success: function(r) { if(r.success) location.reload(); else { showNotice(safeMsg(r, S.error),'error'); $btn.prop('disabled',false).text(S.retry); } },
-                    error: function() { showNotice(S.connectionError,'error'); $btn.prop('disabled',false).text(S.retry); }
-                });
+                self.postInvoiceAction('alegra_record_payment', $btn.data('order-id'), $btn, S.registering, S.retry, S.invoiceOpened);
             });
         },
 
         initOpenInvoice: function() {
+            var self = this;
             $('.alegra-open-invoice').on('click', function() {
                 var $btn = $(this);
                 if (!confirm(S.confirmOpenInvoice)) return;
+                self.postInvoiceAction('alegra_open_invoice', $btn.data('order-id'), $btn, null, null, S.invoiceOpened);
+            });
+        },
+
+        initRetryInvoice: function() {
+            $('.alegra-retry-invoice').on('click', function() {
+                var $btn = $(this);
+                $btn.prop('disabled', true).text(S.retryingInvoice);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_retry_invoice', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, S.retryDone), 'success');
+                            setTimeout(function(){ location.reload(); }, 1200);
+                        } else {
+                            showNotice(safeMsg(r, S.error), 'error');
+                            $btn.prop('disabled', false).text(S.retryInvoice);
+                        }
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false).text(S.retryInvoice); }
+                });
+            });
+        },
+
+        initIgnoreInvoice: function() {
+            $('.alegra-ignore-invoice').on('click', function() {
+                var $btn = $(this);
+                if (!confirm(S.confirmIgnoreInvoice)) return;
                 $btn.prop('disabled', true);
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_open_invoice', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
+                    data: { action: 'alegra_ignore_invoice', _ajax_nonce: alegraConnector.nonce, order_id: $btn.data('order-id') },
                     success: function(r) {
                         if (r.success) {
-                            showNotice(safeMsg(r, S.invoiceOpened), 'success');
+                            showNotice(safeMsg(r, S.ignoredInvoice), 'success');
                             setTimeout(function(){ location.reload(); }, 1200);
                         } else {
                             showNotice(safeMsg(r, S.error), 'error');
@@ -662,6 +730,43 @@
                         }
                     },
                     error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false); }
+                });
+            });
+        },
+
+        initRepairDivergence: function() {
+            $('.alegra-repair-divergence').on('click', function() {
+                var $btn = $(this);
+                var productId = $btn.data('product-id');
+                if (!confirm(fmt(S.confirmRepairDivergence, productId))) return;
+                var payload = {
+                    action: 'alegra_repair_stock_divergence', _ajax_nonce: alegraConnector.nonce,
+                    product_id: productId, mechanism: $btn.data('mechanism'),
+                    repair_mode: $btn.data('repair-mode')
+                };
+                if ($btn.data('qty-doble')) { payload.qty_doble = $btn.data('qty-doble'); }
+                $btn.prop('disabled', true).text(S.repairing);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST', data: payload,
+                    success: function(r) {
+                        if (r.success) {
+                            showNotice(safeMsg(r, S.repairDone), 'success');
+                            setTimeout(function(){ location.reload(); }, 1500);
+                        } else {
+                            showNotice(safeMsg(r, S.error), 'error');
+                            $btn.prop('disabled', false).text(S.repairDivergence);
+                        }
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false).text(S.repairDivergence); }
+                });
+            });
+        },
+
+        initInvoiceNoticeDismiss: function() {
+            $(document).on('click', '#alegra-invoice-failure-notice .notice-dismiss', function() {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_dismiss_invoice_notice', _ajax_nonce: alegraConnector.nonce }
                 });
             });
         },
@@ -810,7 +915,7 @@
                 // Phase 1: count pending
                 $.ajax({
                     url: alegraConnector.ajaxUrl, type: 'POST',
-                    data: { action: 'alegra_sync_pending_start', _ajax_nonce: alegraConnector.nonce },
+                    data: { action: 'alegra_sync_pending_start', _ajax_nonce: alegraConnector.nonce, scope: $btn.data('scope') || 'pending' },
                     success: function(r) {
                         if (!r.success || cancelled) { cleanup(); $btn.prop('disabled', false).text(S.invoicePending); return; }
                         var total = r.data.total;

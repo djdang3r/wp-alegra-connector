@@ -2,6 +2,34 @@
 
 All notable changes to Alegra Connector.
 
+## [2.7.0] - 2026-09-26
+
+> **Dueño único del stock, poll honesto, cola de facturas y reconciliación.** El titular es el
+> **doble descuento**: con los defaults de 2.6.0 cada venta emitía un ajuste y la factura manual
+> volvía a descontar. Ahora el dueño del stock es explícito (`Automático` / `Factura` / `Ajuste`).
+> Verificación: `docs/RELEASE_2.7.0_VERIFICATION.md`.
+
+### Changed
+
+- **El dueño del stock es explícito** (`alegra_connector_stock_owner`). `auto` (default) = lógica exacta
+  de 2.6.0 ⇒ cero cambio para quien no toca nada.
+- **El reporte "Ventas sin factura" se muestra SIEMPRE** (antes se ocultaba con `push_orders_enabled=true`)
+  y detecta facturas `draft`/`void`/meta vacío. **Cambio intencional.**
+- **`open_invoice_on_paid` se coerciona** según el dueño (ON con `invoice`, OFF con `adjustment`).
+- **El poll ya no re-infla ni pisa un cambio local pendiente** (máquina de estados + baseline).
+
+### Added
+
+- Pantalla **"Facturas por subir"** con badge, aviso dismissible y reintento single/bulk.
+- **Reconciliación WC↔Alegra** con causa + reparación explícita (nunca los dos mecanismos).
+- Detección y reparación asistida del **doble decremento existente** (vía `inventory-adjustments`).
+
+### Notes
+
+- Sin cambio de esquema. Opciones nuevas con defaults seguros; **sin migración**.
+- **D1 vs `docs/sdd/inventory/DD-8`:** se mantiene la intención de DD-8 (evitar doble conteo) vía el
+  dueño único; el baseline de factura fija `synced = WC qty` al abrir la factura.
+
 ## [2.6.0] - 2026-09-25
 
 > **Fiabilidad de sincronización: Consumidor Final honesto, inventario bidireccional y poll

@@ -48,6 +48,9 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_emit_credit_note', [$this, 'ajax_emit_credit_note']);
         add_action('wp_ajax_alegra_open_invoice', [$this, 'ajax_open_invoice']);
         add_action('wp_ajax_alegra_repair_stock_divergence', [$this, 'ajax_repair_stock_divergence']);
+        add_action('wp_ajax_alegra_retry_invoice', [$this, 'ajax_retry_invoice']);
+        add_action('wp_ajax_alegra_ignore_invoice', [$this, 'ajax_ignore_invoice']);
+        add_action('wp_ajax_alegra_dismiss_invoice_notice', [$this, 'ajax_dismiss_invoice_notice']);
         add_action('wp_ajax_alegra_import_from_api', [$this, 'ajax_import_from_api']);
         add_action('wp_ajax_alegra_sync_inventory', [$this, 'ajax_sync_inventory']);
         add_action('wp_ajax_alegra_export_csv', [$this, 'ajax_export_csv']);
@@ -232,6 +235,39 @@ class Admin_Dashboard
             'alegra-connector-wizard',
             [$this, 'render_wizard_page']
         );
+
+        // T6.3/T6.6: pantalla de la cola de facturas fallidas + badge con el
+        // conteo cacheado (REQ-QUEUE-03/07). El título lleva el badge.
+        add_submenu_page(
+            'alegra-connector',
+            __('Facturas por subir', 'alegra-connector'),
+            $this->invoice_queue_menu_title(),
+            'manage_woocommerce',
+            'alegra-connector-invoice-queue',
+            [$this, 'render_invoice_queue_page']
+        );
+
+        // REQ-RECON-01: informe de divergencia WC↔Alegra con causa + reparación
+        // explícita. Read-only hasta que el comerciante repara.
+        add_submenu_page(
+            'alegra-connector',
+            __('Reconciliación de stock', 'alegra-connector'),
+            __('Reconciliación de stock', 'alegra-connector'),
+            'manage_woocommerce',
+            'alegra-connector-stock-reconciliation',
+            [$this, 'render_stock_reconciliation_page']
+        );
+    }
+
+    /**
+     * T6.6: título del submenu con badge. Lee el conteo CACHEADO (option), no
+     * ejecuta una query por página (NFR-04/R9).
+     */
+    private function invoice_queue_menu_title(): string
+    {
+        $n = \Alegra\Connector\Sync\Invoice_Queue::count();
+        $title = __('Facturas por subir', 'alegra-connector');
+        return $n > 0 ? $title . ' <span class="awaiting-mod">' . (int) $n . '</span>' : $title;
     }
 
     /**
@@ -767,6 +803,22 @@ class Admin_Dashboard
             'invoicedLabel'         => __('facturados', 'alegra-connector'),
             'invoicesCreated'       => __('%1$s facturas creadas. %2$s errores.', 'alegra-connector'),
 
+            // Fase 6 (2.7.0): cola de facturas fallidas + confirmación del doble descuento.
+            'retryInvoice'          => __('Reintentar', 'alegra-connector'),
+            'retrySelected'         => __('Reintentar seleccionados', 'alegra-connector'),
+            'retryingInvoice'       => __('Reintentando...', 'alegra-connector'),
+            'retryDone'             => __('Se reintentó la factura.', 'alegra-connector'),
+            'alreadyInvoiced'       => __('Ya tiene factura.', 'alegra-connector'),
+            'ignoreInvoice'         => __('Ignorar', 'alegra-connector'),
+            'confirmIgnoreInvoice'  => __('¿Ignorar esta factura? Saldrá de la cola de reintentos.', 'alegra-connector'),
+            'ignoredInvoice'        => __('Factura ignorada.', 'alegra-connector'),
+            'selectOneInvoice'      => __('Seleccioná al menos una factura', 'alegra-connector'),
+            'confirmDoubleDiscount' => __('Los ajustes de inventario están activos; si ya se empujó un ajuste por este pedido, abrir la factura descontará dos veces. ¿Confirmás igual?', 'alegra-connector'),
+            'confirmRepairDivergence' => __('¿Reparar la divergencia del producto #%s? Se emitirá UN solo mecanismo y quedará registrado.', 'alegra-connector'),
+            'repairing'             => __('Reparando...', 'alegra-connector'),
+            'repairDone'            => __('Divergencia reparada.', 'alegra-connector'),
+            'repairDivergence'      => __('Reparar', 'alegra-connector'),
+
             // CSV import page
             'uploadImport'          => __('Subir e Importar', 'alegra-connector'),
             'selectCsv'             => __('Selecciona un archivo CSV', 'alegra-connector'),
@@ -922,6 +974,126 @@ class Admin_Dashboard
         $divergence = $this->get_unjournaled_sales();
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-dashboard.php';
+    }
+
+    /**
+     * T6.3 / REQ-QUEUE-03/08: pantalla "Facturas por subir". Lista el ledger
+     * (failed_retriable/failed_permanent/blocked/payment_missing) y los
+     * nunca-intentados, con motivo/código/intentos/próximo y reintento
+     * single/bulk. La query y el conteo salen de `Invoice_Queue` ⇒ el conteo de
+     * la vista coincide con el badge (REQ-QUEUE-07).
+     */
+    public function render_invoice_queue_page(): void
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
+        }
+
+        // El conteo cacheado se refresca al abrir la pantalla (T4.11).
+        \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+
+        $queue_filters = [
+            'state' => isset($_GET['state']) ? sanitize_key(wp_unslash((string) $_GET['state'])) : '',
+            'from'  => isset($_GET['from']) ? sanitize_text_field(wp_unslash((string) $_GET['from'])) : '',
+            'to'    => isset($_GET['to']) ? sanitize_text_field(wp_unslash((string) $_GET['to'])) : '',
+            's'     => isset($_GET['s']) ? sanitize_text_field(wp_unslash((string) $_GET['s'])) : '',
+        ];
+        $queue_page   = max(1, (int) ($_GET['paged'] ?? 1));
+        $queue_result = \Alegra\Connector\Sync\Invoice_Queue::query(
+            $queue_filters,
+            $queue_page,
+            \Alegra\Connector\Sync\Invoice_Queue::PER_PAGE
+        );
+        $queue_total = (int) $queue_result['total'];
+        $queue_rows  = $this->build_invoice_queue_rows($queue_result['ids']);
+
+        $page_title    = __('Facturas por subir', 'alegra-connector');
+        $page_subtitle = __('Pedidos que no se pudieron facturar en Alegra', 'alegra-connector');
+        $header_color  = 'indigo';
+
+        include ALEGRA_CONNECTOR_PATH . 'templates/admin-invoice-queue.php';
+    }
+
+    /**
+     * T6.3: fila de la cola con los 5 estados distinguidos (REQ-QUEUE-08). El
+     * "nunca intentado" NO se infiere sólo de la ausencia de `_alegra_invoice_id`:
+     * es la ausencia de ledger Y de factura.
+     *
+     * @param array<int,int> $ids
+     * @return array<int,array<string,mixed>>
+     */
+    private function build_invoice_queue_rows(array $ids): array
+    {
+        $labels = [
+            'failed_retriable' => __('Reintentable', 'alegra-connector'),
+            'failed_permanent' => __('Permanente', 'alegra-connector'),
+            'blocked'          => __('Bloqueado', 'alegra-connector'),
+            'payment_missing'  => __('Pago pendiente', 'alegra-connector'),
+            'never'            => __('Nunca intentado', 'alegra-connector'),
+        ];
+
+        $rows = [];
+        foreach ($ids as $id) {
+            $order = wc_get_order((int) $id);
+            if (!$order instanceof \WC_Order) {
+                continue;
+            }
+            $led   = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+            $state = (string) $led['state'];
+            if (!isset($labels[$state])) {
+                $state = 'never';
+            }
+            $created = $order->get_date_created();
+            $rows[] = [
+                'id'             => (int) $order->get_id(),
+                'date'           => $created instanceof \DateTimeInterface ? $created->format('Y-m-d H:i') : '',
+                'customer'       => trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()),
+                'total'          => (float) $order->get_total(),
+                'invoice_status' => (string) $order->get_meta('_alegra_invoice_status', true),
+                'state'          => $state,
+                'state_label'    => $labels[$state],
+                'message'        => (string) $led['message'],
+                'code'           => (string) $led['code'],
+                'attempts'       => (int) $led['attempts'],
+                'last'           => (string) $led['last'],
+                'next'           => (string) $led['next'],
+            ];
+        }
+        return $rows;
+    }
+
+    /**
+     * REQ-RECON-01: informe de divergencia WC↔Alegra con causa. Read-only;
+     * paginado; no hace GET por producto (usa lo que el poll ya midió).
+     */
+    public function render_stock_reconciliation_page(): void
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(esc_html__('No tienes permisos para acceder a esta página.', 'alegra-connector'));
+        }
+
+        $page   = max(1, (int) ($_GET['paged'] ?? 1));
+        $per    = 20;
+        $offset = ($page - 1) * $per;
+        $report = $this->get_stock_divergence($per, $offset);
+        // T7.4: detección read-only del doble decremento heredado (no escribe).
+        $legacy = \Alegra\Connector\Sync\Stock_Divergence::detect_legacy_double_discount(20);
+
+        $page_title    = __('Reconciliación de stock', 'alegra-connector');
+        $page_subtitle = __('Stock de WooCommerce vs. Alegra', 'alegra-connector');
+        $header_color  = 'amber';
+
+        include ALEGRA_CONNECTOR_PATH . 'templates/admin-stock-reconciliation.php';
+    }
+
+    /**
+     * REQ-RECON-01: informe de divergencia (read-only).
+     *
+     * @return array{items:array<int,array<string,mixed>>,total:int}
+     */
+    public function get_stock_divergence(int $limit = 20, int $offset = 0): array
+    {
+        return \Alegra\Connector\Sync\Stock_Divergence::report($limit, $offset);
     }
 
     public function render_settings_page(): void
@@ -3150,6 +3322,110 @@ class Admin_Dashboard
         ]);
     }
 
+    /**
+     * T6.4 / REQ-QUEUE-04: reintento manual de UNA factura fallida. Acción del
+     * comerciante ⇒ contexto explícito. Idempotente: un pedido ya facturado no
+     * crea una segunda factura (REQ-QUEUE-09).
+     */
+    public function ajax_retry_invoice(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_retry_invoice_impl());
+    }
+
+    private function ajax_retry_invoice_impl(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');            // NFR-06
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        $order_id = (int) ($_POST['order_id'] ?? 0);
+        $order    = $order_id > 0 ? wc_get_order($order_id) : false;
+        if (!$order instanceof \WC_Order) {
+            wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
+        }
+
+        // Idempotencia (REQ-QUEUE-09): si ya tiene factura, no se crea otra.
+        if ((string) $order->get_meta('_alegra_invoice_id', true) !== '') {
+            \Alegra\Connector\Sync\Invoice_Failure::clear($order);
+            \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+            wp_send_json_success([
+                'state'   => 'resolved',
+                'message' => __('Ya tiene factura.', 'alegra-connector'),
+            ]);
+        }
+
+        $result = (new \Alegra\Connector\Sync\Controller($this->api, $this->logger))
+            ->sync_entity('order', (int) $order->get_id(), 'complete');
+
+        if (is_wp_error($result)) {
+            \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+            wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
+        }
+
+        if (API\Client::write_was_blocked($result)) {
+            \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+            wp_send_json_error([
+                'message' => self::blocked_message((array) $result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'dry_run'),
+            ]);
+        }
+
+        // El propio flujo persistió el ledger (resolved o fallo clasificado).
+        \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+        wp_send_json_success([
+            'state'   => 'resolved',
+            'message' => __('Se reintentó la factura.', 'alegra-connector'),
+        ]);
+    }
+
+    /**
+     * REQ-QUEUE-04: "Ignorar" saca un pedido de la cola sin reintentar
+     * (design §4.4): `resolved` + `_alegra_invoice_ignored=1` + nota.
+     */
+    public function ajax_ignore_invoice(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_ignore_invoice_impl());
+    }
+
+    private function ajax_ignore_invoice_impl(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        $order_id = (int) ($_POST['order_id'] ?? 0);
+        $order    = $order_id > 0 ? wc_get_order($order_id) : false;
+        if (!$order instanceof \WC_Order) {
+            wp_send_json_error(['message' => __('Pedido no encontrado.', 'alegra-connector')]);
+        }
+
+        $order->update_meta_data(\Alegra\Connector\Sync\Invoice_Failure::META_STATE, 'resolved');
+        $order->update_meta_data('_alegra_invoice_ignored', '1');
+        $order->save();
+        $order->add_order_note(__('[Alegra] Factura ignorada manualmente: sale de la cola de reintentos.', 'alegra-connector'));
+        \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+
+        wp_send_json_success(['message' => __('Factura ignorada.', 'alegra-connector')]);
+    }
+
+    /**
+     * T6.6: dismiss per-user del aviso de fallos. Guarda el hash actual para no
+     * volver a mostrarlo hasta que el conteo cambie (design §4.7).
+     */
+    public function ajax_dismiss_invoice_notice(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+        $hash = (string) get_option('alegra_connector_invoice_failures_hash', '');
+        update_user_meta(get_current_user_id(), '_alegra_invoice_notice_dismissed_hash', $hash);
+        wp_send_json_success(['message' => __('Aviso descartado.', 'alegra-connector')]);
+    }
+
     public function ajax_record_payment(): void
     {
         \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_record_payment_impl());
@@ -4151,26 +4427,37 @@ class Admin_Dashboard
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce')) wp_send_json_error();
 
-        $orders = wc_get_orders([
-            'limit' => 100,
-            'status' => ['processing', 'completed', 'on-hold'],
-            'return' => 'ids',
-        ]);
+        // T6.5/REQ-QUEUE-05: `scope=failed` sale del ledger (estados terminales);
+        // `pending` (default) mantiene la lógica de "sin _alegra_invoice_id".
+        // NUNCA se toca `alegra_batch_state` (es del import, escenario negativo).
+        $scope = sanitize_key($_POST['scope'] ?? 'pending');
 
-        $pending = [];
-        foreach ($orders as $oid) {
-            // AC-34: read order meta through the CRUD API. get_post_meta() is
-            // empty under HPOS, so every order was classified "pending".
-            $order = wc_get_order($oid);
-            if (!$order instanceof \WC_Order) {
-                continue;
-            }
-            if ((string) $order->get_meta('_alegra_invoice_id', true) === '') {
-                $pending[] = (int) $oid;
+        if ($scope === 'failed') {
+            $result  = \Alegra\Connector\Sync\Invoice_Queue::query(['state' => 'failed'], 1, 100);
+            $pending = array_map('intval', $result['ids']);
+        } else {
+            $orders = wc_get_orders([
+                'limit' => 100,
+                'status' => ['processing', 'completed', 'on-hold'],
+                'return' => 'ids',
+            ]);
+
+            $pending = [];
+            foreach ($orders as $oid) {
+                // AC-34: read order meta through the CRUD API. get_post_meta() is
+                // empty under HPOS, so every order was classified "pending".
+                $order = wc_get_order($oid);
+                if (!$order instanceof \WC_Order) {
+                    continue;
+                }
+                if ((string) $order->get_meta('_alegra_invoice_id', true) === '') {
+                    $pending[] = (int) $oid;
+                }
             }
         }
 
         $state = [
+            'scope' => $scope,
             'order_ids' => $pending,
             'total' => count($pending),
             'processed' => 0,
@@ -4179,7 +4466,7 @@ class Admin_Dashboard
         ];
         set_transient('alegra_pending_invoice_batch', $state, 600);
 
-        wp_send_json_success(['total' => count($pending)]);
+        wp_send_json_success(['total' => count($pending), 'scope' => $scope]);
     }
 
     public function ajax_sync_pending_page(): void

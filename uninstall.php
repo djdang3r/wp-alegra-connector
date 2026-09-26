@@ -236,7 +236,7 @@ function alegra_connector_uninstall_site(): void
     delete_metadata('term', 0, 'alegra_category_id', '', true);
 
     // 8. Clear scheduled actions (WP-Cron + Action Scheduler).
-    foreach (['alegra_connector_cron_sync', 'alegra_connector_daily_maintenance', 'alegra_connector_payment_reconcile'] as $hook) {
+    foreach (['alegra_connector_cron_sync', 'alegra_connector_daily_maintenance', 'alegra_connector_payment_reconcile', 'alegra_connector_invoice_retry'] as $hook) {
         wp_clear_scheduled_hook($hook);
     }
     if (function_exists('as_unschedule_all_actions')) {

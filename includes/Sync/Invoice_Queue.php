@@ -35,6 +35,15 @@ final class Invoice_Queue
         if (!empty($filters['from']) || !empty($filters['to'])) {
             $args['date_created'] = trim(($filters['from'] ?? '') . '...' . ($filters['to'] ?? ''), '.');
         }
+        // Búsqueda: por id de pedido (numérico) o por email de facturación.
+        $search = trim((string) ($filters['s'] ?? ''));
+        if ($search !== '') {
+            if (ctype_digit($search)) {
+                $args['include'] = [(int) $search];
+            } else {
+                $args['billing_email'] = $search;
+            }
+        }
         $res = wc_get_orders($args);
         if (is_object($res) && isset($res->orders)) {
             $ids = array_map(static fn ($o) => (int) $o->get_id(), $res->orders);
@@ -114,24 +123,32 @@ final class Invoice_Queue
 
     private static function meta_query(array $filters): array
     {
-        $states = self::resolve_states((string) ($filters['state'] ?? ''));
-        if ($states !== []) {
-            // Filtro explícito por estado ⇒ SÓLO el ledger. Excluye los
-            // nunca-intentados del bulk de reintento (C6): no hay qué reintentar.
-            return ['key' => Invoice_Failure::META_STATE, 'value' => $states, 'compare' => 'IN'];
-        }
-        $ledger = ['key' => Invoice_Failure::META_STATE, 'value' => self::STATES, 'compare' => 'IN'];
+        $state = (string) ($filters['state'] ?? '');
+
         // Nunca-intentado = `_alegra_invoice_id` AUSENTE **o** VACÍO (`''`) **y** sin
         // ledger. `NOT EXISTS` solo NO alcanza: un meta guardado como `''` existe y
         // quedaría afuera (DEF-11; `design.md` §4.4: "ausente **o** vacío"). El stub
         // distingue `= ''` de `NOT EXISTS`.
-        $never  = ['relation' => 'AND',
+        $never = ['relation' => 'AND',
             ['relation' => 'OR',
                 ['key' => '_alegra_invoice_id', 'compare' => 'NOT EXISTS'],
                 ['key' => '_alegra_invoice_id', 'value' => '', 'compare' => '='],
             ],
             ['key' => Invoice_Failure::META_STATE, 'compare' => 'NOT EXISTS'],
         ];
+
+        // Filtro explícito por "nunca intentado" (sólo el conjunto sin ledger).
+        if ($state === 'never') {
+            return $never;
+        }
+
+        $states = self::resolve_states($state);
+        if ($states !== []) {
+            // Filtro explícito por estado ⇒ SÓLO el ledger. Excluye los
+            // nunca-intentados del bulk de reintento (C6): no hay qué reintentar.
+            return ['key' => Invoice_Failure::META_STATE, 'value' => $states, 'compare' => 'IN'];
+        }
+        $ledger = ['key' => Invoice_Failure::META_STATE, 'value' => self::STATES, 'compare' => 'IN'];
         return ['relation' => 'OR', $ledger, $never];
     }
 }

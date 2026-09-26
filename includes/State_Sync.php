@@ -60,6 +60,10 @@ class State_Sync
         // by queue_admin_notice() but nothing ever displayed them, so real
         // failures (e.g. a dropped payment-method change) were silent.
         add_action('admin_notices', [self::class, 'render_admin_notices']);
+
+        // T6.6 (2.7.0): aviso option-backed de facturas fallidas. A diferencia
+        // del transient de 60 s, sobrevive a un fallo escrito por el cron.
+        add_action('admin_notices', [self::class, 'render_invoice_failure_notice']);
     }
 
     /**
@@ -501,5 +505,55 @@ class State_Sync
                 . esc_html((string) $notice)
                 . '</p></div>';
         }
+    }
+
+    /**
+     * T6.6 / REQ-QUEUE-07: siembra el hash del conteo de fallos en una option
+     * (autoload no) para que el aviso sobreviva a un fallo escrito por el cron
+     * (no depende de un request de usuario). Delega en `Invoice_Queue` para no
+     * divergir del hash canónico (`md5((string) $count)`, design §4.7/C4).
+     */
+    public static function queue_invoice_failure_notice(int $count): void
+    {
+        if ($count <= 0) {
+            delete_option('alegra_connector_invoice_failures_hash');
+            return;
+        }
+        update_option(
+            'alegra_connector_invoice_failures_hash',
+            \Alegra\Connector\Sync\Invoice_Queue::failure_hash($count),
+            false
+        );
+    }
+
+    /**
+     * T6.6: render del aviso dismissible + dismiss per-user. Lee la option
+     * (NUNCA ejecuta una query por página, NFR-04). El dismiss se persiste por
+     * usuario (`_alegra_invoice_notice_dismissed_hash`) y no reaparece hasta
+     * que cambie el hash.
+     */
+    public static function render_invoice_failure_notice(): void
+    {
+        $count = (int) get_option('alegra_connector_invoice_failures_count', 0);
+        if ($count <= 0) {
+            return;
+        }
+        $hash = (string) get_option('alegra_connector_invoice_failures_hash', '');
+        if ($hash === '') {
+            $hash = \Alegra\Connector\Sync\Invoice_Queue::failure_hash($count);
+        }
+        if ((string) get_user_meta(get_current_user_id(), '_alegra_invoice_notice_dismissed_hash', true) === $hash) {
+            return;
+        }
+
+        $url = admin_url('admin.php?page=alegra-connector-invoice-queue');
+        echo '<div class="notice notice-warning is-dismissible" id="alegra-invoice-failure-notice" data-alegra-notice-hash="' . esc_attr($hash) . '"><p>';
+        echo esc_html(sprintf(
+            /* translators: %d: number of invoices that failed to upload. */
+            __('%d facturas no se pudieron subir a Alegra.', 'alegra-connector'),
+            $count
+        ));
+        echo ' <a href="' . esc_url($url) . '">' . esc_html__('Ver lista', 'alegra-connector') . '</a>';
+        echo '</p></div>';
     }
 }

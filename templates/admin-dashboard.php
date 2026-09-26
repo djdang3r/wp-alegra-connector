@@ -207,6 +207,7 @@ include __DIR__ . '/header.php';
             </span>
             <span class="alegra-health-action">
                 <?php esc_html_e('El stock de Alegra puede no reflejar esas ventas.', 'alegra-connector'); ?>
+                <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-invoice-queue')); ?>"><?php esc_html_e('Ver facturas por subir', 'alegra-connector'); ?> &rarr;</a>
             </span>
         </div>
         <?php endif; ?>
