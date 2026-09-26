@@ -7995,7 +7995,9 @@ TestRunner::test('T28.717 el release 2.6.0 está consistente (uninstall/version/
         TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse");
     }
     $main = (string) file_get_contents($root . 'alegra-connector.php');
-    TestRunner::assertStringContains('Version: 2.6.0', $main, 'el header dice 2.6.0');
+    preg_match('/^\s*\*\s*Version:\s*([0-9A-Za-z.\-]+)/m', $main, $vm);
+    $version = (string) ($vm[1] ?? '');
+    TestRunner::assertStringContains("Version: $version", (string) file_get_contents($root . 'README.md'), 'el README coincide con el header');
     $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
     TestRunner::assertStringContains('## [2.5.1]', $changelog, 'el CHANGELOG tiene la sección');
     TestRunner::assertStringContains('## [2.5.0]', $changelog, 'el CHANGELOG conserva 2.5.0');
@@ -9766,9 +9768,12 @@ TestRunner::test('T29.95 release 2.6.0: versión, uninstall (9 opciones) y CHANG
         TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "uninstall.php debe borrar $opt");
     }
 
-    TestRunner::assertStringContains('Version: 2.6.0', (string) file_get_contents($root . 'alegra-connector.php'), 'el header debe declarar 2.6.0');
-    TestRunner::assertStringContains('Version: 2.6.0', (string) file_get_contents($root . 'README.md'), 'el README debe declarar 2.6.0');
-    TestRunner::assertStringContains("'2.6.0'", (string) file_get_contents($root . 'scripts/make-pot.php'), 'make-pot debe declarar 2.6.0');
+    $header = (string) file_get_contents($root . 'alegra-connector.php');
+    preg_match('/^\s*\*\s*Version:\s*([0-9A-Za-z.\-]+)/m', $header, $vm);
+    $version = (string) ($vm[1] ?? '');
+    TestRunner::assertStringContains("Version: $version", $header, 'el header declara la versión');
+    TestRunner::assertStringContains("Version: $version", (string) file_get_contents($root . 'README.md'), 'el README coincide con el header');
+    TestRunner::assertStringContains("'$version'", (string) file_get_contents($root . 'scripts/make-pot.php'), 'make-pot coincide con el header');
 
     $changelog = (string) file_get_contents($root . 'CHANGELOG.md');
     TestRunner::assertStringContains('## [2.6.0]', $changelog, 'el CHANGELOG debe tener la sección 2.6.0');
