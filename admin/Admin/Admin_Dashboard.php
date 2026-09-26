@@ -526,6 +526,12 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => max(0, (int) $v),
             'default' => 0,
         ]);
+        // D7 §8.3: presupuesto global de una corrida del cron. Debe quedar por
+        // debajo del TTL 600 del lock global (alegra_cron_global).
+        register_setting('alegra_connector_settings', 'alegra_connector_cron_run_budget', [
+            'sanitize_callback' => fn($v) => max(60, min(590, (int) $v)),
+            'default' => 540,
+        ]);
         // D5/T5.3a: extra image hosts the merchant allowlists by hand. Sanitized
         // (no wildcard/path/port) and merged with the built-in ['alegra.com'].
         register_setting('alegra_connector_settings', 'alegra_connector_allowed_image_hosts_extra', [
@@ -1954,6 +1960,12 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
         }
 
+        // T7.2.b-2: "desde cero" borra el cursor antes de la corrida.
+        if (!empty($_POST['from_zero'])) {
+            delete_option('alegra_connector_inventory_pull_cursor');
+            delete_option('alegra_connector_inventory_pull_total');
+        }
+
         $result = (new Sync\Controller($this->api, $this->logger))->run_inventory_sync();
 
         if (!empty($result['skipped'])) {
@@ -1963,13 +1975,27 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Ya hay una sincronización en curso. Intenta de nuevo en unos segundos.', 'alegra-connector')]);
         }
 
-        wp_send_json_success([
-            'message' => sprintf(
+        $truncated = !empty($result['truncated']);
+        $message = $truncated
+            ? sprintf(
+                /* translators: 1: updated count, 2: resume cursor */
+                __('Inventario sincronizado parcialmente: %1$d productos actualizados. Quedó trabajo pendiente (cursor %2$d); volvé a ejecutar para continuar.', 'alegra-connector'),
+                (int) ($result['updated'] ?? 0),
+                (int) ($result['cursor'] ?? 0)
+            )
+            : sprintf(
                 /* translators: %d: number of products whose stock was updated */
                 __('Inventario sincronizado: %d productos actualizados.', 'alegra-connector'),
                 (int) ($result['updated'] ?? 0)
-            ),
-            'updated' => (int) ($result['updated'] ?? 0),
+            );
+
+        wp_send_json_success([
+            'message'   => $message,
+            'updated'   => (int) ($result['updated'] ?? 0),
+            'truncated' => $truncated,
+            'completed' => !empty($result['completed']),
+            'cursor'    => (int) ($result['cursor'] ?? 0),
+            'pages'     => (int) ($result['pages'] ?? 0),
         ]);
     }
 

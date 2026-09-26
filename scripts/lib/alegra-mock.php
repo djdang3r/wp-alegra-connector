@@ -271,12 +271,25 @@ function alegra_mock_dispatch(string $url, array $args)
     ];
 
     // Failure injection first.
+    //
+    // Semantics: `times === 0` means "fail forever" (the default). A FINITE
+    // `times > 0` must recover after exactly that many calls — the old code
+    // decremented to 0, which the dispatcher then read as "forever", so a
+    // finite failure never recovered (a silent false-green generator).
     $key = $method . ' ' . $path;
     if (isset($GLOBALS['alegra_mock_failures'][$key])) {
         $fail = &$GLOBALS['alegra_mock_failures'][$key];
-        if ($fail['times'] === 0 || $fail['times'] > 0) {
-            if ($fail['times'] > 0) { $fail['times']--; }
-            return alegra_mock_response($fail['code'], $fail['body']);
+        $forever = ((int) $fail['times'] === 0);
+        if ($forever || (int) $fail['times'] > 0) {
+            $fail_code = (int) $fail['code'];
+            $fail_body = $fail['body'];
+            if (!$forever) {
+                $fail['times']--;
+                if ((int) $fail['times'] <= 0) {
+                    unset($GLOBALS['alegra_mock_failures'][$key]);
+                }
+            }
+            return alegra_mock_response($fail_code, $fail_body);
         }
     }
 

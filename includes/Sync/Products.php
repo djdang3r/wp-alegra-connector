@@ -1139,10 +1139,22 @@ class Products
     /**
      * Sync inventory from Alegra to WooCommerce (pull)
      */
-    public function sync_inventory_from_alegra(int $run_id = 0): array
+    public function sync_inventory_from_alegra(int $run_id = 0, float $deadline = 0.0): array
     {
-        $result = ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false,
-                   'skipped_not_manageable' => 0];
+        // Conjunto CANÓNICO de claves (9): updated, errors, pages, locked,
+        // skipped, skipped_not_manageable, truncated, completed, cursor.
+        // `divergence` NO es clave de $result (vive en el informe de divergencia).
+        $result = [
+            'updated'                => 0,
+            'errors'                 => 0,
+            'pages'                  => 0,
+            'locked'                 => false,
+            'skipped'                => false,
+            'skipped_not_manageable' => 0,
+            'truncated'              => false,
+            'completed'              => false,
+            'cursor'                 => 0,
+        ];
 
         // Kill switch guard: the pull is a sync entry point like any other and
         // must abort when the plugin is disconnected/deactivated. This was the
@@ -1168,11 +1180,77 @@ class Products
             return $result;
         }
 
-        try {
-            $max_pages = 200;
-            set_time_limit(300);
+        // D7 §8.1 (FIX-16, primer bloque tras el lock): un fatal saltea el
+        // finally y deja el lock tomado 300 s. El shutdown handler lo libera;
+        // release_lock() valida el token (Controller.php:441-448) ⇒ nunca libera
+        // un lock ajeno (DR10/R12).
+        $lock_key = 'alegra_sync_running_products';
+        register_shutdown_function(static function () use ($lock_key, $lock): void {
+            \Alegra\Connector\Sync\Controller::release_lock($lock_key, $lock);
+        });
 
-            for ($p = 1; $p <= $max_pages; $p++) {
+        // D6 §8.2 (FIX-16, segundo bloque): cortar la cascada WC→Alegra mientras
+        // escribimos stock. El guard real es el transient `alegra_import_in_progress`
+        // (Public_.php:433), leído por trigger_sync() (:371). Patrón anidado.
+        $was_syncing = \Alegra\Connector\Public\Public_::is_syncing();
+        if (!$was_syncing) {
+            \Alegra\Connector\Public\Public_::set_syncing(true);
+        }
+
+        try {
+            $cursor_key = 'alegra_connector_inventory_pull_cursor';
+            $total_key  = 'alegra_connector_inventory_pull_total';
+
+            // Cursor persistido (D6 §7.2): un cursor viejo es válido y reanudable.
+            $cursor = max(0, (int) get_option($cursor_key, 0));
+
+            // FIX-14 (momus C6): el total DEBE venir de la API, no del cursor.
+            // Probe metadata=true (mismo patrón que ajax_sync_start). Si falla,
+            // se conserva el total previo (nunca se resetea por un total stale/0).
+            //
+            // El probe sólo corre cuando hay un cursor/total persistido que
+            // validar: sin cursor no hay nada que resetear (caso 3) y sería una
+            // llamada extra en cada corrida fresca — los gates del poll
+            // (T16.9/T16.11/T-INV-GATE-1) cuentan exactamente los GET /items.
+            $known_total = max(0, (int) get_option($total_key, 0));
+            if ($cursor > 0 || $known_total > 0) {
+                $total_probe = $this->api->get_items(['limit' => 1, 'metadata' => true, 'mode' => 'advanced']);
+                if (is_array($total_probe) && isset($total_probe['metadata']['total'])) {
+                    $known_total = max(0, (int) $total_probe['metadata']['total']);
+                    update_option($total_key, $known_total, false);
+                }
+            }
+
+            // Defensivo (D6 §7.3-3): si el cursor apunta más allá del total
+            // conocido, el catálogo se encogió ⇒ arrancar de cero. El guard
+            // `> 0` es obligatorio: con total 0 el cursor se resetearía siempre.
+            if ($known_total > 0 && $cursor >= $known_total) {
+                $cursor = 0;
+                delete_option($cursor_key);
+            }
+
+            // Presupuesto propio, NO del host (NFR-03). Default conservador 60 s.
+            $budget = max(10, (int) get_option('alegra_connector_inventory_poll_budget', 60));
+            $own_deadline = microtime(true) + $budget;
+            if ($deadline > 0.0) {
+                $own_deadline = min($own_deadline, $deadline);   // deadline global del cron (T8.2)
+            }
+
+            // 0 = sin tope: el cursor reanuda. Reemplaza el 200 fijo de HEAD.
+            $max_pages = max(0, (int) get_option('alegra_connector_inventory_poll_max_pages', 0));
+
+            $p = 0;
+            $completed = false;
+            while (true) {
+                if (microtime(true) >= $own_deadline) {
+                    $result['truncated'] = true;
+                    break;
+                }
+                if ($max_pages > 0 && $p >= $max_pages) {
+                    $result['truncated'] = true;
+                    break;
+                }
+
                 if (get_transient('alegra_sync_cancelled')) {
                     delete_transient('alegra_sync_cancelled');
                     $this->logger->info('Inventory sync cancelled by user');
@@ -1185,17 +1263,24 @@ class Products
                     break;
                 }
 
+                // D6 §8.2 / DR8: refrescar el transient de import por página
+                // (TTL 300 < poll largo). Sólo si el poll lo puso (anidado).
+                if (!$was_syncing) {
+                    set_transient('alegra_import_in_progress', 1, 300);
+                }
+
                 // AC-83: throttle the progress write (every 5th page) and use a
                 // TTL longer than a run so the admin UI never sees it expire
                 // mid-import.
-                if ($p === 1 || $p % 5 === 0) {
+                if ($p === 0 || ($p + 1) % 5 === 0) {
                     set_transient('alegra_sync_progress', [
                         'type' => 'inventory',
-                        'current_page' => $p,
+                        'current_page' => $p + 1,
                         'items_processed' => $result['updated'] + $result['errors'],
                         'updated' => $result['updated'],
                         'errors' => $result['errors'],
-                        'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p),
+                        'cursor' => $cursor,
+                        'message' => sprintf(__('Sincronizando inventario... Página %d', 'alegra-connector'), $p + 1),
                     ], 600);
                 }
 
@@ -1203,10 +1288,16 @@ class Products
                 // `availableQuantity` is absent and the guard below skips every
                 // item. Request advanced mode (as import_from_alegra already
                 // does) so the pull actually updates stock.
+                // FIX-15 (Oracle R-3): orden estable por id para que el cursor
+                // (offset `start`) no se corra entre corridas. Si la cuenta no
+                // soporta order_field/order_direction, se mantiene el offset y se
+                // acepta la limitación (idempotencia por ledger + pasada completa).
                 $items = $this->api->get_items([
-                    'start' => ($p - 1) * 30,
-                    'limit' => 30,
-                    'mode'  => 'advanced',
+                    'start'           => $cursor,
+                    'limit'           => 30,
+                    'mode'            => 'advanced',
+                    'order_field'     => 'id',
+                    'order_direction' => 'ASC',
                 ]);
 
                 if (is_wp_error($items)) {
@@ -1214,6 +1305,7 @@ class Products
                     break;
                 }
                 if (empty($items)) {
+                    $completed = true;
                     break;
                 }
 
@@ -1309,11 +1401,34 @@ class Products
                     }
                 }
 
-                $result['pages'] = $p;
+                $result['pages'] = ++$p;
+                $cursor += 30;
+                // Persistir el cursor por página (patrón import :1474). NO se
+                // escribe $total_key acá (FIX-14): el total es el de la API.
+                update_option($cursor_key, $cursor, false);
 
                 if (count($items) < 30) {
+                    $completed = true;
                     break;
                 }
+            }
+
+            // Reset del cursor SOLO al completar (D6 §7.3-1). Los casos 2
+            // (`from_zero`, T7.4) y 3 (catálogo encogido, arriba) también resetean.
+            if ($completed) {
+                delete_option($cursor_key);
+                delete_option($total_key);
+            }
+            $result['completed'] = $completed;
+            $result['cursor'] = $completed ? 0 : $cursor;
+
+            if ($result['truncated']) {
+                $this->logger->warning('Inventory poll truncated; resuming next run', [
+                    'cursor'  => $cursor,
+                    'pages'   => $result['pages'],
+                    'updated' => $result['updated'],
+                    'errors'  => $result['errors'],
+                ]);
             }
 
             // D3.4 (T2.5): report the legacy manage_stock=no backlog so the
@@ -1329,11 +1444,15 @@ class Products
 
             return $result;
         } finally {
+            // D6 §8.2: apagar el flag sólo si lo pusimos nosotros (anidado).
+            if (!$was_syncing) {
+                \Alegra\Connector\Public\Public_::set_syncing(false);
+            }
             \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $lock);
         }
     }
 
-    public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0): array|\WP_Error
+    public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0, float $run_deadline = 0.0): array|\WP_Error
     {
         // Kill switch guard
         if (\Alegra\Connector\Kill_Switch::is_active()) {
@@ -1361,6 +1480,10 @@ class Products
             $budget = 30;
         }
         $deadline = microtime(true) + $budget;
+        if ($run_deadline > 0.0) {
+            // El presupuesto global del cron manda cuando es más corto (D7 §8.3).
+            $deadline = min($deadline, $run_deadline);
+        }
 
         // AC-19: 0 = unlimited. The resume cursor makes a hard page cap
         // unnecessary — a 50k-item catalog imports across several runs.

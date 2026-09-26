@@ -501,6 +501,21 @@ foreach ($ac_event_labels as $ac_slug => $ac_label): ?>
 </table>
 </div>
 
+<!-- ==================== CRON REAL (RECOMENDADO) ==================== -->
+<div class="ac-card" style="margin-top:20px;border-left:4px solid var(--ac-amber);">
+<div class="ac-card-header"><h2><?php esc_html_e('Sincronización con cron real (recomendado)','alegra-connector');?></h2></div>
+<div class="ac-notice info" style="margin-bottom:16px;"><?php esc_html_e('Por defecto, WordPress dispara el cron cuando alguien visita el sitio. En tiendas con poco tráfico la sincronización puede demorar horas. Un cron real del sistema la ejecuta a horario.','alegra-connector');?></div>
+
+<p><?php esc_html_e('1) Desactivá el cron por visitas: agregá en wp-config.php','alegra-connector');?></p>
+<pre><code>define('DISABLE_WP_CRON', true);</code></pre>
+
+<p><?php esc_html_e('2) Agregá esta línea a tu crontab (crontab -e), reemplazando la ruta si tu hosting la cambia:','alegra-connector');?></p>
+<pre><code>*/15 * * * * wget -q -O - <?php echo esc_html(home_url('/wp-cron.php')); ?>?doing_wp_cron &gt;/dev/null 2&gt;&amp;1</code></pre>
+
+<p class="description"><?php esc_html_e('Si tu host permite PHP CLI:','alegra-connector');?></p>
+<pre><code>*/15 * * * * cd /ruta/a/wordpress &amp;&amp; wp cron event run --due-now &gt;/dev/null 2&gt;&amp;1</code></pre>
+</div>
+
 </div>
 <?php submit_button(esc_html__('Guardar Cambios','alegra-connector'));?></form>
 <?php include __DIR__ . '/footer.php'; ?></div>

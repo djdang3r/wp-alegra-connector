@@ -107,9 +107,9 @@ class Controller
      * Manual inventory-pull entry point for the
      * `alegra_sync_inventory_from_alegra` action (WP-CLI / do_action).
      */
-    public function run_inventory_sync(): array
+    public function run_inventory_sync(float $deadline = 0.0): array
     {
-        $result = $this->products->sync_inventory_from_alegra();
+        $result = $this->products->sync_inventory_from_alegra(0, $deadline);
         $this->logger->info('Inventory pull triggered', $result);
         return $result;
     }
@@ -135,6 +135,19 @@ class Controller
             return;
         }
 
+        // D7 §8.3: avisar si el lock global quedó vencido de una corrida anterior
+        // (acquire_lock lo reclama en silencio, Controller.php:421-428).
+        $cron_lock_option = 'alegra_lock_alegra_cron_global';
+        $existing_lock = get_option($cron_lock_option);
+        if (is_array($existing_lock)
+            && isset($existing_lock['expires'])
+            && (int) $existing_lock['expires'] < time()) {
+            $this->logger->warning('cron lock reclaimed (previous run overran)', [
+                'expired_at' => (int) $existing_lock['expires'],
+                'now'        => time(),
+            ]);
+        }
+
         // AC-20: one global mutex around the WHOLE run. Per-entity locks alone
         // let two ticks interleave (each holding a different entity lock),
         // producing duplicate runs, double API traffic and double writes.
@@ -144,21 +157,34 @@ class Controller
             return;
         }
 
+        // D7 §8.1 (extendido): un fatal saltea el finally (:156-158) y deja el
+        // lock global tomado 600 s ⇒ TODO el cron se saltea. El shutdown handler
+        // lo libera; release_lock() valida el token (:441-448) ⇒ nunca libera un
+        // lock ajeno (DR10/R12).
+        register_shutdown_function(static function () use ($global_lock): void {
+            \Alegra\Connector\Sync\Controller::release_lock('alegra_cron_global', $global_lock);
+        });
+
+        // D7 §8.3: presupuesto global de la corrida < TTL 600 del lock global,
+        // para que un tick no se solape con el anterior (R13).
+        $run_budget = max(60, min(590, (int) get_option('alegra_connector_cron_run_budget', 540)));
+        $deadline = microtime(true) + $run_budget;
+
         $this->logger->info('Starting cron synchronization (Alegra → WC only)');
 
         try {
             // D1: mismo contrato que Runs::track (start → fn → completed /
             // failed+rethrow), pero centralizado en Run_Context (Runs + Heartbeat
             // + Logger). El global lock se libera en el finally.
-            Run_Context::wrap('cron_sync_all', function ($run_id) {
-                $this->run_cron_sync_inner($run_id);
+            Run_Context::wrap('cron_sync_all', function ($run_id) use ($deadline) {
+                $this->run_cron_sync_inner($run_id, $deadline);
             }, 'cron');
         } finally {
             self::release_lock('alegra_cron_global', $global_lock);
         }
     }
 
-    private function run_cron_sync_inner(int $run_id): void
+    private function run_cron_sync_inner(int $run_id, float $deadline = 0.0): void
     {
         $result = [
             'products' => 0,
@@ -185,7 +211,7 @@ class Controller
                 $this->logger->info('Cron sync skipped products: another sync is running');
             } else {
                 try {
-                    $products_result = $this->products->import_from_alegra(1, 30, $run_id);
+                    $products_result = $this->products->import_from_alegra(1, 30, $run_id, $deadline);
                 } finally {
                     $this->release_sync_lock('products', $lock);
                 }
@@ -208,7 +234,7 @@ class Controller
         // transient, the per-run stop and inventory_source.
         if ((string) get_option('alegra_connector_inventory_source', 'alegra') === 'alegra'
             && get_option('alegra_connector_inventory_sync_enabled', true)) {
-            $inventory_result = $this->products->sync_inventory_from_alegra($run_id);
+            $inventory_result = $this->products->sync_inventory_from_alegra($run_id, $deadline);
             if (!empty($inventory_result['updated'])) {
                 $result['inventory'] = (int) $inventory_result['updated'];
             }

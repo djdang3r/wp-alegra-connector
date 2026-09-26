@@ -8455,9 +8455,14 @@ TestRunner::test('T29.32 ledger del pusher', function (): void {
     TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1010), 'synced=7 tras el OK');
     TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(1010), 'pending limpio');
 
-    // (d) api_error deja pending y synced viejo
+    // (d) api_error deja pending y synced viejo.
+    // `times=0` = fail forever: the Client retries 5xx up to 5 times, so a
+    // finite failure (the old `1`) recovers on the first retry and the push
+    // succeeds — it no longer models a persistent API outage now that the mock
+    // honours one-shot semantics (the dispatcher used to treat the decremented
+    // 0 as "forever", which silently made `times=1` persistent).
     \Alegra\Connector\Sync\Inventory_Pusher::set_synced(1010, 7);
-    alegra_mock_fail('POST', '/inventory-adjustments', 500, ['message' => 'boom'], 1);
+    alegra_mock_fail('POST', '/inventory-adjustments', 500, ['message' => 'boom']);
     $r = $pusher->push_delta($p, 5, true);
     TestRunner::assertSame('api_error', $r['reason'], 'el POST falla');
     TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(1010), 'synced NO avanza con el POST fallido');
@@ -9211,6 +9216,417 @@ TestRunner::test('T29.640 the dashboard template has no write-capable CF call (R
     TestRunner::assertStringNotContains('::resolve(', $tpl, 'the render must not call resolve()');
     TestRunner::assertStringContains('probe_state()', $tpl, 'the render must read the persisted probe');
     TestRunner::assertStringContains('peek_id()', $tpl, 'the render must use the read-only peek');
+});
+
+// ===========================================================================
+// Fase 7 — poll: budget/cursor/truncated/set_syncing (D6)
+// IDs: T29.71, T29.72, T29.72b, T29.73, T29.74, T29.75, T29.75b, T29.76.
+// ===========================================================================
+
+/**
+ * GET /items requests that are the poll's PAGE fetch (limit=30), ignoring the
+ * metadata probe (limit=1). Optionally starts after $offset recorded requests.
+ *
+ * @return array<int, array{method:string,path:string,query:array,body:mixed}>
+ */
+function alegra_poll_page_requests(int $offset = 0): array
+{
+    $all = array_slice(alegra_mock_requests('GET', '/items'), $offset);
+    return array_values(array_filter($all, static function ($req): bool {
+        return (int) ($req['query']['limit'] ?? 0) === 30;
+    }));
+}
+
+/**
+ * Seed $count active items for the poll tests. Products are intentionally NOT
+ * mapped to WC products: the pagination/cursor behaviour is independent of the
+ * writer, so `get_product_by_alegra_id()` returning falsy keeps the loop light.
+ */
+function alegra_poll_seed_items(string $prefix, int $count): void
+{
+    for ($n = 1; $n <= $count; $n++) {
+        alegra_mock_seed_item($prefix . $n, [
+            'name'      => 'Item ' . $n,
+            'reference' => 'S' . $n,
+            'status'    => 'active',
+        ]);
+    }
+}
+
+function alegra_poll_use_fake_clock(float $start, float $step): void
+{
+    $GLOBALS['alegra_test_fake_microtime'] = $start;
+    $GLOBALS['alegra_test_fake_microtime_step'] = $step;
+}
+
+function alegra_poll_reset_clock(): void
+{
+    $GLOBALS['alegra_test_fake_microtime'] = null;
+    $GLOBALS['alegra_test_fake_microtime_step'] = 0.0;
+}
+
+TestRunner::test('T29.71 el poll pausa por budget y reanuda por cursor', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_poll_budget', 10, false);
+    alegra_poll_seed_items('it-71-', 45);   // 2 páginas: 30 + 15
+
+    // Reloj falso con paso 6 s: own_deadline = t0 + 10; la 1.ª página entra y la
+    // 2.ª iteración ya superó el budget => truncated, cursor=30.
+    alegra_poll_use_fake_clock(1000.0, 6.0);
+    $r1 = make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertTrue($r1['truncated'], 'debe truncar por budget');
+    TestRunner::assertFalse($r1['completed'], 'no completó el catálogo');
+    TestRunner::assertSame(30, $r1['cursor'], 'cursor = start de la próxima página');
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_inventory_pull_cursor', 0), 'cursor persistido por página');
+
+    // La 2.ª corrida arranca desde el cursor persistido.
+    $before = count(alegra_mock_requests('GET', '/items'));
+    alegra_poll_use_fake_clock(2000.0, 0.0);
+    $r2 = make_products()->sync_inventory_from_alegra();
+
+    $pages = alegra_poll_page_requests($before);
+    TestRunner::assertTrue(isset($pages[0]), 'la 2.ª corrida debe pedir una página');
+    TestRunner::assertSame(30, (int) ($pages[0]['query']['start'] ?? -1), 'la 2.ª corrida arranca desde el cursor (start=30)');
+    TestRunner::assertTrue($r2['completed'], 'la 2.ª corrida completa el catálogo');
+    TestRunner::assertSame(0, $r2['cursor'], 'cursor a 0 al completar');
+    TestRunner::assertFalse(get_option('alegra_connector_inventory_pull_cursor', false), 'cursor borrado al completar');
+
+    alegra_poll_reset_clock();
+});
+
+TestRunner::test('T29.72 el poll trunca con log y completa borrando cursor y total', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_poll_budget', 10, false);
+    alegra_poll_seed_items('it-72-', 45);
+
+    alegra_poll_use_fake_clock(1000.0, 6.0);
+    $logger = alegra_test_capture_logger();
+    $products = new \Alegra\Connector\Sync\Products(make_api($logger), $logger);
+    $r1 = $products->sync_inventory_from_alegra();
+
+    TestRunner::assertTrue($r1['truncated'], 'truncado por budget');
+    TestRunner::assertTrue(alegra_test_logs_contain('Inventory poll truncated'), 'el log de truncación debe existir');
+
+    // Corrida completa (reloj constante): borra cursor y total.
+    alegra_poll_use_fake_clock(3000.0, 0.0);
+    $r2 = make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertFalse($r2['truncated'], 'sin budget no trunca');
+    TestRunner::assertTrue($r2['completed'], 'completa');
+    TestRunner::assertSame(0, $r2['cursor'], 'cursor 0 al completar');
+    TestRunner::assertFalse(get_option('alegra_connector_inventory_pull_cursor', false), 'cursor borrado');
+    TestRunner::assertFalse(get_option('alegra_connector_inventory_pull_total', false), 'total borrado');
+
+    alegra_poll_reset_clock();
+});
+
+TestRunner::test('T29.72b el cuerpo del poll no llama set_time_limit (source-scan)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Sync\Products::class, 'sync_inventory_from_alegra');
+    TestRunner::assertStringNotContains('set_time_limit', $src, 'el poll ya no usa set_time_limit');
+    TestRunner::assertStringContains('own_deadline', $src, 'el poll corta por presupuesto propio');
+});
+
+TestRunner::test('T29.73 reset del cursor: catálogo encogido y from_zero', function (): void {
+    // (1) Catálogo encogido: cursor viejo 1500 >= total real (45) => start=0.
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_poll_budget', 10, false);
+    alegra_poll_seed_items('it-73-', 45);
+    update_option('alegra_connector_inventory_pull_cursor', 1500, false);
+    update_option('alegra_connector_inventory_pull_total', 999, false);
+
+    alegra_poll_use_fake_clock(1000.0, 6.0);
+    $before = count(alegra_mock_requests('GET', '/items'));
+    make_products()->sync_inventory_from_alegra();
+    alegra_poll_reset_clock();
+
+    $pages = alegra_poll_page_requests($before);
+    TestRunner::assertSame(0, (int) ($pages[0]['query']['start'] ?? -1), 'el catálogo encogido resetea el cursor a 0');
+    TestRunner::assertSame(45, (int) get_option('alegra_connector_inventory_pull_total', 0), 'el total sale de metadata.total (45), no del cursor');
+
+    // (2) Control sin from_zero: cursor válido 30 => start=30.
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_poll_seed_items('it-73b-', 45);
+    update_option('alegra_connector_inventory_pull_cursor', 30, false);
+    update_option('alegra_connector_inventory_pull_total', 45, false);
+
+    $before = count(alegra_mock_requests('GET', '/items'));
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_sync_inventory());
+    $control = alegra_poll_page_requests($before);
+    TestRunner::assertSame(30, (int) ($control[0]['query']['start'] ?? -1), 'sin from_zero el cursor válido reanuda en 30');
+
+    // (3) from_zero=1: borra el cursor antes del poll => start=0.
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_poll_seed_items('it-73c-', 45);
+    update_option('alegra_connector_inventory_pull_cursor', 30, false);
+    update_option('alegra_connector_inventory_pull_total', 45, false);
+    $_POST['from_zero'] = '1';
+
+    $before = count(alegra_mock_requests('GET', '/items'));
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_sync_inventory());
+    unset($_POST['from_zero']);
+    $fresh = alegra_poll_page_requests($before);
+    TestRunner::assertSame(0, (int) ($fresh[0]['query']['start'] ?? -1), 'from_zero arranca de cero (start=0)');
+});
+
+TestRunner::test('T29.74 el poll corre con set_syncing y no dispara la cascada (FIX-2/FIX-8)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_push_products_enabled', true);
+
+    alegra_make_product(7401, ['name' => 'A', 'sku' => 'A74', 'stock' => 5, 'manage_stock' => true]);
+    update_post_meta(7401, '_alegra_item_id', 'it-74');
+    alegra_mock_seed_item('it-74', ['name' => 'A', 'reference' => 'A74', 'status' => 'active', 'inventory' => ['availableQuantity' => 9]]);
+
+    // Observa is_syncing() en el momento exacto del hook de stock (el writer del
+    // poll dispara woocommerce_product_set_stock).
+    $GLOBALS['alegra_test_is_syncing_at_hook'] = null;
+    add_action('woocommerce_product_set_stock', function ($product): void {
+        $GLOBALS['alegra_test_is_syncing_at_hook'] = \Alegra\Connector\Public\Public_::is_syncing();
+    }, 20, 1);
+    \Alegra\Connector\Sync\Inventory_Pusher::register_hooks(make_api(), make_logger());
+
+    $result = make_products()->sync_inventory_from_alegra();
+
+    TestRunner::assertSame(true, $GLOBALS['alegra_test_is_syncing_at_hook'], 'el poll corre con is_syncing=true');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'sin cascada de push');
+    TestRunner::assertSame(9, wc_get_product(7401)->get_stock_quantity(), 'el poll escribe WC desde Alegra');
+    TestRunner::assertSame(1, $result['updated'], 'cuenta el updated');
+    TestRunner::assertFalse(\Alegra\Connector\Public\Public_::is_syncing(), 'is_syncing vuelve a false al terminar');
+    TestRunner::assertFalse(get_transient('alegra_import_in_progress'), 'el transient de import se limpia al terminar');
+
+    // Borde anidado: si ya estaba syncing, el poll NO apaga el flag externo.
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    make_products()->sync_inventory_from_alegra();
+    TestRunner::assertTrue((bool) get_transient('alegra_import_in_progress'), 'el flag externo no se apaga');
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+
+    // Borde FIX-8: push_inventory_enabled=false (reason='disabled') => el poll
+    // igual escribe WC desde Alegra (no se muere de hambre).
+    update_option('alegra_connector_push_inventory_enabled', false);
+    alegra_make_product(7402, ['name' => 'B', 'sku' => 'B74', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(7402, '_alegra_item_id', 'it-74b');
+    alegra_mock_seed_item('it-74b', ['name' => 'B', 'reference' => 'B74', 'status' => 'active', 'inventory' => ['availableQuantity' => 2]]);
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(7402, 10);
+
+    make_products()->sync_inventory_from_alegra();
+    TestRunner::assertSame(2, wc_get_product(7402)->get_stock_quantity(), 'con disabled el poll escribe WC con el valor de Alegra');
+});
+
+TestRunner::test('T29.75 el AJAX surfacea truncated/completed/cursor/pages + message', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_poll_budget', 10, false);
+    alegra_poll_seed_items('it-75-', 45);
+
+    alegra_poll_use_fake_clock(1000.0, 6.0);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_inventory());
+    alegra_poll_reset_clock();
+
+    TestRunner::assertTrue($resp->success, 'el AJAX responde success');
+    foreach (['message', 'updated', 'truncated', 'completed', 'cursor', 'pages'] as $k) {
+        TestRunner::assertArrayHasKey($k, $resp->payload, "la respuesta debe incluir $k");
+    }
+    TestRunner::assertTrue($resp->payload['truncated'], 'truncated true con budget bajo');
+    TestRunner::assertStringContains('parcialmente', (string) $resp->payload['message'], 'el mensaje avisa que quedó pendiente');
+    TestRunner::assertSame(30, (int) $resp->payload['cursor'], 'el cursor viaja en la respuesta');
+});
+
+TestRunner::test('T29.75b run_inventory_sync propaga el deadline al poll (spy)', function (): void {
+    alegra_test_reset();
+
+    $spy = new class(make_api(), make_logger()) extends \Alegra\Connector\Sync\Products {
+        /** @var array<int, array{0:int,1:float}> */
+        public array $calls = [];
+        public function sync_inventory_from_alegra(int $run_id = 0, float $deadline = 0.0): array
+        {
+            $this->calls[] = [$run_id, $deadline];
+            return ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false,
+                    'skipped_not_manageable' => 0, 'truncated' => false, 'completed' => false, 'cursor' => 0];
+        }
+    };
+
+    $controller = make_controller();
+    $ref = new ReflectionProperty(\Alegra\Connector\Sync\Controller::class, 'products');
+    $ref->setAccessible(true);
+    $ref->setValue($controller, $spy);
+
+    $controller->run_inventory_sync(123.0);
+
+    TestRunner::assertCount(1, $spy->calls, 'el poll debe llamarse una vez');
+    TestRunner::assertSame(0, $spy->calls[0][0], 'run_id 0');
+    TestRunner::assertSame(123.0, $spy->calls[0][1], 'el 2º argumento es el deadline pasado');
+});
+
+TestRunner::test('T29.76 el poll reconcilia un pending con set_syncing activo (FIX-2 cross-fase)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_push_orders_enabled', false);
+    alegra_mock_seed_item('it-76', ['name' => 'S', 'reference' => 'S76', 'status' => 'active', 'inventory' => ['availableQuantity' => 10]]);
+    alegra_make_product(7601, ['name' => 'S', 'sku' => 'S76', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(7601, '_alegra_item_id', 'it-76');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(7601, 10);
+    \Alegra\Connector\Sync\Inventory_Pusher::set_pending(7601, 7);
+
+    // FIX-2: el guard is_syncing() vive en el HOOK, no en push_delta; el poll
+    // llama push_delta(from_poll: true) y debe poder reconciliar.
+    \Alegra\Connector\Public\Public_::set_syncing(true);
+    make_products()->sync_inventory_from_alegra();
+    \Alegra\Connector\Public\Public_::set_syncing(false);
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'from_poll bypassa is_syncing y el POST sale');
+    TestRunner::assertSame('', \Alegra\Connector\Sync\Inventory_Pusher::pending(7601), 'pending limpio');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(7601), 'synced = WC');
+    TestRunner::assertSame(7, (int) $GLOBALS['alegra_mock_state']['items']['it-76']['inventory']['availableQuantity'], 'Alegra reconciliada a 7');
+});
+
+// ===========================================================================
+// Fase 8 — lock shutdown + cron budget + cron real (D7)
+// IDs: T29.81–T29.85.
+// ===========================================================================
+
+TestRunner::test('T29.81 el shutdown libera ambos locks y respeta tokens ajenos', function (): void {
+    // --- Parte A: ambos locks liberados por los shutdown handlers ---
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_sync_enabled', true);
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_push_orders_enabled', false);
+    $GLOBALS['alegra_mock_shutdown_callbacks'] = [];
+
+    alegra_make_product(8101, ['name' => 'Sh', 'sku' => 'SH81', 'stock' => 5, 'manage_stock' => true]);
+    update_post_meta(8101, '_alegra_item_id', 'it-81');
+    alegra_mock_seed_item('it-81', ['name' => 'Sh', 'reference' => 'SH81', 'status' => 'active', 'inventory' => ['availableQuantity' => 8]]);
+
+    $GLOBALS['alegra_test_lock_before'] = null;
+    $GLOBALS['alegra_test_lock_after'] = null;
+    add_action('woocommerce_product_set_stock', function (): void {
+        if ($GLOBALS['alegra_test_lock_after'] !== null) {
+            return;
+        }
+        $GLOBALS['alegra_test_lock_before'] = [
+            'global'   => (bool) get_option('alegra_lock_alegra_cron_global', false),
+            'products' => (bool) get_option('alegra_lock_alegra_sync_running_products', false),
+        ];
+        // Simula el fatal: corre los shutdown callbacks sin pasar por el finally.
+        alegra_mock_run_shutdown_callbacks();
+        $GLOBALS['alegra_test_lock_after'] = [
+            'global'   => (bool) get_option('alegra_lock_alegra_cron_global', false),
+            'products' => (bool) get_option('alegra_lock_alegra_sync_running_products', false),
+        ];
+    }, 99, 1);
+
+    make_controller()->run_cron_sync();
+
+    TestRunner::assertTrue($GLOBALS['alegra_test_lock_before']['global'], 'el lock global está tomado durante la corrida');
+    TestRunner::assertTrue($GLOBALS['alegra_test_lock_before']['products'], 'el lock del poll está tomado durante la corrida');
+    TestRunner::assertFalse($GLOBALS['alegra_test_lock_after']['global'], 'el shutdown libera el lock global');
+    TestRunner::assertFalse($GLOBALS['alegra_test_lock_after']['products'], 'el shutdown libera el lock del poll');
+
+    // --- Parte B: un lock con token ajeno NO se libera ---
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_push_orders_enabled', false);
+    $GLOBALS['alegra_mock_shutdown_callbacks'] = [];
+    alegra_make_product(8102, ['name' => 'Sh2', 'sku' => 'SH82', 'stock' => 5, 'manage_stock' => true]);
+    update_post_meta(8102, '_alegra_item_id', 'it-82');
+    alegra_mock_seed_item('it-82', ['name' => 'Sh2', 'reference' => 'SH82', 'status' => 'active', 'inventory' => ['availableQuantity' => 8]]);
+
+    // El hook vacía el registro re-entrante: el finally del poll queda no-op y el
+    // lock queda tomado (simula que el finally no corrió).
+    add_action('woocommerce_product_set_stock', function (): void {
+        \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+    }, 50, 1);
+
+    make_products()->sync_inventory_from_alegra();
+    $held = get_option('alegra_lock_alegra_sync_running_products', false);
+    TestRunner::assertTrue(is_array($held) && !empty($held['token']), 'el lock del poll quedó tomado tras el finally no-op');
+
+    // Token ajeno: el handler no debe liberar.
+    update_option('alegra_lock_alegra_sync_running_products', ['token' => 'foreign', 'expires' => time() + 300], false);
+    alegra_mock_run_shutdown_callbacks();
+    $after = get_option('alegra_lock_alegra_sync_running_products', false);
+    TestRunner::assertSame('foreign', $after['token'] ?? null, 'el shutdown NO libera un lock con token ajeno');
+
+    delete_option('alegra_lock_alegra_sync_running_products');
+    $GLOBALS['alegra_mock_shutdown_callbacks'] = [];
+});
+
+TestRunner::test('T29.82 el cron propaga el deadline global a import y poll', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', true);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_inventory_sync_enabled', true);
+    update_option('alegra_connector_cron_run_budget', 540, false);
+
+    $spy = new class(make_api(), make_logger()) extends \Alegra\Connector\Sync\Products {
+        public array $import_args = [];
+        public array $inventory_args = [];
+        public function import_from_alegra(int $page = 1, int $per_page = 30, int $run_id = 0, float $run_deadline = 0.0): array|\WP_Error
+        {
+            $this->import_args[] = [$page, $per_page, $run_id, $run_deadline];
+            return ['imported' => 0, 'updated' => 0, 'errors' => 0, 'total_pages' => 0, 'current_page' => 0, 'paused' => false];
+        }
+        public function sync_inventory_from_alegra(int $run_id = 0, float $deadline = 0.0): array
+        {
+            $this->inventory_args[] = [$run_id, $deadline];
+            return ['updated' => 0, 'errors' => 0, 'pages' => 0, 'locked' => false, 'skipped' => false,
+                    'skipped_not_manageable' => 0, 'truncated' => false, 'completed' => false, 'cursor' => 0];
+        }
+    };
+
+    $controller = make_controller();
+    $ref = new ReflectionProperty(\Alegra\Connector\Sync\Controller::class, 'products');
+    $ref->setAccessible(true);
+    $ref->setValue($controller, $spy);
+
+    $controller->run_cron_sync();
+
+    TestRunner::assertCount(1, $spy->import_args, 'el import del cron corre');
+    TestRunner::assertCount(1, $spy->inventory_args, 'el poll del cron corre');
+    $import_deadline = $spy->import_args[0][3];
+    $inventory_deadline = $spy->inventory_args[0][1];
+    TestRunner::assertTrue($import_deadline > 0.0, 'el import recibe un deadline');
+    TestRunner::assertSame($import_deadline, $inventory_deadline, 'import y poll comparten el deadline global');
+});
+
+TestRunner::test('T29.83 el cron avisa al reclamar un lock global vencido', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    // Lock global vencido (expires en el pasado) con un token cualquiera.
+    update_option('alegra_lock_alegra_cron_global', ['token' => 'stale', 'expires' => time() - 10], false);
+
+    $logger = alegra_test_capture_logger();
+    $controller = new Controller(make_api($logger), $logger);
+    $controller->run_cron_sync();
+
+    TestRunner::assertTrue(alegra_test_logs_contain('cron lock reclaimed'), 'el warning de lock vencido debe emitirse');
+});
+
+TestRunner::test('T29.84 Ajustes recomienda un cron real (source-scan)', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('DISABLE_WP_CRON', $tpl, 'la card debe mencionar DISABLE_WP_CRON');
+    TestRunner::assertStringContains("home_url('/wp-cron.php')", $tpl, 'la URL real del cron');
+    TestRunner::assertStringContains('wp cron event run --due-now', $tpl, 'el fallback WP-CLI');
+    TestRunner::assertStringContains('Sincronización con cron real', $tpl, 'el título de la card');
+});
+
+TestRunner::test('T29.85 el poll/cron no dependen de Action Scheduler (source-scan)', function (): void {
+    foreach (['includes/Sync/Products.php', 'includes/Sync/Controller.php'] as $rel) {
+        $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . $rel);
+        foreach (['as_enqueue_async_action', 'as_schedule_', 'as_next_scheduled_action'] as $needle) {
+            TestRunner::assertStringNotContains($needle, $src, "$rel no debe usar $needle");
+        }
+    }
 });
 
 exit(TestRunner::summary());
