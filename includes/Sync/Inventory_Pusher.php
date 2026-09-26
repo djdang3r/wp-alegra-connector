@@ -342,6 +342,90 @@ final class Inventory_Pusher
     }
 
     /**
+     * Oracle#6: reconcilia Alegra con WC en modo `adjustment`. El delta se calcula
+     * contra `A` real (no contra `synced`), reusando `push_delta()` (lock + pending
+     * + idempotencia + `reference` + `unitCost` + `set_synced`). NUNCA un POST crudo.
+     *
+     * @return array{pushed:bool, delta:int, reason:string}
+     */
+    public function repair_to_wc(\WC_Product $product): array
+    {
+        $id = (int) $product->get_id();
+        $alegra_item = (string) get_post_meta($id, '_alegra_item_id', true);
+        if ($alegra_item === '') {
+            return ['pushed' => false, 'delta' => 0, 'reason' => 'not_linked'];
+        }
+        $a = $this->fetch_alegra_available_quantity($alegra_item);
+        if ($a === null) {
+            return ['pushed' => false, 'delta' => 0, 'reason' => 'baseline_unverified'];
+        }
+        self::set_synced($id, $a);                       // baseline = A real
+        return $this->push_delta($product, (int) $product->get_stock_quantity());
+    }
+
+    /**
+     * B4/T7.4: compensación explícita del doble decremento heredado. Emite UN `in`
+     * por `$qty` con lock + pending + idempotencia + `unitCost` + `warehouse` +
+     * `reference`, y re-baselina `synced` con el `availableQuantity` corregido (o el
+     * stock de WC si no se puede leer). NO chequea `owner()`: es la reparación
+     * explícita bajo `run_explicit`.
+     *
+     * @return array{pushed:bool, delta:int, reason:string}
+     */
+    public function push_compensation(\WC_Product $product, int $qty): array
+    {
+        $id = (int) $product->get_id();
+        if ($qty <= 0) {
+            return ['pushed' => false, 'delta' => 0, 'reason' => 'no_delta'];
+        }
+        $alegra_item = (string) get_post_meta($id, '_alegra_item_id', true);
+        if ($alegra_item === '' || $this->api === null
+            || !get_option('alegra_connector_push_inventory_enabled', true)) {
+            return ['pushed' => false, 'delta' => $qty, 'reason' => 'not_linked'];
+        }
+
+        $lock_key = 'alegra_inventory_push_' . $id;
+        $token = Controller::acquire_lock($lock_key, 30);
+        if ($token === false) {
+            return ['pushed' => false, 'delta' => $qty, 'reason' => 'locked'];
+        }
+        $pending_prev = (string) self::pending($id);
+        $reference    = 'wc-repair-' . $id . '-' . $qty;
+        try {
+            self::set_pending($id, (int) $product->get_stock_quantity());
+            if ($pending_prev !== '' && $this->adjustment_already_exists($alegra_item, $reference, $qty)) {
+                self::set_synced($id, (int) $product->get_stock_quantity());
+                self::clear_pending($id);
+                self::mark_adjusted($id);
+                return ['pushed' => true, 'delta' => $qty, 'reason' => 'already_applied'];
+            }
+            $res = $this->api->create_inventory_adjustment(
+                $this->build_adjustment_payload($alegra_item, $qty, $product, $reference)   // qty>0 ⇒ 'in'
+            );
+            if (API\Client::write_was_blocked($res)) {
+                return ['pushed' => false, 'delta' => $qty, 'reason' => (string) ($res['reason'] ?? 'blocked')];
+            }
+            if (is_wp_error($res)) {
+                if ($this->logger) {
+                    $this->logger->error('Legacy stock compensation failed', [
+                        'product_id' => $id, 'alegra_item' => $alegra_item,
+                        'delta' => $qty, 'error' => $res->get_error_message(),
+                    ]);
+                }
+                return ['pushed' => false, 'delta' => $qty, 'reason' => 'api_error'];
+            }
+            // (c) Re-baseline con el availableQuantity corregido; fallback a WC.
+            $after = $this->fetch_alegra_available_quantity($alegra_item);
+            self::set_synced($id, $after ?? (int) $product->get_stock_quantity());
+            self::clear_pending($id);
+            self::mark_adjusted($id);
+            return ['pushed' => true, 'delta' => $qty, 'reason' => 'ok'];
+        } finally {
+            Controller::release_lock($lock_key, $token);
+        }
+    }
+
+    /**
      * FIX-1: `availableQuantity` de Alegra para `GET /items/{id}`.
      * Devuelve null si no hay dato usable (nunca 0 por ausencia).
      */

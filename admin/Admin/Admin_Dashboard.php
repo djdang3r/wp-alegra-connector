@@ -47,6 +47,7 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_record_payment', [$this, 'ajax_record_payment']);
         add_action('wp_ajax_alegra_emit_credit_note', [$this, 'ajax_emit_credit_note']);
         add_action('wp_ajax_alegra_open_invoice', [$this, 'ajax_open_invoice']);
+        add_action('wp_ajax_alegra_repair_stock_divergence', [$this, 'ajax_repair_stock_divergence']);
         add_action('wp_ajax_alegra_import_from_api', [$this, 'ajax_import_from_api']);
         add_action('wp_ajax_alegra_sync_inventory', [$this, 'ajax_sync_inventory']);
         add_action('wp_ajax_alegra_export_csv', [$this, 'ajax_export_csv']);
@@ -871,13 +872,20 @@ class Admin_Dashboard
      */
     public function get_unjournaled_sales(int $limit = 20): array
     {
+        // REQ-RECON-02: corre SIEMPRE; incluye on-hold (S2) y detecta
+        // ausente / vacío / draft / void (no sólo NOT EXISTS).
         $ids = wc_get_orders([
-            'status'     => ['processing', 'completed'],
+            'status'     => ['processing', 'completed', 'on-hold'],
             'limit'      => $limit,
             'return'     => 'ids',
             'orderby'    => 'date',
             'order'      => 'DESC',
-            'meta_query' => [[ 'key' => '_alegra_invoice_id', 'compare' => 'NOT EXISTS' ]],
+            'meta_query' => [
+                'relation' => 'OR',
+                ['key' => '_alegra_invoice_id', 'compare' => 'NOT EXISTS'],
+                ['key' => '_alegra_invoice_id', 'value' => '', 'compare' => '='],
+                ['key' => '_alegra_invoice_status', 'value' => ['draft', 'void'], 'compare' => 'IN'],
+            ],
         ]);
         $orders = [];
         foreach ($ids as $id) {
@@ -908,11 +916,10 @@ class Admin_Dashboard
         $stats = $this->get_sync_stats();
         $header_color = 'indigo';
 
-        // REQ-INV-07: honest visibility. With owner=adjustment the sales ARE
-        // reflected via adjustments; only the manual-invoice mode can diverge.
-        $divergence = (!get_option('alegra_connector_push_orders_enabled', false))
-            ? $this->get_unjournaled_sales()
-            : ['count' => 0, 'orders' => []];
+        // REQ-RECON-02: el reporte se muestra SIEMPRE (cambio intencional,
+        // CHANGELOG). Con owner=adjustment las ventas se reflejan por ajustes,
+        // pero el reporte ya no se oculta justo en el modo del comerciante.
+        $divergence = $this->get_unjournaled_sales();
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-dashboard.php';
     }
@@ -3008,6 +3015,138 @@ class Admin_Dashboard
         wp_send_json_success([
             'message' => __('Factura abierta en Alegra.', 'alegra-connector'),
             'status'  => $status,
+        ]);
+    }
+
+    /**
+     * T5.4 / REQ-RECON-03: reparación explícita de una divergencia. Emite **o**
+     * la factura faltante **o** un ajuste correctivo, nunca ambos.
+     */
+    public function ajax_repair_stock_divergence(): void
+    {
+        \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_repair_stock_divergence_impl());
+    }
+
+    private function ajax_repair_stock_divergence_impl(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');            // NFR-06
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $product_id  = (int) ($_POST['product_id'] ?? 0);
+        $mechanism   = sanitize_text_field($_POST['mechanism'] ?? '');
+        $repair_mode = sanitize_key($_POST['repair_mode'] ?? 'divergence');
+        if ($product_id <= 0 || !in_array($mechanism, ['invoice', 'adjustment'], true)
+            || !in_array($repair_mode, ['divergence', 'legacy_compensation'], true)) {
+            wp_send_json_error(['message' => __('Parámetros inválidos.', 'alegra-connector')]);
+        }
+
+        $product = wc_get_product($product_id);
+        if (!$product instanceof \WC_Product) {
+            wp_send_json_error(['message' => __('Producto no encontrado.', 'alegra-connector')]);
+        }
+
+        $pusher = new \Alegra\Connector\Sync\Inventory_Pusher($this->api, $this->logger);
+        $orders = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+
+        if ($mechanism === 'invoice') {
+            // REQ-RECON-03: la elección respeta el dueño vigente. Con dueño
+            // `adjustment`, emitir una factura abierta duplicaría el movimiento (la
+            // factura mueve y el ajuste también) ⇒ se rechaza. La reparación de
+            // corrupción heredada va por `repair_mode=legacy_compensation`.
+            if (\Alegra\Connector\Sync\Inventory_Pusher::owner() !== 'invoice') {
+                wp_send_json_error(['message' => __('El dueño del stock es el ajuste; no se emite una factura.', 'alegra-connector')]);
+            }
+            // Reparar por factura: exige un pedido pagado sin factura `open`.
+            $order = $orders->find_paid_order_without_open_invoice($product_id);
+            if (!$order instanceof \WC_Order) {
+                wp_send_json_error(['message' => __('No hay un pedido pagado sin factura para este producto.', 'alegra-connector')]);
+            }
+            $result = (new \Alegra\Connector\Sync\Controller($this->api, $this->logger))
+                ->sync_entity('order', (int) $order->get_id(), 'complete');
+
+            if (is_wp_error($result) || API\Client::write_was_blocked($result)) {
+                wp_send_json_error(['message' => self::blocked_message((array) $result)]);
+            }
+            // G1 Rama A: si la factura quedó draft, abrirla (mueve stock recién ahí).
+            if (\Alegra\Connector\Sync\Inventory_Pusher::owner() === 'invoice'
+                && (string) $order->get_meta('_alegra_invoice_status', true) === 'draft') {
+                $orders->ensure_invoice_open((string) $order->get_meta('_alegra_invoice_id', true));
+            }
+            // Rastro (T5.5).
+            $order->add_order_note(__('[Alegra] Reparación de divergencia: factura emitida (un solo mecanismo).', 'alegra-connector'));
+            $this->logger->info('Stock divergence repaired', ['product_id' => $product_id, 'mechanism' => 'invoice', 'order_id' => (int) $order->get_id()]);
+            \Alegra\Connector\Sync\Stock_Divergence::clear($product_id);
+            wp_send_json_success(['message' => __('Divergencia reparada emitiendo la factura.', 'alegra-connector'), 'mechanism' => 'invoice']);
+        }
+
+        // mechanism === 'adjustment'.
+        if ($repair_mode === 'legacy_compensation') {
+            // T7.4 (a)→(d): compensación explícita del doble decremento heredado.
+            $qty_doble = (int) ($_POST['qty_doble'] ?? 0);   // del informe (Σ ajustes)
+            if ($qty_doble <= 0) {
+                wp_send_json_error(['message' => __('Falta qty_doble del informe.', 'alegra-connector')]);
+            }
+            // (a) SECUENCIA CANÓNICA compartida con T7.4 (idéntica). Dueño → `invoice`
+            //     POR EL SANITIZADOR (T2.8/C8): allowlist + epoch + reset de cachés.
+            //     `sanitize_stock_owner()` sólo DEVUELVE el valor ⇒ hay que persistirlo.
+            //     Luego se coercen las dos opciones que lee `owner()` por sus propios
+            //     sanitizers (T2.8/Oracle#9) para no quedar en el estado B3.
+            update_option(
+                'alegra_connector_stock_owner',
+                self::sanitize_stock_owner('invoice')
+            );
+            update_option(
+                'alegra_connector_push_orders_enabled',
+                self::sanitize_push_orders_enabled(true)
+            );
+            update_option(
+                'alegra_connector_open_invoice_on_paid',
+                self::sanitize_open_invoice_on_paid(true)
+            );
+            // (b) UN `in qty_doble` (lock + idempotencia + unitCost + warehouse + reference).
+            $res = $pusher->push_compensation($product, $qty_doble);
+            if (empty($res['pushed'])) {
+                wp_send_json_error(['message' => self::blocked_message((array) $res)]);
+            }
+            // (c) `push_compensation()` ya re-baselinó `S = availableQuantity`.
+            $product->add_meta_data('_alegra_stock_divergence_note', gmdate('Y-m-d H:i:s'), true);
+            $product->save();
+            $this->logger->info('Stock divergence repaired', [
+                'product_id' => $product_id, 'mechanism' => 'adjustment',
+                'repair_mode' => 'legacy_compensation', 'delta' => $qty_doble,
+            ]);
+            \Alegra\Connector\Sync\Stock_Divergence::clear($product_id);
+            wp_send_json_success([
+                'message' => __('Corrupción heredada reparada (un solo mecanismo).', 'alegra-connector'),
+                'mechanism' => 'adjustment', 'repair_mode' => 'legacy_compensation',
+            ]);
+        }
+
+        // repair_mode === 'divergence': reconciliar Alegra con WC (Oracle#6).
+        if (\Alegra\Connector\Sync\Inventory_Pusher::owner() !== 'adjustment') {
+            wp_send_json_error(['message' => __('El dueño del stock es la factura; no se emite un ajuste.', 'alegra-connector')]);
+        }
+        if ((string) get_post_meta($product_id, '_alegra_item_id', true) === '') {
+            wp_send_json_error(['message' => __('El producto no está vinculado a Alegra.', 'alegra-connector')]);
+        }
+        // Delta contra A real, reusando push_delta() (lock/pending/idempotencia/
+        // reference/unitCost/set_synced). Nunca `synced` ni un POST crudo.
+        $res = $pusher->repair_to_wc($product);
+        if (empty($res['pushed']) && ($res['reason'] ?? '') !== 'in_sync') {
+            wp_send_json_error(['message' => self::blocked_message((array) $res)]);
+        }
+        $product->add_meta_data('_alegra_stock_divergence_note', gmdate('Y-m-d H:i:s'), true);
+        $product->save();
+        $this->logger->info('Stock divergence repaired', [
+            'product_id' => $product_id, 'mechanism' => 'adjustment',
+            'repair_mode' => 'divergence', 'delta' => (int) $res['delta'],
+        ]);
+        \Alegra\Connector\Sync\Stock_Divergence::clear($product_id);
+        wp_send_json_success([
+            'message' => __('Divergencia reparada emitiendo un ajuste.', 'alegra-connector'),
+            'mechanism' => 'adjustment', 'repair_mode' => 'divergence',
         ]);
     }
 

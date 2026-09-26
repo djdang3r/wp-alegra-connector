@@ -1312,6 +1312,22 @@ class WC_Product
     public function set_stock_status($s) { $this->data['stock_status'] = $s; return $this; }
     public function set_backorders($b) { $this->data['backorders'] = $b; return $this; }
     public function set_sku($s) { $this->data['sku'] = $s; return $this; }
+    /**
+     * WC_Data meta API. Production persists it via CRUD; the harness backs it
+     * with the shared wp_postmeta store so a test can read the note with
+     * get_post_meta() (used by the T5.4 repair trace).
+     */
+    public function add_meta_data($key, $value, $unique = false)
+    {
+        if ($unique && get_post_meta($this->id, (string) $key, true) !== '') {
+            return $this;
+        }
+        update_post_meta($this->id, (string) $key, $value);
+        return $this;
+    }
+    public function update_meta_data($key, $value) { update_post_meta($this->id, (string) $key, $value); return $this; }
+    public function get_meta($key, $single = true) { return get_post_meta($this->id, (string) $key, $single); }
+    public function delete_meta_data($key) { delete_post_meta($this->id, (string) $key); return $this; }
     public function save()
     {
         // Replica WC_Product::validate_props() (WC >= 3.0): el estado se deriva
@@ -1548,6 +1564,14 @@ function wc_update_product_stock($product, $qty = null, $operation = 'set', $upd
  */
 function alegra_stub_meta_query_matches($order, array $meta_query): bool
 {
+    // WP_Meta_Query accepts a SINGLE associative clause (with a top-level
+    // `key`) and normalizes it to an array of one. Mirror that here so a
+    // caller (e.g. Invoice_Queue::meta_query with an explicit state filter)
+    // can pass a flat clause and still get the right result.
+    if (isset($meta_query['key'])) {
+        return alegra_stub_meta_clause_matches($order, $meta_query);
+    }
+
     $relation = strtoupper((string) ($meta_query['relation'] ?? 'AND'));
     $clauses = array_filter($meta_query, static fn ($k) => $k !== 'relation', ARRAY_FILTER_USE_KEY);
 

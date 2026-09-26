@@ -194,6 +194,8 @@ final class Alegra_Connector
         add_action('init', [$this, 'maybe_self_heal_cron'], 20);
         // Same self-heal for the hourly payment retry sweep.
         add_action('init', [$this, 'maybe_self_heal_payment_reconcile'], 21);
+        // Same self-heal for the hourly failed-invoice retry (opt-in).
+        add_action('init', [$this, 'maybe_self_heal_invoice_retry'], 22);
         register_activation_hook(__FILE__, [$this, 'activate']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
 
@@ -543,6 +545,7 @@ final class Alegra_Connector
         $this->schedule_cron();
         Maintenance::schedule();
         $this->maybe_self_heal_payment_reconcile();
+        $this->maybe_self_heal_invoice_retry();
 
         // Log activation
         if ($this->logger) {
@@ -580,7 +583,7 @@ final class Alegra_Connector
         );
 
         // 3. Clear ALL cron events with alegra prefix
-        $cron_hooks = ['alegra_connector_cron_sync', Maintenance::CRON_HOOK, 'alegra_connector_payment_reconcile'];
+        $cron_hooks = ['alegra_connector_cron_sync', Maintenance::CRON_HOOK, 'alegra_connector_payment_reconcile', 'alegra_connector_invoice_retry'];
         foreach ($cron_hooks as $hook) {
             wp_clear_scheduled_hook($hook);
         }
@@ -688,6 +691,25 @@ final class Alegra_Connector
         }
 
         wp_schedule_event(time() + 300, 'hourly', $hook);
+    }
+
+    /**
+     * Self-heal the hourly failed-invoice retry schedule (REQ-QUEUE-06).
+     *
+     * Opt-in: when `alegra_connector_invoice_retry_enabled` is off, the hook is
+     * cleared so no event exists. When on, a missing event is (re)scheduled.
+     * Disabling is done through the option; this only keeps the schedule honest.
+     */
+    public function maybe_self_heal_invoice_retry(): void
+    {
+        $hook = 'alegra_connector_invoice_retry';
+        if (!get_option('alegra_connector_invoice_retry_enabled', false)) {
+            wp_clear_scheduled_hook($hook);   // apagado ⇒ sin evento
+            return;
+        }
+        if (wp_next_scheduled($hook) === false) {
+            wp_schedule_event(time() + 300, 'hourly', $hook);
+        }
     }
 
     /**

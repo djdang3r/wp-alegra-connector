@@ -51,6 +51,9 @@ class Orders
      */
     private const ALEGRA_PAYMENT_METHOD_ENUM = ['cash', 'check', 'transfer', 'deposit', 'credit-card', 'debit-card'];
 
+    /** REQ-QUEUE-06: backoff exponencial del reintento de facturas [5m,15m,1h,6h,24h]. */
+    private const RETRY_BACKOFF = [300, 900, 3600, 21600, 86400];
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -165,6 +168,24 @@ class Orders
                     return $healed;
                 }
 
+                // REQ-QUEUE-09: el POST pudo haber commiteado (timeout/5xx). Re-buscar
+                // ANTES de persistir el fallo; si existe, adoptarla (no duplicar).
+                $classification = Invoice_Failure::classify($result);
+                if (!empty($classification['retriable']) || $classification['state'] === 'failed_retriable') {
+                    $existing = $this->find_existing_invoice($order, $client_id);
+                    if ($existing !== null && (string) ($existing['id'] ?? '') !== '') {
+                        $this->persist_invoice_result($order, (string) $existing['id'], $existing);
+                        $order->add_order_note(sprintf(
+                            __('[Alegra] Factura #%s recuperada tras un fallo de red; no se creó una nueva.', 'alegra-connector'),
+                            (string) $existing['id']
+                        ));
+                        return ['id' => (string) $existing['id'], 'already_exists' => true, 'recovered' => true];
+                    }
+                }
+
+                Invoice_Failure::persist($order, $classification);
+                Invoice_Queue::refresh_count();   // REQ-QUEUE-07: badge/aviso al instante.
+
                 if ($this->logger) {
                     $this->logger->error('Invoice creation failed', [
                         'order_id' => $order_id,
@@ -172,6 +193,24 @@ class Orders
                     ]);
                 }
 
+                return $result;
+            }
+
+            // REQ-QUEUE-02: un marker de bloqueo es un ARRAY, no un WP_Error.
+            // Dry-run NO se persiste; gate/kill-switch ⇒ `blocked` (no loopear).
+            if (API\Client::write_was_blocked($result)) {
+                $classification = Invoice_Failure::classify($result);
+                Invoice_Failure::persist($order, $classification); // persist=false en dry-run
+                if (!empty($classification['persist'])) {
+                    Invoice_Queue::refresh_count();   // REQ-QUEUE-07.
+                }
+                if ($this->logger) {
+                    $this->logger->warning('Invoice creation blocked by config', [
+                        'order_id' => $order_id,
+                        'state'    => $classification['state'],
+                        'code'     => $classification['code'],
+                    ]);
+                }
                 return $result;
             }
 
@@ -226,6 +265,11 @@ class Orders
         }
 
         $order->save();
+
+        // REQ-QUEUE-01: éxito ⇒ sale de la cola. El badge se recalcula de forma
+        // DIFERIDA (apertura de la pantalla / cron, DEF-11): no una meta query
+        // pesada por cada factura creada (NFR-04).
+        Invoice_Failure::clear($order);
 
         // AC-07: write the indexed mapping so a later lookup never scans
         // wp_postmeta.meta_value (O(N²) on a large catalog).
@@ -586,7 +630,27 @@ class Orders
         }
 
         if ($will_record_payment) {
-            $this->record_payment_for_invoice($order, (string) $invoice_result['id']);
+            $payment = $this->record_payment_for_invoice($order, (string) $invoice_result['id']);
+
+            // REQ-QUEUE-08: la factura subió pero el pago no ⇒ estado distinto,
+            // retriable (el sweep de pagos o el reintento manual lo recuperan).
+            if (is_wp_error($payment) || API\Client::write_was_blocked($payment)) {
+                $c = [
+                    'state'     => 'payment_missing',
+                    'code'      => is_wp_error($payment) ? (string) $payment->get_error_code() : (string) ($payment['reason'] ?? 'blocked'),
+                    'message'   => is_wp_error($payment) ? wp_strip_all_tags($payment->get_error_message()) : '',
+                    'retriable' => true,
+                    'persist'   => true,
+                ];
+                Invoice_Failure::persist($order, $c);
+                Invoice_Queue::refresh_count();   // REQ-QUEUE-07.
+                if ($this->logger) {
+                    $this->logger->warning('Invoice created but payment failed', [
+                        'order_id' => (int) $order->get_id(),
+                        'code'     => $c['code'],
+                    ]);
+                }
+            }
         } elseif (!in_array($payment_account, ['', '0'], true)
             && (string) $order->get_meta('_alegra_payment_id', true) === '') {
             // REQ-MAN-1: an account is configured and no payment exists, but the
@@ -883,6 +947,143 @@ class Orders
 
         $this->logger->info('Payment reconcile completed', $result);
         return $result;
+    }
+
+    /**
+     * REQ-QUEUE-06 / design §4.6: reintenta SÓLO los `failed_retriable`
+     * vencidos, con backoff exponencial y tope de intentos; al tope ⇒
+     * `failed_permanent`. Permanentes/bloqueados nunca auto-reintentan.
+     *
+     * @return array{checked:int,retried:int,resolved:int,failed:int,errors:int,skipped?:string}
+     */
+    public function retry_failed_invoices(): array
+    {
+        $max   = max(1, (int) get_option('alegra_connector_invoice_retry_max_attempts', 5));
+        $batch = max(1, (int) get_option('alegra_connector_invoice_retry_batch', 20));
+        $now   = time();
+
+        $ids = wc_get_orders([
+            'status'     => ['processing', 'completed', 'on-hold'],
+            'limit'      => $batch,
+            'return'     => 'ids',
+            'orderby'    => 'date',
+            'order'      => 'ASC',
+            'meta_query' => [
+                'relation' => 'AND',
+                ['key' => Invoice_Failure::META_STATE, 'value' => 'failed_retriable'],
+                // B3: `persist()` siembra META_ATTEMPTS=0 en el primer fallo, así el
+                // INNER JOIN de WP_Meta_Query SÍ matchea el pedido recién fallado.
+                ['key' => Invoice_Failure::META_ATTEMPTS, 'value' => $max, 'compare' => '<', 'type' => 'NUMERIC'],
+                ['relation' => 'OR',
+                    ['key' => Invoice_Failure::META_NEXT, 'compare' => 'NOT EXISTS'],
+                    ['key' => Invoice_Failure::META_NEXT, 'value' => gmdate('Y-m-d H:i:s', $now), 'compare' => '<=', 'type' => 'DATETIME'],
+                ],
+            ],
+        ]);
+
+        $out = ['checked' => 0, 'retried' => 0, 'resolved' => 0, 'failed' => 0, 'errors' => 0];
+
+        foreach ($ids as $id) {
+            $order = wc_get_order($id);
+            if (!$order instanceof \WC_Order) {
+                continue;
+            }
+            if (\Alegra\Connector\Kill_Switch::is_active()) {
+                $out['skipped'] = 'kill_switch';
+                break;
+            }
+            if (\Alegra\Connector\Run_Context::should_stop()) {
+                $out['skipped'] = 'cancelled';
+                break;
+            }
+
+            $out['checked']++;
+            $attempts = (int) $order->get_meta(Invoice_Failure::META_ATTEMPTS, true) + 1;
+            $order->update_meta_data(Invoice_Failure::META_ATTEMPTS, $attempts);
+
+            $result = $this->create_invoice_with_payment($order); // contexto automático
+
+            if (!is_wp_error($result) && !API\Client::write_was_blocked($result)) {
+                // persist_invoice_result() ya limpió el ledger (T4.5); un
+                // `already_exists` (id ya presente) no pasa por ahí, así que se
+                // limpia acá para que el pedido no vuelva a la cola (REQ-QUEUE-09).
+                Invoice_Failure::clear($order);
+                $out['retried']++;
+                $out['resolved']++;
+                continue;
+            }
+
+            $c = Invoice_Failure::classify($result);
+            if ($c['state'] === 'blocked' || $c['retriable'] === false) {
+                $c['state'] = $c['state'] === 'blocked' ? 'blocked' : 'failed_permanent';
+                Invoice_Failure::persist($order, $c);
+                $out['failed']++;
+                continue;
+            }
+
+            if ($attempts >= $max) {
+                $c['state']     = 'failed_permanent';
+                $c['retriable'] = false;
+                Invoice_Failure::persist($order, $c);
+            } else {
+                $delay = self::RETRY_BACKOFF[min($attempts - 1, count(self::RETRY_BACKOFF) - 1)];
+                Invoice_Failure::persist($order, $c, $now + $delay);
+            }
+            $out['retried']++;
+            $out['failed']++;
+        }
+
+        // REQ-QUEUE-07 / NFR-04: un solo refresco por batch (no uno por pedido).
+        if ($out['checked'] > 0) {
+            Invoice_Queue::refresh_count();
+        }
+
+        return $out;
+    }
+
+    /**
+     * T5.4: pedido pagado que contiene el producto y NO tiene una factura `open`.
+     * Coste acotado: `wc_get_orders(limit=20)`; el chequeo Alegra-side
+     * (`find_existing_invoice`, vía `find_open_invoice_for_order()`) sólo corre
+     * para pedidos que contienen el producto y no tienen una factura vinculada `open`.
+     */
+    public function find_paid_order_without_open_invoice(int $product_id): ?\WC_Order
+    {
+        if ($this->api === null) {
+            return null;
+        }
+        $ids = wc_get_orders([
+            'status'  => ['processing', 'completed', 'on-hold'],
+            'limit'   => 20,
+            'return'  => 'ids',
+            'orderby' => 'date',
+            'order'   => 'DESC',
+        ]);
+        foreach ($ids as $id) {
+            $order = wc_get_order($id);
+            if (!$order instanceof \WC_Order || !$order->is_paid()) {
+                continue;
+            }
+            // ¿Contiene el producto? Se chequea ANTES del GET a Alegra (acota el coste).
+            $has_product = false;
+            foreach ($order->get_items() as $item) {
+                if ((int) $item->get_product_id() === $product_id
+                    || (int) $item->get_variation_id() === $product_id) {
+                    $has_product = true;
+                    break;
+                }
+            }
+            if (!$has_product) {
+                continue;
+            }
+            // Sin factura `open`: ni vinculada (`_alegra_invoice_id`) ni en Alegra
+            // (`find_existing_invoice`, vía `find_open_invoice_for_order()`).
+            if ($this->find_open_invoice_for_order($order) !== null) {
+                continue;
+            }
+            return $order;
+        }
+        return null;
     }
 
     /**

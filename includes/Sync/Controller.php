@@ -72,6 +72,12 @@ class Controller
         if (!has_action('alegra_connector_payment_reconcile', [$this, 'run_payment_reconcile'])) {
             add_action('alegra_connector_payment_reconcile', [$this, 'run_payment_reconcile']);
         }
+
+        // Hourly retry of retriable failed invoices (REQ-QUEUE-06). Opt-in
+        // (`alegra_connector_invoice_retry_enabled`, default false).
+        if (!has_action('alegra_connector_invoice_retry', [$this, 'run_invoice_retry'])) {
+            add_action('alegra_connector_invoice_retry', [$this, 'run_invoice_retry']);
+        }
     }
 
     /**
@@ -100,6 +106,34 @@ class Controller
             return $this->orders->reconcile_missing_payments();
         } finally {
             self::release_lock('alegra_payment_reconcile', $lock);
+        }
+    }
+
+    /**
+     * Reintento horario de facturas fallidas retriables (REQ-QUEUE-06).
+     * Opt-in: `alegra_connector_invoice_retry_enabled` (default false).
+     *
+     * @return array{checked?:int,retried?:int,resolved?:int,failed?:int,errors?:int,skipped?:string}
+     */
+    public function run_invoice_retry(): array
+    {
+        if (Kill_Switch::is_active()) {
+            return ['skipped' => 'kill_switch'];
+        }
+        if (!get_option('alegra_connector_invoice_retry_enabled', false)) {
+            return ['skipped' => 'disabled'];
+        }
+
+        $lock = self::acquire_lock('alegra_invoice_retry', 300);
+        if ($lock === false) {
+            return ['skipped' => 'locked'];
+        }
+        register_shutdown_function(static fn () => self::release_lock('alegra_invoice_retry', $lock));
+
+        try {
+            return Run_Context::wrap('invoice_retry', fn ($run_id) => $this->orders->retry_failed_invoices());
+        } finally {
+            self::release_lock('alegra_invoice_retry', $lock);
         }
     }
 

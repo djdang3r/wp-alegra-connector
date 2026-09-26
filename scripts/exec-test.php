@@ -10556,4 +10556,478 @@ TestRunner::test('T30.310 B2/Oracle#4: S viejo + W==A ⇒ converge y el poll sig
     TestRunner::assertSame(12, wc_get_product(31000)->get_stock_quantity(), 'el poll vuelve a bajar a 12');
 });
 
+// ---------------------------------------------------------------------------
+// Fase 4 — D3: cola de facturas fallidas (T30.4x)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pedido facturable (producto vinculado + contacto cacheado) para los tests de
+ * la cola. El producto usa el id del pedido salvo override.
+ */
+function alegra_so_billable_order(int $id, array $overrides = []): \WC_Order
+{
+    $product_id = (int) ($overrides['product_id'] ?? $id);
+    $item_id    = (string) ($overrides['item_id'] ?? ('it-so-' . $product_id));
+    alegra_make_product($product_id, [
+        'name' => 'SO' . $product_id, 'sku' => 'SO' . $product_id,
+        'regular_price' => '10', 'stock' => 7, 'manage_stock' => true,
+    ]);
+    update_post_meta($product_id, '_alegra_item_id', $item_id);
+    alegra_mock_seed_item($item_id, ['name' => 'SO' . $product_id, 'inventory' => ['availableQuantity' => 7]]);
+
+    $data = [
+        'status' => 'processing', 'total' => 10.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'b@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c' . $id],
+        'items' => [new \WC_Order_Item(['product_id' => $product_id, 'name' => 'SO', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
+    ];
+    return alegra_make_order($id, array_merge($data, $overrides['order'] ?? []));
+}
+
+TestRunner::test('T30.41 classify() marca retriable red/timeout/429/5xx/lock', function (): void {
+    $r = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('rate_limited', 'slow down'));
+    TestRunner::assertSame('failed_retriable', $r['state'], 'rate_limited ⇒ retriable');
+    TestRunner::assertTrue($r['retriable'], 'retriable=true');
+    TestRunner::assertTrue($r['persist'], 'persist=true');
+
+    foreach (['http_request_failed', 'http_request_timeout', 'json_error', 'max_retries'] as $code) {
+        $x = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error($code, 'x'));
+        TestRunner::assertSame('failed_retriable', $x['state'], "$code ⇒ retriable");
+    }
+
+    $e503 = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('api_error', 'boom', ['code' => 503]));
+    TestRunner::assertSame('failed_retriable', $e503['state'], '5xx ⇒ retriable');
+    TestRunner::assertSame('503', $e503['code'], 'el code es el HTTP');
+
+    $e429 = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('api_error', 'boom', ['code' => 429]));
+    TestRunner::assertSame('failed_retriable', $e429['state'], '429 ⇒ retriable');
+
+    $lock = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('invoice_in_progress', 'lock'));
+    TestRunner::assertSame('failed_retriable', $lock['state'], 'lock ⇒ retriable');
+    TestRunner::assertSame('lock', $lock['code'], 'code=lock');
+
+    $unknown = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('weird_new_code', 'x'));
+    TestRunner::assertSame('failed_retriable', $unknown['state'], 'desconocido ⇒ retriable (conservador)');
+});
+
+TestRunner::test('T30.42 classify() marca permanente 4xx y errores de datos', function (): void {
+    foreach ([400, 401, 403, 404, 409, 422] as $http) {
+        $x = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('api_error', 'bad', ['code' => $http]));
+        TestRunner::assertSame('failed_permanent', $x['state'], "$http ⇒ permanente");
+        TestRunner::assertFalse($x['retriable'], "$http retriable=false");
+        TestRunner::assertTrue($x['persist'], "$http persist=true");
+    }
+    foreach (['customer_unresolved', 'invoice_item_unlinked', 'invoice_shipping_unlinked',
+              'invoice_fee_unlinked', 'invoice_still_draft', 'draft_invoice_not_opened'] as $code) {
+        $x = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error($code, 'data'));
+        TestRunner::assertSame('failed_permanent', $x['state'], "$code ⇒ permanente");
+        TestRunner::assertSame('data:' . $code, $x['code'], "$code conserva el prefijo data:");
+        TestRunner::assertFalse($x['retriable'], "$code retriable=false");
+    }
+});
+
+TestRunner::test('T30.43 classify() distingue dry-run, gate y skipped', function (): void {
+    $dry = \Alegra\Connector\Sync\Invoice_Failure::classify(['dry_run' => true]);
+    TestRunner::assertSame('blocked', $dry['state'], 'dry-run ⇒ blocked');
+    TestRunner::assertSame('dry_run', $dry['code'], 'code=dry_run');
+    TestRunner::assertFalse($dry['persist'], 'dry-run NO persiste');
+    TestRunner::assertFalse($dry['retriable'], 'dry-run no retriable');
+
+    $gate = \Alegra\Connector\Sync\Invoice_Failure::classify(['blocked_by_gate' => true, 'reason' => 'entity_disabled']);
+    TestRunner::assertSame('blocked', $gate['state'], 'gate ⇒ blocked');
+    TestRunner::assertSame('blocked:entity_disabled', $gate['code'], 'code=blocked:reason');
+    TestRunner::assertTrue($gate['persist'], 'gate SÍ persiste');
+    TestRunner::assertFalse($gate['retriable'], 'gate no retriable');
+
+    $skip = \Alegra\Connector\Sync\Invoice_Failure::classify(['skipped' => true, 'manual_only' => true, 'reason' => 'adjustment_manual_only']);
+    TestRunner::assertSame('skipped', $skip['state'], 'skipped ⇒ estado propio');
+    TestRunner::assertFalse($skip['retriable'], 'skipped NO retriable (Oracle#10)');
+    TestRunner::assertFalse($skip['persist'], 'skipped NO persiste');
+
+    $ok = \Alegra\Connector\Sync\Invoice_Failure::classify(['id' => 'inv-1']);
+    TestRunner::assertSame('resolved', $ok['state'], 'éxito ⇒ resolved');
+});
+
+TestRunner::test('T30.44 persist()/get() de los 7 metas + siembra attempts=0 (B3)', function (): void {
+    alegra_test_reset();
+    $order = alegra_so_billable_order(44001);
+    $order->update_meta_data('_alegra_invoice_id', 'inv-keep');
+    $order->save();
+
+    $c = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('api_error', 'boom', ['code' => 503]));
+    \Alegra\Connector\Sync\Invoice_Failure::persist($order, $c, time() + 300);
+
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('failed_retriable', $led['state'], 'state persistido');
+    TestRunner::assertSame('503', $led['code'], 'code persistido');
+    TestRunner::assertSame('1', $led['retriable'], 'retriable=1');
+    TestRunner::assertSame('0', $led['attempts'], 'B3: attempts sembrado en 0');
+    TestRunner::assertTrue($led['last'] !== '', 'last_attempt escrito');
+    TestRunner::assertTrue($led['next'] !== '', 'next_retry escrito');
+    TestRunner::assertSame('inv-keep', (string) $order->get_meta('_alegra_invoice_id', true), 'no toca _alegra_invoice_id');
+
+    // persist() no pisa un attempts existente (no pierde la cuenta).
+    $order->update_meta_data(\Alegra\Connector\Sync\Invoice_Failure::META_ATTEMPTS, 3);
+    \Alegra\Connector\Sync\Invoice_Failure::persist($order, $c);
+    TestRunner::assertSame('3', \Alegra\Connector\Sync\Invoice_Failure::get($order)['attempts'], 'no pisa attempts');
+});
+
+TestRunner::test('T30.45 el éxito limpia el ledger (resolved) y no toca el invoice id', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'adjustment');
+    $order = alegra_so_billable_order(45001);
+    $c = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('rate_limited', 'x'));
+    \Alegra\Connector\Sync\Invoice_Failure::persist($order, $c, time() + 300);
+    TestRunner::assertSame('failed_retriable', \Alegra\Connector\Sync\Invoice_Failure::get($order)['state'], 'falló');
+
+    // Camino de éxito real: create_invoice() llama persist_invoice_result() ⇒ clear().
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura se crea');
+
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('resolved', $led['state'], 'éxito ⇒ resolved');
+    TestRunner::assertSame('', $led['code'], 'code limpio');
+    TestRunner::assertSame('', $led['next'], 'next limpio');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_invoice_id', true) !== '', 'invoice id presente (clear no lo borra)');
+});
+
+TestRunner::test('T30.46 re-búsqueda post-error adopta la factura (no duplica)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'adjustment');
+    $order = alegra_so_billable_order(46001);
+    alegra_mock_seed_invoice('inv-recover', [
+        'status' => 'draft', 'total' => 10.0,
+        'client' => ['id' => 'c46001'],
+        'observations' => 'Pedido WooCommerce #46001',
+        'items' => [['id' => 'x', 'price' => 10, 'quantity' => 1]],
+    ]);
+    // La pre-búsqueda (AC-14) falla una vez; el POST falla; la re-búsqueda post-error la encuentra.
+    alegra_mock_fail('GET', '/invoices', 404, ['message' => 'down'], 1);
+    alegra_mock_fail('POST', '/invoices', 503, ['message' => 'timeout']);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r), 'no es WP_Error');
+    TestRunner::assertTrue(!empty($r['recovered']), 'marcado recovered');
+    TestRunner::assertSame('inv-recover', (string) $order->get_meta('_alegra_invoice_id', true), 'adopta la existente');
+    TestRunner::assertSame(1, count($GLOBALS['alegra_mock_state']['invoices']), 'no se creó una segunda factura');
+    TestRunner::assertSame('resolved', \Alegra\Connector\Sync\Invoice_Failure::get($order)['state'], 'ledger limpio');
+});
+
+TestRunner::test('T30.47 payment_missing: factura OK + pago falló', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'invoice');
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    $order = alegra_so_billable_order(47001);
+    // 400 (no retryable) ⇒ el Client no reintenta; el fallo del pago se persiste igual.
+    alegra_mock_fail('POST', '/payments', 400, ['message' => 'boom']);
+
+    $r = make_orders()->create_invoice_with_payment($order);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura se creó');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('payment_missing', $led['state'], 'estado payment_missing');
+    TestRunner::assertSame('1', $led['retriable'], 'retriable=1');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/payments'), 'se intentó el pago');
+});
+
+TestRunner::test('T30.48 idempotencia: un pedido ya facturado no crea una segunda', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'invoice');
+    $order = alegra_so_billable_order(48001);
+    $order->update_meta_data('_alegra_invoice_id', 'inv-48');
+    $order->update_meta_data('_alegra_invoice_status', 'open');
+    $order->save();
+    alegra_mock_seed_invoice('inv-48', ['status' => 'open', 'total' => 10.0, 'items' => [['id' => 'x', 'price' => 10, 'quantity' => 1]]]);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertSame('inv-48', (string) ($r['id'] ?? ''), 'devuelve la existente');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'cero POST');
+
+    // El cron tampoco la reintenta: sale de la cola.
+    $c = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('rate_limited', 'x'));
+    \Alegra\Connector\Sync\Invoice_Failure::persist($order, $c);
+    make_orders()->retry_failed_invoices();
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'el cron no crea otra');
+    TestRunner::assertSame('resolved', \Alegra\Connector\Sync\Invoice_Failure::get($order)['state'], 'sale de la cola');
+});
+
+TestRunner::test('T30.49 retry_failed_invoices: query acotada + backoff + tope (B3)', function (): void {
+    alegra_test_reset();
+    $F = \Alegra\Connector\Sync\Invoice_Failure::class;
+    $retriable = $F::classify(new \WP_Error('rate_limited', 'x'));
+    $permanent = $F::classify(new \WP_Error('customer_unresolved', 'x'));
+    $blocked   = $F::classify(['blocked_by_gate' => true, 'reason' => 'entity_disabled']);
+
+    // A: recién fallado (attempts=0, sin next) DEBE ser seleccionado (B3).
+    $a = alegra_so_billable_order(49001);
+    $F::persist($a, $retriable);
+    // B: permanente ⇒ nunca.
+    $b = alegra_so_billable_order(49002);
+    $F::persist($b, $permanent);
+    // C: bloqueado ⇒ nunca.
+    $c = alegra_so_billable_order(49003);
+    $F::persist($c, $blocked);
+    // D: retriable con attempts=max ⇒ fuera.
+    $d = alegra_so_billable_order(49004);
+    $F::persist($d, $retriable);
+    $d->update_meta_data($F::META_ATTEMPTS, 5);
+    // E: retriable con next futuro ⇒ fuera.
+    $e = alegra_so_billable_order(49005);
+    $F::persist($e, $retriable, time() + 3600);
+    // F: retriable en el último intento ⇒ al tope pasa a permanente.
+    $f = alegra_so_billable_order(49006);
+    $F::persist($f, $retriable);
+    $f->update_meta_data($F::META_ATTEMPTS, 4);
+
+    // Fallo retriable sin sleeps: el lock por pedido hace que create_invoice()
+    // devuelva `invoice_in_progress` (classify ⇒ retriable, code 'lock').
+    \Alegra\Connector\Sync\Controller::acquire_lock('alegra_invoice_lock_49001', 30);
+    \Alegra\Connector\Sync\Controller::acquire_lock('alegra_invoice_lock_49006', 30);
+    $out = make_orders()->retry_failed_invoices();
+
+    TestRunner::assertSame(2, $out['checked'], 'sólo A y F (retriable + vencido + attempts<max)');
+    TestRunner::assertSame(1, (int) $F::get($a)['attempts'], 'A intentó una vez');
+    TestRunner::assertSame('failed_retriable', $F::get($a)['state'], 'A sigue retriable');
+    TestRunner::assertTrue($F::get($a)['next'] !== '', 'A tiene backoff');
+    TestRunner::assertSame('failed_permanent', $F::get($f)['state'], 'F llegó al tope ⇒ permanente');
+    TestRunner::assertSame('0', $F::get($f)['retriable'], 'F ya no es retriable');
+    TestRunner::assertSame('failed_permanent', $F::get($b)['state'], 'B intacto');
+    TestRunner::assertSame('blocked', $F::get($c)['state'], 'C intacto');
+    TestRunner::assertSame('5', $F::get($d)['attempts'], 'D intacto (no seleccionado)');
+    TestRunner::assertTrue($F::get($e)['next'] !== '', 'E conserva su next futuro');
+    TestRunner::assertSame(6, \Alegra\Connector\Sync\Invoice_Queue::count(), 'el conteo del batch = 6');
+});
+
+TestRunner::test('T30.410 el cron invoice_retry es opt-in, respeta kill switch y deja run', function (): void {
+    alegra_test_reset();
+    $controller = new \Alegra\Connector\Sync\Controller(make_api(), make_logger());
+    TestRunner::assertSame('disabled', (string) ($controller->run_invoice_retry()['skipped'] ?? ''), 'default off');
+
+    update_option('alegra_connector_invoice_retry_enabled', true);
+    \Alegra\Connector\Kill_Switch::activate('test');
+    TestRunner::assertSame('kill_switch', (string) ($controller->run_invoice_retry()['skipped'] ?? ''), 'kill switch');
+    \Alegra\Connector\Kill_Switch::deactivate();
+
+    $out = $controller->run_invoice_retry();
+    TestRunner::assertArrayNotHasKey('skipped', $out, 'corre con opt-in');
+    $found = false;
+    foreach (\Alegra\Connector\Runs::recent(20) as $run) {
+        if ((string) ($run->run_type ?? '') === 'invoice_retry') { $found = true; }
+    }
+    TestRunner::assertTrue($found, 'el Monitor lista el run invoice_retry');
+});
+
+TestRunner::test('T30.411 Invoice_Queue::query/refresh_count/count (G4)', function (): void {
+    alegra_test_reset();
+    $F = \Alegra\Connector\Sync\Invoice_Failure::class;
+    $retriable = $F::classify(new \WP_Error('rate_limited', 'x'));
+    $blocked   = $F::classify(['blocked_by_gate' => true, 'reason' => 'entity_disabled']);
+
+    $o1 = alegra_make_order(42001, ['status' => 'processing']);
+    $F::persist($o1, $retriable);
+    $o2 = alegra_make_order(42002, ['status' => 'processing']);
+    $F::persist($o2, $blocked);
+    alegra_make_order(42003, ['status' => 'processing']);                       // nunca-intentado
+    alegra_make_order(42004, ['status' => 'processing', 'meta' => [             // facturado: fuera
+        '_alegra_invoice_id' => 'inv-42004', '_alegra_invoice_status' => 'open',
+    ]]);
+    $o5 = alegra_make_order(42005, ['status' => 'processing']);
+    $F::persist($o5, ['state' => 'payment_missing', 'code' => 'x', 'message' => '', 'retriable' => true, 'persist' => true]);
+    alegra_make_order(42006, ['status' => 'pending']);                          // estado fuera del filtro
+
+    $q = \Alegra\Connector\Sync\Invoice_Queue::query([], 1, 20);
+    sort($q['ids']);
+    TestRunner::assertSame([42001, 42002, 42003, 42005], $q['ids'], 'ledger + nunca-intentado');
+    TestRunner::assertSame(4, $q['total'], 'total = conjunto filtrado');
+
+    TestRunner::assertSame(4, \Alegra\Connector\Sync\Invoice_Queue::refresh_count(), 'refresh_count = total');
+    TestRunner::assertSame(4, \Alegra\Connector\Sync\Invoice_Queue::count(), 'count lee la option');
+
+    TestRunner::assertSame([42001], \Alegra\Connector\Sync\Invoice_Queue::query(['state' => 'failed_retriable'])['ids'], 'filtro explícito excluye nunca-intentados');
+    TestRunner::assertSame([42001], \Alegra\Connector\Sync\Invoice_Queue::query(['state' => 'failed'])['ids'], 'alias failed');
+    TestRunner::assertSame(md5('4'), \Alegra\Connector\Sync\Invoice_Queue::failure_hash(4), 'hash canónico');
+
+    $page1 = \Alegra\Connector\Sync\Invoice_Queue::query([], 1, 2);
+    $page2 = \Alegra\Connector\Sync\Invoice_Queue::query([], 2, 2);
+    TestRunner::assertCount(2, $page1['ids'], 'página 1 limit=2');
+    TestRunner::assertCount(2, $page2['ids'], 'página 2 limit=2');
+    TestRunner::assertSame(4, $page1['total'], 'total estable entre páginas');
+});
+
+// ---------------------------------------------------------------------------
+// Fase 5 — D4: reconciliación WC↔Alegra (T30.5x)
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T30.51 divergence_cause() (2 args) + record() FIFO 200', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame('baseline_ausente', \Alegra\Connector\Sync\Stock_Divergence::divergence_cause('invoice', ''), 'S vacío ⇒ baseline_ausente');
+    TestRunner::assertSame('divergencia_dueno', \Alegra\Connector\Sync\Stock_Divergence::divergence_cause('adjustment', 5), 'S presente ⇒ divergencia_dueno');
+    TestRunner::assertSame('divergencia_dueno', \Alegra\Connector\Sync\Stock_Divergence::divergence_cause('invoice', '0'), "'0' no es vacío");
+
+    \Alegra\Connector\Sync\Stock_Divergence::record(101, ['w' => 5, 'a' => 7, 's' => '', 'cause' => 'baseline_ausente', 'at' => 100]);
+    \Alegra\Connector\Sync\Stock_Divergence::record(102, ['w' => 3, 'a' => 3, 's' => 3, 'cause' => 'divergencia_dueno', 'at' => 200]);
+    $all = get_option('alegra_connector_stock_divergence', []);
+    TestRunner::assertCount(2, $all, 'dos entradas');
+    \Alegra\Connector\Sync\Stock_Divergence::record(101, ['w' => 4, 'a' => 7, 's' => '', 'cause' => 'baseline_ausente', 'at' => 300]);
+    TestRunner::assertCount(2, get_option('alegra_connector_stock_divergence', []), 'mismo producto actualiza, no duplica');
+    TestRunner::assertSame(4, (int) (get_option('alegra_connector_stock_divergence', [])['101']['w'] ?? 0), 'actualizó el valor');
+
+    for ($i = 1; $i <= 201; $i++) {
+        \Alegra\Connector\Sync\Stock_Divergence::record(1000 + $i, ['w' => 1, 'a' => 2, 's' => '', 'cause' => 'baseline_ausente', 'at' => $i]);
+    }
+    $all = get_option('alegra_connector_stock_divergence', []);
+    TestRunner::assertSame(200, count($all), 'bounded a 200');
+    TestRunner::assertArrayNotHasKey('1001', $all, 'evicta la más vieja');
+    TestRunner::assertArrayHasKey('1201', $all, 'conserva la más nueva');
+
+    \Alegra\Connector\Sync\Stock_Divergence::clear(1201);
+    TestRunner::assertArrayNotHasKey('1201', get_option('alegra_connector_stock_divergence', []), 'clear saca la fila');
+});
+
+TestRunner::test('T30.52 report() pagina y completa la causa por pedido', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'invoice');
+
+    alegra_so_billable_order(52001, ['product_id' => 501, 'item_id' => 'it-501']);
+    $o1 = wc_get_order(52001);
+    $o1->update_meta_data('_alegra_invoice_sync_state', 'failed_retriable');
+    $o1->save();
+    \Alegra\Connector\Sync\Stock_Divergence::record(501, ['w' => 5, 'a' => 8, 's' => '', 'cause' => 'baseline_ausente', 'at' => 100]);
+
+    alegra_so_billable_order(52002, ['product_id' => 502, 'item_id' => 'it-502']);
+    $o2 = wc_get_order(52002);
+    $o2->update_meta_data('_alegra_credit_note_id', 'cn-1');
+    $o2->save();
+    \Alegra\Connector\Sync\Stock_Divergence::record(502, ['w' => 3, 'a' => 3, 's' => 3, 'cause' => 'divergencia_dueno', 'at' => 200]);
+
+    alegra_so_billable_order(52003, ['product_id' => 503, 'item_id' => 'it-503']);
+    $o3 = wc_get_order(52003);
+    $o3->update_meta_data('_alegra_invoice_status', 'draft');
+    $o3->save();
+    \Alegra\Connector\Sync\Stock_Divergence::record(503, ['w' => 1, 'a' => 2, 's' => 1, 'cause' => 'divergencia_dueno', 'at' => 300]);
+
+    $r = \Alegra\Connector\Sync\Stock_Divergence::report(20, 0);
+    TestRunner::assertSame(3, $r['total'], 'total = registradas');
+    TestRunner::assertCount(3, $r['items'], 'las 3 registradas');
+    $by = [];
+    foreach ($r['items'] as $it) { $by[$it['product_id']] = $it['cause']; }
+    TestRunner::assertSame('factura_fallida', $by[501] ?? '', '501 ⇒ factura_fallida');
+    TestRunner::assertSame('reembolso', $by[502] ?? '', '502 ⇒ reembolso');
+    TestRunner::assertSame('factura_pendiente', $by[503] ?? '', '503 ⇒ factura_pendiente');
+
+    $p = \Alegra\Connector\Sync\Stock_Divergence::report(1, 0);
+    TestRunner::assertSame(3, $p['total'], 'total global');
+    TestRunner::assertCount(1, $p['items'], 'limit=1');
+    TestRunner::assertSame(503, $p['items'][0]['product_id'], 'el más reciente primero');
+
+    // Un producto que coincide no está en la option ⇒ no aparece (sin falsos positivos).
+    alegra_so_billable_order(52004, ['product_id' => 504, 'item_id' => 'it-504']);
+    TestRunner::assertSame(3, \Alegra\Connector\Sync\Stock_Divergence::report(20, 0)['total'], 'no lista lo no divergente');
+});
+
+TestRunner::test('T30.53 get_unjournaled_sales corre siempre y detecta vacío/draft/void/on-hold', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+
+    alegra_make_order(53001, ['status' => 'processing']);
+    alegra_make_order(53002, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => '']]);
+    alegra_make_order(53003, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-a', '_alegra_invoice_status' => 'draft']]);
+    alegra_make_order(53004, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-b', '_alegra_invoice_status' => 'void']]);
+    alegra_make_order(53005, ['status' => 'on-hold']);
+    alegra_make_order(53006, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-c', '_alegra_invoice_status' => 'open']]);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $r = $admin->get_unjournaled_sales();
+    TestRunner::assertSame(5, $r['count'], '5 pendientes (incluye on-hold, draft, void, vacío)');
+
+    // El gate `push_orders_enabled` ya no oculta el reporte (REQ-RECON-02).
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'render_dashboard');
+    TestRunner::assertStringNotContains('push_orders_enabled', $src, 'render_dashboard ya no oculta el reporte');
+    TestRunner::assertStringContains('$divergence = $this->get_unjournaled_sales();', $src, 'llama siempre');
+});
+
+TestRunner::test('T30.54 la reparación emite UN solo mecanismo y deja rastro', function (): void {
+    // Rama adjustment/divergence: un ajuste, cero facturas, nota + log.
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_stock_owner', 'adjustment');
+    alegra_make_product(54001, ['name' => 'P', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(54001, '_alegra_item_id', 'it-54001');
+    alegra_mock_seed_item('it-54001', ['name' => 'P', 'inventory' => ['availableQuantity' => 10]]);
+    \Alegra\Connector\Sync\Stock_Divergence::record(54001, ['w' => 7, 'a' => 10, 's' => '', 'cause' => 'baseline_ausente', 'at' => 1]);
+
+    $_POST['product_id']  = 54001;
+    $_POST['mechanism']   = 'adjustment';
+    $_POST['repair_mode'] = 'divergence';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_repair_stock_divergence());
+    TestRunner::assertTrue($resp->success, 'ajuste reparado');
+    TestRunner::assertSame('adjustment', (string) ($resp->payload['mechanism'] ?? ''), 'mecanismo adjustment');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/inventory-adjustments'), 'un ajuste');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'cero facturas (nunca ambos)');
+    TestRunner::assertTrue((string) get_post_meta(54001, '_alegra_stock_divergence_note', true) !== '', 'nota en el producto');
+    TestRunner::assertStringContains('Stock divergence repaired', alegra_read_log(), 'log de reparación');
+    TestRunner::assertStringContains('divergence', alegra_read_log(), 'log con el modo');
+    $all = get_option('alegra_connector_stock_divergence', []);
+    TestRunner::assertArrayNotHasKey('54001', is_array($all) ? $all : [], 'se limpia del informe');
+    unset($_POST['product_id'], $_POST['mechanism'], $_POST['repair_mode']);
+
+    // Rama invoice: una factura, cero ajustes, nota en el pedido.
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'invoice');
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    alegra_so_billable_order(54002, ['product_id' => 54002, 'item_id' => 'it-54002']);
+    \Alegra\Connector\Sync\Stock_Divergence::record(54002, ['w' => 7, 'a' => 7, 's' => 7, 'cause' => 'divergencia_dueno', 'at' => 1]);
+    $_POST['product_id'] = 54002;
+    $_POST['mechanism']  = 'invoice';
+    $admin2 = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp2 = alegra_capture_json(fn () => $admin2->ajax_repair_stock_divergence());
+    TestRunner::assertTrue($resp2->success, 'factura reparada');
+    TestRunner::assertSame('invoice', (string) ($resp2->payload['mechanism'] ?? ''), 'mecanismo invoice');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'una factura');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'cero ajustes (nunca ambos)');
+    TestRunner::assertStringContains('Reparación de divergencia', implode("\n", wc_get_order(54002)->get_notes()), 'nota en el pedido');
+    unset($_POST['product_id'], $_POST['mechanism']);
+});
+
+TestRunner::test('T30.55 la reparación por factura respeta el dueño (adjustment rechaza)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'adjustment');
+    alegra_make_product(55001, ['name' => 'P', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(55001, '_alegra_item_id', 'it-55001');
+    alegra_mock_seed_item('it-55001', ['name' => 'P', 'inventory' => ['availableQuantity' => 10]]);
+
+    $_POST['product_id'] = 55001;
+    $_POST['mechanism']  = 'invoice';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_repair_stock_divergence());
+    TestRunner::assertFalse($resp->success, 'rechaza con dueño adjustment');
+    TestRunner::assertStringContains('dueño del stock es el ajuste', (string) ($resp->payload['message'] ?? ''), 'mensaje del dueño');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'cero POST');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/invoices'), 'ni siquiera busca');
+    unset($_POST['product_id'], $_POST['mechanism']);
+});
+
+TestRunner::test('T30.56 la reparación exige nonce y capacidad', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'adjustment');
+    alegra_make_product(56001, ['name' => 'P', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(56001, '_alegra_item_id', 'it-56001');
+    alegra_mock_seed_item('it-56001', ['name' => 'P', 'inventory' => ['availableQuantity' => 10]]);
+
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = false;
+    $_POST['product_id']  = 56001;
+    $_POST['mechanism']   = 'adjustment';
+    $_POST['repair_mode'] = 'divergence';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_repair_stock_divergence());
+    TestRunner::assertFalse($resp->success, 'sin capacidad ⇒ error');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'cero API');
+
+    // La compuerta de nonce existe (el stub de check_ajax_referer siempre pasa).
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_repair_stock_divergence_impl');
+    TestRunner::assertStringContains("check_ajax_referer('alegra_connector_nonce')", $src, 'nonce verificado');
+    unset($_POST['product_id'], $_POST['mechanism'], $_POST['repair_mode']);
+});
+
 exit(TestRunner::summary());
