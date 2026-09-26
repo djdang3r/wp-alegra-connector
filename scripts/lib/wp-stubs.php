@@ -1222,6 +1222,18 @@ class WC_Order_Item
     }
 
     public function get_product_id(): int { return $this->product_id; }
+
+    /**
+     * H-E: resuelve el producto de la línea (variación si la hay, si no el
+     * simple). Devuelve false si el producto no está en el mundo del harness,
+     * como WC_Order_Item::get_product() del core.
+     */
+    public function get_product()
+    {
+        $id = $this->variation_id > 0 ? $this->variation_id : $this->product_id;
+        return $GLOBALS['wc_products'][$id] ?? false;
+    }
+
     public function get_variation_id(): int { return $this->variation_id; }
     public function get_name(): string { return $this->name; }
     public function get_quantity(): float { return $this->quantity; }
@@ -1546,7 +1558,8 @@ function alegra_stub_meta_clause_matches($order, array $clause): bool
     }
 
     $compare = strtoupper((string) ($clause['compare'] ?? '='));
-    $value   = (string) ($clause['value'] ?? '');
+    $type    = strtoupper((string) ($clause['type'] ?? 'CHAR'));
+    $raw     = $clause['value'] ?? '';              // puede ser array (IN/NOT IN)
     $exists  = (bool) $order->meta_exists($key);
     $actual  = (string) $order->get_meta($key, true);
 
@@ -1555,13 +1568,44 @@ function alegra_stub_meta_clause_matches($order, array $clause): bool
             return !$exists;
         case 'EXISTS':
             return $exists;
+        case 'IN':
+            // WP_Meta_Query usa INNER JOIN: la fila de meta debe existir.
+            if (!$exists) { return false; }
+            foreach ((is_array($raw) ? $raw : [$raw]) as $wanted) {
+                if ($actual === (string) $wanted) { return true; }
+            }
+            return false;
+        case 'NOT IN':
+            if (!$exists) { return false; }
+            foreach ((is_array($raw) ? $raw : [$raw]) as $wanted) {
+                if ($actual === (string) $wanted) { return false; }
+            }
+            return true;
         case '!=':
-            return $exists && $actual !== $value;
+            return $exists && $actual !== (string) $raw;
         case 'LIKE':
-            return $exists && stripos($actual, trim($value, '%')) !== false;
+            return $exists && stripos($actual, trim((string) $raw, '%')) !== false;
+        case '<':
+        case '<=':
+        case '>':
+        case '>=':
+            if (!$exists) { return false; }
+            // NUMERIC/DECIMAL/SIGNED/UNSIGNED comparan como número; el resto
+            // (CHAR/DATETIME/DATE/TIME) como string, igual que WP_Meta_Query.
+            // Las fechas GMT `Y-m-d H:i:s` ordenan lexicográficamente.
+            $numeric = in_array($type, ['NUMERIC', 'DECIMAL', 'SIGNED', 'UNSIGNED'], true);
+            $left    = $numeric ? (float) $actual : (string) $actual;
+            $right   = $numeric ? (float) $raw    : (string) $raw;
+            switch ($compare) {
+                case '<':  return $left <  $right;
+                case '<=': return $left <= $right;
+                case '>':  return $left >  $right;
+                case '>=': return $left >= $right;
+            }
+            return false;
         case '=':
         default:
-            return $exists && $actual === $value;
+            return $exists && $actual === (string) $raw;
     }
 }
 
@@ -1599,13 +1643,26 @@ function wc_get_orders($args = [])
         $orders = array_values(array_filter($orders, static fn ($o) => (int) $o->get_customer_id() === $cid));
     }
 
-    if (!empty($args['limit'])) {
-        $offset = (int) ($args['offset'] ?? 0);
-        $orders = array_slice($orders, $offset, (int) $args['limit']);
+    // H-C: el total es el conjunto FILTRADO, antes de paginar.
+    $total = count($orders);
+
+    $limit = (int) ($args['limit'] ?? 0);
+    $paged = max(1, (int) ($args['paged'] ?? 1));
+    if ($limit > 0) {
+        $offset = isset($args['offset']) ? (int) $args['offset'] : ($paged - 1) * $limit;
+        $orders = array_slice($orders, $offset, $limit);
     }
 
     if (($args['return'] ?? '') === 'ids') {
         return array_map(static fn ($o) => $o->get_id(), $orders);
+    }
+
+    if (!empty($args['paginate'])) {
+        return (object) [
+            'orders'        => $orders,
+            'total'         => $total,
+            'max_num_pages' => $limit > 0 ? (int) ceil($total / $limit) : 1,
+        ];
     }
 
     return $orders;

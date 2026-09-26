@@ -211,6 +211,24 @@ check(
     '— el pusher de inventario debe resolver por el autoloader PSR-4'
 );
 
+check(
+    'Invoice_Failure class loads',
+    class_exists(\Alegra\Connector\Sync\Invoice_Failure::class),
+    '— el clasificador puro de fallos debe resolver por el autoloader PSR-4'
+);
+
+check(
+    'Invoice_Queue class loads',
+    class_exists(\Alegra\Connector\Sync\Invoice_Queue::class),
+    '— la query de la cola debe resolver por el autoloader PSR-4'
+);
+
+check(
+    'Stock_Divergence class loads',
+    class_exists(\Alegra\Connector\Sync\Stock_Divergence::class),
+    '— el informe de divergencia debe resolver por el autoloader PSR-4'
+);
+
 // ---- Assertion 4: critical main class is reachable ----
 echo "\n[4] Autoloader reachability: Alegra\\Connector\\Alegra_Connector\n";
 $main_class_exists = class_exists('Alegra\\Connector\\Alegra_Connector');

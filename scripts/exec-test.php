@@ -9755,4 +9755,234 @@ TestRunner::test('T29.95 release 2.6.0: versión, uninstall (9 opciones) y CHANG
     TestRunner::assertStringContains('DD-8', $changelog, 'el CHANGELOG debe documentar D2 vs DD-8');
 });
 
+// ===========================================================================
+// === stock-ownership (2.7.0) ===
+// Fase 1 — cimientos (harness D5 H-A/H-B/H-C/H-E), opciones y esqueletos.
+// IDs: T30.1{n} (T30.11…T30.17 + T30.13b). Fases 2..7 agregan T30.2x..T30.7x.
+// ===========================================================================
+
+TestRunner::test('T30.11 el mock modela stock por factura (draft no mueve; open/paid sí; idempotente)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-inv-ha', ['name' => 'HA', 'inventory' => ['availableQuantity' => 10]]);
+    $api = make_api();
+
+    $draft = $api->create_invoice([
+        'status' => 'draft', 'client' => ['id' => 'c1'],
+        'items' => [['id' => 'it-inv-ha', 'price' => 1, 'quantity' => 3]],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    TestRunner::assertFalse(is_wp_error($draft), 'el draft debe aceptarse');
+    TestRunner::assertSame('draft', (string) ($draft['status'] ?? ''), 'el mock respeta draft');
+    TestRunner::assertSame(10, (int) $GLOBALS['alegra_mock_state']['items']['it-inv-ha']['inventory']['availableQuantity'], 'draft NO mueve');
+
+    $open = $api->create_invoice([
+        'status' => 'open', 'client' => ['id' => 'c1'],
+        'items' => [['id' => 'it-inv-ha', 'price' => 1, 'quantity' => 4]],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    TestRunner::assertSame(6, (int) $GLOBALS['alegra_mock_state']['items']['it-inv-ha']['inventory']['availableQuantity'], 'open descuenta 4');
+
+    alegra_mock_apply_invoice_stock((string) $open['id'], $open);
+    TestRunner::assertSame(6, (int) $GLOBALS['alegra_mock_state']['items']['it-inv-ha']['inventory']['availableQuantity'], 'idempotente por invoice id');
+
+    $draft2 = $api->create_invoice([
+        'status' => 'draft', 'client' => ['id' => 'c1'],
+        'items' => [['id' => 'it-inv-ha', 'price' => 1, 'quantity' => 2]],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    $api->update_invoice((string) $draft2['id'], ['status' => 'open']);
+    TestRunner::assertSame(4, (int) $GLOBALS['alegra_mock_state']['items']['it-inv-ha']['inventory']['availableQuantity'], 'draft→open mueve una vez');
+
+    alegra_mock_set_draft_moves_stock(true);
+    $api->create_invoice([
+        'status' => 'draft', 'client' => ['id' => 'c1'],
+        'items' => [['id' => 'it-inv-ha', 'price' => 1, 'quantity' => 1]],
+        'date' => '2026-09-25', 'dueDate' => '2026-09-25',
+    ]);
+    TestRunner::assertSame(3, (int) $GLOBALS['alegra_mock_state']['items']['it-inv-ha']['inventory']['availableQuantity'], 'Rama B: draft mueve con el flag');
+});
+
+TestRunner::test('T30.12 GET /inventory-adjustments filtra por el reference del payload', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-ref', ['name' => 'Ref', 'reference' => 'SKU-REF', 'inventory' => ['availableQuantity' => 10]]);
+    $api = make_api();
+
+    $api->create_inventory_adjustment([
+        'date' => '2026-09-25', 'reference' => 'wc-stock-1-10-9',
+        'items' => [['id' => 'it-ref', 'type' => 'out', 'quantity' => 1, 'unitCost' => 1]],
+    ]);
+    $api->create_inventory_adjustment([
+        'date' => '2026-09-25', 'reference' => 'wc-stock-1-9-8',
+        'items' => [['id' => 'it-ref', 'type' => 'out', 'quantity' => 1, 'unitCost' => 1]],
+    ]);
+
+    $one = $api->get_inventory_adjustments(['reference' => 'wc-stock-1-10-9']);
+    TestRunner::assertFalse(is_wp_error($one), 'GET debe responder');
+    TestRunner::assertSame(1, count($one), 'references distintas no se confunden');
+    TestRunner::assertSame('wc-stock-1-10-9', (string) ($one[0]['reference'] ?? ''), 'se guarda el reference del payload');
+    TestRunner::assertSame('SKU-REF', (string) ($one[0]['items'][0]['reference'] ?? ''), 'items[].reference sigue siendo el del ítem');
+});
+
+TestRunner::test('T30.13 wc_get_orders soporta paginate (orders + total) y mantiene ids', function (): void {
+    alegra_test_reset();
+    for ($i = 1; $i <= 5; $i++) {
+        alegra_make_order(1000 + $i, ['status' => 'processing']);
+    }
+    $page = wc_get_orders(['paginate' => true, 'limit' => 2, 'paged' => 1, 'return' => 'objects']);
+    TestRunner::assertTrue(is_object($page), 'paginate devuelve objeto');
+    TestRunner::assertSame(5, (int) ($page->total ?? -1), 'total = conjunto filtrado');
+    TestRunner::assertCount(2, $page->orders, 'page 1 trae limit=2');
+
+    $page3 = wc_get_orders(['paginate' => true, 'limit' => 2, 'paged' => 3, 'return' => 'objects']);
+    TestRunner::assertCount(1, $page3->orders, 'page 3 trae el resto');
+
+    $ids = wc_get_orders(['return' => 'ids', 'limit' => 2]);
+    TestRunner::assertTrue(is_array($ids), 'return=ids sigue siendo array');
+    TestRunner::assertSame(2, count($ids), 'ids respeta limit');
+});
+
+TestRunner::test('T30.13b meta_query soporta IN, NOT IN, <, <=, DATETIME y NOT EXISTS en OR', function (): void {
+    alegra_test_reset();
+    // Metas literales: no depende de que T1.6 haya creado Invoice_Failure.
+    alegra_make_order(2001, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_sync_state' => 'failed_retriable',
+        '_alegra_invoice_attempts'   => '2',
+        '_alegra_invoice_next_retry' => '2026-09-25 10:00:00',
+    ]]);
+    alegra_make_order(2002, ['status' => 'processing', 'meta' => [
+        '_alegra_invoice_sync_state' => 'failed_permanent',
+        '_alegra_invoice_attempts'   => '5',
+    ]]);
+    alegra_make_order(2003, ['status' => 'processing']); // sin ledger
+
+    // IN — Invoice_Queue::meta_query (fase-4:789).
+    $in = wc_get_orders([
+        'status' => ['processing'], 'return' => 'ids',
+        'meta_query' => [[
+            'key' => '_alegra_invoice_sync_state',
+            'value' => ['failed_retriable', 'blocked'],
+            'compare' => 'IN',
+        ]],
+    ]);
+    TestRunner::assertSame([2001], array_values($in), 'IN matchea sólo el estado de la lista');
+
+    // NOT IN — excluye lo listado y lo inexistente (INNER JOIN).
+    $not_in = wc_get_orders([
+        'status' => ['processing'], 'return' => 'ids',
+        'meta_query' => [[
+            'key' => '_alegra_invoice_sync_state',
+            'value' => ['failed_retriable'],
+            'compare' => 'NOT IN',
+        ]],
+    ]);
+    TestRunner::assertSame([2002], array_values($not_in), 'NOT IN excluye lo listado y lo ausente');
+
+    // < NUMERIC — retry_failed_invoices (fase-4:519).
+    $lt = wc_get_orders([
+        'status' => ['processing'], 'return' => 'ids',
+        'meta_query' => [[
+            'key' => '_alegra_invoice_attempts',
+            'value' => 5, 'compare' => '<', 'type' => 'NUMERIC',
+        ]],
+    ]);
+    TestRunner::assertSame([2001], array_values($lt), '< NUMERIC compara como número, no como string');
+
+    // <= DATETIME + NOT EXISTS en OR — retry_failed_invoices (fase-4:520-523).
+    $due = wc_get_orders([
+        'status' => ['processing'], 'return' => 'ids',
+        'meta_query' => [
+            'relation' => 'AND',
+            ['key' => '_alegra_invoice_sync_state', 'value' => 'failed_retriable'],
+            ['relation' => 'OR',
+                ['key' => '_alegra_invoice_next_retry', 'compare' => 'NOT EXISTS'],
+                ['key' => '_alegra_invoice_next_retry', 'value' => '2026-09-25 12:00:00', 'compare' => '<=', 'type' => 'DATETIME'],
+            ],
+        ],
+    ]);
+    TestRunner::assertSame([2001], array_values($due), 'DATETIME <= y NOT EXISTS combinan en OR');
+});
+
+TestRunner::test('T30.14 WC_Order_Item::get_product + is_paid para el baseline de factura', function (): void {
+    alegra_test_reset();
+    $p = alegra_make_product(900, ['manage_stock' => true, 'stock' => 10]);
+    $order = alegra_make_order(900, [
+        'status' => 'processing',
+        'items' => [new WC_Order_Item(['product_id' => 900, 'quantity' => 3])],
+    ]);
+    $items = $order->get_items();
+    TestRunner::assertCount(1, $items, 'get_items devuelve las líneas');
+    $product = $items[0]->get_product();
+    TestRunner::assertInstanceOf(WC_Product::class, $product, 'get_product resuelve el producto');
+    TestRunner::assertSame(10, $product->get_stock_quantity(), 'resuelve por product_id');
+    TestRunner::assertTrue($order->is_paid(), 'processing es paid');
+
+    TestRunner::assertFalse(alegra_make_order(901, ['status' => 'on-hold'])->is_paid(), 'on-hold no es paid');
+    TestRunner::assertFalse(alegra_make_order(902, ['status' => 'pending'])->is_paid(), 'pending no es paid');
+});
+
+TestRunner::test('T30.15 las 8 opciones de stock-ownership se siembran y se limpian', function (): void {
+    $root = $GLOBALS['alegra_plugin_root'];
+    $boot = (string) file_get_contents($root . 'alegra-connector.php');
+    $uninstall = (string) file_get_contents($root . 'uninstall.php');
+
+    $seed = [
+        'alegra_connector_stock_owner' => "'auto'",
+        'alegra_connector_invoice_retry_enabled' => 'false',
+        'alegra_connector_invoice_retry_max_attempts' => '5',
+        'alegra_connector_invoice_retry_batch' => '20',
+    ];
+    foreach ($seed as $opt => $default) {
+        TestRunner::assertStringContains("'$opt' => $default", $boot, "$opt debe estar en \$defaults con default $default");
+    }
+    foreach ([
+        'alegra_connector_stock_owner', 'alegra_connector_invoice_retry_enabled',
+        'alegra_connector_invoice_retry_max_attempts', 'alegra_connector_invoice_retry_batch',
+        'alegra_connector_invoice_failures_count', 'alegra_connector_invoice_failures_hash',
+        'alegra_connector_stock_divergence', 'alegra_connector_stock_owner_epoch',
+    ] as $opt) {
+        TestRunner::assertStringContains($opt, $boot, "$opt debe estar en \$non_autoload");
+        TestRunner::assertStringContains("delete_option('$opt')", $uninstall, "$opt debe limpiarse en uninstall");
+    }
+
+    alegra_test_reset();
+    TestRunner::assertSame(false, get_option('alegra_connector_stock_owner', false), 'sin sembrar');
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+    TestRunner::assertSame('auto', get_option('alegra_connector_stock_owner'), 'maybe_migrate siembra auto');
+    update_option('alegra_connector_stock_owner', 'invoice');
+    \Alegra\Connector\Write_Gate::maybe_migrate();
+    TestRunner::assertSame('invoice', get_option('alegra_connector_stock_owner'), 'no pisa un valor elegido');
+});
+
+TestRunner::test('T30.16 Invoice_Failure::classify devuelve el shape y las 3 clases cargan por PSR-4', function (): void {
+    alegra_test_reset();
+    TestRunner::assertTrue(class_exists(\Alegra\Connector\Sync\Invoice_Failure::class), 'Invoice_Failure carga');
+    TestRunner::assertTrue(class_exists(\Alegra\Connector\Sync\Invoice_Queue::class), 'Invoice_Queue carga');
+    TestRunner::assertTrue(class_exists(\Alegra\Connector\Sync\Stock_Divergence::class), 'Stock_Divergence carga');
+
+    $shape = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error('api_error', 'boom'));
+    foreach (['state', 'code', 'message', 'retriable', 'persist'] as $key) {
+        TestRunner::assertArrayHasKey($key, $shape, "classify() debe traer $key");
+    }
+    TestRunner::assertSame('failed_retriable', $shape['state'], 'un error desconocido es retriable');
+    TestRunner::assertTrue($shape['retriable'], 'retriable=true');
+    TestRunner::assertTrue($shape['persist'], 'persist=true');
+
+    $ok = \Alegra\Connector\Sync\Invoice_Failure::classify(['id' => 'inv-1']);
+    TestRunner::assertSame('resolved', $ok['state'], 'un éxito es resolved');
+});
+
+TestRunner::test('T30.17 la sección T30 existe y las 3 clases nuevas cargan por PSR-4', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'scripts/exec-test.php');
+    // Needle armado por concatenación: el literal completo NO debe aparecer en
+    // el test, o la aserción se auto-satisface leyendo su propio archivo.
+    $needle = '=== stock-ownership (' . '2.7.0) ===';
+    TestRunner::assertStringContains($needle, $src, 'la sección T30 debe existir');
+    foreach (['Invoice_Failure', 'Invoice_Queue', 'Stock_Divergence'] as $class) {
+        TestRunner::assertTrue(
+            class_exists('Alegra\\Connector\\Sync\\' . $class),
+            "$class debe cargar por PSR-4"
+        );
+    }
+});
+
 exit(TestRunner::summary());

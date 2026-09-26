@@ -34,6 +34,8 @@ $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
 $GLOBALS['alegra_mock_contact_identification_mode'] = 'exact';
+$GLOBALS['alegra_mock_draft_moves_stock'] = false;
+$GLOBALS['alegra_mock_invoices_stock_moved'] = [];
 
 function alegra_mock_reset(): void
 {
@@ -44,6 +46,8 @@ $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' =
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
     $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
     $GLOBALS['alegra_mock_contact_identification_mode'] = 'exact';
+    $GLOBALS['alegra_mock_draft_moves_stock'] = false;
+    $GLOBALS['alegra_mock_invoices_stock_moved'] = [];
     $GLOBALS['alegra_mock_invoice_client_check'] = false;
     $GLOBALS['alegra_mock_shutdown_callbacks'] = [];
     // Default Alegra tax catalog: one IVA 19% tax, as a CO account has.
@@ -79,6 +83,16 @@ function alegra_mock_set_invoice_client_check(bool $on): void
     $GLOBALS['alegra_mock_invoice_client_check'] = $on;
 }
 
+/**
+ * H-A / G1 Rama B: cuando está ON, una factura `draft` también mueve stock.
+ * OFF por default (modela la Rama A: el borrador no mueve). Se resetea en
+ * alegra_mock_reset().
+ */
+function alegra_mock_set_draft_moves_stock(bool $on): void
+{
+    $GLOBALS['alegra_mock_draft_moves_stock'] = $on;
+}
+
 function alegra_mock_uuid(string $prefix = 'aaaaaaaa'): string
 {
     $GLOBALS['alegra_mock_seq']++;
@@ -98,6 +112,32 @@ function alegra_mock_seed_item(string $id, array $data = []): void
 function alegra_mock_seed_invoice(string $id, array $data = []): void
 {
     $GLOBALS['alegra_mock_state']['invoices'][$id] = array_merge(['id' => $id], $data);
+}
+
+/**
+ * H-A: aplica el movimiento de stock de una factura. Descuenta
+ * `availableQuantity` por línea de ítem inventariable, UNA sola vez por
+ * invoice id. `draft` no mueve (Rama A); con draft_moves_stock=true sí.
+ */
+function alegra_mock_apply_invoice_stock(string $invoice_id, mixed $body): void
+{
+    if ($invoice_id === '' || !is_array($body)) { return; }
+    $status = (string) ($body['status'] ?? 'open');
+    $moves  = in_array($status, ['open', 'paid'], true)
+        || !empty($GLOBALS['alegra_mock_draft_moves_stock']);
+    if (!$moves) { return; }
+    if (!empty($GLOBALS['alegra_mock_invoices_stock_moved'][$invoice_id])) { return; }
+    $GLOBALS['alegra_mock_invoices_stock_moved'][$invoice_id] = true;
+
+    foreach ((array) ($body['items'] ?? []) as $line) {
+        if (!is_array($line)) { continue; }
+        $item_id = (string) ($line['id'] ?? '');
+        if ($item_id === '' || !isset($GLOBALS['alegra_mock_state']['items'][$item_id])) { continue; }
+        if (!array_key_exists('inventory', $GLOBALS['alegra_mock_state']['items'][$item_id])) { continue; }
+        $qty     = (int) ($line['quantity'] ?? 0);
+        $current = (int) ($GLOBALS['alegra_mock_state']['items'][$item_id]['inventory']['availableQuantity'] ?? 0);
+        $GLOBALS['alegra_mock_state']['items'][$item_id]['inventory']['availableQuantity'] = max(0, $current - $qty);
+    }
 }
 
 function alegra_mock_seed_payment(string $id, array $data = []): void
@@ -776,6 +816,13 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
                 return false;
             }));
         }
+        // H-B: filtro por el reference TOP-LEVEL del payload (idempotencia).
+        if (!empty($query['reference'])) {
+            $ref = (string) $query['reference'];
+            $all = array_values(array_filter($all, static function ($adj) use ($ref) {
+                return (string) ($adj['reference'] ?? '') === $ref;
+            }));
+        }
         $start = (int) ($query['start'] ?? 0);
         $limit = (int) ($query['limit'] ?? 30);
         return alegra_mock_response(200, array_slice($all, $start, $limit));
@@ -854,15 +901,19 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     if ($method === 'POST' && $path === '/invoices') {
         $id = alegra_mock_uuid('eeeeeeee');
         $number = 'FV-' . $GLOBALS['alegra_mock_seq'];
+        // H-A: respetar el status del body. Ausente => 'open' (preserva el
+        // baseline del harness; el plugin SIEMPRE manda status).
+        $status = (string) (is_array($body) ? ($body['status'] ?? 'open') : 'open');
         $stored = array_merge(is_array($body) ? $body : [], [
             'id' => $id,
             'number' => $number,
             'numberTemplate' => ['id' => '11111111-1111-1111-1111-111111111111', 'fullNumber' => $number],
-            'status' => 'open',
+            'status' => $status,
             'total' => alegra_mock_body_total($body),
             'balance' => alegra_mock_body_total($body),
         ]);
         $GLOBALS['alegra_mock_state']['invoices'][$id] = $stored;
+        alegra_mock_apply_invoice_stock($id, $stored);
         return alegra_mock_response(200, $stored);
     }
     if ($method === 'POST' && $path === '/credit-notes') {
@@ -906,6 +957,7 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         $stored = [
             'id'           => alegra_mock_uuid('a9a9a9a9'),
             'date'         => (string) ($body['date'] ?? ''),
+            'reference'    => (string) ($body['reference'] ?? ''),   // H-B: el del PAYLOAD
             'observations' => (string) ($body['observations'] ?? ''),
             'warehouse'    => $body['warehouse'] ?? null,
             'items'        => $stored_items,
@@ -919,6 +971,7 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     if ($method === 'POST' && preg_match('#^/invoices/([^/]+)/open$#', $path, $m)) {
         if (isset($GLOBALS['alegra_mock_state']['invoices'][$m[1]])) {
             $GLOBALS['alegra_mock_state']['invoices'][$m[1]]['status'] = 'open';
+            alegra_mock_apply_invoice_stock($m[1], $GLOBALS['alegra_mock_state']['invoices'][$m[1]]);
         }
         return alegra_mock_response(200, ['id' => $m[1], 'status' => 'open']);
     }
@@ -932,7 +985,9 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         }
         $patch = is_array($body) ? $body : [];
         $GLOBALS['alegra_mock_state']['invoices'][$m[1]] = array_merge($existing, $patch);
-        return alegra_mock_response(200, $GLOBALS['alegra_mock_state']['invoices'][$m[1]]);
+        $merged = $GLOBALS['alegra_mock_state']['invoices'][$m[1]];
+        alegra_mock_apply_invoice_stock($m[1], $merged);
+        return alegra_mock_response(200, $merged);
     }
 
     // --- Webhook subscriptions ---

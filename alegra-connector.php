@@ -458,6 +458,13 @@ final class Alegra_Connector
             'alegra_connector_cron_run_budget' => 540,
             // 2.6.0 (Fase 3 C4): con dueño invoice, un pedido pagado nace `open`.
             'alegra_connector_open_invoice_on_paid' => true,
+            // 2.7.0: dueño único del stock. `auto` reproduce 2.6.0 con la condición
+            // DOBLE (push_orders_enabled && open_invoice_on_paid) — CORRECCIÓN C1.
+            'alegra_connector_stock_owner' => 'auto',
+            // 2.7.0: cola de reintento de facturas (opt-in, default off por ser dinero).
+            'alegra_connector_invoice_retry_enabled' => false,
+            'alegra_connector_invoice_retry_max_attempts' => 5,
+            'alegra_connector_invoice_retry_batch' => 20,
             'alegra_connector_customer_resolution_mode' => 'auto',
             'alegra_connector_invoice_status' => 'draft',
             'alegra_connector_payment_account_id' => '',
@@ -491,6 +498,15 @@ final class Alegra_Connector
             'alegra_connector_inventory_pull_cursor',
             'alegra_connector_inventory_pull_total',
             'alegra_connector_consumidor_final_probe',
+            // 2.7.0: dueño del stock + cola de reintento + ledger de divergencia.
+            'alegra_connector_stock_owner',
+            'alegra_connector_invoice_retry_enabled',
+            'alegra_connector_invoice_retry_max_attempts',
+            'alegra_connector_invoice_retry_batch',
+            'alegra_connector_invoice_failures_count',
+            'alegra_connector_invoice_failures_hash',
+            'alegra_connector_stock_divergence',
+            'alegra_connector_stock_owner_epoch',
             // Only read by the chunked import handler (admin/AJAX).
             'alegra_connector_chunked_page_budget',
             // Only read while importing product images (admin/cron).

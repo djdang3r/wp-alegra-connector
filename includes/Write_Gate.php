@@ -213,6 +213,22 @@ class Write_Gate
             update_option('alegra_connector_gate_migration_version', 1);
         }
 
+        // Guard 1b (2.7.0): dueño del stock + cola de reintento en instalaciones ya
+        // activas. Idempotente: sólo siembra si la opción no existe (nunca pisa).
+        // La condición sobre stock_owner evita releer las otras 3 en cada request.
+        if (get_option('alegra_connector_stock_owner') === false) {
+            add_option('alegra_connector_stock_owner', 'auto', '', 'no');
+            if (get_option('alegra_connector_invoice_retry_enabled') === false) {
+                add_option('alegra_connector_invoice_retry_enabled', false, '', 'no');
+            }
+            if (get_option('alegra_connector_invoice_retry_max_attempts') === false) {
+                add_option('alegra_connector_invoice_retry_max_attempts', 5, '', 'no');
+            }
+            if (get_option('alegra_connector_invoice_retry_batch') === false) {
+                add_option('alegra_connector_invoice_retry_batch', 20, '', 'no');
+            }
+        }
+
         // Guard 2 (independent): webhook event selection. An existing install
         // must keep receiving every event, so seed all 12 when the option is
         // absent. Its own guard leaves the gate migration version at 1.
