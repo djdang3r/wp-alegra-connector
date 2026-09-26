@@ -1552,11 +1552,6 @@ class Products
         $name = $item['name'] ?? '';
         $type = $item['type'] ?? 'simple';
 
-        // Skip variant children - they're imported with their parent
-        if ($type === 'variant') {
-            return 'skipped';
-        }
-
         // TOMBSTONE GUARD: skip CREATION unless the active policy overrides it (D4).
         // Only blocks CREATION, not updates of existing products.
         $tombstone_reason = \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', $alegra_id);
@@ -1584,6 +1579,29 @@ class Products
         }
 
         try {
+            // D4: un item variant suelto se aplica a su variación hija.
+            // Se resuelve DENTRO del try para que el finally libere el guard de
+            // sincronización. Nunca se saltea en silencio.
+            if ($type === 'variant') {
+                $parent_alegra_id = (string) ($item['variantParent']['id'] ?? '');
+                if ($parent_alegra_id === '') {
+                    $this->logger->warning('Item variant sin variantParent; no se puede aplicar', [
+                        'alegra_id' => $alegra_id,
+                    ]);
+                    return 'skipped';
+                }
+                $parent_wc = $this->get_product_by_alegra_id($parent_alegra_id);
+                if (!$parent_wc) {
+                    $this->logger->warning('Item variant con padre no importado; se ignora con señal', [
+                        'alegra_id' => $alegra_id,
+                        'parent'    => $parent_alegra_id,
+                    ]);
+                    return 'skipped';
+                }
+                $this->import_variation_from_alegra((int) $parent_wc, $item);   // update ⇒ W1
+                return 'updated';
+            }
+
             $existing_id = $this->get_product_by_alegra_id($alegra_id);
 
             if ($existing_id) {
@@ -1594,6 +1612,15 @@ class Products
                     \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $existing_id);
                     $this->update_product_from_alegra($product, $item);
                     $this->assign_product_category((int) $existing_id, $item);
+
+                    // D4: refrescar variaciones TAMBIÉN en update.
+                    if ($product->is_type('variable')
+                        || $type === 'variantParent'
+                        || $type === 'kit'
+                    ) {
+                        $this->refresh_variant_children((int) $existing_id, $item);
+                    }
+
                     return 'updated';
                 }
             }
@@ -1690,6 +1717,46 @@ class Products
             return array_values(array_filter($item['subitems'], 'is_array'));
         }
         return [];
+    }
+
+    /**
+     * Refresca las variaciones hijas de un variantParent/kit existente (D4).
+     *
+     * Reusa `import_variation_from_alegra()` (que hace GET /items/{child} y, si
+     * existe, update_product_from_alegra → W1 → Inventory_Writer).
+     *
+     * Si el payload del webhook no trae `itemVariants`/`subitems`, se traen con
+     * GET /items?variantParent_id={id}. SIN VERIFICAR en producción (G2): el mock
+     * soporta el filtro (alegra-mock.php:880).
+     */
+    private function refresh_variant_children(int $parent_id, array $item): void
+    {
+        $children = $this->get_variant_children($item);
+
+        if (empty($children)) {
+            // El payload no trae hijos (típico de un webhook de edit-item).
+            $alegra_parent = (string) ($item['id'] ?? '');
+            if ($alegra_parent !== '') {
+                $fetched = $this->api->get_items([
+                    'variantParent_id' => $alegra_parent,
+                    'limit'            => 100,
+                ]);
+                if (!is_wp_error($fetched) && is_array($fetched)) {
+                    $children = $fetched;
+                } else {
+                    $this->logger->warning('No se pudieron traer las variaciones del padre', [
+                        'parent' => $alegra_parent,
+                        'error'  => is_wp_error($fetched) ? $fetched->get_error_message() : 'bad_response',
+                    ]);
+                }
+            }
+        }
+
+        foreach ($children as $child) {
+            if (is_array($child)) {
+                $this->import_variation_from_alegra($parent_id, $child);
+            }
+        }
     }
 
     /**

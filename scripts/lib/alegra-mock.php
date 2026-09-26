@@ -210,6 +210,12 @@ function wp_remote_post($url, $args = [])
     $args['method'] = 'POST';
     return alegra_mock_dispatch((string) $url, $args);
 }
+function wp_remote_head($url, $args = [])
+{
+    $args = is_array($args) ? $args : [];
+    $args['method'] = 'HEAD';
+    return alegra_mock_dispatch((string) $url, $args);
+}
 function wp_remote_retrieve_response_code($response)
 {
     return is_array($response) ? (int) ($response['response']['code'] ?? 0) : 0;

@@ -155,6 +155,13 @@ class Orders
             $result = $this->api->create_invoice($data);
 
             if (is_wp_error($result)) {
+                // D1 / REQ-CF-06: auto-sanado de la caché podrida (400 por client id
+                // muerto). Sólo dispara con 400 + mención de cliente + id CF + una vez.
+                $healed = $this->try_self_heal_dead_client($order, $data, $result);
+                if ($healed !== null) {
+                    return $healed;
+                }
+
                 if ($this->logger) {
                     $this->logger->error('Invoice creation failed', [
                         'order_id' => $order_id,
@@ -330,6 +337,96 @@ class Orders
         }
 
         return null;
+    }
+
+    /**
+     * Auto-sanado de la caché podrida del CF ante un 400 por client id muerto.
+     *
+     * D1 / REQ-CF-06. Sólo dispara con 400 + mención de cliente + id CF + una vez.
+     * Reusa find_existing_invoice() ANTES del reintento para no duplicar la factura.
+     *
+     * @param array<string,mixed> $data  Invoice payload sent to Alegra.
+     * @return array<string,mixed>|null  El resultado de la factura si se auto-sanó, null si no aplica.
+     */
+    private function try_self_heal_dead_client(\WC_Order $order, array $data, \WP_Error $error): ?array
+    {
+        // 1) Sólo un 400.
+        $code = (int) (($error->get_error_data()['code'] ?? 0));
+        if ($code !== 400) {
+            return null;
+        }
+
+        // 2) El error debe referenciar al cliente.
+        $body = $error->get_error_data()['response'] ?? [];
+        $mentions_client = (is_array($body) && isset($body['client']))
+            || stripos($error->get_error_message(), 'client') !== false
+            || stripos($error->get_error_message(), 'cliente') !== false;
+        if (!$mentions_client) {
+            return null;
+        }
+
+        // 3) El client.id usado debe ser el CF cacheado.
+        $old_id = (string) ($data['client']['id'] ?? '');
+        if ($old_id === '' || !\Alegra\Connector\Consumidor_Final::is_consumidor_final($old_id)) {
+            return null;
+        }
+
+        // 4) Reintento ÚNICO por pedido (guard entre requests; el design lo llama
+        //    "$retried === false", la firma no lo lleva).
+        $guard = 'alegra_cf_self_heal_' . (int) $order->get_id();
+        if (get_transient($guard)) {
+            return null;
+        }
+        set_transient($guard, 1, 60);
+
+        // 5) Invalidar + re-resolver con el barrido PAGINADO (FIX-18 / Oracle D9).
+        //    NO usar resolve()/get_or_create_id() directo: resolve() pide `limit=5`
+        //    y, si el CF está detrás de >5 falsos positivos CONTAINS, lo pierde otra
+        //    vez (el mismo bug que REQ-CF-05 arregla). probe() barre por páginas
+        //    (scan_candidates, hasta 300) y sólo con un barrido COMPLETO sin match
+        //    se cae a crear (get_or_create_id respeta la compuerta: en contexto
+        //    automático sólo crea si push_customers_enabled).
+        \Alegra\Connector\Consumidor_Final::invalidate_cache();
+        $probe = \Alegra\Connector\Consumidor_Final::probe();
+        if ($probe['state'] === 'available' && !empty($probe['id'])) {
+            $new_id = (string) $probe['id'];
+        } elseif ($probe['state'] === 'not_found') {
+            $new_id = \Alegra\Connector\Consumidor_Final::get_or_create_id();
+        } else {
+            // unverified (api_error / truncated): NO crear a ciegas.
+            $new_id = false;
+        }
+        if ($new_id === false || $new_id === '') {
+            // T5.6: soltar el id muerto del pedido para no re-loopear + nota accionable.
+            $order->delete_meta_data('_billing_alegra_contact_id');
+            $order->add_order_note(__('[Alegra] El Consumidor Final cambió en Alegra y no se pudo re-resolver. Revisá el contacto.', 'alegra-connector'));
+            $order->save();
+            return null;
+        }
+
+        // 6) Idempotencia ANTES de reintentar (no duplicar la factura).
+        $existing = $this->find_existing_invoice($order, (string) $new_id);
+        if ($existing !== null && !empty($existing['id'])) {
+            $this->persist_invoice_result($order, (string) $existing['id'], $existing);
+            $order->add_order_note(__('[Alegra] Factura recuperada tras re-resolver el Consumidor Final (auto-sanado).', 'alegra-connector'));
+            return ['id' => (string) $existing['id'], 'already_exists' => true, 'self_healed' => true];
+        }
+
+        // 7) Reintento ÚNICO con el nuevo client.
+        $data['client'] = ['id' => $new_id] + (is_array($data['client'] ?? null) ? $data['client'] : []);
+        $retry = $this->api->create_invoice($data);
+        if (is_wp_error($retry)) {
+            $order->add_order_note(sprintf(
+                __('[Alegra] No se pudo facturar tras re-resolver el Consumidor Final: %s', 'alegra-connector'),
+                $retry->get_error_message()
+            ));
+            return null;
+        }
+        if (isset($retry['id'])) {
+            $this->persist_invoice_result($order, (string) $retry['id'], $retry);
+            $order->add_order_note(__('[Alegra] Consumidor Final re-resuelto y factura creada (auto-sanado).', 'alegra-connector'));
+        }
+        return $retry;
     }
 
     /**

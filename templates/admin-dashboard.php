@@ -14,11 +14,37 @@ $kill_switch = \Alegra\Connector\Kill_Switch::is_active();
 // Billing health data.
 $dry_run = (bool) get_option('alegra_connector_dry_run', false);
 $consumidor_final_checked = $is_connected && class_exists('\Alegra\Connector\Consumidor_Final');
-// REQ-RB-1: read-only check. Rendering the dashboard must never resolve or
-// create the contact (is_available()/get_id() could POST /contacts).
-$consumidor_final_available = $consumidor_final_checked
-    ? \Alegra\Connector\Consumidor_Final::is_configured()
+
+// REQ-RB-1 / REQ-CF-02: read-only. El render NUNCA resuelve ni crea el contacto
+// (las APIs que resuelven/crean podrían POSTear). Sólo se lee la caché
+// (peek_id) y el último probe persistido (probe_state), ambos sin red.
+$cf_peeked = $consumidor_final_checked
+    ? \Alegra\Connector\Consumidor_Final::peek_id()
     : false;
+$cf_probe = $consumidor_final_checked
+    ? \Alegra\Connector\Consumidor_Final::probe_state()
+    : ['state' => 'unverified', 'id' => null, 'reason' => '', 'scanned' => 0, 'at' => 0];
+
+if (!$is_connected) {
+    $cf_state = 'disconnected';
+} elseif ($cf_peeked !== false || $cf_probe['state'] === 'available') {
+    $cf_state = 'available';
+} elseif ($cf_probe['state'] === 'not_found') {
+    $cf_state = 'not_found';
+} else {
+    $cf_state = 'unverified';
+}
+$consumidor_final_available = ($cf_state === 'available');
+
+// REQ-CF-07: motivo legible por estado (fail-loud). Claves de probe()/scan_candidates().
+$cf_reason_labels = [
+    'api_error'          => __('la API de Alegra no respondió', 'alegra-connector'),
+    'truncated'          => __('el barrido de contactos quedó incompleto', 'alegra-connector'),
+    'bad_response'       => __('Alegra devolvió una respuesta inválida', 'alegra-connector'),
+    'client_unavailable' => __('el cliente de Alegra no está disponible', 'alegra-connector'),
+];
+$cf_reason      = (string) ($cf_probe['reason'] ?? '');
+$cf_reason_text = $cf_reason_labels[$cf_reason] ?? '';
 
 $page_title = __('Dashboard', 'alegra-connector');
 include __DIR__ . '/header.php';
@@ -127,21 +153,30 @@ include __DIR__ . '/header.php';
                 <?php endif; ?>
             </span>
         </div>
-        <div class="alegra-health-row">
-            <span class="alegra-health-dot <?php echo $consumidor_final_available ? 'is-green' : 'is-amber'; ?>"></span>
+        <div class="alegra-health-row" id="alegra-cf-row" data-cf-state="<?php echo esc_attr($cf_state); ?>">
+            <span class="alegra-health-dot <?php echo $cf_state === 'available' ? 'is-green' : ($cf_state === 'not_found' ? 'is-red' : 'is-amber'); ?>"></span>
             <span class="alegra-health-label"><?php esc_html_e('Consumidor Final', 'alegra-connector'); ?></span>
-            <span class="alegra-health-status">
-                <?php if (!$is_connected): ?>
+            <span class="alegra-health-status" id="alegra-cf-status">
+                <?php if ($cf_state === 'disconnected'): ?>
                     <?php esc_html_e('No verificado (sin conexión)', 'alegra-connector'); ?>
-                <?php elseif ($consumidor_final_available): ?>
+                <?php elseif ($cf_state === 'available'): ?>
                     <?php esc_html_e('Disponible', 'alegra-connector'); ?>
-                <?php else: ?>
+                <?php elseif ($cf_state === 'not_found'): ?>
                     <strong><?php esc_html_e('No encontrado en Alegra', 'alegra-connector'); ?></strong>
+                <?php else: ?>
+                    <strong><?php esc_html_e('No verificado', 'alegra-connector'); ?></strong>
+                    <?php if ($cf_reason_text !== ''): ?>
+                        <span class="description"> — <?php echo esc_html($cf_reason_text); ?></span>
+                    <?php endif; ?>
                 <?php endif; ?>
             </span>
-            <span class="alegra-health-action">
-                <?php if ($consumidor_final_checked && !$consumidor_final_available): ?>
-                    <?php esc_html_e('Créalo en Alegra con identificación CC 222222222222.', 'alegra-connector'); ?>
+            <span class="alegra-health-action" id="alegra-cf-action">
+                <?php if ($cf_state === 'disconnected'): ?>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=alegra-connector-settings')); ?>"><?php esc_html_e('Conectar ahora', 'alegra-connector'); ?> &rarr;</a>
+                <?php elseif ($cf_state === 'not_found'): ?>
+                    <button type="button" class="ac-btn ac-btn-sm ac-btn-primary alegra-cf-create" data-create="1"><?php esc_html_e('Crear Consumidor Final', 'alegra-connector'); ?></button>
+                <?php elseif ($cf_state === 'unverified'): ?>
+                    <button type="button" class="ac-btn ac-btn-sm alegra-cf-verify" data-create="0"><?php esc_html_e('Verificar ahora', 'alegra-connector'); ?></button>
                 <?php endif; ?>
             </span>
         </div>

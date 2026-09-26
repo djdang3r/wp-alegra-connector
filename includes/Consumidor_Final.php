@@ -106,8 +106,7 @@ class Consumidor_Final
             return false;
         }
 
-        set_transient(self::cache_key(self::CACHE_TRANSIENT), $resolved, self::CACHE_TTL);
-        update_option(self::cache_key(self::OPTION_KEY), $resolved);
+        self::cache_id($resolved);
 
         return $resolved;
     }
@@ -229,6 +228,165 @@ class Consumidor_Final
         } finally {
             \Alegra\Connector\Sync\Controller::release_lock($lock_key, $token);
         }
+    }
+
+    /**
+     * Resuelve el CF SÓLO con GET + match + caché. NUNCA POSTea. D1 Rama A.
+     *
+     * @return string|false Id del CF, o false si no se encontró / no se pudo verificar.
+     */
+    public static function resolve_readonly(?Client $client = null): string|false
+    {
+        $peeked = self::peek_id();
+        if ($peeked !== false) {
+            return $peeked;
+        }
+        if ($client === null) {
+            if (!class_exists(Client::class)) {
+                return false;
+            }
+            $client = new Client();
+        }
+        $scan = self::scan_candidates($client);
+        if ($scan['found'] !== null) {
+            self::cache_id($scan['found']);
+            return $scan['found'];
+        }
+        return false;
+    }
+
+    /**
+     * Estado honesto del CF, sin escribir nunca.
+     *
+     * 1. cache/override ⇒ available (sin red).
+     * 2. barrido read-only ⇒ match ⇒ cache_id() + available.
+     * 3. barrido completo sin match ⇒ not_found.
+     * 4. red caída / barrido truncado ⇒ unverified (NUNCA "no encontrado").
+     *
+     * @return array{state:'available'|'not_found'|'unverified',id:?string,reason:string,scanned:int}
+     */
+    public static function probe(?Client $client = null): array
+    {
+        $peeked = self::peek_id();
+        if ($peeked !== false) {
+            return ['state' => 'available', 'id' => $peeked, 'reason' => 'cached', 'scanned' => 0];
+        }
+        if ($client === null) {
+            if (!class_exists(Client::class)) {
+                return ['state' => 'unverified', 'id' => null, 'reason' => 'client_unavailable', 'scanned' => 0];
+            }
+            $client = new Client();
+        }
+
+        $scan = self::scan_candidates($client);
+        if ($scan['found'] !== null) {
+            self::cache_id($scan['found']);
+            return ['state' => 'available', 'id' => $scan['found'], 'reason' => 'match', 'scanned' => $scan['scanned']];
+        }
+        if ($scan['complete']) {
+            return ['state' => 'not_found', 'id' => null, 'reason' => 'not_found', 'scanned' => $scan['scanned']];
+        }
+        return ['state' => 'unverified', 'id' => null, 'reason' => $scan['reason'], 'scanned' => $scan['scanned']];
+    }
+
+    /**
+     * Lee el último probe persistido SIN tocar la red (para el render).
+     *
+     * @return array{state:string,id:?string,reason:string,scanned:int,at:int}
+     */
+    public static function probe_state(): array
+    {
+        $default = ['state' => 'unverified', 'id' => null, 'reason' => '', 'scanned' => 0, 'at' => 0];
+        $stored = get_option('alegra_connector_consumidor_final_probe', []);
+        if (!is_array($stored)
+            || !isset($stored['state'])
+            || !in_array($stored['state'], ['available', 'not_found', 'unverified'], true)
+        ) {
+            return $default;
+        }
+        return array_merge($default, $stored);
+    }
+
+    /**
+     * Persiste el resultado de probe() con timestamp. Autoload off.
+     *
+     * @param array<string,mixed> $probe
+     * @return array<string,mixed>
+     */
+    public static function persist_probe(array $probe): array
+    {
+        $probe['at'] = time();
+        update_option('alegra_connector_consumidor_final_probe', $probe, false);
+        return $probe;
+    }
+
+    /**
+     * Barrido read-only de los candidatos del filtro `identification` (CONTAINS).
+     *
+     * Pagina con `limit=30` hasta `max_pages=10` (300 candidatos). Una página llena
+     * NO es "fin": se pide la siguiente. Sólo un barrido COMPLETO habilita
+     * `not_found`; un tope ⇒ `truncated` (⇒ el caller reporta `unverified`).
+     * NUNCA POSTea: sólo GET + match + store_metadata.
+     *
+     * @return array{found:?string,complete:bool,scanned:int,reason:string}
+     */
+    private static function scan_candidates(Client $client): array
+    {
+        $per_page  = 30;   // máximo documentado de /contacts
+        $max_pages = 10;   // 300 candidatos; más ⇒ unverified
+        $found     = null;
+        $scanned   = 0;
+        $complete  = false;
+
+        for ($p = 0; $p < $max_pages; $p++) {
+            $batch = $client->get_contacts([
+                'identification' => self::IDENTIFICATION,   // CONTAINS en Alegra
+                'limit'          => $per_page,
+                'start'          => $p * $per_page,
+            ]);
+
+            if (is_wp_error($batch)) {
+                return ['found' => null, 'complete' => false, 'scanned' => $scanned, 'reason' => 'api_error'];
+            }
+            if (!is_array($batch)) {
+                return ['found' => null, 'complete' => false, 'scanned' => $scanned, 'reason' => 'bad_response'];
+            }
+
+            foreach ($batch as $contact) {
+                $scanned++;
+                if (is_array($contact) && isset($contact['id']) && self::matches($contact)) {
+                    $found = (string) $contact['id'];
+                    self::store_metadata($contact);
+                    break 2;
+                }
+            }
+
+            // Una página llena NO es "fin": pedir la siguiente.
+            if (count($batch) < $per_page) {
+                $complete = true;
+                break;
+            }
+        }
+
+        return [
+            'found'    => $found,
+            'complete' => $complete,
+            'scanned'  => $scanned,
+            'reason'   => $found !== null ? 'match' : ($complete ? 'not_found' : 'truncated'),
+        ];
+    }
+
+    /**
+     * Cachea el id del CF en transient + option (misma representación que
+     * get_or_create_id()). Sólo lo llama el camino read-only tras un match exacto.
+     */
+    private static function cache_id(string $id): void
+    {
+        if ($id === '') {
+            return;
+        }
+        set_transient(self::cache_key(self::CACHE_TRANSIENT), $id, self::CACHE_TTL);
+        update_option(self::cache_key(self::OPTION_KEY), $id);
     }
 
     /**

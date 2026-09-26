@@ -190,6 +190,18 @@
 <?php else:?>
 <tr><th><?php esc_html_e('Bodega por defecto:','alegra-connector');?></th><td><input type="text" name="alegra_connector_warehouse_id" value="<?php echo esc_attr(get_option('alegra_connector_warehouse_id',''));?>" class="small-text" placeholder="ID o UUID"><p class="description"><?php esc_html_e('Conecta con Alegra para ver tus bodegas o ingresa el ID manualmente.','alegra-connector');?></p></td></tr>
 <?php endif;?>
+<?php
+$ac_wh_enabled = (bool) get_option('alegra_connector_warehouse_enabled', false);
+$ac_wh_id      = (string) get_option('alegra_connector_warehouse_id', '');
+if ($ac_wh_enabled && $ac_wh_id !== '' && $ac_wh_id !== '0'):
+?>
+<tr><td colspan="2">
+<div class="ac-notice warning" style="margin:0;">
+<strong><?php esc_html_e('Aviso sobre el inventario por bodega','alegra-connector');?></strong><br>
+<?php esc_html_e('Tenés una bodega configurada. Los productos y facturas se envían a esa bodega, pero la sincronización de inventario (Alegra → WooCommerce) todavía lee el stock TOTAL del artículo, no el de la bodega elegida. Si repartís stock entre varias bodegas, el número que ves en WooCommerce puede no coincidir con la bodega configurada.','alegra-connector');?>
+</div>
+</td></tr>
+<?php endif;?>
 </table>
 </div>
 

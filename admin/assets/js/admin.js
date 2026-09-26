@@ -47,6 +47,7 @@
         init: function() {
             this.initTabs();
             this.initConnectionTest();
+            this.initConsumidorFinal();
             this.initSyncNow();
             this.initImportFilters();
             this.initLogManagement();
@@ -119,6 +120,52 @@
                         var msg = status === 'timeout' ? S.timeout : fmt(S.networkError, status);
                         $status.html('<span style="color:var(--ac-danger);">&#10007; ' + msg + '</span>');
                         showNotice(msg + '. ' + S.checkUrl, 'error');
+                    }
+                });
+            });
+        },
+
+        // D1 / REQ-CF-03: "Verificar ahora" / "Crear Consumidor Final".
+        initConsumidorFinal: function() {
+            $(document).on('click', '.alegra-cf-verify, .alegra-cf-create', function() {
+                var $btn  = $(this);
+                var label = $btn.text();
+                var create = $btn.data('create') ? 1 : 0;
+
+                $btn.prop('disabled', true).text(S.cfVerifying);
+
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    data: {
+                        action: 'alegra_verify_consumidor_final',
+                        _ajax_nonce: alegraConnector.nonce,
+                        create: create
+                    },
+                    success: function(r) {
+                        if (!r || !r.success) {
+                            showNotice(safeMsg(r, S.cfVerifyError), 'error');
+                            $btn.prop('disabled', false).text(label);
+                            return;
+                        }
+                        var d    = r.data || {};
+                        var $row = $('#alegra-cf-row');
+
+                        $row.attr('data-cf-state', d.state || 'unverified');
+                        $('#alegra-cf-status').text(d.message || '');
+
+                        if (d.state === 'available') {
+                            $('#alegra-cf-action').empty();
+                            $row.find('.alegra-health-dot').removeClass('is-amber is-red').addClass('is-green');
+                            showNotice(d.message || S.cfVerifyOk, 'success');
+                        } else {
+                            showNotice(d.message || S.cfVerifyNotFound, 'warning');
+                            $btn.prop('disabled', false).text(label);
+                        }
+                    },
+                    error: function() {
+                        showNotice(S.connectionError, 'error');
+                        $btn.prop('disabled', false).text(label);
                     }
                 });
             });

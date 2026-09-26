@@ -8765,4 +8765,452 @@ TestRunner::test('T29.39 informe de divergencia (REQ-INV-07)', function (): void
     TestRunner::assertSame(0, $admin->get_unjournaled_sales()['count'], 'con factura no hay divergencia');
 });
 
+// ===========================================================================
+// Fase 4 — variaciones en el update + warehouse diferido (D4)
+// ===========================================================================
+
+/**
+ * Logger that captures entries in memory so a test can assert on a warning
+ * without depending on the filesystem log directory.
+ */
+class Alegra_Test_Capture_Logger extends \Alegra\Connector\Logger\Logger
+{
+    public function info(string $message, array $context = []): void { $GLOBALS['alegra_test_logs'][] = ['info', $message, $context]; }
+    public function warning(string $message, array $context = []): void { $GLOBALS['alegra_test_logs'][] = ['warning', $message, $context]; }
+    public function error(string $message, array $context = []): void { $GLOBALS['alegra_test_logs'][] = ['error', $message, $context]; }
+}
+
+function alegra_test_capture_logger(): \Alegra\Connector\Logger\Logger
+{
+    $GLOBALS['alegra_test_logs'] = [];
+    return new Alegra_Test_Capture_Logger();
+}
+
+function alegra_test_logs_contain(string $needle): bool
+{
+    foreach ((array) ($GLOBALS['alegra_test_logs'] ?? []) as $entry) {
+        if (stripos((string) $entry[1], $needle) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TestRunner::test('T29.41 update of a variantParent refreshes child variation stock (D4)', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(1000, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        1001 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+    ]);
+    update_post_meta(1000, '_alegra_item_id', 'par-1');
+    update_post_meta(1001, '_alegra_item_id', 'var-1');
+    \Alegra\Connector\Entity_Map::map('item', 'par-1', 'product', 1000);
+    \Alegra\Connector\Entity_Map::map('item', 'var-1', 'product', 1001);
+
+    alegra_mock_seed_item('par-1', ['name' => 'P', 'type' => 'variantParent', 'inventory' => ['availableQuantity' => 9]]);
+    alegra_mock_seed_item('var-1', [
+        'name' => 'P / Rojo', 'type' => 'variant', 'variantParent' => ['id' => 'par-1'],
+        'inventory' => ['availableQuantity' => 3],
+    ]);
+
+    $p = make_products();
+    $r = alegra_call_private($p, 'import_single_item_from_alegra', [
+        'id' => 'par-1', 'name' => 'P', 'type' => 'variantParent',
+    ], 0);
+
+    TestRunner::assertSame('updated', $r, 'the parent must be updated');
+    $variation = wc_get_product(1001);
+    TestRunner::assertSame(3, (int) $variation->get_stock_quantity(), 'the child variation must receive the new stock');
+    $list = alegra_mock_last_request('GET', '/items');
+    TestRunner::assertSame('par-1', (string) ($list['query']['variantParent_id'] ?? ''), 'the explicit child fetch must run when the payload has no children');
+    TestRunner::assertTrue(alegra_mock_count('GET', '/items/var-1') >= 1, 'each child must be fetched by id');
+});
+
+TestRunner::test('T29.42 a loose type=variant item is applied to its child or logged, never silently skipped', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(1000, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        1001 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+    ]);
+    update_post_meta(1000, '_alegra_item_id', 'par-1');
+    update_post_meta(1001, '_alegra_item_id', 'var-1');
+    \Alegra\Connector\Entity_Map::map('item', 'par-1', 'product', 1000);
+    \Alegra\Connector\Entity_Map::map('item', 'var-1', 'product', 1001);
+
+    alegra_mock_seed_item('var-1', [
+        'name' => 'P / Rojo', 'type' => 'variant',
+        'variantParent' => ['id' => 'par-1'],
+        'inventory' => ['availableQuantity' => 5],
+    ]);
+
+    $logger = alegra_test_capture_logger();
+    $p = make_products($logger);
+    $r = alegra_call_private($p, 'import_single_item_from_alegra', [
+        'id' => 'var-1', 'type' => 'variant', 'variantParent' => ['id' => 'par-1'],
+    ], 0);
+
+    TestRunner::assertSame('updated', $r, 'a loose variant with a known parent must be applied');
+    TestRunner::assertSame(5, (int) wc_get_product(1001)->get_stock_quantity(), 'the child stock must be updated');
+
+    $r2 = alegra_call_private($p, 'import_single_item_from_alegra', ['id' => 'var-2', 'type' => 'variant'], 0);
+    TestRunner::assertSame('skipped', $r2, 'a variant without a parent must be skipped');
+    TestRunner::assertTrue(alegra_test_logs_contain('variantParent'), 'the skip must be logged with a reason');
+});
+
+TestRunner::test('T29.43 the chunked handler routes variants instead of skipping them (D4)', function (): void {
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringNotContains("if (\$item_type === 'variant') { continue; }", $src, 'the silent variant skip must be gone');
+    TestRunner::assertStringContains('import_single_item_public($item, $run_id)', $src, 'variants must be routed through the handler');
+});
+
+TestRunner::test('T29.44 the warehouse notice is rendered in settings when a warehouse is configured', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-settings.php');
+    TestRunner::assertStringContains('alegra_connector_warehouse_enabled', $tpl, 'the notice must be conditional on the warehouse flag');
+    TestRunner::assertStringContains('stock TOTAL del artículo', $tpl, 'the notice must state that the poll reads the total');
+    TestRunner::assertStringContains(
+        "if (\$ac_wh_enabled && \$ac_wh_id !== '' && \$ac_wh_id !== '0'):",
+        $tpl,
+        'the notice must be guarded so it does not show without a configured warehouse'
+    );
+});
+
+TestRunner::test('T29.45 creating a new variantParent still creates its children (no regression)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('par-new', [
+        'name' => 'Nuevo', 'type' => 'variantParent',
+        'itemVariants' => [
+            ['id' => 'var-new', 'variantAttributes' => [['id' => 'a1', 'value' => 'Rojo']],
+             'inventory' => ['availableQuantity' => 7]],
+        ],
+    ]);
+    alegra_mock_seed_item('var-new', [
+        'name' => 'Nuevo / Rojo', 'type' => 'variant', 'variantParent' => ['id' => 'par-new'],
+        'inventory' => ['availableQuantity' => 7],
+    ]);
+
+    $p = make_products();
+    $r = alegra_call_private($p, 'import_single_item_from_alegra', [
+        'id' => 'par-new', 'name' => 'Nuevo', 'type' => 'variantParent',
+        'itemVariants' => [['id' => 'var-new']],
+    ], 0);
+
+    TestRunner::assertTrue($r === true, 'the parent must be created');
+
+    $variation_id = \Alegra\Connector\Entity_Map::find_wc_id('item', 'var-new', 'product');
+    TestRunner::assertTrue($variation_id !== null && $variation_id > 0, 'the child variation must be created and mapped');
+    $created = $GLOBALS['wp_posts'][$variation_id] ?? null;
+    TestRunner::assertSame('product_variation', $created->post_type ?? '', 'the child must be a product_variation post');
+    TestRunner::assertSame('var-new', (string) get_post_meta($variation_id, '_alegra_item_id', true), 'the child must link to its Alegra item');
+});
+
+// ===========================================================================
+// Fase 5 — Consumidor Final: engine read-only + self-heal (D1)
+// ===========================================================================
+
+TestRunner::test('T29.51 scan_candidates paginates CONTAINS results and finds the real CF (REQ-CF-05)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_contact_identification_mode('contains');
+
+    for ($i = 1; $i <= 30; $i++) {
+        alegra_mock_seed_contact('decoy-' . $i, [
+            'identificationObject' => ['type' => 'CC', 'number' => '222222222222' . $i],
+        ]);
+    }
+    alegra_mock_seed_contact('cf-real', [
+        'name' => 'Consumidor Final',
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+
+    $scan = alegra_call_private_static(\Alegra\Connector\Consumidor_Final::class, 'scan_candidates', make_api());
+    TestRunner::assertSame('cf-real', $scan['found'], 'the real CF on page 2 must be found');
+    TestRunner::assertSame(31, $scan['scanned'], 'the scan must have walked page 1 and page 2');
+
+    alegra_test_reset();
+    alegra_mock_set_contact_identification_mode('contains');
+    for ($i = 1; $i <= 301; $i++) {
+        alegra_mock_seed_contact('d-' . $i, ['identificationObject' => ['type' => 'CC', 'number' => '222222222222' . $i]]);
+    }
+    $scan2 = alegra_call_private_static(\Alegra\Connector\Consumidor_Final::class, 'scan_candidates', make_api());
+    TestRunner::assertSame(null, $scan2['found'], 'no real CF exists');
+    TestRunner::assertFalse($scan2['complete'], 'a capped scan is NOT complete');
+    TestRunner::assertSame('truncated', $scan2['reason'], 'a capped scan must report truncated');
+});
+
+TestRunner::test('T29.52 probe is read-only and reports available/not_found/unverified (REQ-CF-02/04/07)', function (): void {
+    alegra_test_reset();
+
+    alegra_mock_seed_contact('cf-1', [
+        'name' => 'Consumidor Final',
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+    $probe = \Alegra\Connector\Consumidor_Final::probe(make_api());
+    TestRunner::assertSame('available', $probe['state'], 'the seeded CF must be available');
+    TestRunner::assertSame('cf-1', $probe['id'], 'the id must be returned');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'probe must never POST');
+
+    alegra_test_reset();
+    $probe2 = \Alegra\Connector\Consumidor_Final::probe(make_api());
+    TestRunner::assertSame('not_found', $probe2['state'], 'a complete empty scan is not_found');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'not_found must not create');
+
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/contacts', 500, ['message' => 'boom']);
+    $probe3 = \Alegra\Connector\Consumidor_Final::probe(make_api());
+    TestRunner::assertSame('unverified', $probe3['state'], 'an API error is unverified, never not_found');
+    TestRunner::assertSame('api_error', $probe3['reason'], 'the reason must be readable');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'an API error must not create');
+
+    alegra_test_reset();
+    $created = \Alegra\Connector\Write_Gate::run_explicit(static fn () => \Alegra\Connector\Consumidor_Final::get_or_create_id());
+    TestRunner::assertTrue($created !== false && $created !== '', 'resolve() must still be able to create under explicit context');
+});
+
+TestRunner::test('T29.520 probe_state reads the persisted option without network', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame('unverified', \Alegra\Connector\Consumidor_Final::probe_state()['state'], 'default is unverified');
+
+    update_option('alegra_connector_consumidor_final_probe', [
+        'state' => 'available', 'id' => 'cf-1', 'reason' => 'match', 'scanned' => 2, 'at' => 123,
+    ], false);
+    $before = alegra_mock_count('GET', '/contacts');
+    $state  = \Alegra\Connector\Consumidor_Final::probe_state();
+    TestRunner::assertSame('available', $state['state'], 'the stored state is read');
+    TestRunner::assertSame('cf-1', $state['id'], 'the stored id is read');
+    TestRunner::assertSame($before, alegra_mock_count('GET', '/contacts'), 'probe_state must not touch the network');
+});
+
+TestRunner::test('T29.53 connecting resolves the CF read-only and persists the probe (REQ-CF-01)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('cf-1', [
+        'name' => 'Consumidor Final',
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+
+    $_POST['email'] = 'harness@example.test';
+    $_POST['token'] = 'harness-token';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_test_connection());
+    unset($_POST['email'], $_POST['token']);
+
+    TestRunner::assertTrue($resp->success, 'connection must succeed');
+    TestRunner::assertSame('available', $resp->payload['consumidor_final']['state'] ?? null, 'the CF probe must be available');
+    $stored = get_option('alegra_connector_consumidor_final_probe', []);
+    TestRunner::assertSame('available', $stored['state'] ?? null, 'the probe must be persisted');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'connecting must not create the CF');
+});
+
+TestRunner::test('T29.54 the verify AJAX requires nonce/cap and never POSTs unless create=true (REQ-CF-03/04)', function (): void {
+    alegra_test_reset();
+
+    $GLOBALS['alegra_test_caps'] = ['manage_options' => false];
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_verify_consumidor_final());
+    TestRunner::assertFalse($resp->success, 'without manage_options the AJAX must fail');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'no API call without permission');
+
+    alegra_test_reset();
+    alegra_mock_seed_contact('cf-1', [
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_verify_consumidor_final());
+    TestRunner::assertTrue($resp2->success, 'the AJAX must succeed');
+    TestRunner::assertSame('available', $resp2->payload['state'], 'the CF must be available');
+    TestRunner::assertTrue(isset($resp2->payload['message']) && $resp2->payload['message'] !== '', 'message must always be present');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'create=false must not POST');
+
+    alegra_test_reset();
+    $_POST['create'] = '1';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp3 = alegra_capture_json(fn () => $admin->ajax_verify_consumidor_final());
+    unset($_POST['create']);
+    TestRunner::assertSame('available', $resp3->payload['state'], 'the created CF must be available');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/contacts'), 'create=true must POST exactly once');
+});
+
+/**
+ * An order create_invoice() can process with a cached Alegra contact id.
+ */
+function alegra_make_cf_order(int $order_id, string $contact_id): WC_Order
+{
+    alegra_make_product(1000, ['name' => 'Widget', 'regular_price' => '10']);
+    update_post_meta(1000, '_alegra_item_id', 'it-cf-1');
+    return alegra_make_order($order_id, [
+        'total'    => 10.0,
+        'currency' => 'COP',
+        'status'   => 'processing',
+        'billing'  => ['country' => 'CO', 'email' => 'x@y.test'],
+        'meta'     => ['_billing_alegra_contact_id' => $contact_id],
+        'items'    => [new WC_Order_Item(['product_id' => 1000, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 10.0, 'total' => 10.0])],
+    ]);
+}
+
+TestRunner::test('T29.55 a dead-CF 400 self-heals once without duplicating (REQ-CF-06/NFR-07)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_invoice_client_check(true);
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-dead', false);
+
+    // FIX-18 / Oracle D9: el CF vivo está DETRÁS de >5 falsos positivos CONTAINS.
+    alegra_mock_set_contact_identification_mode('contains');
+    for ($i = 1; $i <= 6; $i++) {
+        alegra_mock_seed_contact('decoy-' . $i, [
+            'identificationObject' => ['type' => 'CC', 'number' => '222222222222' . $i],
+        ]);
+    }
+    alegra_mock_seed_contact('cf-live', [
+        'name' => 'Consumidor Final',
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+
+    $order = alegra_make_cf_order(7001, 'cf-dead');
+    $orders = make_orders();
+    $result = $orders->create_invoice($order);
+
+    TestRunner::assertTrue(!is_wp_error($result), 'the invoice must be created after self-heal');
+    TestRunner::assertSame(2, alegra_mock_count('POST', '/invoices'), 'exactly one failed attempt + one retry');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'the paginated re-resolve must not create a duplicate CF');
+    TestRunner::assertTrue((string) $order->get_meta('_alegra_invoice_id', true) !== '', 'the invoice id must be persisted');
+    TestRunner::assertStringContains('auto-sanado', implode("\n", $order->get_notes()), 'an auto-heal note must be added');
+});
+
+TestRunner::test('T29.56 the idempotency pre-search prevents a duplicate invoice (REQ-CF-06)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_invoice_client_check(true);
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-dead', false);
+    alegra_mock_seed_contact('cf-live', [
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+    alegra_mock_seed_invoice('inv-existing', [
+        'client' => ['id' => 'cf-live'],
+        'observations' => 'Pedido WooCommerce #7002',
+        'status' => 'open',
+    ]);
+
+    $order2 = alegra_make_cf_order(7002, 'cf-dead');
+    $orders2 = make_orders();
+    $r2 = $orders2->create_invoice($order2);
+    TestRunner::assertTrue(!is_wp_error($r2), 'the existing invoice must be recovered');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'the idempotency pre-search must prevent a second POST');
+    TestRunner::assertSame('inv-existing', (string) $order2->get_meta('_alegra_invoice_id', true), 'the recovered id must be persisted');
+});
+
+TestRunner::test('T29.57 non-client 400s and other errors are returned unchanged (REQ-CF-08)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-dead', false);
+    alegra_mock_fail('POST', '/invoices', 400, ['message' => 'El campo items es obligatorio'], 1);
+
+    $order = alegra_make_cf_order(7003, 'cf-dead');
+    $orders = make_orders();
+    $r = $orders->create_invoice($order);
+    TestRunner::assertTrue(is_wp_error($r), 'a non-client 400 must be returned as-is');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'no retry for a non-client error');
+});
+
+TestRunner::test('T29.58 an unresolvable CF drops the dead meta and leaves an actionable note (REQ-CF-06)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_invoice_client_check(true);
+    update_option('alegra_connector_push_customers_enabled', false, false);
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-dead', false);
+
+    $order = alegra_make_cf_order(7004, 'cf-dead');
+    $orders = make_orders();
+    $r = $orders->create_invoice($order);
+
+    TestRunner::assertTrue(is_wp_error($r), 'the invoice still fails');
+    TestRunner::assertSame('', (string) $order->get_meta('_billing_alegra_contact_id', true), 'the dead meta must be dropped');
+    TestRunner::assertStringContains('no se pudo re-resolver', implode("\n", $order->get_notes()), 'an actionable note must be added');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'no retry when the CF cannot be re-resolved');
+});
+
+TestRunner::test('T29.59 a normal invoice is unaffected by the self-heal (NFR-01)', function (): void {
+    alegra_test_reset();
+    alegra_mock_set_invoice_client_check(true);
+    alegra_mock_seed_contact('cf-1', [
+        'identificationObject' => ['type' => 'CC', 'number' => \Alegra\Connector\Consumidor_Final::IDENTIFICATION],
+    ]);
+    update_option('alegra_connector_consumidor_final_contact_id', 'cf-1', false);
+
+    $order = alegra_make_cf_order(7005, 'cf-1');
+    $orders = make_orders();
+    $r = $orders->create_invoice($order);
+
+    TestRunner::assertTrue(!is_wp_error($r), 'the normal invoice must be created');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'exactly one POST, no self-heal');
+    TestRunner::assertStringNotContains('auto-sanado', implode("\n", $order->get_notes()), 'no self-heal note on a normal invoice');
+});
+
+// ===========================================================================
+// Fase 6 — Consumidor Final UI honesta + REQ-RB-1
+// ===========================================================================
+
+/**
+ * Render templates/admin-dashboard.php with the locals the template needs.
+ */
+function alegra_render_dashboard(array $overrides = []): string
+{
+    $is_connected = $overrides['is_connected'] ?? true;
+    $company_name = $overrides['company_name'] ?? 'Test Co';
+    $last_sync    = $overrides['last_sync'] ?? false;
+    $stats        = $overrides['stats'] ?? ['products' => 0, 'customers' => 0, 'orders' => 0, 'categories' => 0];
+    ob_start();
+    include $GLOBALS['alegra_plugin_root'] . 'templates/admin-dashboard.php';
+    return (string) ob_get_clean();
+}
+
+TestRunner::test('T29.61 the dashboard CF row renders the four honest states (REQ-CF-02)', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-dashboard.php');
+    TestRunner::assertStringContains('probe_state()', $tpl, 'the render must read the persisted probe');
+    TestRunner::assertStringContains("'No verificado (sin conexión)'", $tpl, 'disconnected state');
+    TestRunner::assertStringContains("'Disponible'", $tpl, 'available state');
+    TestRunner::assertStringContains("'No encontrado en Alegra'", $tpl, 'not_found state');
+    TestRunner::assertStringContains("'No verificado'", $tpl, 'unverified state');
+    TestRunner::assertStringContains('data-cf-state', $tpl, 'the row must expose the state to JS');
+});
+
+TestRunner::test('T29.62 the CF verify button wires the AJAX and updates the row without reload (REQ-CF-03)', function (): void {
+    $js = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/assets/js/admin.js');
+    TestRunner::assertStringContains("action: 'alegra_verify_consumidor_final'", $js, 'the JS must call the verify action');
+    TestRunner::assertStringContains('_ajax_nonce: alegraConnector.nonce', $js, 'the JS must send the nonce');
+    TestRunner::assertStringContains('#alegra-cf-status', $js, 'the JS must update the row in place');
+
+    $admin = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("'cfVerifying'", $admin, 'the i18n key must be declared');
+});
+
+TestRunner::test('T29.63 an unverified CF is surfaced with a readable reason (REQ-CF-07)', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-dashboard.php');
+    TestRunner::assertStringContains('$cf_reason_labels', $tpl, 'the reason map must exist');
+    TestRunner::assertStringContains("'api_error'", $tpl, 'api_error must map to a readable text');
+    TestRunner::assertStringContains("'truncated'", $tpl, 'truncated must map to a readable text');
+
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true, false);
+    update_option('alegra_connector_consumidor_final_probe', [
+        'state' => 'unverified', 'id' => null, 'reason' => 'api_error', 'scanned' => 0, 'at' => 1,
+    ], false);
+    $html = alegra_render_dashboard(['is_connected' => true]);
+    TestRunner::assertStringContains('la API de Alegra no respondió', $html, 'the readable reason must be shown');
+    TestRunner::assertStringNotContains('No encontrado en Alegra', $html, 'an API error must never read as not_found');
+});
+
+TestRunner::test('T29.64 rendering the dashboard never touches /contacts (REQ-RB-1/REQ-CF-02)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true, false);
+
+    $html = alegra_render_dashboard(['is_connected' => true]);
+
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/contacts'), 'the render must not GET /contacts');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/contacts'), 'the render must not POST /contacts');
+    TestRunner::assertStringContains('No verificado', $html, 'an unverified CF must read as No verificado');
+    TestRunner::assertStringNotContains('No encontrado en Alegra', $html, 'without a complete scan it must NOT read as not_found');
+});
+
+TestRunner::test('T29.640 the dashboard template has no write-capable CF call (REQ-RB-1)', function (): void {
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-dashboard.php');
+    TestRunner::assertStringNotContains('get_or_create_id', $tpl, 'the render must not resolve/create');
+    TestRunner::assertStringNotContains('::get_id(', $tpl, 'the render must not use get_id()');
+    TestRunner::assertStringNotContains('is_available', $tpl, 'the render must not use is_available()');
+    TestRunner::assertStringNotContains('::resolve(', $tpl, 'the render must not call resolve()');
+    TestRunner::assertStringContains('probe_state()', $tpl, 'the render must read the persisted probe');
+    TestRunner::assertStringContains('peek_id()', $tpl, 'the render must use the read-only peek');
+});
+
 exit(TestRunner::summary());

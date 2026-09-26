@@ -37,6 +37,7 @@ class Admin_Dashboard
         add_action('admin_post_alegra_clear_webhooks', [$this, 'handle_clear_webhooks']);
 
         add_action('wp_ajax_alegra_test_connection', [$this, 'ajax_test_connection']);
+        add_action('wp_ajax_alegra_verify_consumidor_final', [$this, 'ajax_verify_consumidor_final']);
         add_action('wp_ajax_alegra_sync_now', [$this, 'ajax_sync_now']);
         add_action('wp_ajax_alegra_import_csv', [$this, 'ajax_import_csv']);
         add_action('wp_ajax_alegra_clear_logs', [$this, 'ajax_clear_logs']);
@@ -837,6 +838,13 @@ class Admin_Dashboard
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
             // T5.2b (dueño único): desglose de fallos de imagen en el resumen.
             'imagesFailed'          => __('%1$s imágenes no se pudieron importar (%2$s host no permitido, %3$s fallo de descarga, %4$s fallo al adjuntar, %5$s diferidas).', 'alegra-connector'),
+
+            // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
+            'cfVerifying'           => __('Verificando...', 'alegra-connector'),
+            'cfVerifyOk'            => __('Consumidor Final disponible.', 'alegra-connector'),
+            'cfVerifyNotFound'      => __('No se encontró el Consumidor Final en Alegra. Podés crearlo.', 'alegra-connector'),
+            'cfVerifyError'         => __('No se pudo verificar el Consumidor Final.', 'alegra-connector'),
+            'cfCreateOk'            => __('Consumidor Final creado.', 'alegra-connector'),
         ];
     }
 
@@ -1776,6 +1784,14 @@ class Admin_Dashboard
         // are still returned in the JSON payload below (derived from $result).
         update_option('alegra_connector_connection_tested', true);
 
+        // D1 / REQ-CF-01: resolver el CF bajo contexto explícito, READ-ONLY.
+        // probe() nunca POSTea; run_explicit() deja el contexto listo para el
+        // sub-flujo explícito "Crear Consumidor Final" (mismo AJAX, create=true).
+        $cf_probe = \Alegra\Connector\Write_Gate::run_explicit(
+            static fn (): array => \Alegra\Connector\Consumidor_Final::probe()
+        );
+        \Alegra\Connector\Consumidor_Final::persist_probe($cf_probe);
+
         $diagnostics = $result['diagnostics'] ?? [];
         update_option('alegra_connector_diagnostics', $diagnostics, false);
 
@@ -1789,7 +1805,75 @@ class Admin_Dashboard
             'items_count' => $result['items_count'] ?? 0,
             'contacts_count' => $result['contacts_count'] ?? 0,
             'diagnostics' => $diagnostics,
+            'consumidor_final' => $cf_probe,
         ]);
+    }
+
+    /**
+     * AJAX: verifica (y opcionalmente crea) el Consumidor Final.
+     *
+     * - action:  alegra_verify_consumidor_final
+     * - nonce:   alegra_connector_nonce
+     * - cap:     manage_options
+     * - body:    create (bool, opcional)
+     * - resp:    {success, data:{state, id, message}}  (message SIEMPRE, NFR-04)
+     *
+     * READ-ONLY salvo create=true, que corre get_or_create_id() bajo run_explicit().
+     * Con el kill switch activo, la compuerta bloquea el POST y no se cachea nada.
+     */
+    public function ajax_verify_consumidor_final(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $create = !empty($_POST['create'])
+            && filter_var(wp_unslash($_POST['create']), FILTER_VALIDATE_BOOLEAN);
+
+        $probe = \Alegra\Connector\Write_Gate::run_explicit(
+            static function () use ($create): array {
+                if ($create) {
+                    // Rama B explícita: crear SÓLO bajo acción explícita.
+                    $id = \Alegra\Connector\Consumidor_Final::get_or_create_id();
+                    if ($id !== false && $id !== '') {
+                        return ['state' => 'available', 'id' => (string) $id, 'reason' => 'created', 'scanned' => 0];
+                    }
+                    // No se pudo crear (kill switch / sin datos): caer al barrido
+                    // read-only para no mentir con un estado "available" falso.
+                }
+                return \Alegra\Connector\Consumidor_Final::probe();
+            }
+        );
+
+        $probe = \Alegra\Connector\Consumidor_Final::persist_probe($probe);
+
+        wp_send_json_success([
+            'state'   => $probe['state'],
+            'id'      => $probe['id'],
+            'message' => self::consumidor_final_message($probe),
+        ]);
+    }
+
+    /**
+     * Mensaje accionable por estado (NFR-04). Siempre no vacío.
+     *
+     * @param array<string,mixed> $probe
+     */
+    private static function consumidor_final_message(array $probe): string
+    {
+        switch ((string) ($probe['state'] ?? '')) {
+            case 'available':
+                return __('Consumidor Final disponible.', 'alegra-connector');
+            case 'not_found':
+                return __('No se encontró el Consumidor Final en Alegra. Podés crearlo.', 'alegra-connector');
+            default:
+                $reason = (string) ($probe['reason'] ?? '');
+                return $reason !== ''
+                    ? sprintf(__('No se pudo verificar el Consumidor Final: %s', 'alegra-connector'), $reason)
+                    : __('No se pudo verificar el Consumidor Final.', 'alegra-connector');
+        }
     }
 
     public function ajax_sync_now(): void
@@ -2367,8 +2451,8 @@ class Admin_Dashboard
                 if (microtime(true) >= $deadline) { $paused = true; break; }  // ANTES de cada ítem
 
                 $item_type = $item['type'] ?? 'simple';
-                // Skip variants - imported with their parent
-                if ($item_type === 'variant') { continue; }
+                // D4: las variantes sueltas se rutean por el handler, que resuelve
+                // el variantParent (import_single_item_from_alegra). Ya no hay skip mudo.
 
                 // Client-side `variantParent` filter: the API does not document
                 // this value for the `type` query param, so the whole catalog is

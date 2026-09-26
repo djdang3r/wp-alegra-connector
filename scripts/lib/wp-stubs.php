@@ -370,6 +370,11 @@ function esc_textarea($text) { return htmlspecialchars((string) $text, ENT_QUOTE
 function esc_url($text) { return (string) $text; }
 function wp_kses_post($text) { return (string) $text; }
 function wp_strip_all_tags($text, $remove_breaks = false) { return strip_tags((string) $text); }
+function sanitize_email($email)
+{
+    $email = trim((string) $email);
+    return filter_var($email, FILTER_VALIDATE_EMAIL) !== false ? $email : '';
+}
 function sanitize_text_field($text)
 {
     if (is_array($text)) { return ''; }
