@@ -29,8 +29,18 @@ if (!defined('ABSPATH')) {
  */
 final class Inventory_Pusher
 {
-    public const META_SYNCED  = '_alegra_stock_synced';
-    public const META_PENDING = '_alegra_stock_push_pending';
+    public const META_SYNCED       = '_alegra_stock_synced';
+    public const META_PENDING      = '_alegra_stock_push_pending';
+    public const META_ADJUSTED_AT  = '_alegra_stock_adjusted_at';   // D1 §2.2.1 (T2.2)
+
+    /**
+     * REQ-POLL-06 / D2 §3.6 / G3: rama del filtro server-side por `reference`.
+     * Decisión de BUILD, no de runtime (CORRECCIONES C5/C29): NO hay opción.
+     * Rama A (el GET soporta `reference`) ⇒ true; Rama B ⇒ false.
+     * phase0-results G3 = Rama B: la doc oficial no documenta el filtro, así que
+     * el pre-chequeo compara la `reference` localmente sobre la respuesta.
+     */
+    public const USE_REFERENCE_FILTER = false;
 
     private ?API\Client $api;
     private ?Logger\Logger $logger;
@@ -76,18 +86,70 @@ final class Inventory_Pusher
     }
 
     /**
-     * Dueño del movimiento de stock de Alegra (K-P / FIX-3).
-     * `invoice` SÓLO si `push_orders_enabled && open_invoice_on_paid` (la
-     * factura realmente mueve stock). Si no, el dueño es `adjustment`.
+     * D1 §2.2.1: marca que el plugin emitió (o reconoció como ya emitido) un
+     * ajuste para este producto. La lee la guarda de apertura manual (T2.5/T2.6).
+     */
+    public static function mark_adjusted(int $product_id): void
+    {
+        update_post_meta($product_id, self::META_ADJUSTED_AT, time());
+    }
+
+    /**
+     * Timestamp del último ajuste emitido, o 0 si nunca.
+     */
+    public static function adjusted_at(int $product_id): int
+    {
+        $value = get_post_meta($product_id, self::META_ADJUSTED_AT, true);
+        return ($value === '' || $value === false || $value === null) ? 0 : (int) $value;
+    }
+
+    /** Evita repetir el warning de valor inválido dentro del mismo request. */
+    private static bool $invalid_owner_logged = false;
+
+    /**
+     * Dueño único del stock (D1 / REQ-OWN-02). Resolución ÚNICA del plugin.
+     *
+     * `auto` reproduce la condición DOBLE de 2.6.0 (CORRECCIÓN C1): la factura
+     * sólo es dueña si ADEMÁS de subir pedidos se abre al pagar; si no, la
+     * factura nace draft y no mueve stock ⇒ ningún mecanismo lo movería (B3).
      *
      * @return 'invoice'|'adjustment'
      */
     public static function owner(): string
     {
+        $mode = (string) get_option('alegra_connector_stock_owner', 'auto');
+
+        if ($mode === 'invoice' || $mode === 'adjustment') {
+            return $mode;
+        }
+        if ($mode !== 'auto') {
+            // REQ-OWN-02 (borde): valor inválido ⇒ auto + warning una vez.
+            self::log_invalid_owner($mode);
+        }
+
         return (get_option('alegra_connector_push_orders_enabled', false)
             && get_option('alegra_connector_open_invoice_on_paid', true))
             ? 'invoice'
             : 'adjustment';
+    }
+
+    /**
+     * REQ-OWN-02: un valor no reconocido cae a `auto` y se advierte una vez
+     * por request (no por ítem, no por hook).
+     */
+    private static function log_invalid_owner(string $mode): void
+    {
+        if (self::$invalid_owner_logged) {
+            return;
+        }
+        self::$invalid_owner_logged = true;
+
+        if (function_exists('wc_get_logger')) {
+            wc_get_logger()->warning('Valor inválido de alegra_connector_stock_owner; se usa auto', [
+                'source' => 'alegra-connector',
+                'value'  => $mode,
+            ]);
+        }
     }
 
     /**
@@ -230,6 +292,7 @@ final class Inventory_Pusher
         }
 
         $pending_prev = (string) self::pending($id);
+        $reference    = $this->adjustment_reference($id, (int) $synced, $new_qty);
 
         try {
             // K-F: pending ANTES del POST. Si el POST entra y la respuesta se
@@ -240,14 +303,15 @@ final class Inventory_Pusher
             // re-emitir. Si un intento anterior entró y su respuesta se perdió,
             // el ajuste ya está en Alegra ⇒ considerarlo aplicado (no duplicar).
             if ($pending_prev !== ''
-                && $this->adjustment_already_exists($alegra_item, $delta)) {
+                && $this->adjustment_already_exists($alegra_item, $reference, $delta)) {
                 self::set_synced($id, $new_qty);
                 self::clear_pending($id);
+                self::mark_adjusted($id);   // D1 §2.2.1: hubo (o ya había) un ajuste
                 return ['pushed' => true, 'delta' => $delta, 'reason' => 'already_applied'];
             }
 
             $res = $this->api->create_inventory_adjustment(
-                $this->build_adjustment_payload($alegra_item, $delta, $product)
+                $this->build_adjustment_payload($alegra_item, $delta, $product, $reference)
             );
 
             // Dry-run / gate: no llegó nada a Alegra ⇒ no tocar `synced`.
@@ -270,6 +334,7 @@ final class Inventory_Pusher
             // Éxito: recién acá WC y Alegra acuerdan.
             self::set_synced($id, $new_qty);
             self::clear_pending($id);
+            self::mark_adjusted($id);       // D1 §2.2.1
             return ['pushed' => true, 'delta' => $delta, 'reason' => 'ok'];
         } finally {
             Controller::release_lock($lock_key, $token);
@@ -297,20 +362,36 @@ final class Inventory_Pusher
     }
 
     /**
-     * FIX-4: ¿ya existe en Alegra un ajuste con el mismo ítem, tipo y cantidad?
+     * REQ-POLL-06 / D2 §3.6: reference estable del movimiento. Distingue dos
+     * `out 1` del mismo ítem y reconoce el MISMO movimiento reintentado.
+     */
+    private function adjustment_reference(int $product_id, int $synced, int $new_qty): string
+    {
+        return 'wc-stock-' . $product_id . '-' . $synced . '-' . $new_qty;
+    }
+
+    /**
+     * FIX-4 + REQ-POLL-06: ¿ya existe en Alegra el MISMO movimiento?
+     * Compara la `reference` estable (G3: local sobre la respuesta) y, si el
+     * endpoint no la devuelve, cae al fallback `item+type+quantity` de HEAD.
      * Fail-open: ante error de red devuelve false (se reintenta el POST).
      */
-    private function adjustment_already_exists(string $alegra_item, int $delta): bool
+    private function adjustment_already_exists(string $alegra_item, string $reference, int $delta): bool
     {
         if ($this->api === null) {
             return false;
         }
-        $res = $this->api->get_inventory_adjustments([
+        $query = [
             'item_id'         => $alegra_item,
             'limit'           => 30,
             'order_field'     => 'date',
             'order_direction' => 'DESC',
-        ]);
+        ];
+        // G3 Rama A: filtro server-side por reference (la constante es de build).
+        if (self::USE_REFERENCE_FILTER) {
+            $query['reference'] = $reference;
+        }
+        $res = $this->api->get_inventory_adjustments($query);
         if (is_wp_error($res) || !is_array($res)) {
             return false;
         }
@@ -318,6 +399,16 @@ final class Inventory_Pusher
         $want_qty  = abs($delta);
         foreach ($res as $adjustment) {
             if (!is_array($adjustment)) {
+                continue;
+            }
+            // G3 Rama B: comparación LOCAL de la reference devuelta. Si hay
+            // reference y no coincide, es OTRO movimiento (no se confunde un
+            // `out 1` viejo con uno nuevo). Si no la trae, fallback.
+            $ref = (string) ($adjustment['reference'] ?? '');
+            if ($ref !== '') {
+                if ($ref === $reference) {
+                    return true;
+                }
                 continue;
             }
             foreach (($adjustment['items'] ?? []) as $line) {
@@ -337,11 +428,12 @@ final class Inventory_Pusher
     /**
      * Payload documentado de `POST /inventory-adjustments` (K-A / C1).
      */
-    private function build_adjustment_payload(string $alegra_item, int $delta, \WC_Product $product): array
+    private function build_adjustment_payload(string $alegra_item, int $delta, \WC_Product $product, string $reference): array
     {
         $payload = [
-            'date'  => current_time('Y-m-d'),
-            'items' => [[
+            'date'      => current_time('Y-m-d'),
+            'reference' => $reference,          // REQ-POLL-06
+            'items'     => [[
                 'id'       => $alegra_item,
                 'type'     => $delta < 0 ? 'out' : 'in',
                 'quantity' => abs($delta),

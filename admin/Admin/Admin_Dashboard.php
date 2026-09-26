@@ -376,10 +376,19 @@ class Admin_Dashboard
             },
             'default' => 'cron',
         ]);
+        // D1 §2.3 / REQ-OWN-05: dueño único del stock + epoch de modo. El
+        // sanitize_callback corre al guardar y, si el valor cambió, escribe el
+        // epoch y borra los conteos cacheados (badge/divergencia).
+        register_setting('alegra_connector_settings', 'alegra_connector_stock_owner', [
+            'type'              => 'string',
+            'sanitize_callback' => [self::class, 'sanitize_stock_owner'],
+            'default'           => 'auto',
+        ]);
         // Outbound order uploads. Manual (false) is the default; only an explicit
-        // opt-in enables automatic invoicing.
+        // opt-in enables automatic invoicing. Oracle#8: con dueño invoice se
+        // coerciona ON (si no, cero mecanismos mueven stock).
         register_setting('alegra_connector_settings', 'alegra_connector_push_orders_enabled', [
-            'sanitize_callback' => 'rest_sanitize_boolean',
+            'sanitize_callback' => [self::class, 'sanitize_push_orders_enabled'],
             'default' => false,
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_push_products_enabled', ['sanitize_callback' => 'rest_sanitize_boolean']);
@@ -389,9 +398,10 @@ class Admin_Dashboard
             'default' => true,
         ]);
         // D2/FIX-3 (T3.5): with owner=invoice, a paid order opens its invoice so
-        // Alegra moves stock natively. Inert unless push_orders_enabled=true.
+        // Alegra moves stock natively. D1 §2.5: coerción determinista por dueño
+        // (invoice ⇒ ON, adjustment ⇒ OFF; auto ⇒ sin coerción).
         register_setting('alegra_connector_settings', 'alegra_connector_open_invoice_on_paid', [
-            'sanitize_callback' => 'rest_sanitize_boolean',
+            'sanitize_callback' => [self::class, 'sanitize_open_invoice_on_paid'],
             'default' => true,
         ]);
         // Independent customer toggle (REQ-CFG-4): enabling products must never
@@ -2071,6 +2081,83 @@ class Admin_Dashboard
     }
 
     /**
+     * D1 §2.3: allowlist + epoch de modo. Si el dueño cambió, se escribe el
+     * epoch y se borran los conteos cacheados (badge/divergencia). NO se recorre
+     * el catálogo (NFR-04): el `pending` se limpia lazy desde el poll (T2.7).
+     *
+     * Oracle#9: acá NO se coerciona otra opción (options.php lo pisaba según el
+     * orden). La coerción vive en los sanitizers de abajo.
+     *
+     * @param mixed $value
+     */
+    public static function sanitize_stock_owner($value): string
+    {
+        $allowed = ['auto', 'invoice', 'adjustment'];
+        $value   = in_array($value, $allowed, true) ? (string) $value : 'auto';
+
+        if ((string) get_option('alegra_connector_stock_owner', 'auto') !== $value) {
+            update_option('alegra_connector_stock_owner_epoch', time(), false);
+            delete_option('alegra_connector_invoice_failures_count');
+            delete_option('alegra_connector_stock_divergence');
+        }
+
+        return $value;
+    }
+
+    /**
+     * Oracle#9 (DEF-9): dueño EFECTIVO determinista. Lee el POST explícito (lo
+     * que el comerciante acaba de elegir) y cae a la opción guardada. No depende
+     * del orden de register_setting ni de que options.php haya nullado la opción.
+     */
+    private static function effective_stock_owner_from_request(): string
+    {
+        $allowed = ['auto', 'invoice', 'adjustment'];
+        $posted  = isset($_POST['alegra_connector_stock_owner'])
+            ? (string) wp_unslash($_POST['alegra_connector_stock_owner'])
+            : '';
+        if (in_array($posted, $allowed, true)) {
+            return $posted;
+        }
+        $stored = (string) get_option('alegra_connector_stock_owner', 'auto');
+        return in_array($stored, $allowed, true) ? $stored : 'auto';
+    }
+
+    /**
+     * D1 §2.5 / REQ-OWN-04: coerción server-side de open_invoice_on_paid.
+     *   invoice    ⇒ ON  (la factura debe abrir al pagar; si no, nada mueve stock)
+     *   adjustment ⇒ OFF (la factura NO debe abrir)
+     *   auto       ⇒ sin coerción (compat total con 2.6.0)
+     *
+     * @param mixed $value
+     */
+    public static function sanitize_open_invoice_on_paid($value): bool
+    {
+        $value = (bool) rest_sanitize_boolean($value);
+        $owner = self::effective_stock_owner_from_request();
+        if ($owner === 'invoice') {
+            return true;
+        }
+        if ($owner === 'adjustment') {
+            return false;
+        }
+        return $value;
+    }
+
+    /**
+     * Oracle#8 (REVIEW-oracle DEF-8): con dueño invoice el plugin DEBE facturar.
+     * Con push_orders_enabled=false, Guard 2 (Inventory_Pusher.php:170-173)
+     * corta los ajustes y no hay facturación automática ⇒ CERO mecanismos mueven
+     * stock. Se coerciona ON en modo invoice; en adjustment/auto no se toca.
+     *
+     * @param mixed $value
+     */
+    public static function sanitize_push_orders_enabled($value): bool
+    {
+        $value = (bool) rest_sanitize_boolean($value);
+        return self::effective_stock_owner_from_request() === 'invoice' ? true : $value;
+    }
+
+    /**
      * Suma dos desgloses de imagen (por página) preservando las claves. D5.
      * @param array<string,int> $a @param array<string,int> $b
      * @return array<string,int>
@@ -2861,6 +2948,21 @@ class Admin_Dashboard
         }
 
         $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+
+        // D1 §2.2.1 / REQ-OWN-06: con dueño adjustment y un ajuste ya emitido,
+        // abrir la factura descontaría dos veces. Confirmación SERVER-ENFORCED
+        // (no un confirm() de cliente, no un bloqueo duro): sin el flag no se
+        // llama a Alegra; con el flag se procede y queda nota + log.
+        $confirm = (string) ($_POST['confirm_double_discount'] ?? '') === '1';
+        if (\Alegra\Connector\Sync\Inventory_Pusher::owner() === 'adjustment'
+            && $orders_sync->order_has_emitted_adjustment($order)
+            && !$confirm) {
+            wp_send_json_error([
+                'code'    => 'double_discount_confirm_required',
+                'message' => __('Los ajustes de inventario están activos y ya se empujó un ajuste por este pedido. Abrir la factura descontará dos veces. Confirmá para continuar.', 'alegra-connector'),
+            ]);
+        }
+
         $result = $orders_sync->ensure_invoice_open($alegra_invoice_id);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
@@ -2881,12 +2983,27 @@ class Admin_Dashboard
         }
 
         $orders_sync->persist_invoice_status($order, $result);
+        $orders_sync->baseline_products_for_invoice($order);   // REQ-POLL-02
 
         $order->add_order_note(sprintf(
             /* translators: %s: Alegra invoice number or id */
             __('[Alegra] Factura #%s abierta (ya no es borrador).', 'alegra-connector'),
             (string) $order->get_meta('_alegra_invoice_number', true) ?: $alegra_invoice_id
         ));
+
+        // D1 §2.2.1: la apertura confirmada queda auditada (nota + log).
+        if ($confirm
+            && \Alegra\Connector\Sync\Inventory_Pusher::owner() === 'adjustment') {
+            $order->add_order_note(__(
+                '[Alegra] Apertura manual con ajuste ya emitido: el comerciante confirmó el doble descuento.',
+                'alegra-connector'
+            ));
+            $this->logger->warning('Apertura manual en modo adjustment con ajuste emitido (doble descuento confirmado)', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+                'owner'      => 'adjustment',
+            ]);
+        }
 
         wp_send_json_success([
             'message' => __('Factura abierta en Alegra.', 'alegra-connector'),
@@ -2928,12 +3045,24 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('El pago ya está registrado en Alegra.', 'alegra-connector')]);
         }
 
+        // D1 §2.2.1 / REQ-OWN-06: misma guarda que ajax_open_invoice_impl.
+        // Registrar el pago abre la factura; con dueño adjustment y ajuste
+        // emitido, exige confirmación server-enforced.
+        $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
+        $confirm = (string) ($_POST['confirm_double_discount'] ?? '') === '1';
+        if (\Alegra\Connector\Sync\Inventory_Pusher::owner() === 'adjustment'
+            && $orders_sync->order_has_emitted_adjustment($order)
+            && !$confirm) {
+            wp_send_json_error([
+                'code'    => 'double_discount_confirm_required',
+                'message' => __('Los ajustes de inventario están activos y ya se empujó un ajuste por este pedido. Registrar el pago abrirá la factura y descontará dos veces. Confirmá para continuar.', 'alegra-connector'),
+            ]);
+        }
+
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
         if ($account_id === '' || $account_id === '0') {
             wp_send_json_error(['message' => __('Configura una cuenta bancaria en Ajustes > Avanzado.', 'alegra-connector')]);
         }
-
-        $orders_sync = new \Alegra\Connector\Sync\Orders($this->api, $this->logger);
 
         // A payment requires an OPEN invoice. This is an explicit MANUAL action
         // ("Registrar pago"), so opening a draft here is the merchant's own
@@ -3020,6 +3149,20 @@ class Admin_Dashboard
             'payment_id' => $payment_id,
             'invoice_id' => $alegra_invoice_id,
         ]);
+
+        // D1 §2.2.1: el registro confirmado queda auditado (nota + log).
+        if ($confirm
+            && \Alegra\Connector\Sync\Inventory_Pusher::owner() === 'adjustment') {
+            $order->add_order_note(__(
+                '[Alegra] Registro de pago con ajuste ya emitido: el comerciante confirmó el doble descuento.',
+                'alegra-connector'
+            ));
+            $this->logger->warning('Registro de pago en modo adjustment con ajuste emitido (doble descuento confirmado)', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+                'owner'      => 'adjustment',
+            ]);
+        }
 
         wp_send_json_success([
             'message' => __('Pago registrado en Alegra.', 'alegra-connector'),

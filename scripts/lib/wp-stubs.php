@@ -386,6 +386,20 @@ function sanitize_textarea_field($text)
     return trim(strip_tags((string) $text));
 }
 function sanitize_key($text) { return preg_replace('/[^a-z0-9_\-]/', '', strtolower((string) $text)); }
+/**
+ * WordPress REST helper. The settings sanitizers (T2.8) use it as a normalizer;
+ * WordPress provides it in production.
+ */
+function rest_sanitize_boolean($value)
+{
+    if (is_bool($value)) {
+        return $value;
+    }
+    if (is_string($value)) {
+        return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+    }
+    return (bool) $value;
+}
 function map_deep($value, $callback)
 {
     if (is_array($value)) {
@@ -1466,6 +1480,16 @@ function wc_get_product($product_id)
 {
     $product_id = (int) $product_id;
     return $GLOBALS['wc_products'][$product_id] ?? false;
+}
+
+/**
+ * WooCommerce provides wc_get_logger() in production. The plugin's
+ * Inventory_Pusher::log_invalid_owner() (REQ-OWN-02) uses it; the harness
+ * delegates to the plugin Logger so the warning lands in the readable log file.
+ */
+function wc_get_logger()
+{
+    return new \Alegra\Connector\Logger\Logger();
 }
 
 /**

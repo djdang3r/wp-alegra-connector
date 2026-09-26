@@ -1156,6 +1156,9 @@ class Products
             'cursor'                 => 0,
         ];
 
+        // D4 §5.1: contador run-scoped. NO es clave de $result (9 claves).
+        $divergence = 0;
+
         // Kill switch guard: the pull is a sync entry point like any other and
         // must abort when the plugin is disconnected/deactivated. This was the
         // only entry point missing the check.
@@ -1324,80 +1327,153 @@ class Products
                         continue;
                     }
 
-                    // D2/D6/FIX-8 (REQ-INV-01, NFR-07): el poll NUNCA re-infla
-                    // y TAMPOCO se muere de hambre.
-                    $synced  = Inventory_Pusher::synced($product_id);
-                    $pending = Inventory_Pusher::pending($product_id);
+                    // D2 §3.3: leer A/W/S/P y el dueño; clasificar el estado.
+                    $a_raw  = $item['inventory']['availableQuantity'] ?? null;
+                    $has_a  = ($a_raw !== null && $a_raw !== '' && is_numeric($a_raw));
+                    $a      = $has_a ? (int) $a_raw : null;
 
-                    $needs_reconcile = $product->get_manage_stock()
-                        && ($pending !== ''
-                            || ($synced !== '' && (int) $product->get_stock_quantity() !== (int) $synced));
+                    $w       = (int) $product->get_stock_quantity();
+                    $s       = Inventory_Pusher::synced($product_id);    // int|''
+                    $p       = Inventory_Pusher::pending($product_id);   // int|''
 
-                    if ($needs_reconcile) {
-                        // (a) push fallido en vuelo, (b) delta local sin empujar,
-                        // (c) baseline pendiente (FIX-1): reconciliar WC→Alegra.
-                        // `from_poll=true` bypassa `is_syncing()` (FIX-2): el poll
-                        // es el que corre con set_syncing(true) (T7.3).
-                        $push = (new Inventory_Pusher($this->api, $this->logger))
-                            ->push_delta($product, (int) $product->get_stock_quantity(), true);
+                    $owner   = Inventory_Pusher::owner();
+                    $push_on = (bool) get_option('alegra_connector_push_inventory_enabled', true);
+                    $linked  = (string) get_post_meta($product_id, '_alegra_item_id', true) !== '';
+                    $manage  = $product->get_manage_stock();
+                    $can_push = ($owner === 'adjustment') && $push_on && $linked && $manage;
+                    // D2 §3.4 / momus gap #3: con `preserve=inventory` el stock lo
+                    // maneja el comerciante. El poll NO debe baselinar `S=A` (mentiría
+                    // y luego divergiría para siempre) ni fijar el baseline pre-venta.
+                    $preserve_inventory = in_array('inventory', $this->resolve_preserve_fields(), true);
 
-                        // FIX-8: sólo se salta WC cuando el push REALMENTE maneja
-                        // el ítem. Si el pusher no es el dueño (disabled/
-                        // invoice_owner/not_linked/not_manageable), cae al writer:
-                        // el poll es el dueño de la escritura WC y no se congela.
-                        $handled = ['ok', 'already_applied', 'in_sync', 'api_error',
-                                    'blocked', 'locked', 'baseline_unverified'];
-                        if (in_array($push['reason'], $handled, true)) {
-                            continue;
-                        }
+                    // (A) REQ-OWN-05: limpieza lazy del pending de un modo anterior.
+                    if ($owner === 'invoice' && $p !== '') {
+                        Inventory_Pusher::clear_pending($product_id);
+                        $p = '';
                     }
 
-                    $old_qty = $product->get_stock_quantity();
-                    try {
-                        // C7: suprimir la cascada del propio wc_update_product_stock
-                        // (set_syncing del poll es T7.3; acá el guard por producto).
-                        set_transient('alegra_updating_product_' . $product_id, 1, 30);
+                    // (B) Clasificación del estado.
+                    $converged      = ($s !== '' && $p === '' && $w === (int) $s);
+                    $no_baseline_eq = ($s === '' && $p === '' && $has_a && $w === $a);
+                    $local_pending  = (!$converged && !$no_baseline_eq);
 
-                        // D3 (REQ-INV-02): un solo escritor. El writer decide
-                        // fuente/preserve/nulo/negativo/servicio/manage_stock y
-                        // deriva _stock_status con wc_update_product_stock (D5).
-                        $status = (new Inventory_Writer($this->logger))->apply($product, $item, [
-                            'source'       => 'alegra',
-                            'preserve'     => in_array('inventory', $this->resolve_preserve_fields(), true),
-                            'manage_stock' => get_option('alegra_connector_inventory_manage_stock_enabled', false)
-                                ? 'enable'
-                                : 'respect',
-                            'dry_run'      => (bool) get_option('alegra_connector_dry_run', false),
-                            'warehouse_id' => $this->resolve_warehouse_id(),
-                        ]);
+                    // (B.2) B2/Oracle#4 — convergencia por baseline viejo. Si NO
+                    // hay push local en vuelo y WC YA coincide con Alegra, el
+                    // baseline S quedó viejo (factura abierta FUERA del plugin,
+                    // migración 2.6.0 con S stale). Re-baselinar y caer al writer
+                    // evita la starvation (el poll nunca volvería a escribir WC)
+                    // y la divergencia FALSA cuando W==A.
+                    if ($local_pending && $p === '' && $s !== '' && $has_a && $w === $a) {
+                        Inventory_Pusher::set_synced($product_id, $w);
+                        $s = $w;
+                        $local_pending = false;
+                    }
 
-                        if ($status === 'updated' || $status === 'clamped_negative') {
-                            // FIX-1: éste es el ÚNICO camino del poll que fija
-                            // `synced` sin push: el poll escribió el valor de
-                            // Alegra en WC, así que WC y Alegra acuerdan.
-                            Inventory_Pusher::set_synced($product_id, (int) $product->get_stock_quantity());
-                            Inventory_Pusher::clear_pending($product_id);
-                            $result['updated']++;
-                            $new_qty = $product->get_stock_quantity();
-                            if ($old_qty !== $new_qty) {
-                                $this->logger->info('Inventory updated from Alegra', [
-                                    'product_id' => $product_id,
-                                    'alegra_id'  => $item['id'],
-                                    'old_qty'    => $old_qty,
-                                    'new_qty'    => $new_qty,
-                                ]);
+                    if ($local_pending) {
+                        if ($can_push) {
+                            if ($s === '') {
+                                // FIX-1: baseline desde ALEGRA. El poll YA tiene A ⇒ sin GET extra.
+                                if (!$has_a) {
+                                    Stock_Divergence::record($product_id, [
+                                        'w' => $w, 'a' => $a, 's' => $s,
+                                        'cause' => Stock_Divergence::divergence_cause($owner, $s),
+                                        'at' => time(),
+                                    ]);
+                                    $divergence++;                 // no se puede decidir; NO pisar WC
+                                    continue;
+                                }
+                                Inventory_Pusher::set_synced($product_id, $a);
+                                $s = $a;
                             }
-                        } elseif ($status === 'skipped_not_manageable') {
-                            $result['skipped_not_manageable']++;
+                            $push = (new Inventory_Pusher($this->api, $this->logger))
+                                ->push_delta($product, $w, true);
+
+                            if (in_array($push['reason'], ['ok', 'already_applied'], true)) {
+                                // WC y Alegra acordaron (Alegra == W tras el push).
+                                // NO caer al writer: `$item` todavía trae el A VIEJO
+                                // y escribiría WC con él (re-inflación). `synced` ya
+                                // quedó en W dentro de push_delta(). Lo ancla T29.34.
+                                continue;
+                            }
+                            if ($push['reason'] !== 'in_sync') {
+                                // api_error | blocked | locked | baseline_unverified
+                                //   | disabled | not_linked | not_manageable
+                                // Hay un cambio local sin empujar ⇒ NO pisar WC (se perdería la venta).
+                                Stock_Divergence::record($product_id, [
+                                    'w' => $w, 'a' => $a, 's' => $s,
+                                    'cause' => Stock_Divergence::divergence_cause($owner, $s),
+                                    'at' => time(),
+                                ]);
+                                $divergence++;
+                                continue;
+                            }
+                            // in_sync ⇒ W == S: no hay delta real; el poll puede bajar A al writer.
+                        } else {
+                            // owner=invoice (o push apagado): el cambio local no se puede empujar.
+                            if ($s === '' && $has_a && !$preserve_inventory) {
+                                Inventory_Pusher::set_synced($product_id, $a);   // baseline PRE-venta
+                            }
+                            // REQ-POLL-03/04: NO pisar WC; reportar divergencia.
+                            Stock_Divergence::record($product_id, [
+                                'w' => $w, 'a' => $a, 's' => $s,
+                                'cause' => Stock_Divergence::divergence_cause($owner, $s),
+                                'at' => time(),
+                            ]);
+                            $divergence++;
+                            continue;
                         }
-                    } catch (\Exception $e) {
-                        $result['errors']++;
-                        $this->logger->error('Failed to update inventory', [
-                            'product_id' => $product_id,
-                            'error' => $e->getMessage(),
-                        ]);
-                    } finally {
-                        delete_transient('alegra_updating_product_' . $product_id);
+                    } elseif ($no_baseline_eq && !$preserve_inventory) {
+                        // REQ-POLL-01: baselinar sin escribir de más (el writer es no-op).
+                        // Con preserve=inventory NO se baselina: el comerciante maneja el
+                        // stock y `S=A` sería un baseline mentiroso (momus gap #3).
+                        Inventory_Pusher::set_synced($product_id, $a);
+                    }
+
+                    // (C) Sin cambio local pendiente: el poll es dueño de la escritura WC.
+                    //     Incluye owner=invoice DESPUÉS de que la factura movió stock y baselinó (§3.5).
+                    if ($has_a) {
+                        $old_qty = $product->get_stock_quantity();
+                        try {
+                            // C7: suprimir la cascada del propio wc_update_product_stock.
+                            set_transient('alegra_updating_product_' . $product_id, 1, 30);
+
+                            // D3 (REQ-INV-02): un solo escritor.
+                            $status = (new Inventory_Writer($this->logger))->apply($product, $item, [
+                                'source'       => 'alegra',
+                                'preserve'     => $preserve_inventory,
+                                'manage_stock' => get_option('alegra_connector_inventory_manage_stock_enabled', false)
+                                    ? 'enable'
+                                    : 'respect',
+                                'dry_run'      => (bool) get_option('alegra_connector_dry_run', false),
+                                'warehouse_id' => $this->resolve_warehouse_id(),
+                            ]);
+
+                            if ($status === 'updated' || $status === 'clamped_negative') {
+                                // ÚNICO camino del poll que fija `synced` sin push.
+                                Inventory_Pusher::set_synced($product_id, (int) $product->get_stock_quantity());
+                                Inventory_Pusher::clear_pending($product_id);
+                                $result['updated']++;
+                                $new_qty = $product->get_stock_quantity();
+                                if ($old_qty !== $new_qty) {
+                                    $this->logger->info('Inventory updated from Alegra', [
+                                        'product_id' => $product_id,
+                                        'alegra_id'  => $item['id'],
+                                        'old_qty'    => $old_qty,
+                                        'new_qty'    => $new_qty,
+                                    ]);
+                                }
+                            } elseif ($status === 'skipped_not_manageable') {
+                                $result['skipped_not_manageable']++;
+                            }
+                        } catch (\Exception $e) {
+                            $result['errors']++;
+                            $this->logger->error('Failed to update inventory', [
+                                'product_id' => $product_id,
+                                'error' => $e->getMessage(),
+                            ]);
+                        } finally {
+                            delete_transient('alegra_updating_product_' . $product_id);
+                        }
                     }
                 }
 
@@ -1429,6 +1505,11 @@ class Products
                     'updated' => $result['updated'],
                     'errors'  => $result['errors'],
                 ]);
+            }
+
+            // D4 §5.1: cierre del conteo run-scoped (NO es clave de $result).
+            if ($divergence > 0) {
+                $this->logger->info('Inventory poll: divergences reported', ['count' => $divergence]);
             }
 
             // D3.4 (T2.5): report the legacy manage_stock=no backlog so the
@@ -2273,7 +2354,7 @@ class Products
      */
     private function apply_inventory_to_product(\WC_Product $product, array $item, array $preserve = []): void
     {
-        (new Inventory_Writer($this->logger))->apply($product, $item, [
+        $status = (new Inventory_Writer($this->logger))->apply($product, $item, [
             'source'       => (string) get_option('alegra_connector_inventory_source', 'alegra'),
             'preserve'     => in_array('inventory', $preserve, true),
             // El import SIEMPRE habilitó manage_stock (comportamiento HEAD, W1
@@ -2282,6 +2363,15 @@ class Products
             'dry_run'      => (bool) get_option('alegra_connector_dry_run', false),
             'warehouse_id' => $this->resolve_warehouse_id(),
         ]);
+
+        // REQ-POLL-01: el import fija el baseline SÓLO si el writer realmente
+        // escribió. Con skipped_*/dry_run/skipped_source WC y Alegra NO
+        // acordaron; fijar `synced` mentiría y el poll no reconciliaría (DR14).
+        if ($status === 'updated' || $status === 'clamped_negative') {
+            $pid = (int) $product->get_id();
+            Inventory_Pusher::set_synced($pid, (int) $product->get_stock_quantity());
+            Inventory_Pusher::clear_pending($pid);
+        }
     }
 
     /**

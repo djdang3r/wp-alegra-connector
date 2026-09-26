@@ -85,12 +85,15 @@ class Orders
                 // FIX-3 (D1): con owner=invoice, un pedido que pasa a pagado
                 // debe ABRIR el borrador pre-existente. Hoy se retorna sin
                 // abrirlo ⇒ la factura queda draft y no mueve stock.
+                // D1 §2.5: con dueño invoice la apertura al pagar es un contrato
+                // del modo, no una preferencia. Se quita la dependencia de
+                // open_invoice_on_paid (T2.8 lo coerciona ON en la UI/servidor).
                 if (Inventory_Pusher::owner() === 'invoice'
-                    && (bool) get_option('alegra_connector_open_invoice_on_paid', true)
                     && $order->is_paid()) {
                     $opened = $this->ensure_invoice_open($alegra_id, true);
                     if (!is_wp_error($opened)) {
                         $this->persist_invoice_status($order, $opened);
+                        $this->baseline_products_for_invoice($order);   // T3.3
                     } elseif ($this->logger) {
                         $this->logger->warning('No se pudo abrir el borrador pre-existente (owner=invoice)', [
                             'order_id'   => $order_id,
@@ -174,6 +177,7 @@ class Orders
 
             if (isset($result['id'])) {
                 $this->persist_invoice_result($order, (string) $result['id'], $result);
+                $this->baseline_products_for_invoice($order);   // REQ-POLL-02
                 $order->add_order_note(sprintf(
                     __('Factura Alegra #%s creada.', 'alegra-connector'),
                     (string) $order->get_meta('_alegra_invoice_number', true)
@@ -247,6 +251,59 @@ class Orders
         }
         $order->update_meta_data('_alegra_invoice_status', $status);
         $order->save();
+    }
+
+    /**
+     * REQ-POLL-02 / D2 §3.5: al mover stock la factura, fija el baseline en WC
+     * qty por línea. Sin esto el poll queda congelado (starvation, C27).
+     * Exige dueño invoice + pago (DR13); NO hace GET por producto (NFR-04).
+     *
+     * Público: lo consumen create_invoice(), create_invoice_with_payment() y
+     * Admin_Dashboard::ajax_open_invoice_impl().
+     */
+    public function baseline_products_for_invoice(\WC_Order $order): void
+    {
+        if (Inventory_Pusher::owner() !== 'invoice') {
+            return;   // en adjustment la factura NO mueve stock
+        }
+        if (!$order->is_paid()) {
+            return;   // WC todavía no redujo: el baseline sería mentira (DR13)
+        }
+        foreach ($order->get_items() as $item) {
+            $product = $item->get_product();
+            if (!$product instanceof \WC_Product) {
+                continue;
+            }
+            $pid = (int) $product->get_id();
+            if ($pid <= 0) {
+                continue;
+            }
+            Inventory_Pusher::set_synced($pid, (int) $product->get_stock_quantity());
+            Inventory_Pusher::clear_pending($pid);
+        }
+    }
+
+    /**
+     * D1 §2.2.1 (C2): ¿el plugin emitió un ajuste para alguna línea de este
+     * pedido DESPUÉS de su creación? `push_delta()` no conoce el pedido, así que
+     * la evidencia es el timestamp por producto `_alegra_stock_adjusted_at`.
+     * O(líneas del pedido); no depende del orden de hooks.
+     */
+    public function order_has_emitted_adjustment(\WC_Order $order): bool
+    {
+        $created = $order->get_date_created();
+        $since   = $created instanceof \DateTimeInterface ? $created->getTimestamp() : 0;
+
+        foreach ($order->get_items() as $item) {
+            $product = $item->get_product();
+            if (!$product instanceof \WC_Product) {
+                continue;
+            }
+            if (Inventory_Pusher::adjusted_at((int) $product->get_id()) > $since) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -509,7 +566,13 @@ class Orders
             && (string) $order->get_meta('_alegra_payment_id', true) === ''
             && $order->is_paid();
 
-        $invoice_result = $this->create_invoice($order, $will_record_payment ? 'open' : null);
+        // B1/Oracle#1 (REVIEW-momus + REVIEW-oracle DEF-1): el `'open'` de este
+        // camino NO estaba gated por owner(); con cuenta de pago + pedido pagado
+        // la factura nacía `open` y Alegra descontaba stock, y el pusher emitía
+        // ADEMÁS el ajuste ⇒ doble descuento automático en adjustment. La
+        // apertura SÓLO es válida con dueño invoice (la factura es el mecanismo).
+        $will_open = $will_record_payment && Inventory_Pusher::owner() === 'invoice';
+        $invoice_result = $this->create_invoice($order, $will_open ? 'open' : null);
 
         if (is_wp_error($invoice_result)) {
             return $invoice_result;

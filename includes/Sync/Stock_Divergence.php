@@ -19,6 +19,23 @@ final class Stock_Divergence
     }
 
     /**
+     * D4 §5.1 / Oracle#2: causa calculable desde el poll. DOS parámetros
+     * (`$owner`, `$s`); nunca un `WC_Order` (el poll no tiene un pedido por
+     * producto y `declare(strict_types=1)` lanzaría TypeError).
+     *
+     * Fase 3 sólo produce `baseline_ausente` (`S===''`) y `divergencia_dueno`
+     * (resto). Las causas que requieren pedido se resuelven en el informe
+     * (`T5.2::report()`), no acá.
+     */
+    public static function divergence_cause(string $owner, int|string $s): string
+    {
+        if ($s === '') {
+            return 'baseline_ausente';
+        }
+        return 'divergencia_dueno';
+    }
+
+    /**
      * @return array{items:array,total:int}
      */
     public static function report(int $limit = 20, int $offset = 0): array
