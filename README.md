@@ -6,7 +6,7 @@
 
 Developed by [Script Develop](https://scriptdevelop.com.co)
 
-Version: 2.5.1 | PHP 8.0+ | WP 5.8+ | WC 6.0+
+Version: 2.6.0 | PHP 8.0+ | WP 5.8+ | WC 6.0+
 
 ## Description
 

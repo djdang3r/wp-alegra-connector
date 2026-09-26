@@ -2,6 +2,58 @@
 
 All notable changes to Alegra Connector.
 
+## [2.6.0] - 2026-09-25
+
+> **Fiabilidad de sincronización: Consumidor Final honesto, inventario bidireccional y poll
+> robusto.** El titular es la **sobreventa**: WC nunca empujaba stock a Alegra y el poll re-inflaba
+> lo vendido. Ahora el plugin es dueño del movimiento de stock (ajuste WC→Alegra con delta) y el
+> poll tiene presupuesto, cursor y `truncated`. Verificación de release:
+> `docs/RELEASE_2.6.0_VERIFICATION.md` y `docs/sdd/sync-reliability/MANUAL-ACCEPTANCE.md`.
+
+### Changed
+
+- **El poll ya no re-infla el stock.** WC→Alegra empuja el **delta** vía
+  `POST /inventory-adjustments` cuando `push_orders_enabled=false` (default). Con
+  `push_orders_enabled=true` la factura es dueña del movimiento. **Nunca** los dos para el mismo
+  movimiento (REQ-INV-08).
+- **`_stock_status` se deriva con `wc_update_product_stock()`** respetando `_backorders` y el umbral
+  de no-stock. **Cambio intencional:** con `backorders=yes` y stock 0 el estado pasa a
+  `onbackorder` (antes `outofstock`). Con `backorders=no` y el umbral por defecto (`0`) el resultado
+  es idéntico a 2.5.1; **si `woocommerce_notify_no_stock_amount > 0`**, WC deriva `outofstock` en el
+  umbral (p. ej. qty 1 con umbral 2), donde 2.5.1 forzaba `instock`. Ver **R19**.
+- **El poll ahora honra `preserve_fields`:** con `inventory` en la lista de preservados, el poll no
+  escribe stock (antes lo ignoraba en silencio). **Cambio intencional** (corrección de bug).
+- **El dashboard distingue "No verificado" de "No encontrado"** para el Consumidor Final; conectar
+  resuelve el CF bajo un contexto explícito; "Verificar ahora" re-chequea sin recargar.
+
+### Added
+
+- **`Inventory_Writer`** (escritor único de `_manage_stock`/`_stock`/`_stock_status`) y
+  **`Inventory_Pusher`** (push WC→Alegra con ledger `_alegra_stock_synced`/`_alegra_stock_push_pending`).
+- **Poll con presupuesto y cursor:** `alegra_connector_inventory_poll_budget` (60 s),
+  `_max_pages` (0 = sin tope), `_pull_cursor`, `_pull_total`; resultado con `truncated/completed/cursor/pages`.
+- **Auto-sanado del 400 por Consumidor Final borrado** (invalida + re-resuelve + reintenta una vez
+  reusando `find_existing_invoice`).
+- **Cron real recomendado** en Ajustes: `DISABLE_WP_CRON` + línea de crontab con la URL del sitio.
+- **Lock a prueba de fatales:** `register_shutdown_function` libera `alegra_sync_running_products`.
+- **`cron_run_budget`** (540 s) < TTL 600 del lock global `alegra_cron_global`.
+
+### Notes
+
+- Sin cambio de esquema. Opciones nuevas con defaults seguros; **sin migración**.
+- **Decisión de diseño D2 (dueño híbrido):** contradice deliberadamente `docs/sdd/inventory/DD-8`
+  ("no cablear `create_inventory_adjustment()`"). Con los defaults (`push_orders=false`,
+  `invoice_status=draft`) la factura **no** movía stock, así que el titular persistía. La intención
+  de DD-8 (evitar doble conteo) se preserva vía el dueño a nivel tienda.
+- **Action Scheduler (diferido):** el poll corre por WP-Cron con presupuesto y cursor; sin
+  dependencia de AS.
+- Opciones nuevas: `alegra_connector_push_inventory_enabled`,
+  `alegra_connector_inventory_manage_stock_enabled`,
+  `alegra_connector_inventory_poll_budget`, `alegra_connector_inventory_poll_max_pages`,
+  `alegra_connector_cron_run_budget`, `alegra_connector_open_invoice_on_paid`,
+  `alegra_connector_inventory_pull_cursor`,
+  `alegra_connector_inventory_pull_total`, `alegra_connector_consumidor_final_probe`.
+
 ## [2.5.1] - 2026-09-25
 
 > **Descarga de imágenes flexible.** Por defecto ya no se restringe el host de
