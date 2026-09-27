@@ -11465,4 +11465,429 @@ TestRunner::test('T30.77 end-to-end: factura/pago/webhook/import sin regresión'
     TestRunner::assertSame(5, wc_get_product(77004)->get_stock_quantity(), 'preserve=inventory conserva el stock de WC');
 });
 
+// ===========================================================================
+// === fix-facturacion-invoice-items (2.7.x) ===
+// IDs: T31.1..T31.6. Cubre: payload-log, guarda de ítems vacíos, classify
+// permanente (no_items + item_unlinked), persistencia del early-return, y la
+// regresión del fatal de "Reconciliación de stock".
+// ===========================================================================
+
+TestRunner::test('T31.1 payload-log recibe items_count >= 1 antes del POST', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    $order = alegra_so_billable_order(31001);
+    alegra_clear_log();
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura normal se crea');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'), 'se hizo exactamente UN POST');
+
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('Invoice payload about to POST', $log,
+        'el log contiene la línea del payload');
+
+    // Parsear el JSON embebido en la línea "[ts] [INFO] msg {json}".
+    $found_count = null;
+    foreach (preg_split('/\R/', $log) ?: [] as $line) {
+        if (!str_contains($line, 'Invoice payload about to POST')) { continue; }
+        if (preg_match('/\{.*\}\s*$/', $line, $m) === 1) {
+            $ctx = json_decode((string) $m[0], true);
+            if (is_array($ctx) && array_key_exists('items_count', $ctx)) {
+                $found_count = (int) $ctx['items_count'];
+                TestRunner::assertSame(31001, (int) ($ctx['order_id'] ?? 0), 'order_id logueado');
+                TestRunner::assertTrue(is_array($ctx['items'] ?? null) && count($ctx['items']) === 1,
+                    'items[] trae el ítem del pedido');
+                TestRunner::assertSame('it-so-31001', (string) ($ctx['items'][0]['id'] ?? ''),
+                    'id del ítem registrado en el log');
+                break;
+            }
+        }
+    }
+    TestRunner::assertSame(1, $found_count, 'items_count=1 parseado del log');
+});
+
+TestRunner::test('T31.2 orden con 0 ítems ⇒ WP_Error(invoice_no_items) y NO se postea a Alegra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+
+    // El producto se crea (para que exista el WC_Order) pero el pedido va sin
+    // ítems de línea, sin shipping y sin fees ⇒ prepare_invoice_items() debe
+    // devolver el WP_Error de guarda.
+    $order = alegra_so_billable_order(31002, [
+        'order' => [
+            'items'          => [],
+            'shipping_items' => [],
+            'fee_items'      => [],
+            'total'          => 0.0,
+        ],
+    ]);
+
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $res, 'create_invoice devuelve WP_Error');
+    TestRunner::assertSame('invoice_no_items', (string) $res->get_error_code(),
+        'código invoice_no_items');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'),
+        'NO se envió ninguna factura a Alegra');
+});
+
+TestRunner::test('T31.3 producto sin _alegra_item_id ⇒ WP_Error(invoice_item_unlinked)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+
+    // Producto creado SIN _alegra_item_id. Para impedir que el fallback de
+    // resolve_item_alegra_id() (last-resort: push vía Products::sync_to_alegra)
+    // cree un id sintético con el mock, forzamos que POST /items falle.
+    $product_id = 31003;
+    alegra_make_product($product_id, [
+        'name' => 'SinVincular',
+        'regular_price' => '10', 'stock' => 5, 'manage_stock' => true,
+    ]);
+    // NO se setea _sku ni _alegra_item_id — el producto queda "sin vincular".
+
+    alegra_mock_fail('POST', '/items', 500, ['error' => 'forced_for_test'], 0);
+
+    $order = alegra_make_order(31003, [
+        'status'   => 'processing',
+        'total'    => 10.0,
+        'currency' => 'COP',
+        'payment_method' => 'bacs',
+        'billing'  => ['country' => 'CO', 'email' => 'b@example.test'],
+        'meta'     => ['_billing_alegra_contact_id' => 'c31003'],
+        'items'    => [new \WC_Order_Item([
+            'product_id' => $product_id, 'name' => 'SinVincular',
+            'quantity' => 1, 'subtotal' => 10, 'total' => 10,
+        ])],
+    ]);
+
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $res, 'create_invoice devuelve WP_Error');
+    TestRunner::assertSame('invoice_item_unlinked', (string) $res->get_error_code(),
+        'código invoice_item_unlinked (verificado en prepare_invoice_items líneas 1955-1963)');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'),
+        'NO se envió ninguna factura a Alegra');
+    alegra_mock_clear_failures();
+});
+
+TestRunner::test('T31.4 classify() marca invoice_no_items e invoice_item_unlinked como permanente', function (): void {
+    foreach (['invoice_no_items', 'invoice_item_unlinked'] as $code) {
+        $c = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error($code, 'boom'));
+        TestRunner::assertSame('failed_permanent', $c['state'], "$code ⇒ failed_permanent");
+        TestRunner::assertFalse($c['retriable'], "$code ⇒ retriable=false");
+        TestRunner::assertTrue($c['persist'], "$code ⇒ persist=true (el cron NO debe reintentar en loop)");
+        TestRunner::assertSame('data:' . $code, $c['code'], "$code conserva el prefijo data:");
+    }
+});
+
+TestRunner::test('T31.5 el early-return de create_invoice() PERSISTE el fallo en la cola', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+
+    // Pedido sin ítems ⇒ dispara la guarda de prepare_invoice_items() y la
+    // rama de early-return de create_invoice() que ahora persiste vía
+    // Invoice_Failure::classify() → Invoice_Failure::persist() + Queue::refresh_count().
+    $order = alegra_so_billable_order(31005, [
+        'order' => ['items' => [], 'shipping_items' => [], 'fee_items' => [], 'total' => 0.0],
+    ]);
+
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $res, 'WP_Error devuelto');
+
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('failed_permanent', $led['state'], 'state=failed_permanent');
+    TestRunner::assertSame('data:invoice_no_items', $led['code'], 'code persistido');
+    TestRunner::assertSame('0', $led['retriable'], 'retriable=0 (no cron-loop)');
+    TestRunner::assertTrue($led['last'] !== '', 'last_attempt escrito');
+
+    // El meta canónico de la cola (Invoice_Failure::META_STATE) queda seteado.
+    $meta = (string) $order->get_meta(\Alegra\Connector\Sync\Invoice_Failure::META_STATE, true);
+    TestRunner::assertSame('failed_permanent', $meta,
+        '_alegra_invoice_sync_state persistido en el pedido');
+});
+
+TestRunner::test('T31.6 REGRESIÓN FATAL — render_stock_reconciliation_page no tira TypeError', function (): void {
+    // Antes del fix, Admin_Dashboard.php:1080 llamaba
+    //   Stock_Divergence::detect_legacy_double_discount(20)
+    // pero la firma espera (?Client $api = null, int $limit = 20). Pasar 20
+    // como $api (int) ⇒ TypeError (declare(strict_types=1)) ⇒ fatal. Esta
+    // ruta NO la cubre T30.74 porque T30.74 invoca detect_legacy_double_discount
+    // directamente con (make_api(), 20). El test debe ejercitar el camino de la
+    // PÁGINA, no el del helper.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    ob_start();
+    try {
+        $admin->render_stock_reconciliation_page();
+        $html = (string) ob_get_clean();
+    } catch (\Throwable $e) {
+        ob_end_clean();
+        TestRunner::fail('render_stock_reconciliation_page lanzó Throwable: ' . $e::class . ' — ' . $e->getMessage());
+        return;
+    }
+
+    TestRunner::assertStringContains('Reconciliación de stock', $html,
+        'la página carga y renderiza el título (no fatal)');
+});
+
+// ===========================================================================
+// T32 — Shipping/fee lines best-effort (invoice_shipping_unlinked bug fix)
+// ===========================================================================
+
+/**
+ * Build a billable order (producto + contacto cacheado) that ALSO carries a
+ * shipping line and/or a fee line. Used by T32.{1,2,3,6}.
+ *
+ * @param array<string, mixed> $overrides overrides forwarded to alegra_so_billable_order()
+ * @return array{0:\WC_Order, 1:float} order + shipping_total (so the test can
+ *         assert the line carried the same amount).
+ */
+function alegra_so_order_with_shipping(int $id, float $shipping_total, array $overrides = []): array
+{
+    $order = alegra_so_billable_order($id, array_merge([
+        'order' => [
+            'shipping_items' => [new \WC_Order_Item([
+                'name' => 'Envío', 'quantity' => 1, 'subtotal' => $shipping_total, 'total' => $shipping_total,
+            ])],
+        ],
+    ], $overrides));
+    return [$order, $shipping_total];
+}
+
+TestRunner::test('T32.1 HAPPY: pedido CON envío (total>0) crea la factura y la línea de envío viaja en el POST /invoices', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    alegra_clear_log();
+
+    [$order, $ship_total] = alegra_so_order_with_shipping(32001, 12.5);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura normal se crea sin errores');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
+        'se hizo exactamente UN POST /invoices');
+
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    $items = is_array($body['items'] ?? null) ? $body['items'] : [];
+
+    $found = null;
+    foreach ($items as $line) {
+        if (!is_array($line)) { continue; }
+        if ((string) ($line['name'] ?? '') === 'Envío') { $found = $line; break; }
+    }
+    TestRunner::assertTrue($found !== null, 'hay una línea con name=Envío en el payload de la factura');
+    TestRunner::assertSame(12.5, (float) ($found['price'] ?? 0),
+        'el precio de la línea de envío es el shipping_total');
+    TestRunner::assertTrue((string) ($found['id'] ?? '') !== '',
+        'la línea de envío tiene un items[].id no vacío (vinculada al ítem Ajuste)');
+
+    // El ítem genérico fue creado (find-or-create).
+    TestRunner::assertTrue(alegra_mock_count('POST', '/items') >= 1,
+        'el helper creó el ítem genérico "Ajuste"');
+
+    // No se añadió nota de error (flujo feliz).
+    $notes = (array) $order->get_notes();
+    foreach ($notes as $n) {
+        TestRunner::assertFalse(str_contains((string) $n, 'No se pudo vincular'),
+            'no hay nota de error de fallback en el flujo feliz');
+    }
+});
+
+TestRunner::test('T32.2 FALLBACK: POST /items falla y el envío no se vincula → la factura SE crea SIN la línea de envío (sin WP_Error)', function (): void {
+    // Bug reportado: prepare_invoice_items() devolvía WP_Error('invoice_shipping_unlinked')
+    // y la factura NUNCA se creaba. El nuevo contrato es best-effort: se loguea
+    // error + nota de pedido y la factura igual sale con el resto de las líneas.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    // Importante: NO hay _alegra_item_id cacheado para el genérico (el helper
+    // reset limpia alegra_connector_generic_item_ids). El POST /items fallará.
+    update_option('alegra_connector_generic_item_ids', []);
+    alegra_mock_fail('POST', '/items', 400, ['error' => 'forced_for_test'], 0);
+    alegra_clear_log();
+
+    [$order, $ship_total] = alegra_so_order_with_shipping(32002, 8.0);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r),
+        'create_invoice NO devuelve WP_Error cuando solo el envío no se vincula');
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
+        'la factura igual se postea aunque el envío no se haya podido vincular');
+
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    $items = is_array($body['items'] ?? null) ? $body['items'] : [];
+    foreach ($items as $line) {
+        if (!is_array($line)) { continue; }
+        TestRunner::assertNotSame('Envío', (string) ($line['name'] ?? ''),
+            'el payload NO contiene la línea de envío cuando el genérico falló');
+    }
+
+    // Se escribió un error en el log con el código del WP_Error subyacente.
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('Shipping line could not be linked to an Alegra item', $log,
+        'el logger emite el error de shipping no vinculado');
+    TestRunner::assertStringContains('error_code', $log,
+        'el log incluye el campo error_code para diagnóstico');
+
+    // Y se agregó la nota localized al pedido.
+    $notes = (array) $order->get_notes();
+    $found_note = false;
+    foreach ($notes as $n) {
+        if (str_contains((string) $n, 'No se pudo vincular el envío')) { $found_note = true; break; }
+    }
+    TestRunner::assertTrue($found_note, 'se agregó order_note con el mensaje localized de fallback');
+
+    alegra_mock_clear_failures();
+});
+
+TestRunner::test('T32.3 FALLBACK fee: POST /items falla y el recargo no se vincula → la factura SE crea SIN la línea de fee', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_generic_item_ids', []);
+    alegra_mock_fail('POST', '/items', 400, ['error' => 'forced_for_test'], 0);
+    alegra_clear_log();
+
+    $order = alegra_so_billable_order(32003, [
+        'order' => [
+            'fee_items' => [new \WC_Order_Item([
+                'name' => 'Manejo especial', 'quantity' => 1, 'subtotal' => 5.0, 'total' => 5.0,
+            ])],
+        ],
+    ]);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r),
+        'create_invoice NO devuelve WP_Error cuando solo el fee no se vincula');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
+        'la factura igual se postea aunque el fee no se haya podido vincular');
+
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    $items = is_array($body['items'] ?? null) ? $body['items'] : [];
+    foreach ($items as $line) {
+        if (!is_array($line)) { continue; }
+        TestRunner::assertNotSame('Manejo especial', (string) ($line['name'] ?? ''),
+            'el payload NO contiene la línea de fee cuando el genérico falló');
+    }
+
+    $log = alegra_read_log();
+    TestRunner::assertStringContains('Fee line could not be linked to an Alegra item', $log,
+        'el logger emite el error de fee no vinculado');
+
+    $notes = (array) $order->get_notes();
+    $found_note = false;
+    foreach ($notes as $n) {
+        if (str_contains((string) $n, 'No se pudo vincular el recargo')) { $found_note = true; break; }
+    }
+    TestRunner::assertTrue($found_note, 'se agregó order_note con el mensaje localized de fallback del fee');
+
+    alegra_mock_clear_failures();
+});
+
+TestRunner::test('T32.4 PRICE LIST: POST /items para el genérico usa regular_price_list de field_mapping, NO 1 hardcoded', function (): void {
+    // El bug histórico: el helper creaba el genérico con idPriceList=1 fijo,
+    // ignorando la lista configurada por el comercio. Ahora se lee de
+    // alegra_connector_field_mapping['regular_price_list'] (default 1).
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 7]);
+    update_option('alegra_connector_generic_item_ids', []);
+    alegra_clear_log();
+
+    [$order] = alegra_so_order_with_shipping(32004, 3.0);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura se crea');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
+        'se creó exactamente UN ítem genérico');
+
+    $created = alegra_mock_requests('POST', '/items')[0]['body'] ?? [];
+    TestRunner::assertSame('alegra-connector-adjustment', (string) ($created['reference'] ?? ''),
+        'la referencia sigue siendo el genérico estable');
+    TestRunner::assertSame(7, (int) (($created['price'][0]['idPriceList'] ?? 0)),
+        'idPriceList refleja regular_price_list del field_mapping (NO 1 hardcoded)');
+    TestRunner::assertSame('service', (string) ($created['type'] ?? ''),
+        'type sigue siendo service (enum válido para POST /items)');
+});
+
+TestRunner::test('T32.5 NON-EXPLICIT: con push_products_enabled=false (cron/automático), POST /items del genérico NO es bloqueado por el gate', function (): void {
+    // Antes del fix: create_item() se llamaba sin run_explicit() ⇒ con el
+    // toggle de productos apagado, el gate bloqueaba el POST y el helper
+    // devolvía '' (flujo de error). Ahora create_item() corre dentro de
+    // run_explicit() ⇒ el gate SIEMPRE permite la escritura dependiente.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_push_products_enabled', false); // simula cron
+    update_option('alegra_connector_generic_item_ids', []);
+    TestRunner::assertFalse(\Alegra\Connector\Write_Gate::is_explicit(),
+        'el contexto arranca NO explícito (simula cron)');
+    alegra_clear_log();
+
+    [$order] = alegra_so_order_with_shipping(32005, 6.5);
+
+    $r = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($r),
+        'la factura se crea pese a push_products_enabled=false (gate no bloquea al genérico)');
+
+    // El POST /items del genérico ocurrió: la línea de envío viaja en la factura.
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    $items = is_array($body['items'] ?? null) ? $body['items'] : [];
+    $ship_line = null;
+    foreach ($items as $line) {
+        if (!is_array($line)) { continue; }
+        if ((string) ($line['name'] ?? '') === 'Envío') { $ship_line = $line; break; }
+    }
+    TestRunner::assertTrue($ship_line !== null,
+        'la línea de envío está presente: el genérico SÍ se creó pese al gate de productos');
+    TestRunner::assertTrue((string) ($ship_line['id'] ?? '') !== '',
+        'la línea de envío tiene id (el genérico fue creado con run_explicit)');
+
+    // Tras create_invoice() el contexto vuelve a NO explícito (run_explicit
+    // usa try/finally para restaurar).
+    TestRunner::assertFalse(\Alegra\Connector\Write_Gate::is_explicit(),
+        'el contexto vuelve a NO explícito después de run_explicit');
+});
+
+TestRunner::test('T32.6 TRUE EMPTY: pedido SIN productos + envío no vinculable → WP_Error(invoice_no_items) y CERO POST /invoices', function (): void {
+    // Cuando la línea de envío no se puede vincular y NO hay nada más
+    // facturable, prepare_invoice_items() debe devolver invoice_no_items (la
+    // factura no se crea). Esto preserva la guarda documentada en T31.2.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_generic_item_ids', []);
+    alegra_mock_fail('POST', '/items', 400, ['error' => 'forced_for_test'], 0);
+
+    $order = alegra_make_order(32006, [
+        'status'   => 'processing',
+        'total'    => 4.0,
+        'currency' => 'COP',
+        'payment_method' => 'bacs',
+        'billing'  => ['country' => 'CO', 'email' => 'empty@example.test'],
+        'meta'     => ['_billing_alegra_contact_id' => 'c32006'],
+        'items'    => [],
+        'shipping_items' => [new \WC_Order_Item([
+            'name' => 'Envío', 'quantity' => 1, 'subtotal' => 4.0, 'total' => 4.0,
+        ])],
+    ]);
+
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $res,
+        'sin productos y con envío no vinculable, create_invoice devuelve WP_Error');
+    TestRunner::assertSame('invoice_no_items', (string) $res->get_error_code(),
+        'código invoice_no_items (la guarda de prepare_invoice_items líneas 2002-2010)');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'),
+        'NO se envió ninguna factura a Alegra');
+
+    alegra_mock_clear_failures();
+});
+
 exit(TestRunner::summary());

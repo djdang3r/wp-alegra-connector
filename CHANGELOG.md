@@ -2,6 +2,37 @@
 
 All notable changes to Alegra Connector.
 
+## [2.7.1] - 2026-09-27
+
+> **Facturación fiable: HTTP 400 sin ítems abortado antes, fatal de reconciliación corregido, y
+> líneas de envío/recargo best-effort.** El titular es la **factura que Alegra rechaza con
+> "debe contener mínimo un item"**: el guard ahora corta el POST con un error legible y registra
+> el payload; el fatal de "Reconciliación de stock" se va; las líneas de envío/recargo ya no
+> pueden tumbar la factura.
+
+### Fixed
+
+- **HTTP 400 "la factura debe contener mínimo un item"** en `Orders::prepare_invoice_items()`:
+  guard `invoice_no_items` que corta con `Alegra_API_Exception` antes del POST, más log del payload
+  saliente y del `body` completo del 400 en `Client::request()` para diagnosticar en caliente.
+- **Fatal "Reconciliación de stock"** en `Admin_Dashboard`: `detect_legacy_double_discount()`
+  recibía `20` (int) como `?Client`; ahora se pasa `$this->api` (la misma instancia que el resto
+  de la pantalla).
+- **Las líneas de envío/recargo (`invoice_shipping_unlinked` / `invoice_fee_unlinked`) ya NO
+  abortan la factura:** pasan a best-effort — se registran con `logger->error` + nota en el
+  pedido y se saltean, para que la facturación manual y automática funcione aunque Alegra no
+  encuentre el item genérico de envío/recargo.
+- **El ítem genérico de Alegra usa el `price-list` correcto** (`regular_price_list`) y su
+  `POST /items` corre bajo `Write_Gate::run_explicit` para que no quede bloqueado por el gate
+  automático cuando se lo llama desde paths explícitos (p. ej. reparación de la reconciliación).
+- **T31.* y T32.* — tests de regresión** para los cinco puntos anteriores (suite 2497
+  assertions / 0 fallas, `EXEC-TEST OK`).
+
+### Changed
+
+- Sin cambio de esquema ni de opciones. Default seguro: la factura se sigue emitiendo aunque
+  las líneas de envío/recargo fallen.
+
 ## [2.7.0] - 2026-09-26
 
 > **Dueño único del stock, poll honesto, cola de facturas y reconciliación.** El titular es el

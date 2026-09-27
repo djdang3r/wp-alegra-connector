@@ -133,6 +133,11 @@ class Orders
 
             $data = $this->prepare_invoice_data($order, $status_override);
             if (is_wp_error($data)) {
+                $classification = Invoice_Failure::classify($data);
+                if (!empty($classification['persist'])) {
+                    Invoice_Failure::persist($order, $classification);
+                    Invoice_Queue::refresh_count();
+                }
                 return $data;
             }
 
@@ -156,6 +161,24 @@ class Orders
                     ]);
                     return ['id' => $existing_id, 'already_exists' => true, 'recovered' => true];
                 }
+            }
+
+            if ($this->logger) {
+                $log_items = array_map(
+                    static fn (array $it): array => [
+                        'id'       => (string) ($it['id'] ?? ''),
+                        'name'     => (string) ($it['name'] ?? ''),
+                        'quantity' => $it['quantity'] ?? 0,
+                        'price'    => $it['price'] ?? 0,
+                    ],
+                    array_values((array) ($data['items'] ?? []))
+                );
+                $this->logger->info('Invoice payload about to POST', [
+                    'order_id'    => $order_id,
+                    'client_id'   => (string) ($data['client']['id'] ?? ''),
+                    'items_count' => count($log_items),
+                    'items'       => $log_items,
+                ]);
             }
 
             $result = $this->api->create_invoice($data);
@@ -1969,18 +1992,22 @@ class Orders
         // BUG 2: `$order->get_items()` returns ONLY line_item rows, so shipping
         // and fees were dropped and the invoice total was smaller than the
         // order total. Map them as their own invoice lines.
-        $shipping_lines = $this->build_shipping_lines($order);
-        if (is_wp_error($shipping_lines)) {
-            return $shipping_lines;
-        }
-        $items = array_merge($items, $shipping_lines);
+        //
+        // Both helpers are best-effort and ALWAYS return array (possibly empty).
+        // A shipping/fee line that cannot be linked is logged + skipped (with an
+        // order note) so the rest of the invoice can still be created.
+        $items = array_merge($items, $this->build_shipping_lines($order));
+        $items = array_merge($items, $this->build_fee_lines($order));
 
-        $fee_lines = $this->build_fee_lines($order);
-        if (is_wp_error($fee_lines)) {
-            return $fee_lines;
+        if ($items === []) {
+            return new \WP_Error(
+                'invoice_no_items',
+                sprintf(
+                    __('El pedido #%d no tiene ítems facturables (sin productos, envío ni recargos). Verificá el pedido.', 'alegra-connector'),
+                    (int) $order->get_id()
+                )
+            );
         }
-        $items = array_merge($items, $fee_lines);
-
         return $items;
     }
 
@@ -2009,9 +2036,14 @@ class Orders
      * reference (see GENERIC_ITEM_REFERENCE).
      * The line price is pre-tax; the shipping tax is mapped like a line tax.
      *
-     * @return array<int, array<string, mixed>>|\WP_Error
+     * Best-effort: when the generic item cannot be resolved, the line is SKIPPED
+     * (logged + order note) instead of aborting the whole invoice. Returning
+     * `WP_Error` here used to break legitimate orders with a working invoice
+     * just because the catalog write path was temporarily failing.
+     *
+     * @return array<int, array<string, mixed>>
      */
-    private function build_shipping_lines(\WC_Order $order): array|\WP_Error
+    private function build_shipping_lines(\WC_Order $order): array
     {
         $lines = [];
 
@@ -2029,10 +2061,18 @@ class Orders
                 __('Ajuste', 'alegra-connector')
             );
             if ($item_id === '') {
-                return new \WP_Error(
-                    'invoice_shipping_unlinked',
-                    __('No se pudo vincular el envío con un ítem de Alegra. La factura no se creó.', 'alegra-connector')
-                );
+                if ($this->logger) {
+                    $this->logger->error('Shipping line could not be linked to an Alegra item; invoicing without it', [
+                        'order_id'       => $order->get_id(),
+                        'shipping_total' => $total,
+                    ]);
+                }
+                $order->add_order_note(sprintf(
+                    /* translators: %s: shipping amount */
+                    __('[Alegra] No se pudo vincular el envío (%s) con un ítem de Alegra; la factura se creó sin esa línea. Revisá el log de Alegra.', 'alegra-connector'),
+                    wc_price($total)
+                ));
+                continue;
             }
 
             $line = [
@@ -2057,9 +2097,12 @@ class Orders
      * readable. The line price is pre-tax and the fee tax is mapped like a line
      * tax.
      *
-     * @return array<int, array<string, mixed>>|\WP_Error
+     * Best-effort: when the generic item cannot be resolved, the line is SKIPPED
+     * (logged + order note) instead of aborting the whole invoice.
+     *
+     * @return array<int, array<string, mixed>>
      */
-    private function build_fee_lines(\WC_Order $order): array|\WP_Error
+    private function build_fee_lines(\WC_Order $order): array
     {
         $lines = [];
 
@@ -2082,10 +2125,20 @@ class Orders
                 __('Ajuste', 'alegra-connector')
             );
             if ($item_id === '') {
-                return new \WP_Error(
-                    'invoice_fee_unlinked',
-                    __('No se pudo vincular un recargo con un ítem de Alegra. La factura no se creó.', 'alegra-connector')
-                );
+                if ($this->logger) {
+                    $this->logger->error('Fee line could not be linked to an Alegra item; invoicing without it', [
+                        'order_id' => $order->get_id(),
+                        'fee_name' => $name,
+                        'fee_total' => $total,
+                    ]);
+                }
+                $order->add_order_note(sprintf(
+                    /* translators: 1: fee name, 2: fee amount */
+                    __('[Alegra] No se pudo vincular el recargo "%1$s" (%2$s) con un ítem de Alegra; la factura se creó sin esa línea. Revisá el log de Alegra.', 'alegra-connector'),
+                    $name,
+                    wc_price($total)
+                ));
+                continue;
             }
 
             $line = [
@@ -2100,6 +2153,22 @@ class Orders
         }
 
         return $lines;
+    }
+
+    /**
+     * Configured Alegra price-list id for the shared generic service item.
+     *
+     * Mirrors Products::price_list_id(): reads the merchant-configured
+     * `regular_price_list` from `alegra_connector_field_mapping`, defaulting to
+     * 1 ("General"). The previous hardcoded value caused the generic item to
+     * land on the wrong price list and made shipping/fee lines invisible to
+     * the merchant's configured catalog.
+     */
+    private function generic_item_price_list_id(): int
+    {
+        $map = get_option('alegra_connector_field_mapping', []);
+        $id  = is_array($map) ? (int) ($map['regular_price_list'] ?? 1) : 1;
+        return $id > 0 ? $id : 1;
     }
 
     /**
@@ -2134,12 +2203,20 @@ class Orders
             return $id;
         }
 
-        $created = $this->api->create_item([
-            'name'      => $name,
-            'reference' => $reference,
-            'type'      => 'service',
-            'price'     => [['idPriceList' => 1, 'price' => 0]],
-        ]);
+        // The internal `POST /items` for the shared generic service is a
+        // dependency of the (merchant-driven) invoice write. We wrap it in
+        // `run_explicit()` so the per-entity gate (`push_products_enabled`)
+        // can NEVER block it from an automatic/cron invoice — without this,
+        // a cron invoice with a shipping line would silently lose the line
+        // because the generic item could not be created.
+        $created = \Alegra\Connector\Write_Gate::run_explicit(
+            fn () => $this->api->create_item([
+                'name'      => $name,
+                'reference' => $reference,
+                'type'      => 'service',
+                'price'     => [['idPriceList' => $this->generic_item_price_list_id(), 'price' => 0]],
+            ])
+        );
         if (!is_wp_error($created) && isset($created['id'])) {
             $id = (string) $created['id'];
             $this->remember_generic_item_id($reference, $id);
@@ -2155,8 +2232,9 @@ class Orders
 
         if ($this->logger) {
             $this->logger->error('Could not resolve a generic Alegra item', [
-                'reference' => $reference,
-                'error'     => is_wp_error($created) ? $created->get_error_message() : 'missing id',
+                'reference'  => $reference,
+                'error'      => is_wp_error($created) ? $created->get_error_message() : 'missing id',
+                'error_code' => is_wp_error($created) ? $created->get_error_code() : 'missing_id',
             ]);
         }
 

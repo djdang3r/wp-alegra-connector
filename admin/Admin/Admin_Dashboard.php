@@ -1076,8 +1076,10 @@ class Admin_Dashboard
         $per    = 20;
         $offset = ($page - 1) * $per;
         $report = $this->get_stock_divergence($per, $offset);
-        // T7.4: detección read-only del doble decremento heredado (no escribe).
-        $legacy = \Alegra\Connector\Sync\Stock_Divergence::detect_legacy_double_discount(20);
+        // T7.4: detección read-only del doble decremento heredado.
+        // El 1er parámetro es ?Client (para medir availableQuantity), NO el limit.
+        // Pasar $this->api (null si no hay conexión) — nunca un int (TypeError).
+        $legacy = \Alegra\Connector\Sync\Stock_Divergence::detect_legacy_double_discount($this->api, 20);
 
         $page_title    = __('Reconciliación de stock', 'alegra-connector');
         $page_subtitle = __('Stock de WooCommerce vs. Alegra', 'alegra-connector');

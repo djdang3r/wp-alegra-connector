@@ -239,6 +239,13 @@ class Client
                 }
                 $message = wp_strip_all_tags((string) $message);
                 if ($this->logger) $this->logger->error('API Error response', ['code' => $code, 'message' => $message]);
+                if ($this->logger) {
+                    $this->logger->error('API Error body (full)', [
+                        'endpoint' => $endpoint,
+                        'code'     => $code,
+                        'body'     => $error_data,
+                    ]);
+                }
                 return new \WP_Error('api_error', $message, ['code' => $code, 'response' => $error_data]);
             }
 
