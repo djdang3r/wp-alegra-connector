@@ -19,7 +19,7 @@ $root = dirname(__DIR__);
 $out  = $argv[1] ?? ($root . '/languages/alegra-connector.pot');
 
 $text_domain = 'alegra-connector';
-$version      = '2.8.1';
+$version      = '2.8.2';
 $package      = 'Alegra Connector';
 
 $php_functions = [

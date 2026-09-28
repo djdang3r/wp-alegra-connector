@@ -255,12 +255,33 @@ if ($ac_wh_enabled && $ac_wh_id !== '' && $ac_wh_id !== '0'):
 <?php esc_html_e('No se detectaron métodos de envío en WooCommerce. Configurá al menos uno en WooCommerce > Ajustes > Envíos.','alegra-connector');?>
 </div>
 <?php else:?>
+<?php
+// 2.8.2: drift notice. Hidden when nothing needs attention — no green "all
+// good" noise on every visit. The summary text is reused by the JS
+// re-render after a rename so the merchant sees the count tick down.
+$ac_drift_rows_by_key = [];
+foreach (($ac_drift_report['rows'] ?? []) as $ac_drift_row) {
+    $ac_drift_rows_by_key[(string) ($ac_drift_row['key'] ?? '')] = $ac_drift_row;
+}
+$ac_drift_pending = (int) ($ac_drift_report['summary']['pending_changes'] ?? 0);
+$ac_drift_orphan_count = (int) ($ac_drift_report['counts']['orphan'] ?? 0);
+?>
+<?php if($ac_drift_pending > 0):?>
+<div class="ac-notice warning" id="ac-shipping-drift-notice" style="margin:0 0 12px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <span><strong><?php echo esc_html($ac_drift_report['summary']['pending_label']);?></strong> — <?php esc_html_e('hay nombres que no coinciden en Alegra o métodos que fueron eliminados.', 'alegra-connector');?></span>
+    <button type="button" class="ac-btn ac-btn-sm" id="ac-shipping-drift-update-all" style="margin-left:auto;">
+        <span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;line-height:1.3;"></span>
+        <?php esc_html_e('Actualizar todo','alegra-connector');?>
+    </button>
+</div>
+<?php endif;?>
 <table class="form-table ac-shipping-table">
 <thead><tr>
 <th><?php esc_html_e('Zona','alegra-connector');?></th>
 <th><?php esc_html_e('Método','alegra-connector');?></th>
 <th><?php esc_html_e('Costo','alegra-connector');?></th>
 <th><?php esc_html_e('Ítem en Alegra','alegra-connector');?></th>
+<th><?php esc_html_e('Estado','alegra-connector');?></th>
 <th><?php esc_html_e('Acción','alegra-connector');?></th>
 </tr></thead>
 <tbody>
@@ -270,8 +291,11 @@ foreach($ac_shipping_methods as $ac_sm):
 $ac_key = $ac_sm['method_id'].':'.$ac_sm['instance_id'];
 $ac_mapped = isset($ac_shipping_map[$ac_key]) ? (string)$ac_shipping_map[$ac_key] : '';
 $ac_cost = $ac_sm['cost'];
+$ac_drift = $ac_drift_rows_by_key[$ac_key] ?? null;
+$ac_drift_status = (string) ($ac_drift['status'] ?? 'unmapped');
+$ac_alegra_name = (string) ($ac_drift['mapped_item_name'] ?? '');
 ?>
-<tr>
+<tr data-shipping-key="<?php echo esc_attr($ac_key);?>">
 <td><?php echo esc_html($ac_sm['zone_name']);?></td>
 <td>
 <strong><?php echo esc_html($ac_sm['method_title']);?></strong>
@@ -302,18 +326,101 @@ $ac_cost = $ac_sm['cost'];
 <p class="description"><?php esc_html_e('Conecta con Alegra para ver tus ítems disponibles, o usá el botón "Crear ítem de envío".','alegra-connector');?></p>
 <?php endif;?>
 </td>
+<td class="ac-shipping-drift-cell">
+<?php
+// Per-row drift badge: status drives both colour AND whether the matching
+// action button (update / remove) renders below. `ok` rows render no button.
+$ac_badge_class = 'ac-badge';
+$ac_badge_label = '';
+$ac_badge_color = '#6b7280';
+switch ($ac_drift_status) {
+    case 'ok':
+        $ac_badge_label = __('OK','alegra-connector');
+        $ac_badge_color = '#0f766e';
+        break;
+    case 'name_mismatch':
+        $ac_badge_label = __('Nombre distinto','alegra-connector');
+        $ac_badge_color = '#b45309';
+        break;
+    case 'unmapped':
+        $ac_badge_label = __('Sin mapear','alegra-connector');
+        $ac_badge_color = '#6b7280';
+        break;
+    case 'unverified':
+        $ac_badge_label = __('Sin verificar','alegra-connector');
+        $ac_badge_color = '#6b7280';
+        break;
+}
+?>
+<span class="<?php echo esc_attr($ac_badge_class);?>" data-drift-status="<?php echo esc_attr($ac_drift_status);?>" style="display:inline-block;padding:2px 8px;border-radius:10px;background:<?php echo esc_attr($ac_badge_color);?>;color:#fff;font-size:11px;font-weight:600;line-height:1.4;white-space:nowrap;">
+<?php echo esc_html($ac_badge_label);?>
+</span>
+<?php if($ac_drift_status === 'name_mismatch'):?>
+<div style="font-size:11px;margin-top:4px;color:var(--ac-text-secondary);">
+    <div><?php esc_html_e('Nombre en Alegra:','alegra-connector');?> <code><?php echo esc_html(wp_html_excerpt($ac_alegra_name, 60));?></code></div>
+    <div><?php esc_html_e('Nombre en WC:','alegra-connector');?> <code><?php echo esc_html(wp_html_excerpt($ac_sm['method_title'], 60));?></code></div>
+</div>
+<?php endif;?>
+<?php if($ac_drift_status === 'unverified' && !empty($ac_drift['mapped_item_error'])):?>
+<div style="font-size:11px;margin-top:4px;color:var(--ac-text-muted);" title="<?php echo esc_attr($ac_drift['mapped_item_error']);?>">
+    <?php esc_html_e('No se pudo consultar Alegra para este ítem.','alegra-connector');?>
+</div>
+<?php endif;?>
+</td>
 <td>
 <button type="button" class="ac-btn ac-btn-sm ac-create-shipping-item" data-method-id="<?php echo esc_attr($ac_sm['method_id']);?>" data-instance-id="<?php echo esc_attr((string)$ac_sm['instance_id']);?>" data-type="<?php echo esc_attr($ac_shipping_type);?>" <?php disabled(!$connected);?>>
 <span class="dashicons dashicons-plus" style="font-size:14px;width:14px;height:14px;line-height:1.3;"></span>
 <?php esc_html_e('Crear ítem de envío','alegra-connector');?>
 </button>
+<?php if($ac_drift_status === 'name_mismatch'):?>
+<button type="button" class="ac-btn ac-btn-sm ac-update-shipping-item-name" data-method-id="<?php echo esc_attr($ac_sm['method_id']);?>" data-instance-id="<?php echo esc_attr((string)$ac_sm['instance_id']);?>" style="margin-top:4px;" <?php disabled(!$connected);?>>
+<span class="dashicons dashicons-edit" style="font-size:14px;width:14px;height:14px;line-height:1.3;"></span>
+<?php esc_html_e('Actualizar nombre en Alegra','alegra-connector');?>
+</button>
+<?php endif;?>
 <span class="ac-shipping-item-result" style="display:block;margin-top:4px;font-size:11px;"></span>
 </td>
 </tr>
 <?php endforeach;?>
+<?php
+// Orphans: map entries whose WC method no longer exists. Rendered below
+// the live table (not interleaved) so the merchant can act on them as a
+// group with one click per row.
+$ac_orphan_rows = array_values(array_filter(
+    ($ac_drift_report['rows'] ?? []),
+    static fn ($r) => (string) ($r['status'] ?? '') === 'orphan'
+));
+?>
+<?php if(!empty($ac_orphan_rows)):?>
+<?php foreach($ac_orphan_rows as $ac_orphan):?>
+<tr data-shipping-key="<?php echo esc_attr((string)$ac_orphan['key']);?>">
+<td colspan="4">
+<strong><?php echo esc_html((string)$ac_orphan['key']);?></strong>
+<div style="font-size:11px;color:var(--ac-text-muted);">
+<?php esc_html_e('Este método ya no existe en WooCommerce.','alegra-connector');?>
+<?php if($connected):?>
+<span class="ac-alegra-id-pill" style="font-family:monospace;font-size:11px;background:var(--ac-bg-elevated);padding:1px 6px;border-radius:4px;margin-left:6px;"><?php echo esc_html((string)$ac_orphan['mapped_item_id']);?></span>
+<?php endif;?>
+</div>
+</td>
+<td>
+<span class="ac-badge" style="display:inline-block;padding:2px 8px;border-radius:10px;background:#b91c1c;color:#fff;font-size:11px;font-weight:600;line-height:1.4;">
+<?php esc_html_e('Método eliminado','alegra-connector');?>
+</span>
+</td>
+<td>
+<button type="button" class="ac-btn ac-btn-sm ac-remove-shipping-mapping" data-key="<?php echo esc_attr((string)$ac_orphan['key']);?>" data-method-id="" data-instance-id="0" <?php disabled(!$connected);?>>
+<span class="dashicons dashicons-trash" style="font-size:14px;width:14px;height:14px;line-height:1.3;"></span>
+<?php esc_html_e('Quitar mapeo','alegra-connector');?>
+</button>
+<span class="ac-shipping-item-result" style="display:block;margin-top:4px;font-size:11px;"></span>
+</td>
+</tr>
+<?php endforeach;?>
+<?php endif;?>
 </tbody>
 </table>
-<div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
 <button type="button" class="ac-btn ac-btn-sm" id="ac-refresh-alegra-items"><?php esc_html_e('Actualizar lista de ítems desde Alegra','alegra-connector');?></button>
 <span style="font-size:11px;color:var(--ac-text-muted);"><?php esc_html_e('Lista cacheada por 5 minutos. Forzá una recarga si recién creaste un ítem desde otro lado.','alegra-connector');?></span>
 </div>

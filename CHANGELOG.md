@@ -2,6 +2,61 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.2] - 2026-09-27
+
+> **Detección de "drift" entre WooCommerce y Alegra en la pestaña Envíos + acciones de sincronización por fila.**
+> Cada método de envío detectado ahora se compara contra el ítem de Alegra vinculado y se etiqueta
+> con un badge de estado (`OK`, `Nombre distinto`, `Sin mapear`, `Método eliminado`, `Sin verificar`).
+> Las filas con drift exponen acciones inline (Actualizar nombre en Alegra / Quitar mapeo) y un
+> botón "Actualizar todo" recorre las drifted secuencialmente. Además, al crear un nuevo ítem de
+> envío se siembra el precio cosmético del catálogo con el costo fijo del método de WC cuando es
+> `> 0` (antes siempre iba en 0, sin importar el costo configurado).
+
+### Added
+
+- **Detección de drift en Envíos**: `Admin_Dashboard::build_shipping_drift_report()` clasifica
+  cada método detectado como `ok` (nombres coinciden case-insensitive en `trim()`),
+  `name_mismatch` (existe vínculo pero el título de WC ≠ nombre en Alegra),
+  `unmapped` (detectado en WC, sin entrada en `alegra_connector_shipping_map`),
+  `orphan` (entrada en el map cuyo método ya no existe en WC), o
+  `unverified` (falló `GET /items/{id}` — nunca se reporta como falso `name_mismatch`).
+- **Acciones por fila (merchant-driven, `Write_Gate::run_explicit`)**:
+  - `alegra_update_shipping_item_name` — PUT `/items/{id}` con el título actual del método WC;
+    invalida el cache de nombres por ítem para que el siguiente render pase de `name_mismatch`
+    a `OK`.
+  - `alegra_remove_shipping_mapping` — operación local-only (sin llamada a Alegra, sin gate):
+    elimina la entrada del map para el método indicado. Acepta `method_id`+`instance_id` o la
+    clave explícita `method:instance` (validada por regex). Es idempotente.
+- **Botón "Actualizar todo"** en el aviso de drift: recorre secuencialmente las filas drifted
+  (las que llevan el botón `.ac-update-shipping-item-name`), abortando en el primer fallo para
+  que el comerciante sepa exactamente qué fila falló.
+- **Costo sembrado al crear ítem de envío (cosmético)**: `ajax_create_shipping_item()` ahora usa
+  el `cost` del método WC cuando es `> 0.0`; cae a `0.0` para métodos variables / costo 0. La
+  línea de la factura sigue sobrescribiendo con el shipping real del pedido, así que esto es
+  puramente cosmético en el catálogo de Alegra, pero ahora coincide con lo que la columna "Costo"
+  de Envíos muestra.
+- **Cache de nombres por ítem** (transient `alegra_connector_shipping_item_name_cache`, TTL 5 min):
+  deduplica `GET /items/{id}` entre métodos que mapean al mismo id; sólo se persiste tras una
+  fetch exitosa (los errores NO se cachean, así que la próxima visita reintenta).
+
+### Fixed
+
+- **Cache de precios por ítem**: el alta de ítems de envío ahora siembra el `price` cosmético
+  con el `cost` real del método (antes siempre iba en `0`). Sin esto, el catálogo de Alegra
+  mostraba "0" para métodos con costo fijo configurado.
+
+### Tests
+
+- **T36.1** `build_shipping_drift_report()` clasifica correctamente las 4 ramas deterministas
+  (`ok`, `name_mismatch`, `unmapped`, `orphan`) en una sola corrida con métodos mixtos.
+- **T36.2** `alegra_update_shipping_item_name` ejecuta PUT `/items/{id}` con `name = título WC`,
+  no toca `price`, e invalida el cache de nombres al éxito.
+- **T36.3** `alegra_remove_shipping_mapping` elimina sólo la entrada targeteada (las demás
+  quedan intactas), borra el cache, no hace NINGUNA llamada a Alegra, y es idempotente.
+- **T36.4** `ajax_create_shipping_item` siembra `price = cost` cuando el método tiene
+  `cost > 0`; cae a `0` cuando `cost === '0'` o `cost === ''` (variable). El tipo sigue siendo
+  `service` (cosmético de catálogo, no inventario).
+
 ## [2.8.1] - 2026-09-27
 
 > **Listas de precios robustas, kill-switch saneado en reconexión y UI fiel a WooCommerce.**

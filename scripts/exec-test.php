@@ -12209,6 +12209,7 @@ TestRunner::test('T34.3 ajax_create_shipping_item forces type=service and never 
             public int $instance_id = 0;
             public string $instance_title = "";
             public array $instance_options = [];
+            public string $cost = "";
             public function get_instance_id(): int { return $this->instance_id; }
             public function get_title(): string { return $this->instance_title; }
             public function get_option(string $key): mixed {
@@ -12225,12 +12226,18 @@ TestRunner::test('T34.3 ajax_create_shipping_item forces type=service and never 
     if (!class_exists('WC_Shipping_Zones')) {
         eval('class WC_Shipping_Zones {
             public static function get_zones(): array {
+                $override = $GLOBALS["alegra_test_shipping_zones"] ?? null;
+                if (is_array($override)) { return $override; }
                 $m = new WC_Shipping_Method();
                 $m->id = "flat_rate";
                 $m->instance_id = 99;
                 return [["shipping_methods" => [$m]]];
             }
-            public static function get_zone($id) { return null; }
+            public static function get_zone($id) {
+                $override = $GLOBALS["alegra_test_shipping_zone_0"] ?? null;
+                if ($override !== null) { return $override; }
+                return null;
+            }
         }');
     }
 
@@ -12671,6 +12678,343 @@ TestRunner::test('T35.6 detect_wc_shipping_methods uses the WC instance title, n
     );
     TestRunner::assertSame('Flat rate', (string) ($row3['method_title'] ?? ''),
         'fallback final: get_method_title() cuando get_title() y la opción están vacías');
+});
+
+// ===========================================================================
+// T36 — Drift detection (2.8.2) + per-row sync actions + cost seeding
+// ===========================================================================
+// The Envíos tab now reports drift between WC shipping methods and their
+// mapped Alegra items: name_mismatch (WC title ≠ Alegra name), unmapped
+// (detected but not linked), orphan (linked but the WC method disappeared),
+// and unverified (the fetch failed — never a false alarm). Each drifted row
+// carries a per-row action button; "Actualizar todo" walks them sequentially.
+//
+// The four scenarios below exercise every branch of the new
+// `build_shipping_drift_report()` plus the two new AJAX handlers
+// (`alegra_update_shipping_item_name`, `alegra_remove_shipping_mapping`)
+// and the new cost-seeding behaviour on `ajax_create_shipping_item()`.
+//
+// The harness has WC_Shipping_Method / WC_Shipping_Zone / WC_Shipping_Zones
+// stubs already declared above; we re-use them and only override via the
+// `$GLOBALS['alegra_test_shipping_zones']` hook for the cost scenario.
+
+TestRunner::test('T36.1 2.8.2 drift detection classifies name_mismatch, ok, orphan and unmapped correctly', function (): void {
+    // The Envíos drift report walks every detected WC method, fetches the
+    // mapped Alegra item's current name (cached), and classifies the row:
+    //
+    //   - name_mismatch: Alegra name exists AND it differs from the WC title.
+    //   - ok:            Alegra name matches the WC title (case-insensitive).
+    //   - unmapped:      the WC method has no entry in alegra_connector_shipping_map.
+    //   - orphan:        a map entry whose key does NOT match any detected method.
+    //   - unverified:    the fetch failed (covered separately by mocking).
+    //
+    // We seed four scenarios in a single call so the report exercises every
+    // branch in one shot — cheaper than four separate resets and proves the
+    // function is total over a mixed input set.
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+
+    // Detected WC methods: two instances of flat_rate (different titles so
+    // the drift classifier has both a match and a mismatch to compare).
+    $m_a = new \WC_Shipping_Method();
+    $m_a->id = 'flat_rate';
+    $m_a->instance_id = 101;
+    $m_a->instance_title = 'Bogotá';
+
+    $m_b = new \WC_Shipping_Method();
+    $m_b->id = 'flat_rate';
+    $m_b->instance_id = 102;
+    $m_b->instance_title = 'Medellín';
+
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m_a, $m_b]],
+    ];
+
+    // Alegra items: A's name matches (ok), B's name disagrees (mismatch).
+    // The third id is an orphan (map key not in detected methods).
+    alegra_mock_seed_item('alegra-A', ['name' => 'Bogotá']);
+    alegra_mock_seed_item('alegra-B', ['name' => 'Antioquia']);
+    alegra_mock_seed_item('alegra-orphan', ['name' => 'Orphan item']);
+
+    // Map: A → ok, B → mismatch, C → orphan, D → no method (unmapped).
+    update_option('alegra_connector_shipping_map', [
+        'flat_rate:101' => 'alegra-A',     // ok
+        'flat_rate:102' => 'alegra-B',     // name_mismatch
+        'flat_rate:999' => 'alegra-orphan', // orphan (no WC method 999)
+    ]);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $report = $admin->build_shipping_drift_report(
+        \Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(),
+        (array) get_option('alegra_connector_shipping_map', [])
+    );
+
+    // Index rows by key for clearer assertions.
+    $by_key = [];
+    foreach (($report['rows'] ?? []) as $r) {
+        $by_key[(string) ($r['key'] ?? '')] = $r;
+    }
+
+    // (1) Mapped, names equal → ok.
+    TestRunner::assertSame('ok', (string) ($by_key['flat_rate:101']['status'] ?? ''),
+        'flat_rate:101 (Bogotá === Bogotá) ⇒ ok');
+    TestRunner::assertSame('Bogotá', (string) ($by_key['flat_rate:101']['mapped_item_name'] ?? ''),
+        'flat_rate:101 mapped_item_name viene del Alegra fetch');
+    TestRunner::assertSame('alegra-A', (string) ($by_key['flat_rate:101']['mapped_item_id'] ?? ''),
+        'flat_rate:101 mapped_item_id preservado');
+
+    // (2) Mapped, names differ → name_mismatch.
+    TestRunner::assertSame('name_mismatch', (string) ($by_key['flat_rate:102']['status'] ?? ''),
+        'flat_rate:102 (Medellín vs Antioquia) ⇒ name_mismatch');
+    TestRunner::assertSame('Antioquia', (string) ($by_key['flat_rate:102']['mapped_item_name'] ?? ''),
+        'flat_rate:102 mapped_item_name muestra el valor de Alegra');
+
+    // (3) Map key whose WC method is not detected → orphan.
+    TestRunner::assertSame('orphan', (string) ($by_key['flat_rate:999']['status'] ?? ''),
+        'flat_rate:999 (no detectado en WC) ⇒ orphan');
+    TestRunner::assertSame('alegra-orphan', (string) ($by_key['flat_rate:999']['mapped_item_id'] ?? ''),
+        'el orphan conserva el item_id mapeado');
+
+    // (4) Detected method with no map entry → unmapped. We seed a fourth
+    // method by extending the override.
+    $m_c = new \WC_Shipping_Method();
+    $m_c->id = 'flat_rate';
+    $m_c->instance_id = 200;
+    $m_c->instance_title = 'Cali';
+
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m_a, $m_b, $m_c]],
+    ];
+
+    $admin2 = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $report2 = $admin2->build_shipping_drift_report(
+        \Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(),
+        (array) get_option('alegra_connector_shipping_map', [])
+    );
+
+    $by_key2 = [];
+    foreach (($report2['rows'] ?? []) as $r) {
+        $by_key2[(string) ($r['key'] ?? '')] = $r;
+    }
+    TestRunner::assertSame('unmapped', (string) ($by_key2['flat_rate:200']['status'] ?? ''),
+        'flat_rate:200 (Cali, sin mapear) ⇒ unmapped');
+
+    // Counts must reflect every classification exactly once.
+    TestRunner::assertSame(1, (int) ($report2['counts']['ok'] ?? 0),
+        'counts.ok = 1');
+    TestRunner::assertSame(1, (int) ($report2['counts']['name_mismatch'] ?? 0),
+        'counts.name_mismatch = 1');
+    TestRunner::assertSame(1, (int) ($report2['counts']['orphan'] ?? 0),
+        'counts.orphan = 1');
+    TestRunner::assertSame(1, (int) ($report2['counts']['unmapped'] ?? 0),
+        'counts.unmapped = 1');
+});
+
+TestRunner::test('T36.2 2.8.2 alegra_update_shipping_item_name sends PUT /items/{id} with the WC title and clears the cache', function (): void {
+    // The merchant clicks "Actualizar nombre en Alegra" on a name_mismatch
+    // row. The handler MUST:
+    //   1. enforce nonce + manage_woocommerce;
+    //   2. look up the item id from alegra_connector_shipping_map;
+    //   3. resolve the WC method title;
+    //   4. PUT /items/{id} with body {name: <wc title>};
+    //   5. invalidate the per-item name cache (so the next reload flips to ok).
+    //
+    // The mock rejects any write body that violates the documented schema,
+    // so the assertion is structural as well as behavioural.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_shipping_map', ['flat_rate:7' => 'item-abc']);
+
+    // Seed the cached name so we can prove the handler deletes the
+    // transient on success — the cache key is documented in
+    // Admin_Dashboard::SHIPPING_ITEM_NAME_CACHE_KEY.
+    set_transient(
+        'alegra_connector_shipping_item_name_cache',
+        ['item-abc' => ['name' => 'Old name']],
+        300
+    );
+
+    $m = new \WC_Shipping_Method();
+    $m->id = 'flat_rate';
+    $m->instance_id = 7;
+    $m->instance_title = 'Bogotá actualizada';
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m]],
+    ];
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 7];
+    $resp = alegra_capture_json(fn () => $admin->ajax_update_shipping_item_name());
+    $_POST = [];
+
+    TestRunner::assertTrue($resp->success,
+        'el rename devuelve wp_send_json_success');
+
+    // 1 PUT to /items/{id} with name = WC title.
+    TestRunner::assertSame(1, alegra_mock_count('PUT', '/items/item-abc'),
+        'se hizo exactamente UN PUT /items/item-abc');
+    $body = alegra_mock_last_request('PUT', '/items/item-abc')['body'] ?? [];
+    TestRunner::assertSame('Bogotá actualizada', (string) ($body['name'] ?? ''),
+        'el PUT body lleva name = título de WC');
+    TestRunner::assertArrayNotHasKey('price', $body,
+        'el PUT body NO lleva price (sólo renombramos, no tocamos precio)');
+
+    // Cache cleared so a page reload flips the row to `ok`.
+    $cached = get_transient('alegra_connector_shipping_item_name_cache');
+    TestRunner::assertFalse($cached,
+        'el cache de nombres por ítem se invalidó tras un rename exitoso');
+});
+
+TestRunner::test('T36.3 2.8.2 alegra_remove_shipping_mapping drops the key and never touches other entries', function (): void {
+    // The merchant clicks "Quitar mapeo" on an orphan row (or any row). The
+    // handler is a LOCAL-ONLY write — no Alegra call, no run_explicit — and
+    // it must:
+    //   1. enforce nonce + manage_woocommerce;
+    //   2. remove ONLY the targeted key from alegra_connector_shipping_map;
+    //   3. leave every other key untouched;
+    //   4. clear the per-item name cache so the next reload rebuilds clean.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_shipping_map', [
+        'flat_rate:7'  => 'item-a',
+        'flat_rate:13' => 'item-b',
+        'flat_rate:21' => 'item-c',
+    ]);
+    set_transient(
+        'alegra_connector_shipping_item_name_cache',
+        ['item-b' => ['name' => 'whatever']],
+        300
+    );
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    // First call: removes the middle entry via method_id/instance_id.
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 13];
+    $resp = alegra_capture_json(fn () => $admin->ajax_remove_shipping_mapping());
+    $_POST = [];
+
+    TestRunner::assertTrue($resp->success,
+        'el remove devuelve wp_send_json_success');
+
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    TestRunner::assertArrayHasKey('flat_rate:7', $map,
+        'flat_rate:7 sigue presente (no tocamos las otras entradas)');
+    TestRunner::assertArrayNotHasKey('flat_rate:13', $map,
+        'flat_rate:13 fue removido');
+    TestRunner::assertArrayHasKey('flat_rate:21', $map,
+        'flat_rate:21 sigue presente');
+    TestRunner::assertSame('item-a', (string) ($map['flat_rate:7'] ?? ''),
+        'el valor de flat_rate:7 no fue tocado');
+    TestRunner::assertSame('item-c', (string) ($map['flat_rate:21'] ?? ''),
+        'el valor de flat_rate:21 no fue tocado');
+
+    // Cache cleared.
+    $cached = get_transient('alegra_connector_shipping_item_name_cache');
+    TestRunner::assertFalse($cached,
+        'el cache de nombres por ítem se invalidó tras un remove exitoso');
+
+    // No Alegra call. The handler must be local-only — no PUT, no POST.
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/items/item-b'),
+        'NO se hace PUT /items/{id} — el ítem de Alegra queda intacto');
+
+    // Second call: idempotent path — calling it again on an already-removed
+    // key returns success (the JS can clear the row without a misleading
+    // error to the merchant).
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 13];
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_remove_shipping_mapping());
+    $_POST = [];
+    TestRunner::assertTrue($resp2->success,
+        'segundo remove (idempotente) también devuelve success');
+});
+
+TestRunner::test('T36.4 2.8.2 ajax_create_shipping_item seeds price from the WC method cost when > 0, else 0', function (): void {
+    // The handler's POST /items body carries a catalog-cosmetic price:
+    //   - flat_rate with a fixed cost > 0 → seed that cost (so the item
+    //     looks right in Alegra's catalog);
+    //   - flat_rate with cost == 0 (or null / variable) → seed 0.
+    //
+    // The invoice line ALWAYS overrides the price with the order's real
+    // shipping amount, so this is purely cosmetic — but the merchant
+    // expects the catalog value to match what the Envíos tab shows in its
+    // "Costo" column.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    alegra_mock_seed_price_list('1', ['name' => 'General']);
+
+    // (A) Method with fixed cost > 0 → POST price = 12000.
+    $m_cost = new \WC_Shipping_Method();
+    $m_cost->id = 'flat_rate';
+    $m_cost->instance_id = 501;
+    $m_cost->instance_title = 'Bogotá';
+    $m_cost->cost = '12000';
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m_cost]],
+    ];
+
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 501];
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+    $_POST = [];
+    TestRunner::assertTrue($resp->success,
+        'creación con cost > 0 devuelve success');
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame(12000.0, (float) ($body['price'][0]['price'] ?? -1.0),
+        'POST /items lleva price = 12000 (= cost del método WC)');
+    TestRunner::assertSame('service', (string) ($body['type'] ?? ''),
+        'POST /items sigue siendo type=service (catalog cosmetic, no inventory)');
+
+    // (B) Method with cost = 0 → POST price = 0.
+    $m_free = new \WC_Shipping_Method();
+    $m_free->id = 'flat_rate';
+    $m_free->instance_id = 502;
+    $m_free->instance_title = 'Envío gratis';
+    $m_free->cost = '0';
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m_free]],
+    ];
+
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 502];
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+    $_POST = [];
+    TestRunner::assertTrue($resp2->success,
+        'creación con cost = 0 devuelve success');
+
+    // The mock collects requests in order; the second POST is the second call.
+    $calls = array_values(array_filter(
+        alegra_mock_requests('POST', '/items'),
+        static fn ($r) => true
+    ));
+    $body2 = $calls[1]['body'] ?? [];
+    TestRunner::assertSame(0.0, (float) ($body2['price'][0]['price'] ?? -1.0),
+        'POST /items lleva price = 0 cuando el método tiene cost = 0');
+
+    // (C) Method with cost = '' (variable, unset) → POST price = 0 too.
+    $m_var = new \WC_Shipping_Method();
+    $m_var->id = 'flat_rate';
+    $m_var->instance_id = 503;
+    $m_var->instance_title = 'Resto de Colombia';
+    $m_var->cost = '';
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m_var]],
+    ];
+
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 503];
+    $resp3 = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+    $_POST = [];
+    TestRunner::assertTrue($resp3->success,
+        'creación con cost = "" devuelve success');
+
+    $calls = array_values(array_filter(
+        alegra_mock_requests('POST', '/items'),
+        static fn ($r) => true
+    ));
+    $body3 = $calls[2]['body'] ?? [];
+    TestRunner::assertSame(0.0, (float) ($body3['price'][0]['price'] ?? -1.0),
+        'POST /items lleva price = 0 cuando el método tiene cost vacío (variable)');
 });
 
 exit(TestRunner::summary());

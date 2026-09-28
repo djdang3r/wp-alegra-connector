@@ -87,6 +87,11 @@ class Admin_Dashboard
         // Lane B (Phase 1): manual shipping-map UI in the Envíos tab.
         add_action('wp_ajax_alegra_create_shipping_item', [$this, 'ajax_create_shipping_item']);
         add_action('wp_ajax_alegra_list_alegra_items', [$this, 'ajax_list_alegra_items']);
+        // 2.8.2: drift detection + per-row sync (rename / unmap). Both are
+        // explicit writes (merchant clicked a button) and go through
+        // Write_Gate::run_explicit(), never the automatic path.
+        add_action('wp_ajax_alegra_update_shipping_item_name', [$this, 'ajax_update_shipping_item_name']);
+        add_action('wp_ajax_alegra_remove_shipping_mapping', [$this, 'ajax_remove_shipping_mapping']);
     }
 
     /**
@@ -954,6 +959,24 @@ class Admin_Dashboard
             'shippingItemCreated'     => __('Ítem de envío creado en Alegra.', 'alegra-connector'),
             'shippingItemLinked'      => __('Ítem de envío ya existía en Alegra; se vinculó.', 'alegra-connector'),
             'shippingItemsRefreshed'  => __('Lista actualizada (%s ítems).', 'alegra-connector'),
+            // 2.8.2: drift detection + per-row sync actions.
+            'updatingShippingItem'        => __('Actualizando nombre...', 'alegra-connector'),
+            'shippingItemUpdated'         => __('Nombre del ítem actualizado en Alegra.', 'alegra-connector'),
+            'confirmRemoveShippingMapping' => __('¿Eliminar el mapeo de este método? El ítem de Alegra queda intacto, solo se borra la asociación.', 'alegra-connector'),
+            'shippingMappingRemoved'    => __('Mapeo eliminado.', 'alegra-connector'),
+            'removingShippingMapping'  => __('Eliminando...', 'alegra-connector'),
+            'driftBadgeOk'             => __('OK', 'alegra-connector'),
+            'driftBadgeMismatch'       => __('Nombre distinto', 'alegra-connector'),
+            'driftBadgeUnmapped'       => __('Sin mapear', 'alegra-connector'),
+            'driftBadgeOrphan'         => __('Método eliminado', 'alegra-connector'),
+            'driftBadgeUnverified'     => __('Sin verificar', 'alegra-connector'),
+            'driftUpdateName'          => __('Actualizar nombre en Alegra', 'alegra-connector'),
+            'driftRemoveMapping'       => __('Quitar mapeo', 'alegra-connector'),
+            'driftUpdateAll'           => __('Actualizar todo', 'alegra-connector'),
+            'driftPendingTitle'        => __('%s método(s) con cambios pendientes', 'alegra-connector'),
+            'driftItemName'            => __('Nombre en Alegra:', 'alegra-connector'),
+            'driftExpectedName'        => __('Nombre en WC:', 'alegra-connector'),
+            'driftUnverifiedHint'      => __('No se pudo consultar Alegra para este ítem.', 'alegra-connector'),
         ];
     }
 
@@ -1172,6 +1195,12 @@ class Admin_Dashboard
         }
         $ac_internal_item_ids = self::get_internal_item_ids_safe();
         $ac_alegra_items = $connected ? $this->get_alegra_items_for_shipping_select() : [];
+
+        // 2.8.2: drift detection. Computed for every render that has the
+        // connection ready — `build_shipping_drift_report()` is a no-op for
+        // the per-row API call when $this->api is null, so a disconnected
+        // merchant sees "Sin verificar" instead of crashing.
+        $ac_drift_report = $this->build_shipping_drift_report($ac_shipping_methods, $ac_shipping_map);
 
         // 2.8.1 (Envíos tab transparency): resolve which price list will be
         // used to create the shipping item, the SAME way the create handler
@@ -2989,6 +3018,17 @@ class Admin_Dashboard
         $key = self::shipping_key($method_id, $instance_id);
         $reference = 'alegra-connector-shipping:' . $method_id . ':' . $instance_id;
 
+        // 2.8.2: seed the catalog-cosmetic price with the WC method's fixed
+        // cost when it is > 0. Variable / free methods fall back to 0 — the
+        // invoice line always overrides with the order's real shipping amount,
+        // so this is purely a "looks right in Alegra's catalog" choice. The
+        // resolution mirrors shipping_row_from_method() so the merchant sees
+        // the same value the create handler will POST.
+        $method_cost = self::resolve_wc_shipping_method_cost($method_id, $instance_id);
+        $seed_price = ($method_cost !== null && $method_cost > 0.0)
+            ? (float) $method_cost
+            : 0.0;
+
         $this->api->reload_credentials();
 
         // 1. Look for an existing item with the canonical reference. Linking
@@ -3047,14 +3087,14 @@ class Admin_Dashboard
             }
 
             $price_list_id = $resolved['id'];
-            $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($title, $reference, $type, $price_list_id) {
+            $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($title, $reference, $type, $price_list_id, $seed_price) {
                 return $this->api->create_item([
                     'name'      => $title,
                     'reference' => $reference,
                     'type'      => $type,
                     'price'     => [[
                         'idPriceList' => $price_list_id,
-                        'price'        => 0,
+                        'price'        => $seed_price,
                     ]],
                 ]);
             });
@@ -3142,6 +3182,382 @@ class Admin_Dashboard
             }
         }
         return $title;
+    }
+
+    /**
+     * Resolve a WC method's fixed cost by id+instance (2.8.2).
+     *
+     * Mirrors the cost extraction in `shipping_row_from_method()` — the
+     * create handler uses this so the catalog-cosmetic price it POSTs
+     * matches the value the Envíos tab shows in its "Costo" column.
+     *
+     * @return float|null Null when the method is variable / unknown / has
+     *                    no fixed cost (the UI renders "—" for null).
+     */
+    public static function resolve_wc_shipping_method_cost(string $method_id, int $instance_id): ?float
+    {
+        if (!class_exists('WC_Shipping_Zones')) {
+            return null;
+        }
+        foreach (\WC_Shipping_Zones::get_zones() as $zone) {
+            foreach (($zone['shipping_methods'] ?? []) as $method) {
+                if ($method instanceof \WC_Shipping_Method
+                    && $method->id === $method_id
+                    && (int) $method->get_instance_id() === $instance_id) {
+                    if (isset($method->cost) && $method->cost !== '') {
+                        return (float) $method->cost;
+                    }
+                    return null;
+                }
+            }
+        }
+        $zone_0 = \WC_Shipping_Zones::get_zone(0);
+        if ($zone_0 instanceof \WC_Shipping_Zone) {
+            foreach ($zone_0->get_shipping_methods() as $method) {
+                if ($method instanceof \WC_Shipping_Method
+                    && $method->id === $method_id
+                    && (int) $method->get_instance_id() === $instance_id) {
+                    if (isset($method->cost) && $method->cost !== '') {
+                        return (float) $method->cost;
+                    }
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Cache key for the per-item current-name map used by the drift report.
+     * Same TTL discipline as the Alegra-items dropdown cache.
+     */
+    private const SHIPPING_ITEM_NAME_CACHE_KEY = 'alegra_connector_shipping_item_name_cache';
+    private const SHIPPING_ITEM_NAME_CACHE_TTL = 300; // 5 min
+
+    /**
+     * Build the drift report for the Envíos tab (2.8.2).
+     *
+     * For every detected WC shipping method, compare the merchant's current
+     * WC title with the canonical Alegra item name. Classify each row as one
+     * of: `ok`, `name_mismatch`, `unmapped`, `orphan`, `unverified`.
+     *
+     * Fetching is per unique mapped id (NOT every method) and goes through a
+     * 5-minute transient cache so opening the tab twice in a row is cheap.
+     * A fetch failure marks the row `unverified` — better silence than a
+     * false alarm that panics the merchant into an unnecessary write.
+     *
+     * @param array<int,array{zone_name:string,method_title:string,method_id:string,instance_id:int,cost:?float}> $methods
+     * @param array<string,string> $map method:instance => alegra_item_id
+     * @return array{
+     *     rows: array<int, array<string,mixed>>,
+     *     counts: array<string,int>,
+     *     summary: array{pending_changes:int, pending_label:string}
+     * }
+     */
+    public function build_shipping_drift_report(array $methods, array $map): array
+    {
+        $by_key = [];
+        foreach ($methods as $m) {
+            $by_key[self::shipping_key((string) ($m['method_id'] ?? ''), (int) ($m['instance_id'] ?? 0))] = $m;
+        }
+
+        // Per-id name cache. Reused between rows so an Alegra round-trip
+        // covers every method that maps to the same item.
+        $cache_key = self::SHIPPING_ITEM_NAME_CACHE_KEY;
+        $cached = get_transient($cache_key);
+        if (!is_array($cached)) {
+            $cached = [];
+        }
+        $item_info = $cached; // alegra_item_id => ['name' => string] OR ['error' => string]
+
+        if ($this->api) {
+            $to_fetch = [];
+            foreach ($map as $item_id) {
+                $iid = (string) $item_id;
+                if ($iid === '' || isset($item_info[$iid])) {
+                    continue;
+                }
+                $to_fetch[$iid] = true;
+            }
+            $fetched_any = false;
+            foreach (array_keys($to_fetch) as $item_id) {
+                $resp = $this->api->get_item($item_id);
+                if (is_wp_error($resp)) {
+                    $item_info[$item_id] = ['error' => $resp->get_error_message()];
+                    continue;
+                }
+                if (!is_array($resp)) {
+                    $item_info[$item_id] = ['error' => 'unexpected_response'];
+                    continue;
+                }
+                $item_info[$item_id] = ['name' => (string) ($resp['name'] ?? '')];
+                $fetched_any = true;
+            }
+            if ($fetched_any) {
+                set_transient($cache_key, $item_info, self::SHIPPING_ITEM_NAME_CACHE_TTL);
+            }
+        }
+
+        $rows = [];
+        $counts = ['ok' => 0, 'name_mismatch' => 0, 'unmapped' => 0, 'orphan' => 0, 'unverified' => 0];
+
+        foreach ($methods as $m) {
+            $method_id = (string) ($m['method_id'] ?? '');
+            $instance_id = (int) ($m['instance_id'] ?? 0);
+            $key = self::shipping_key($method_id, $instance_id);
+            $mapped_id = isset($map[$key]) ? (string) $map[$key] : '';
+            $wc_title = (string) ($m['method_title'] ?? '');
+
+            if ($mapped_id === '') {
+                $rows[] = [
+                    'key' => $key,
+                    'status' => 'unmapped',
+                    'method_id' => $method_id,
+                    'instance_id' => $instance_id,
+                    'method_title' => $wc_title,
+                    'zone_name' => (string) ($m['zone_name'] ?? ''),
+                    'cost' => $m['cost'] ?? null,
+                    'mapped_item_id' => '',
+                    'mapped_item_name' => null,
+                    'mapped_item_error' => null,
+                ];
+                $counts['unmapped']++;
+                continue;
+            }
+
+            $info = $item_info[$mapped_id] ?? null;
+            if (!is_array($info) || isset($info['error'])) {
+                $rows[] = [
+                    'key' => $key,
+                    'status' => 'unverified',
+                    'method_id' => $method_id,
+                    'instance_id' => $instance_id,
+                    'method_title' => $wc_title,
+                    'zone_name' => (string) ($m['zone_name'] ?? ''),
+                    'cost' => $m['cost'] ?? null,
+                    'mapped_item_id' => $mapped_id,
+                    'mapped_item_name' => null,
+                    'mapped_item_error' => is_array($info) && isset($info['error']) ? (string) $info['error'] : null,
+                ];
+                $counts['unverified']++;
+                continue;
+            }
+
+            $alegra_name = (string) ($info['name'] ?? '');
+            // Case-insensitive compare on trimmed values is the heuristic the
+            // spec calls out; the merchant sees both spellings in the badge
+            // so a deliberate rename is still obvious.
+            $is_match = strcasecmp(trim($wc_title), trim($alegra_name)) === 0;
+            $status = $is_match ? 'ok' : 'name_mismatch';
+            $counts[$status]++;
+
+            $rows[] = [
+                'key' => $key,
+                'status' => $status,
+                'method_id' => $method_id,
+                'instance_id' => $instance_id,
+                'method_title' => $wc_title,
+                'zone_name' => (string) ($m['zone_name'] ?? ''),
+                'cost' => $m['cost'] ?? null,
+                'mapped_item_id' => $mapped_id,
+                'mapped_item_name' => $alegra_name,
+                'mapped_item_error' => null,
+            ];
+        }
+
+        // Orphans: a map key that does NOT match any detected WC method
+        // (the merchant deleted/renamed the method id on the WC side). These
+        // render below the detected table.
+        foreach ($map as $key => $item_id) {
+            if (isset($by_key[(string) $key])) {
+                continue;
+            }
+            $rows[] = [
+                'key' => (string) $key,
+                'status' => 'orphan',
+                'method_id' => '',
+                'instance_id' => 0,
+                'method_title' => '',
+                'zone_name' => '',
+                'cost' => null,
+                'mapped_item_id' => (string) $item_id,
+                'mapped_item_name' => null,
+                'mapped_item_error' => null,
+            ];
+            $counts['orphan']++;
+        }
+
+        $pending = $counts['name_mismatch'] + $counts['orphan'];
+        $summary = [
+            'pending_changes' => $pending,
+            'pending_label' => sprintf(
+                _n('%s método con cambios pendientes', '%s métodos con cambios pendientes', $pending, 'alegra-connector'),
+                number_format_i18n($pending)
+            ),
+        ];
+
+        return [
+            'rows' => $rows,
+            'counts' => $counts,
+            'summary' => $summary,
+        ];
+    }
+
+    /**
+     * Invalidate the per-item name cache (used after a successful rename).
+     */
+    public static function clear_shipping_item_name_cache(): void
+    {
+        delete_transient(self::SHIPPING_ITEM_NAME_CACHE_KEY);
+    }
+
+    /**
+     * AJAX: rename a mapped Alegra shipping item to match the WC method title.
+     *
+     * - action:  alegra_update_shipping_item_name
+     * - nonce:   alegra_connector_nonce
+     * - cap:     manage_woocommerce
+     * - body:    method_id, instance_id
+     * - resp:    {success, message}
+     *
+     * Runs under Write_Gate::run_explicit() (merchant clicked a button). The
+     * per-item name cache is invalidated so the next page render re-fetches
+     * the new name and the row flips from `name_mismatch` → `ok`.
+     */
+    public function ajax_update_shipping_item_name(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        if (!get_option('alegra_connector_connection_tested')) {
+            wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
+        }
+        if (!$this->api) {
+            wp_send_json_error(['message' => __('API no inicializada.', 'alegra-connector')]);
+        }
+
+        $method_id = sanitize_text_field((string) ($_POST['method_id'] ?? ''));
+        $instance_id = (int) ($_POST['instance_id'] ?? 0);
+        if ($method_id === '' || $instance_id <= 0) {
+            wp_send_json_error(['message' => __('Faltan datos del método de envío.', 'alegra-connector')]);
+        }
+
+        $map = (array) get_option('alegra_connector_shipping_map', []);
+        $key = self::shipping_key($method_id, $instance_id);
+        if (!isset($map[$key]) || $map[$key] === '') {
+            wp_send_json_error(['message' => __('Ese método no tiene un ítem de Alegra mapeado.', 'alegra-connector')]);
+        }
+        $item_id = (string) $map[$key];
+
+        $title = self::resolve_wc_shipping_method_title($method_id, $instance_id);
+        if ($title === '') {
+            wp_send_json_error(['message' => __('No se pudo resolver el nombre del método en WooCommerce.', 'alegra-connector')]);
+        }
+
+        $this->api->reload_credentials();
+        $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($item_id, $title) {
+            return $this->api->update_item($item_id, ['name' => $title]);
+        });
+
+        if (is_wp_error($result)) {
+            wp_send_json_error([
+                'message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message()),
+            ]);
+        }
+        if (\Alegra\Connector\API\Client::is_dry_run_response($result)) {
+            wp_send_json_error([
+                'message' => __('Modo de prueba activo: el nombre NO se actualizó en Alegra. Desactívalo antes de sincronizar.', 'alegra-connector'),
+                'blocked' => true,
+            ]);
+        }
+        if (\Alegra\Connector\API\Client::is_gate_blocked_response($result)) {
+            wp_send_json_error([
+                'message' => self::blocked_message($result),
+                'blocked' => true,
+                'reason'  => (string) ($result['reason'] ?? 'unknown'),
+            ]);
+        }
+        if (!is_array($result)) {
+            wp_send_json_error(['message' => __('Alegra no devolvió una respuesta válida.', 'alegra-connector')]);
+        }
+
+        // Drop the cached name so a reload shows the row as `ok` instead of
+        // a stale `name_mismatch`. The dropdown cache is unrelated — leave it.
+        self::clear_shipping_item_name_cache();
+
+        $this->log('info', 'Shipping item renamed to match WC method', [
+            'key' => $key,
+            'alegra_item_id' => $item_id,
+            'new_name' => $title,
+        ]);
+
+        wp_send_json_success([
+            'message' => __('Nombre del ítem actualizado en Alegra.', 'alegra-connector'),
+            'key' => $key,
+            'alegra_item_id' => $item_id,
+        ]);
+    }
+
+    /**
+     * AJAX: drop the map entry for a WC method.
+     *
+     * - action:  alegra_remove_shipping_mapping
+     * - nonce:   alegra_connector_nonce
+     * - cap:     manage_woocommerce
+     * - body:    method_id, instance_id (or `key` as a direct fallback)
+     * - resp:    {success}
+     *
+     * Local-only: no Alegra call, no write-gate. The item is left untouched
+     * (deleting the map entry only clears the WC→Alegra pointer).
+     */
+    public function ajax_remove_shipping_mapping(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $method_id = sanitize_text_field((string) ($_POST['method_id'] ?? ''));
+        $instance_id = (int) ($_POST['instance_id'] ?? 0);
+        $explicit_key = sanitize_text_field((string) ($_POST['key'] ?? ''));
+
+        if ($explicit_key === '') {
+            if ($method_id === '' || $instance_id <= 0) {
+                wp_send_json_error(['message' => __('Faltan datos del método de envío.', 'alegra-connector')]);
+            }
+            $key = self::shipping_key($method_id, $instance_id);
+        } else {
+            // Accept the raw `method:instance` key only if it matches the
+            // documented shape — never trust user-supplied keys blindly.
+            if (!preg_match('/^[A-Za-z0-9_]+:[A-Za-z0-9_]+$/', $explicit_key)) {
+                wp_send_json_error(['message' => __('Clave de mapeo inválida.', 'alegra-connector')]);
+            }
+            $key = $explicit_key;
+        }
+
+        $map = (array) get_option('alegra_connector_shipping_map', []);
+        if (!isset($map[$key])) {
+            // Already gone — report success so the JS can clear the row
+            // without surfacing a misleading error to the merchant.
+            wp_send_json_success(['message' => __('Mapeo eliminado.', 'alegra-connector'), 'key' => $key]);
+        }
+
+        unset($map[$key]);
+        update_option('alegra_connector_shipping_map', $map, false);
+        // Drop the cached name too: the row now becomes `unmapped` and the
+        // next reload will rebuild the report from a clean cache.
+        self::clear_shipping_item_name_cache();
+
+        $this->log('info', 'Shipping mapping removed', [
+            'key' => $key,
+        ]);
+
+        wp_send_json_success([
+            'message' => __('Mapeo eliminado.', 'alegra-connector'),
+            'key' => $key,
+        ]);
     }
 
     /**

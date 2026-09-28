@@ -1063,6 +1063,117 @@
                 }
             });
         });
+
+        // 2.8.2 — drift actions (rename + unmap). Sequential "Actualizar
+        // todo" walks the drifted rows in the order they appear in the
+        // table; we abort on the first hard failure so the merchant is not
+        // left guessing which row failed.
+        function postShipping(action, payload, $btn, busyText) {
+            if ($btn && $btn.prop('disabled')) { return $.Deferred().reject().promise(); }
+            if ($btn) { $btn.prop('disabled', true); }
+            var $row = $btn ? $btn.closest('tr') : null;
+            var $result = $row ? $row.find('.ac-shipping-item-result') : null;
+            if ($result && busyText) { setResult($result, busyText, 'warning'); }
+            return $.ajax({
+                url: alegraConnector.ajaxUrl,
+                type: 'POST',
+                data: Object.assign({
+                    action: action,
+                    _ajax_nonce: alegraConnector.nonce
+                }, payload || {}),
+                success: function(r) {
+                    if ($btn) { $btn.prop('disabled', false); }
+                    if (r && r.success) {
+                        if ($result) { setResult($result, (r.data && r.data.message) || S.ok, 'success'); }
+                        return r;
+                    }
+                    if ($result) { setResult($result, (r && r.data && r.data.message) || S.error, 'error'); }
+                    return $.Deferred().reject(r).promise();
+                },
+                error: function() {
+                    if ($btn) { $btn.prop('disabled', false); }
+                    if ($result) { setResult($result, S.connectionError || 'Error de red.', 'error'); }
+                    return $.Deferred().reject().promise();
+                }
+            });
+        }
+
+        // Rename a drifted Alegra item to match the WC method title.
+        $(document).on('click', '.ac-update-shipping-item-name', function() {
+            var $btn = $(this);
+            var methodId = $btn.data('method-id');
+            var instanceId = $btn.data('instance-id');
+            var p = postShipping(
+                'alegra_update_shipping_item_name',
+                { method_id: methodId, instance_id: instanceId },
+                $btn,
+                S.updatingShippingItem || 'Actualizando nombre...'
+            );
+            p.done(function(r) {
+                if (r && r.success) {
+                    // Reload so the badge flips to "ok" (we cleared the cache
+                    // server-side and the new name needs to come back).
+                    setTimeout(function() { location.reload(); }, 600);
+                }
+            });
+        });
+
+        // Drop a map entry (orphan or voluntary reset). The item stays in
+        // Alegra; only the WC→Alegra pointer goes away.
+        $(document).on('click', '.ac-remove-shipping-mapping', function() {
+            var $btn = $(this);
+            if (!confirm(S.confirmRemoveShippingMapping || '¿Eliminar el mapeo de este método? El ítem de Alegra queda intacto.')) {
+                return;
+            }
+            var payload = {
+                method_id: $btn.data('method-id') || '',
+                instance_id: $btn.data('instance-id') || 0
+            };
+            // Orphans carry an explicit key (no method/instance anymore).
+            var explicitKey = $btn.data('key');
+            if (explicitKey) { payload.key = explicitKey; }
+            var p = postShipping(
+                'alegra_remove_shipping_mapping',
+                payload,
+                $btn,
+                S.removingShippingMapping || 'Eliminando...'
+            );
+            p.done(function() {
+                setTimeout(function() { location.reload(); }, 500);
+            });
+        });
+
+        // "Actualizar todo" — sequential per-row rename. Only rows that
+        // carry the `.ac-update-shipping-item-name` button (i.e. drifted)
+        // are touched; orphans / unmapped / unverified are not (their
+        // action button is a different class).
+        $('#ac-shipping-drift-update-all').on('click', function() {
+            var $btn = $(this);
+            if ($btn.prop('disabled')) { return; }
+            var $rows = $('.ac-update-shipping-item-name');
+            if (!$rows.length) { return; }
+            if (!window.confirm(
+                (S.driftUpdateAll || 'Actualizar todo') + ' — ' +
+                ($rows.length + ' método(s)')
+            )) { return; }
+            $btn.prop('disabled', true);
+            var chain = $.Deferred().resolve();
+            $rows.each(function() {
+                chain = chain.then(function() {
+                    var $b = $(this);
+                    return postShipping(
+                        'alegra_update_shipping_item_name',
+                        { method_id: $b.data('method-id'), instance_id: $b.data('instance-id') },
+                        null,
+                        null
+                    );
+                }.bind(this));
+            });
+            chain.always(function() {
+                $btn.prop('disabled', false);
+                location.reload();
+            });
+        });
     };
 
     $(document).ready(function() {
