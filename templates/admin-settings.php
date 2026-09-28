@@ -16,6 +16,7 @@
 <button type="button" class="ac-settings-tab" data-tab="sync"><?php esc_html_e('Sincronización','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="currency"><?php esc_html_e('Moneda','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="warehouse"><?php esc_html_e('Bodegas','alegra-connector');?></button>
+<button type="button" class="ac-settings-tab" data-tab="shipping"><?php esc_html_e('Envíos','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="billing"><?php esc_html_e('Datos de facturación','alegra-connector');?></button>
 <button type="button" class="ac-settings-tab" data-tab="advanced"><?php esc_html_e('Avanzado','alegra-connector');?></button>
 </div>
@@ -219,6 +220,116 @@ if ($ac_wh_enabled && $ac_wh_id !== '' && $ac_wh_id !== '0'):
 </td></tr>
 <?php endif;?>
 </table>
+</div>
+
+<!-- ==================== ENVIOS ==================== -->
+<div class="ac-tab-content" id="tab-shipping" style="display:none;">
+<h2><?php esc_html_e('Configuración de Envíos','alegra-connector');?></h2>
+<div class="ac-notice info" style="margin-bottom:16px;">
+<?php esc_html_e('Mapea cada método de envío de WooCommerce a un ítem (producto o servicio) en Alegra. El plugin NO crea ítems automáticamente: usá "Crear ítem de envío" para crear uno nuevo en Alegra, o elegí uno existente del listado. Los ítems del propio plugin (referencia "alegra-connector-…") están excluidos de la lista y nunca pueden mapearse aquí.','alegra-connector');?>
+</div>
+
+<div class="ac-card" style="margin-bottom:16px;border-left:4px solid var(--ac-primary);">
+<div class="ac-card-header"><h2><?php esc_html_e('Métodos de envío detectados','alegra-connector');?></h2></div>
+<?php if(empty($ac_shipping_methods)):?>
+<div class="ac-notice warning" style="margin:0;">
+<?php esc_html_e('No se detectaron métodos de envío en WooCommerce. Configurá al menos uno en WooCommerce > Ajustes > Envíos.','alegra-connector');?>
+</div>
+<?php else:?>
+<table class="form-table ac-shipping-table">
+<thead><tr>
+<th><?php esc_html_e('Zona','alegra-connector');?></th>
+<th><?php esc_html_e('Método','alegra-connector');?></th>
+<th><?php esc_html_e('Costo','alegra-connector');?></th>
+<th><?php esc_html_e('Ítem en Alegra','alegra-connector');?></th>
+<th><?php esc_html_e('Acción','alegra-connector');?></th>
+</tr></thead>
+<tbody>
+<?php
+$ac_shipping_type = (string) get_option('alegra_connector_shipping_item_type','service');
+foreach($ac_shipping_methods as $ac_sm):
+$ac_key = $ac_sm['method_id'].':'.$ac_sm['instance_id'];
+$ac_mapped = isset($ac_shipping_map[$ac_key]) ? (string)$ac_shipping_map[$ac_key] : '';
+$ac_cost = $ac_sm['cost'];
+?>
+<tr>
+<td><?php echo esc_html($ac_sm['zone_name']);?></td>
+<td>
+<strong><?php echo esc_html($ac_sm['method_title']);?></strong>
+<div style="font-size:11px;color:var(--ac-text-muted);"><?php echo esc_html($ac_key);?></div>
+</td>
+<td>
+<?php if($ac_cost === null):?>
+<span style="color:var(--ac-text-muted);">—</span>
+<?php elseif($ac_cost > 0):?>
+<?php echo esc_html(number_format_i18n($ac_cost, 2));?>
+<?php else:?>
+<span style="color:var(--ac-success);"><?php esc_html_e('Gratis','alegra-connector');?></span>
+<?php endif;?>
+</td>
+<td>
+<select class="ac-shipping-map" data-key="<?php echo esc_attr($ac_key);?>" name="alegra_connector_shipping_map[<?php echo esc_attr($ac_key);?>]">
+<option value=""><?php esc_html_e('-- Sin mapear --','alegra-connector');?></option>
+<?php foreach($ac_alegra_items as $ac_alegra_id => $ac_alegra_name):?>
+<option value="<?php echo esc_attr($ac_alegra_id);?>" <?php selected($ac_mapped,(string)$ac_alegra_id);?>><?php echo esc_html(wp_html_excerpt((string)$ac_alegra_name, 80));?> (<?php echo esc_html($ac_alegra_id);?>)</option>
+<?php endforeach;?>
+<?php if($ac_mapped !== '' && !isset($ac_alegra_items[$ac_mapped])):?>
+<option value="<?php echo esc_attr($ac_mapped);?>" selected><?php echo esc_html($ac_mapped);?> (<?php esc_html_e('guardado','alegra-connector');?>)</option>
+<?php endif;?>
+</select>
+<?php if(empty($ac_alegra_items)):?>
+<p class="description"><?php esc_html_e('Conecta con Alegra para ver tus ítems disponibles, o usá el botón "Crear ítem de envío".','alegra-connector');?></p>
+<?php endif;?>
+</td>
+<td>
+<button type="button" class="ac-btn ac-btn-sm ac-create-shipping-item" data-method-id="<?php echo esc_attr($ac_sm['method_id']);?>" data-instance-id="<?php echo esc_attr((string)$ac_sm['instance_id']);?>" data-type="<?php echo esc_attr($ac_shipping_type);?>" <?php disabled(!$connected);?>>
+<span class="dashicons dashicons-plus" style="font-size:14px;width:14px;height:14px;line-height:1.3;"></span>
+<?php esc_html_e('Crear ítem de envío','alegra-connector');?>
+</button>
+<span class="ac-shipping-item-result" style="display:block;margin-top:4px;font-size:11px;"></span>
+</td>
+</tr>
+<?php endforeach;?>
+</tbody>
+</table>
+<div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+<button type="button" class="ac-btn ac-btn-sm" id="ac-refresh-alegra-items"><?php esc_html_e('Actualizar lista de ítems desde Alegra','alegra-connector');?></button>
+<span style="font-size:11px;color:var(--ac-text-muted);"><?php esc_html_e('Lista cacheada por 5 minutos. Forzá una recarga si recién creaste un ítem desde otro lado.','alegra-connector');?></span>
+</div>
+<?php endif;?>
+</div>
+
+<div class="ac-card" style="margin-bottom:16px;">
+<div class="ac-card-header"><h2><?php esc_html_e('Tipo de ítem al crear','alegra-connector');?></h2></div>
+<table class="form-table">
+<tr><th><?php esc_html_e('Tipo al crear:','alegra-connector');?></th>
+<td>
+<strong><?php esc_html_e('Servicio','alegra-connector');?></strong>
+<input type="hidden" name="alegra_connector_shipping_item_type" value="service" />
+<p class="description"><?php esc_html_e('Los ítems de envío se crean siempre como Servicio en Alegra (no afectan inventario). El valor anterior se ignora y se fuerza "service" del lado servidor.','alegra-connector');?></p>
+</td></tr>
+</table>
+</div>
+
+<div class="ac-card" style="margin-bottom:16px;border-left:4px solid var(--ac-amber);">
+<div class="ac-card-header"><h2><?php esc_html_e('Lista de exclusión (ítems internos)','alegra-connector');?></h2></div>
+<div class="ac-notice info" style="margin-bottom:12px;">
+<?php esc_html_e('Pegá acá los IDs de Alegra de los ítems que el plugin NUNCA debe importar, actualizar ni enviar como línea de factura. Los ítems con referencia que empiece por "alegra-connector-" ya están excluidos automáticamente. Esta lista es la vía documentada para los ítems que no usan ese prefijo.','alegra-connector');?>
+</div>
+<?php
+$ac_internal_text = implode("\n", array_map('strval', $ac_internal_item_ids));
+?>
+<textarea name="alegra_connector_internal_item_ids" rows="4" class="large-text code" placeholder="uuid-1&#10;uuid-2&#10;123"><?php echo esc_textarea($ac_internal_text);?></textarea>
+<p class="description"><?php esc_html_e('Un id por línea. Acepta IDs numéricos o UUID (los UUID son los IDs actuales de Alegra). Se guardan al pulsar "Guardar Cambios" en este formulario.','alegra-connector');?></p>
+<?php if(!empty($ac_internal_item_ids)):?>
+<div style="margin-top:8px;font-size:11px;color:var(--ac-text-secondary);">
+<strong><?php echo esc_html(sprintf(_n('%s ítem excluido:','%s ítems excluidos:',count($ac_internal_item_ids),'alegra-connector'),number_format_i18n(count($ac_internal_item_ids))));?></strong>
+<?php foreach($ac_internal_item_ids as $ac_iid):?>
+<span class="ac-badge" style="margin:2px;font-family:monospace;font-size:11px;"><?php echo esc_html($ac_iid);?></span>
+<?php endforeach;?>
+</div>
+<?php endif;?>
+</div>
 </div>
 
 <!-- ==================== DATOS DE FACTURACION ==================== -->

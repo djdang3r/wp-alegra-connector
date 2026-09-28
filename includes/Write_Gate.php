@@ -233,6 +233,11 @@ class Write_Gate
         // must keep receiving every event, so seed all 12 when the option is
         // absent. Its own guard leaves the gate migration version at 1.
         self::maybe_migrate_webhook_events();
+
+        // Guard 3 (Phase 1 Lane B): seed the three shipping options on an
+        // existing install so the Envíos tab is usable on upgrade. Idempotent
+        // — never overwrites a value the merchant already set.
+        self::maybe_migrate_shipping_options();
     }
 
     /**
@@ -258,5 +263,27 @@ class Write_Gate
         }
 
         update_option('alegra_connector_webhook_events_migration_version', 1);
+    }
+
+    /**
+     * Phase 1 Lane B: seed the manual shipping map + the internal-item
+     * allow-list on an existing install. Empty defaults are the contract —
+     * the merchant MUST opt in to mapping and exclusion, so the seed must
+     * never pre-populate with anything else.
+     *
+     * Idempotent: `get_option() === false` only seeds a missing row, so a
+     * merchant who already set values keeps them untouched.
+     */
+    private static function maybe_migrate_shipping_options(): void
+    {
+        if (get_option('alegra_connector_shipping_map') === false) {
+            add_option('alegra_connector_shipping_map', [], '', 'no');
+        }
+        if (get_option('alegra_connector_shipping_item_type') === false) {
+            add_option('alegra_connector_shipping_item_type', 'service', '', 'no');
+        }
+        if (get_option('alegra_connector_internal_item_ids') === false) {
+            add_option('alegra_connector_internal_item_ids', [], '', 'no');
+        }
     }
 }

@@ -2,6 +2,64 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.0] - 2026-09-27
+
+> **Envío configurable por método, facturación automática corregida y exclusión de ítems internos.**
+> El titular es la **factura automática**: el push del producto al resolver un ítem del flujo
+> (hooks/cron) ahora corre bajo `Write_Gate::run_explicit`, así el gate (`push_products_enabled`)
+> ya no bloquea la facturación. Encima de eso, **cada método de envío de WooCommerce se mapea a un
+> ítem de Alegra** en una pestaña nueva, los ítems de envío se crean siempre como **servicio sin
+> inventario**, y la facturación se **bloquea** si un método con costo no está mapeado
+> (`invoice_shipping_unmapped`). Tras crear la factura, si los totales no coinciden, el pago NO se
+> registra y se alerta. Por último, los ítems internos (`reference` `alegra-connector-*` y los ids
+> en `alegra_connector_internal_item_ids`) se **excluyen** de import, update, push, contadores y
+> storefront.
+
+### Added
+
+- **Pestaña "Envíos" en Ajustes**: detecta los métodos de envío de WooCommerce y permite mapear cada
+  uno a un ítem de Alegra (existente o creado manualmente desde la misma pantalla). Los ítems
+  de envío se crean **siempre como servicio sin inventario** (no afectan stock). **Sin
+  auto-creación en runtime** — el mapeo es por configuración, no por pedido.
+- **`invoice_shipping_unmapped`**: si un método de envío con costo > 0 no está mapeado al emitir la
+  factura, la factura se **bloquea** con mensaje accionable (el admin ve cuál método falta y puede
+  mapearlo en la pestaña Envíos antes de reintentar).
+- **`alegra_connector_internal_item_ids`**: lista de ids de Alegra considerados internos (envío
+  genérico, recargo, etc.). Se complementan con el `reference` `alegra-connector-*` para excluir
+  ítems internos de: import, update, push, contadores del dashboard y del storefront.
+- **Pago por el total coincidente**: tras crear la factura, si `invoice_total !== order_total` el
+  pago NO se registra; el pedido queda marcado con la causa y se muestra una alerta en el dashboard
+  (nunca se paga un monto que supere el balance de la factura).
+
+### Fixed
+
+- **Facturación automática bloqueada por el gate**: el push del producto al resolver el ítem de la
+  factura corría bajo el guard automático (`push_products_enabled=false` abortaba). Ahora corre bajo
+  `Write_Gate::run_explicit`, así la facturación automática (hooks/cron) no depende del toggle de
+  push de productos.
+
+### Changed
+
+- Las líneas de envío genéricas (`invoice_shipping_unlinked`) y recargo (`invoice_fee_unlinked`)
+  dejan de ser best-effort: con un método **no** mapeado el flujo se bloquea en vez de saltarse la
+  línea (señal clara para el admin en vez de factura silenciosamente incompleta).
+- Los ítems internos ya no aparecen en: import (`Products::pull_alegra_to_wc`), update
+  (`Products::push_wc_to_alegra`), contadores del dashboard, ni en el front (storefront).
+
+### Tests
+
+- **T32.***: cobertura de `Write_Gate::run_explicit` aplicado al resolver ítems de factura
+  (push del producto no bloqueado por `push_products_enabled`).
+- **T34.***: cobertura del bloque `invoice_shipping_unmapped`, del pago por total coincidente, y
+  de la exclusión de ítems internos en import/update/push/contadores/storefront.
+- Suite: **2545 assertions / 0 fallas** (`EXEC-TEST OK`).
+
+### Notes
+
+- Sin cambio de esquema. Opciones nuevas (`alegra_connector_shipping_method_map` y
+  `alegra_connector_internal_item_ids`) con defaults seguros — quien no mapee nada verá la factura
+  bloquearse con mensaje claro en lugar de fallar silenciosa.
+
 ## [2.7.1] - 2026-09-27
 
 > **Facturación fiable: HTTP 400 sin ítems abortado antes, fatal de reconciliación corregido, y

@@ -1257,6 +1257,21 @@ class WC_Order_Item
     public function get_id(): int { return $this->product_id; }
 }
 
+/**
+ * WC_Order_Item_Shipping — Phase 1 Lane A (CHANGE 2): per-method shipping
+ * resolution needs `get_method_id()` and `get_instance_id()` so the
+ * build_shipping_lines() helper can build the `"<method_id>:<instance_id>"`
+ * lookup key. Mirrors the WooCommerce core signature.
+ */
+class WC_Order_Item_Shipping extends WC_Order_Item
+{
+    public string $method_id = '';
+    public string $instance_id = '';
+
+    public function get_method_id(): string { return (string) $this->method_id; }
+    public function get_instance_id(): string { return (string) $this->instance_id; }
+}
+
 class WC_Product
 {
     protected int $id;

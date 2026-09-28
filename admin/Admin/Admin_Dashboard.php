@@ -84,6 +84,9 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_skip_cron_next', [$this, 'ajax_skip_cron_next']);
         add_action('wp_ajax_alegra_unschedule_cron', [$this, 'ajax_unschedule_cron']);
         add_action('wp_ajax_alegra_change_cron_frequency', [$this, 'ajax_change_cron_frequency']);
+        // Lane B (Phase 1): manual shipping-map UI in the Envíos tab.
+        add_action('wp_ajax_alegra_create_shipping_item', [$this, 'ajax_create_shipping_item']);
+        add_action('wp_ajax_alegra_list_alegra_items', [$this, 'ajax_list_alegra_items']);
     }
 
     /**
@@ -604,6 +607,35 @@ class Admin_Dashboard
             'sanitize_callback' => fn($v) => self::sanitize_alegra_id($v, 'alegra_connector_consumidor_final_manual_id'),
         ]);
 
+        // Lane B (Phase 1): manual WC ↔ Alegra shipping map. The keys are
+        // "<method_id>:<instance_id>", values are Alegra item ids. Empty by
+        // contract; auto-creation is forbidden. Settings page renders one
+        // <select> per detected WC shipping method that posts back into this
+        // option, and the merchant can also pick an existing item via the
+        // Alegra items dropdown.
+        register_setting('alegra_connector_settings', 'alegra_connector_shipping_map', [
+            'sanitize_callback' => [self::class, 'sanitize_shipping_map'],
+            'default' => [],
+        ]);
+        // Default type to use when "Crear ítem de envío" creates a new Alegra
+        // item from the UI. Allowlisted so a bad value cannot pass through to
+        // POST /items (which would 400 on an unknown `type`).
+        register_setting('alegra_connector_settings', 'alegra_connector_shipping_item_type', [
+            'sanitize_callback' => function ($value) {
+                $value = sanitize_text_field((string) $value);
+                return in_array($value, ['service', 'product'], true) ? $value : 'service';
+            },
+            'default' => 'service',
+        ]);
+        // Explicit allow-list of Alegra item ids the plugin must NEVER
+        // import/update/push. Items with reference starting `alegra-connector-`
+        // are excluded automatically; this option covers the manual / legacy
+        // cases that don't use the prefix.
+        register_setting('alegra_connector_settings', 'alegra_connector_internal_item_ids', [
+            'sanitize_callback' => [self::class, 'sanitize_internal_item_ids'],
+            'default' => [],
+        ]);
+
         // Per-field billing toggles. Group A (identification) is force-enabled
         // here so the identification is always collected.
         register_setting('alegra_connector_settings', \Alegra\Connector\Billing_Fields::OPTION_ENABLED, [
@@ -914,6 +946,14 @@ class Admin_Dashboard
             'cfVerifyNotFound'      => __('No se encontró el Consumidor Final en Alegra. Podés crearlo.', 'alegra-connector'),
             'cfVerifyError'         => __('No se pudo verificar el Consumidor Final.', 'alegra-connector'),
             'cfCreateOk'            => __('Consumidor Final creado.', 'alegra-connector'),
+
+            // Lane B (Phase 1): Envíos tab. JS strings for the "Crear ítem"
+            // button and the cache-refresh action. Mirrors the rest of the
+            // file: every user-facing JS string lives here.
+            'creatingShippingItem'    => __('Creando ítem...', 'alegra-connector'),
+            'shippingItemCreated'     => __('Ítem de envío creado en Alegra.', 'alegra-connector'),
+            'shippingItemLinked'      => __('Ítem de envío ya existía en Alegra; se vinculó.', 'alegra-connector'),
+            'shippingItemsRefreshed'  => __('Lista actualizada (%s ítems).', 'alegra-connector'),
         ];
     }
 
@@ -1120,6 +1160,18 @@ class Admin_Dashboard
             $tm = $this->api->get_terms();
             if (!is_wp_error($tm)) $alegra_terms = $tm;
         }
+
+        // Lane B (Phase 1): Envíos tab inputs. Detection runs even when
+        // disconnected so the merchant can pre-stage a map; the Alegra items
+        // list is only fetched when connected (else the dropdown is empty
+        // and the UI prompts the merchant to connect).
+        $ac_shipping_methods = self::detect_wc_shipping_methods();
+        $ac_shipping_map = get_option('alegra_connector_shipping_map', []);
+        if (!is_array($ac_shipping_map)) {
+            $ac_shipping_map = [];
+        }
+        $ac_internal_item_ids = self::get_internal_item_ids_safe();
+        $ac_alegra_items = $connected ? $this->get_alegra_items_for_shipping_select() : [];
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-settings.php';
     }
@@ -2449,6 +2501,538 @@ class Admin_Dashboard
     }
 
     /**
+     * Sanitize the manual shipping map (Lane B).
+     *
+     * Each form field posts as `alegra_connector_shipping_map[<method_id>:<instance_id>]`
+     * with the Alegra item id (or empty string to clear). We keep only
+     * non-empty values, validate the key shape, and accept either legacy
+     * numeric ids or current UUIDs as values — `sanitize_alegra_id()` keeps
+     * the stored value when the input is malformed (REQ-CFG-3 invariant).
+     *
+     * @param mixed $value
+     * @return array<string,string> method:instance => alegra_item_id
+     */
+    public static function sanitize_shipping_map($value): array
+    {
+        if (!is_array($value)) {
+            return (array) get_option('alegra_connector_shipping_map', []);
+        }
+
+        $out = [];
+        foreach ($value as $key => $alegra_id) {
+            $key = (string) $key;
+            // `<method_id>:<instance_id>` — accept letters/digits/colon/underscore
+            // only so an attacker cannot smuggle extra segments into the map.
+            if ($key === '' || !preg_match('/^[A-Za-z0-9_]+:[A-Za-z0-9_]+$/', $key)) {
+                continue;
+            }
+            $id = trim((string) $alegra_id);
+            if ($id === '') {
+                continue;
+            }
+            $is_uuid = (bool) preg_match(
+                '/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/',
+                $id
+            );
+            if ($is_uuid || ctype_digit($id)) {
+                $out[$key] = $id;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Sanitize the internal-item allow-list (Lane B).
+     *
+     * Accepts a comma/space separated list, an array of strings, or a single
+     * string. Empty entries are dropped; invalid ids (UUID or numeric) are
+     * dropped silently so the merchant can paste a block of mixed text and
+     * get the well-formed ids out.
+     *
+     * @param mixed $value
+     * @return string[]
+     */
+    public static function sanitize_internal_item_ids($value): array
+    {
+        $raw = [];
+        if (is_array($value)) {
+            $raw = $value;
+        } else {
+            $raw = preg_split('/[\s,;]+/', (string) $value, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        }
+
+        $is_uuid = static function (string $id): bool {
+            return (bool) preg_match(
+                '/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/',
+                $id
+            );
+        };
+
+        $out = [];
+        foreach ($raw as $candidate) {
+            $id = trim((string) $candidate);
+            if ($id === '' || $out[$id] ?? false) {
+                continue;
+            }
+            if ($is_uuid($id) || ctype_digit($id)) {
+                $out[$id] = $id;
+            }
+        }
+
+        return array_values($out);
+    }
+
+    // ---------------------------------------------------------------------
+    // Lane B (Phase 1): manual shipping-map UI
+    //
+    // The Envíos tab renders one row per WC shipping method and lets the
+    // merchant map it to an Alegra item (existing OR newly created from
+    // the UI). There is NO automatic creation at runtime — every write
+    // path goes through Write_Gate::run_explicit() so a merchant must
+    // click the button to spend an item creation.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Cache key for the Alegra items list used by the Envíos tab.
+     */
+    private const SHIPPING_ITEMS_CACHE_KEY = 'alegra_connector_shipping_items_cache';
+    private const SHIPPING_ITEMS_CACHE_TTL = 300; // 5 min — short enough to reflect recent edits
+
+    /**
+     * Detect every WC shipping method across all zones (plus zone 0 / "Rest
+     * of the world") so the Envíos tab can render a row per method.
+     *
+     * Returns a deterministic, zone-ordered list. Each row carries the keys
+     * the UI needs: `zone_name`, `method_title`, `method_id`, `instance_id`,
+     * and `cost` (0 for free methods — flat_rate exposes it; methods that
+     * don't extend WC_Shipping_Method::cost fall back to `null`).
+     *
+     * @return array<int, array{zone_name:string,method_title:string,method_id:string,instance_id:int,cost:?float}>
+     */
+    public static function detect_wc_shipping_methods(): array
+    {
+        if (!class_exists('WC_Shipping_Zones')) {
+            return [];
+        }
+
+        $rows = [];
+        $seen = [];
+
+        // Zones 1..N (anything that is NOT "Rest of the world"). Each zone
+        // exposes its methods; we do not dedupe across zones — a method
+        // configured in two zones is two distinct methods from the merchant's
+        // POV (they can carry different costs/titles per region).
+        $zones = \WC_Shipping_Zones::get_zones();
+        if (is_array($zones)) {
+            foreach ($zones as $zone) {
+                $zone_name = (string) ($zone['zone_name'] ?? __('(sin nombre)', 'alegra-connector'));
+                $methods = $zone['shipping_methods'] ?? [];
+                if (!is_array($methods)) {
+                    continue;
+                }
+                foreach ($methods as $method) {
+                    if (!$method instanceof \WC_Shipping_Method) {
+                        continue;
+                    }
+                    $key = $method->id . ':' . $method->get_instance_id();
+                    if (isset($seen[$key])) {
+                        continue;
+                    }
+                    $seen[$key] = true;
+                    $rows[] = self::shipping_row_from_method($zone_name, $method);
+                }
+            }
+        }
+
+        // Zone 0 — "Rest of the world". A method that lives ONLY here must
+        // still appear in the table; without it, a fallback shipper would be
+        // unmapped.
+        $zone_0 = \WC_Shipping_Zones::get_zone(0);
+        if ($zone_0 instanceof \WC_Shipping_Zone) {
+            foreach ($zone_0->get_shipping_methods() as $method) {
+                if (!$method instanceof \WC_Shipping_Method) {
+                    continue;
+                }
+                $key = $method->id . ':' . $method->get_instance_id();
+                if (isset($seen[$key])) {
+                    continue;
+                }
+                $seen[$key] = true;
+                $rows[] = self::shipping_row_from_method(
+                    __('Resto del mundo', 'alegra-connector'),
+                    $method
+                );
+            }
+        }
+
+        // Deterministic order: by zone name then by method title. The admin
+        // table looks stable between renders.
+        usort($rows, static function (array $a, array $b): int {
+            $z = strcmp($a['zone_name'], $b['zone_name']);
+            return $z !== 0 ? $z : strcmp($a['method_title'], $b['method_title']);
+        });
+
+        return $rows;
+    }
+
+    /**
+     * Build a single shipping-method row for the Envíos table.
+     *
+     * @return array{zone_name:string,method_title:string,method_id:string,instance_id:int,cost:?float}
+     */
+    private static function shipping_row_from_method(string $zone_name, \WC_Shipping_Method $method): array
+    {
+        $cost = null;
+        // flat_rate exposes `$method->cost`. Other plugins sometimes leave it
+        // null; reading the per-instance WC option directly works but is
+        // plugin-specific, so we surface null and let the UI render "—"
+        // rather than guess.
+        if (isset($method->cost) && $method->cost !== '') {
+            $cost = (float) $method->cost;
+        }
+
+        return [
+            'zone_name'    => $zone_name,
+            'method_title' => (string) $method->get_method_title(),
+            'method_id'    => (string) $method->id,
+            'instance_id'  => (int) $method->get_instance_id(),
+            'cost'         => $cost,
+        ];
+    }
+
+    /**
+     * Build the shipping-map key for a WC shipping method.
+     */
+    public static function shipping_key(string $method_id, int $instance_id): string
+    {
+        return $method_id . ':' . $instance_id;
+    }
+
+    /**
+     * Return the (cached) Alegra items list for the shipping dropdowns.
+     *
+     * Filters out items the plugin owns (reference starting with the
+     * reserved prefix) AND items the merchant added to the explicit
+     * internal allow-list, so the merchant can never accidentally map a
+     * WC shipping method to one of its own helper items.
+     *
+     * Returns an array of `[id => name]` suitable for `<option>` rendering.
+     * The cache TTL is short (5 min) so a freshly created item becomes
+     * selectable within a page refresh.
+     *
+     * @param bool $force_refresh Bypass the cache (used by the AJAX refresh button).
+     * @return array<string,string> alegra item id => display name (UTF-8, escaped on output)
+     */
+    public function get_alegra_items_for_shipping_select(bool $force_refresh = false): array
+    {
+        if (!$this->api) {
+            return [];
+        }
+        if (!get_option('alegra_connector_connection_tested')) {
+            return [];
+        }
+
+        $cached = $force_refresh ? false : get_transient(self::SHIPPING_ITEMS_CACHE_KEY);
+        if (is_array($cached)) {
+            return $cached;
+        }
+
+        $this->api->reload_credentials();
+        $internal = self::get_internal_item_ids_safe();
+        $rows = [];
+        $start = 0;
+        $per_page = 100;
+        // Cap the pagination at 30 pages × 100 = 3000 items; the dropdown is
+        // a human UI and more items would hurt more than help. If a store
+        // has more, the AJAX refresh with a search filter will narrow it.
+        for ($page = 0; $page < 30; $page++) {
+            $batch = $this->api->get_items(['start' => $start, 'limit' => $per_page]);
+            if (is_wp_error($batch)) {
+                break;
+            }
+            if (!is_array($batch) || empty($batch)) {
+                break;
+            }
+            foreach ($batch as $item) {
+                if (!is_array($item)) {
+                    continue;
+                }
+                $id = (string) ($item['id'] ?? '');
+                if ($id === '') {
+                    continue;
+                }
+                // Exclude items whose reference starts with the plugin's
+                // reserved prefix (helper items the merchant cannot pick).
+                $reference = (string) ($item['reference'] ?? '');
+                if ($reference !== '' && str_starts_with($reference, 'alegra-connector-')) {
+                    continue;
+                }
+                // Exclude items the merchant marked internal via the
+                // allow-list option.
+                if (in_array($id, $internal, true)) {
+                    continue;
+                }
+                $name = (string) ($item['name'] ?? $id);
+                $rows[$id] = $name;
+            }
+            if (count($batch) < $per_page) {
+                break;
+            }
+            $start += $per_page;
+        }
+
+        // Stable, human-friendly ordering by name.
+        asort($rows, SORT_LOCALE_STRING);
+
+        set_transient(self::SHIPPING_ITEMS_CACHE_KEY, $rows, self::SHIPPING_ITEMS_CACHE_TTL);
+
+        return $rows;
+    }
+
+    /**
+     * Type-safe read of the internal-item allow-list option.
+     *
+     * @return string[]
+     */
+    public static function get_internal_item_ids_safe(): array
+    {
+        $ids = get_option('alegra_connector_internal_item_ids', []);
+        if (!is_array($ids)) {
+            return [];
+        }
+        $out = [];
+        foreach ($ids as $candidate) {
+            $id = (string) $candidate;
+            if ($id !== '') {
+                $out[] = $id;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * AJAX: list Alegra items for the shipping dropdowns.
+     *
+     * - action:  alegra_list_alegra_items
+     * - nonce:   alegra_connector_nonce
+     * - cap:     manage_woocommerce
+     * - body:    search (string, optional), refresh (1 to bypass cache)
+     * - resp:    {success, data:{items: [{id,name}], internal:[id,...]}}
+     */
+    public function ajax_list_alegra_items(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        if (!get_option('alegra_connector_connection_tested')) {
+            wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
+        }
+        if (!$this->api) {
+            wp_send_json_error(['message' => __('API no inicializada.', 'alegra-connector')]);
+        }
+
+        $force_refresh = !empty($_POST['refresh']);
+        $items = $this->get_alegra_items_for_shipping_select($force_refresh);
+
+        // Optional text filter — narrows the returned payload for the select.
+        $search = strtolower(trim((string) ($_POST['search'] ?? '')));
+        $payload = [];
+        foreach ($items as $id => $name) {
+            if ($search !== '' && strpos(strtolower($name), $search) === false && strpos(strtolower($id), $search) === false) {
+                continue;
+            }
+            $payload[] = ['id' => (string) $id, 'name' => (string) $name];
+        }
+
+        wp_send_json_success([
+            'items'    => $payload,
+            'internal' => self::get_internal_item_ids_safe(),
+            'count'    => count($payload),
+            'cached'   => !$force_refresh,
+        ]);
+    }
+
+    /**
+     * AJAX: create (or link) an Alegra item for a WC shipping method.
+     *
+     * - action:  alegra_create_shipping_item
+     * - nonce:   alegra_connector_nonce
+     * - cap:     manage_woocommerce
+     * - body:    method_id, instance_id (int), type ('service'|'product')
+     * - resp:    {success, data:{alegra_item_id, key, message, created:bool}}
+     *
+     * Steps:
+     *  1. Look up the WC method title (canonical name → item name).
+     *  2. Search Alegra by reference `alegra-connector-shipping:<method>:<instance>`.
+     *     If found, link it (no creation).
+     *  3. Otherwise, run_explicit() a POST /items with reference, name, type,
+     *     and a single price list entry at price 0.
+     *  4. Save the id into alegra_connector_shipping_map[$key].
+     */
+    public function ajax_create_shipping_item(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        if (!get_option('alegra_connector_connection_tested')) {
+            wp_send_json_error(['message' => __('Conecta primero con Alegra.', 'alegra-connector')]);
+        }
+        if (!$this->api) {
+            wp_send_json_error(['message' => __('API no inicializada.', 'alegra-connector')]);
+        }
+
+        $method_id = sanitize_text_field((string) ($_POST['method_id'] ?? ''));
+        $instance_id = (int) ($_POST['instance_id'] ?? 0);
+        // PHASE 1 / service-only enforcement: shipping items are ALWAYS
+        // created as services in Alegra. The UI option and any POST 'type'
+        // value are ignored on purpose — never let a "product" slip through
+        // and be tracked as inventory.
+        unset($_POST['type']);
+        $type = 'service';
+
+        if ($method_id === '' || $instance_id <= 0) {
+            wp_send_json_error(['message' => __('Faltan datos del método de envío.', 'alegra-connector')]);
+        }
+
+        // Locate the WC method to grab its title. Fall back to the key if
+        // WC cannot find the method (e.g. the merchant deleted it mid-form).
+        $title = self::resolve_wc_shipping_method_title($method_id, $instance_id);
+        $key = self::shipping_key($method_id, $instance_id);
+        $reference = 'alegra-connector-shipping:' . $method_id . ':' . $instance_id;
+
+        $this->api->reload_credentials();
+
+        // 1. Look for an existing item with the canonical reference. Linking
+        //    instead of re-creating makes the action idempotent.
+        $existing = $this->api->get_items([
+            'reference' => $reference,
+            'limit'     => 1,
+        ]);
+        if (is_wp_error($existing)) {
+            wp_send_json_error([
+                'message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $existing->get_error_message()),
+            ]);
+        }
+
+        $created = false;
+        if (is_array($existing) && !empty($existing)) {
+            $alegra_item_id = (string) ($existing[0]['id'] ?? '');
+            if ($alegra_item_id === '') {
+                wp_send_json_error(['message' => __('Alegra devolvió un ítem sin id.', 'alegra-connector')]);
+            }
+            $this->log('info', 'Shipping item linked (existing)', [
+                'key' => $key,
+                'alegra_item_id' => $alegra_item_id,
+            ]);
+        } else {
+            // 2. Create via the explicit write path so the gate permits the
+            //    POST even though push_products_enabled is OFF by default.
+            $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($title, $reference, $type) {
+                return $this->api->create_item([
+                    'name'      => $title,
+                    'reference' => $reference,
+                    'type'      => $type,
+                    'price'     => [[
+                        'idPriceList' => (int) get_option(
+                            'alegra_connector_field_mapping',
+                            ['regular_price_list' => 1]
+                        )['regular_price_list'] ?? 1,
+                        'price'        => 0,
+                    ]],
+                ]);
+            });
+
+            if (is_wp_error($result)) {
+                wp_send_json_error([
+                    'message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message()),
+                ]);
+            }
+            if (\Alegra\Connector\API\Client::is_dry_run_response($result)) {
+                wp_send_json_error([
+                    'message' => __('Modo de prueba activo: el ítem NO se creó en Alegra. Desactívalo antes de mapear envíos.', 'alegra-connector'),
+                    'blocked' => true,
+                ]);
+            }
+            if (\Alegra\Connector\API\Client::is_gate_blocked_response($result)) {
+                wp_send_json_error([
+                    'message' => self::blocked_message($result),
+                    'blocked' => true,
+                    'reason'  => (string) ($result['reason'] ?? 'unknown'),
+                ]);
+            }
+            if (!is_array($result) || empty($result['id'])) {
+                wp_send_json_error(['message' => __('Alegra no devolvió un id de ítem.', 'alegra-connector')]);
+            }
+
+            $alegra_item_id = (string) $result['id'];
+            $created = true;
+            $this->log('info', 'Shipping item created in Alegra', [
+                'key' => $key,
+                'alegra_item_id' => $alegra_item_id,
+                'type' => $type,
+            ]);
+        }
+
+        // 3. Persist the mapping. autoload=no keeps it out of every request.
+        $map = get_option('alegra_connector_shipping_map', []);
+        if (!is_array($map)) {
+            $map = [];
+        }
+        $map[$key] = $alegra_item_id;
+        update_option('alegra_connector_shipping_map', $map, false);
+
+        // 4. The cache for the Alegra items dropdown is now stale; drop it
+        //    so a subsequent refresh sees the new item.
+        delete_transient(self::SHIPPING_ITEMS_CACHE_KEY);
+
+        wp_send_json_success([
+            'alegra_item_id' => $alegra_item_id,
+            'key'            => $key,
+            'created'        => $created,
+            'message'        => $created
+                ? __('Ítem de envío creado en Alegra.', 'alegra-connector')
+                : __('Ítem de envío ya existía en Alegra; se vinculó.', 'alegra-connector'),
+        ]);
+    }
+
+    /**
+     * Resolve a WC method's title by id+instance.
+     *
+     * @return string Empty when the method no longer exists.
+     */
+    private static function resolve_wc_shipping_method_title(string $method_id, int $instance_id): string
+    {
+        $title = '';
+        if (class_exists('WC_Shipping_Zones')) {
+            foreach (\WC_Shipping_Zones::get_zones() as $zone) {
+                foreach (($zone['shipping_methods'] ?? []) as $method) {
+                    if ($method instanceof \WC_Shipping_Method
+                        && $method->id === $method_id
+                        && (int) $method->get_instance_id() === $instance_id) {
+                        return (string) $method->get_method_title();
+                    }
+                }
+            }
+            $zone_0 = \WC_Shipping_Zones::get_zone(0);
+            if ($zone_0 instanceof \WC_Shipping_Zone) {
+                foreach ($zone_0->get_shipping_methods() as $method) {
+                    if ($method instanceof \WC_Shipping_Method
+                        && $method->id === $method_id
+                        && (int) $method->get_instance_id() === $instance_id) {
+                        return (string) $method->get_method_title();
+                    }
+                }
+            }
+        }
+        return $title;
+    }
+
+    /**
      * Translate sanitized filters into Alegra `GET /items` query params.
      *
      * The implicit `status=active` (driven by sync_inactive_products) is only
@@ -2760,7 +3344,9 @@ class Admin_Dashboard
                 if ($r === 'stopped') { $paused = true; break; }
                 if ($r === true) { $state['imported']++; }
                 elseif ($r === 'updated') { $state['updated']++; }
-                elseif ($r === 'skipped') { $state['skipped'] = ($state['skipped'] ?? 0) + 1; }  // D-C: contar
+                elseif ($r === 'skipped' || $r === 'skipped_internal') { // Lane C: helper items count as skipped, never imported/updated/errors
+                    $state['skipped'] = ($state['skipped'] ?? 0) + 1;
+                }
                 else { $state['errors']++; }
             }
             Sync\Products::clear_deadline();               // C8/T3.2

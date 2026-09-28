@@ -3,7 +3,7 @@
  * Plugin Name: Alegra Connector
  * Plugin URI: https://github.com/djdang3r/wp-alegra-connector
  * Description: WooCommerce - Alegra integration plugin for bidirectional synchronization of products, customers, orders, and categories.
- * Version: 2.7.1
+ * Version: 2.8.0
  * Author: Script Develop
  * Author URI: https://scriptdevelop.com.co
  * License: GPL v2 or later
@@ -474,6 +474,18 @@ final class Alegra_Connector
             // Webhook event selection. All 12 documented events are registered
             // by default; the merchant can narrow the list in the Avanzado tab.
             'alegra_connector_webhook_selected_events' => \Alegra\Connector\API\Client::get_webhook_events(),
+            // Lane B (Phase 1): manual shipping map (method_id:instance_id =>
+            // Alegra item id). Empty by design — auto-creation is forbidden.
+            'alegra_connector_shipping_map' => [],
+            // Default item type when the merchant clicks "Crear ítem de envío"
+            // from the UI. service is the documented safe choice for shipping
+            // lines (the invoice carries the price, not the item).
+            'alegra_connector_shipping_item_type' => 'service',
+            // Internal allow-list of Alegra item ids that must NEVER be
+            // imported/updated/pushed. Items with reference starting
+            // `alegra-connector-` are excluded automatically; this option is the
+            // documented override for items that don't use the prefix.
+            'alegra_connector_internal_item_ids' => [],
         ];
 
         // AC-81: options that are only ever read in admin/cron context must not
@@ -522,6 +534,12 @@ final class Alegra_Connector
             // Only read in admin/REST context (webhook registration/receiver).
             'alegra_connector_webhook_selected_events',
             'alegra_connector_webhook_events_migration_version',
+            // Lane B (Phase 1): shipping map + internal-item allow-list. Only
+            // read by the settings page and the Orders/Products exclusion
+            // filters; no need to bloat every frontend request with them.
+            'alegra_connector_shipping_map',
+            'alegra_connector_shipping_item_type',
+            'alegra_connector_internal_item_ids',
         ];
 
         foreach ($defaults as $key => $value) {

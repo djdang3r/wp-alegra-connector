@@ -139,6 +139,22 @@ class Products
      */
     public function sync_to_alegra(\WC_Product $product): array|\WP_Error
     {
+        // Lane C (Phase 1): never push a WC product that is linked to an
+        // internal helper item back to Alegra. The plugin owns these items
+        // (refund adjustment, shipping fees, ...) and overwriting them
+        // would corrupt the order-side accounting. Returns a benign
+        // `['skipped' => 'internal']` marker so callers see an array with
+        // no `id` (matches the WP_Error / id-missing path that already
+        // exists in Orders.php:resolve_alegra_item_id()).
+        if (self::is_internal_wc_product($product)) {
+            $this->logger->info('Product push skipped: linked to internal helper item', [
+                'product_id' => (int) $product->get_id(),
+                'alegra_id'  => (string) get_post_meta($product->get_id(), '_alegra_item_id', true),
+                'sku'        => (string) $product->get_sku(),
+            ]);
+            return ['skipped' => 'internal'];
+        }
+
         if ($product->is_type('variable')) {
             return $this->sync_variable_product($product);
         }
@@ -1728,10 +1744,88 @@ class Products
     }
 
     /**
+     * Internal plugin helper item guard (Phase 1 / Lane C).
+     *
+     * The plugin creates its own Alegra items to model order-side concepts
+     * that have no real product counterpart (refund adjustment, shipping
+     * fees, etc.). Their `reference` always starts with the documented
+     * `alegra-connector-` prefix. They MUST NEVER be imported into WC,
+     * updated, pushed back to Alegra, or counted as products.
+     *
+     * Two ways an item is flagged as internal:
+     *  1. Its `reference` starts with the reserved prefix
+     *     (`alegra-connector-`).
+     *  2. Its `id` is in the explicit allow-list option
+     *     `alegra_connector_internal_item_ids` (array of strings; defaults
+     *     to `[]`). The option is the documented override for items that do
+     *     NOT use the prefix (legacy imports, manual repairs).
+     *
+     * @see self::is_internal_alegra_id() for the id-only variant used when
+     *      we only have a parent id in hand (variant handling).
+     */
+    private static function is_internal_item(array $item): bool
+    {
+        $reference = (string) ($item['reference'] ?? '');
+        if ($reference !== '' && str_starts_with($reference, 'alegra-connector-')) {
+            return true;
+        }
+        $id = (string) ($item['id'] ?? '');
+        return $id !== '' && self::is_internal_alegra_id($id);
+    }
+
+    /**
+     * Id-only counterpart to `is_internal_item()`. Same option, same
+     * normalization. Empty id is never internal.
+     */
+    private static function is_internal_alegra_id(string $id): bool
+    {
+        if ($id === '') {
+            return false;
+        }
+        $ids = get_option('alegra_connector_internal_item_ids', []);
+        if (!is_array($ids)) {
+            return false;
+        }
+        foreach ($ids as $internal_id) {
+            if ((string) $internal_id === $id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * WC-product counterpart. The push guard needs the locally stored
+     * `_alegra_item_id` and `_sku` (== Alegra reference, set by the importer).
+     */
+    private static function is_internal_wc_product(\WC_Product $product): bool
+    {
+        $alegra_id = (string) get_post_meta($product->get_id(), '_alegra_item_id', true);
+        if ($alegra_id !== '' && self::is_internal_alegra_id($alegra_id)) {
+            return true;
+        }
+        $sku = (string) $product->get_sku();
+        return $sku !== '' && str_starts_with($sku, 'alegra-connector-');
+    }
+
+    /**
      * Sync a single item by Alegra ID (used by webhooks)
      */
     private function import_single_item_from_alegra(array $item, int $run_id = 0): bool|string
     {
+        // Lane C (Phase 1): internal plugin helper items must never be
+        // imported as WC products. The guard runs BEFORE the tombstone /
+        // re-entrancy / kill-switch blocks because those paths log a
+        // different reason and we want the helper-item path to be the
+        // single source of truth for the dashboard counter.
+        if (self::is_internal_item($item)) {
+            $this->logger->info('Item import skipped: internal helper item', [
+                'alegra_id'  => (string) ($item['id'] ?? ''),
+                'reference'  => (string) ($item['reference'] ?? ''),
+            ]);
+            return 'skipped_internal';
+        }
+
         // REQ-RB-2: the per-item importer must honour the kill switch and the
         // cancellation flag, exactly like import_from_alegra(). The return type
         // is bool|string, so the "stop" sentinel is 'skipped' (a WP_Error would
@@ -1793,6 +1887,18 @@ class Products
                         'alegra_id' => $alegra_id,
                     ]);
                     return 'skipped';
+                }
+                // Lane C: if the parent itself is internal, the children inherit
+                // the same skip policy — do not import or update them. We check
+                // the parent id BEFORE touching WC so we never create a stray
+                // variation under a helper parent.
+                if (self::is_internal_alegra_id($parent_alegra_id)) {
+                    $this->logger->info('Item variant skipped: parent is internal helper item', [
+                        'alegra_id'      => $alegra_id,
+                        'parent_alegra'  => $parent_alegra_id,
+                        'reference'      => (string) ($item['reference'] ?? ''),
+                    ]);
+                    return 'skipped_internal';
                 }
                 $parent_wc = $this->get_product_by_alegra_id($parent_alegra_id);
                 if (!$parent_wc) {

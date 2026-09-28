@@ -2619,13 +2619,16 @@ TestRunner::test('T18.5 BUG 2 shipping, fees and a partial refund share ONE gene
     alegra_test_reset();
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '100']);
     update_post_meta(10, '_alegra_item_id', '1t3m-one');
+    // CHANGE 2 (Phase 1 Lane A): shipping is per-method mapped. Seed the
+    // method→item map so the helper resolves the shipping line.
+    update_option('alegra_connector_shipping_map', ['flat_rate:13' => '999']);
 
     $order = alegra_make_order(1130, [
         'total' => 130.0, 'currency' => 'COP', 'payment_method' => 'bacs',
         'billing' => ['country' => 'CO', 'email' => 'one@example.test'],
         'meta' => ['_billing_alegra_contact_id' => 'c0n-one'],
         'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100])],
-        'shipping_items' => [new WC_Order_Item(['name' => 'Envío', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
+        'shipping_items' => [new WC_Order_Item_Shipping(['name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13', 'quantity' => 1, 'subtotal' => 10, 'total' => 10])],
         'fee_items' => [new WC_Order_Item(['name' => 'Manejo', 'quantity' => 1, 'subtotal' => 20, 'total' => 20])],
     ]);
 
@@ -2636,8 +2639,12 @@ TestRunner::test('T18.5 BUG 2 shipping, fees and a partial refund share ONE gene
     TestRunner::assertCount(3, $body['items'] ?? [], 'product + shipping + fee');
     $ship_id = (string) ($body['items'][1]['id'] ?? '');
     $fee_id  = (string) ($body['items'][2]['id'] ?? '');
-    TestRunner::assertTrue($ship_id !== '' && $ship_id === $fee_id, 'shipping and fee lines must share ONE generic item id');
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'), 'only ONE generic item is created for shipping + fees');
+    TestRunner::assertTrue($ship_id !== '', 'la línea de envío tiene id (del shipping_map)');
+    TestRunner::assertTrue($fee_id !== '', 'la línea de fee tiene id (del genérico "Ajuste")');
+    TestRunner::assertNotSame($ship_id, $fee_id,
+        'CHANGE 2 (Phase 1 Lane A): shipping sale del shipping_map y fee del genérico — IDs distintos por diseño');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
+        'sólo se crea UN ítem genérico (para el fee; el envío sale del shipping_map)');
     $created = alegra_mock_requests('POST', '/items')[0]['body'] ?? [];
     TestRunner::assertSame('alegra-connector-adjustment', $created['reference'] ?? null, 'the shared generic item reference');
 });
@@ -2647,6 +2654,8 @@ TestRunner::test('T18.6 BUG 2 an order WITH shipping and a coupon: the invoice t
     alegra_seed_wc_tax_rate(1, 19.0);
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '100']);
     update_post_meta(10, '_alegra_item_id', '1t3m-coupon');
+    // CHANGE 2: seed the per-method shipping map.
+    update_option('alegra_connector_shipping_map', ['flat_rate:13' => '999']);
 
     // A 20% coupon: line subtotal 100 -> total 80, tax 15.20. Shipping 10 + 1.90.
     // WC order total = 95.20 + 11.90 = 107.10.
@@ -2655,7 +2664,7 @@ TestRunner::test('T18.6 BUG 2 an order WITH shipping and a coupon: the invoice t
         'billing' => ['country' => 'CO', 'email' => 'coupon@example.test'],
         'meta' => ['_billing_alegra_contact_id' => 'c0n-coupon'],
         'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 80, 'taxes' => ['total' => [1 => 15.2]]])],
-        'shipping_items' => [new WC_Order_Item(['name' => 'Envío', 'quantity' => 1, 'subtotal' => 10, 'total' => 10, 'taxes' => ['total' => [1 => 1.9]]])],
+        'shipping_items' => [new WC_Order_Item_Shipping(['name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13', 'quantity' => 1, 'subtotal' => 10, 'total' => 10, 'taxes' => ['total' => [1 => 1.9]]])],
     ]);
 
     $result = make_orders()->create_invoice($order);
@@ -2684,13 +2693,15 @@ TestRunner::test('T18.8 BUG 2 shipping + fees are invoiced and the total matches
     alegra_seed_wc_tax_rate(1, 19.0);
     alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-1', 'regular_price' => '100']);
     update_post_meta(10, '_alegra_item_id', '1t3m-ship');
+    // CHANGE 2: seed the per-method shipping map.
+    update_option('alegra_connector_shipping_map', ['flat_rate:13' => '999']);
 
     $order = alegra_make_order(1120, [
         'total' => 136.85, 'currency' => 'COP', 'payment_method' => 'bacs',
         'billing' => ['country' => 'CO', 'email' => 'ship@example.test'],
         'meta' => ['_billing_alegra_contact_id' => 'c0n-ship'],
         'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 19.0]]])],
-        'shipping_items' => [new WC_Order_Item(['name' => 'Envío', 'quantity' => 1, 'subtotal' => 10, 'total' => 10, 'taxes' => ['total' => [1 => 1.9]]])],
+        'shipping_items' => [new WC_Order_Item_Shipping(['name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13', 'quantity' => 1, 'subtotal' => 10, 'total' => 10, 'taxes' => ['total' => [1 => 1.9]]])],
         'fee_items' => [new WC_Order_Item(['name' => 'Manejo', 'quantity' => 1, 'subtotal' => 5, 'total' => 5, 'taxes' => ['total' => [1 => 0.95]]])],
     ]);
 
@@ -4019,7 +4030,10 @@ TestRunner::test('T-PAY-1a a paid order with a NULL date_paid falls back to toda
     TestRunner::assertStringContains('Payment date missing', alegra_read_log(), 'the fallback must be logged as a warning');
 });
 
-TestRunner::test('T-PAY-1b an order total different from the invoice balance is reported, not silently adjusted', function (): void {
+TestRunner::test('T-PAY-1b an order total above the invoice balance is clamped, not overpaid', function (): void {
+    // CHANGE 4 (Phase 1 Lane A): the payment MUST NOT exceed the invoice balance.
+    // Before CHANGE 4 the plugin posted the WC total and surfaced a discrepancy
+    // note; now it clamps to balance and tells the merchant why.
     alegra_test_reset();
     alegra_clear_log();
     update_option('alegra_connector_payment_account_id', '5');
@@ -4032,9 +4046,150 @@ TestRunner::test('T-PAY-1b an order total different from the invoice balance is 
     make_orders()->create_invoice_with_payment($order);
 
     $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
-    TestRunner::assertSame(100.0, (float) ($payment['invoices'][0]['amount'] ?? 0), 'the payment must use the WC total, not the balance');
-    TestRunner::assertStringContains('no coincide', implode("\n", $order->get_notes()), 'the discrepancy must be surfaced in a note');
-    TestRunner::assertStringContains('differs from invoice balance', alegra_read_log(), 'the discrepancy must be logged');
+    TestRunner::assertSame(80.0, (float) ($payment['invoices'][0]['amount'] ?? 0), 'the payment must be clamped to the invoice balance (never overpay)');
+    TestRunner::assertStringContains('excede el saldo', implode("\n", $order->get_notes()), 'the clamping must be surfaced in a note');
+    TestRunner::assertStringContains('Payment amount clamped', alegra_read_log(), 'the clamping must be logged');
+});
+
+TestRunner::test('T-PAY-1d an invoice with balance ≤ 0.01 (already paid) skips the payment with a note', function (): void {
+    // CHANGE 4 (Phase 1 Lane A): when Alegra reports balance ≤ 0.01 the
+    // invoice is already paid or overpaid; the plugin MUST skip the POST and
+    // tell the merchant instead of risking an overpayment rejection.
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-paid', ['status' => 'open', 'total' => 100.0, 'balance' => 0.0]);
+    $order = alegra_make_order(5004, [
+        'total' => 100.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => ['_alegra_invoice_id' => 'inv-paid', '_billing_alegra_contact_id' => 'c0n-paid'],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'),
+        'NO se postea el pago cuando el saldo ya es ≤ 0.01');
+    TestRunner::assertStringContains('ya figura saldada', implode("\n", $order->get_notes()),
+        'el merchant recibe una nota explicando el skip');
+});
+
+TestRunner::test('T-PAY-1e the mismatch marker blocks the payment (no false failure)', function (): void {
+    // CHANGE 4 (Phase 1 Lane A): si `_alegra_invoice_total_mismatch = 1` está
+    // seteado (CHANGE 3 detectó drift en create_invoice), prepare_payment_data
+    // devuelve [] sin postear el pago y sin marcar la cola como fallida.
+    alegra_test_reset();
+    alegra_clear_log();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-mismatch', ['status' => 'open', 'total' => 100.0, 'balance' => 100.0]);
+    $order = alegra_make_order(5005, [
+        'total' => 100.0, 'status' => 'processing', 'payment_method' => 'mercadopago',
+        'meta' => [
+            '_alegra_invoice_id'             => 'inv-mismatch',
+            '_billing_alegra_contact_id'     => 'c0n-mismatch',
+            '_alegra_invoice_total_mismatch' => '1',
+        ],
+    ]);
+
+    make_orders()->create_invoice_with_payment($order);
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'),
+        'el mismatch marker bloquea el POST del pago');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertNotSame('payment_missing', $led['state'],
+        'NO se persiste payment_missing — el mismatch ya fue registrado por CHANGE 3');
+});
+
+// ===========================================================================
+// T-REC — Reconciliation (CHANGE 3: invoice total vs order total)
+// ===========================================================================
+
+TestRunner::test('T-REC-1 assert_invoice_total_matches_order: drift > 0.01 setea marker, bloquea pago y persiste estado invoice_total_mismatch', function (): void {
+    // CHANGE 3 (Phase 1 Lane A): cuando el total de la factura de Alegra NO
+    // coincide con el del pedido WC, el pago se BLOQUEA con un marker y se
+    // persiste un queue state nuevo (invoice_total_mismatch) para que el
+    // comercio sepa que algo se cargó distinto en Alegra.
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    // Invoice en Alegra con total 95.00 vs pedido WC total 100.00 ⇒ drift -5.00.
+    alegra_mock_seed_invoice('inv-drift', ['status' => 'open', 'total' => 95.0, 'balance' => 95.0]);
+    $order = make_payable_order(6001, 1, 'rec@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-drift'],
+    ]);
+
+    $result = alegra_call_private(
+        make_orders(),
+        'assert_invoice_total_matches_order',
+        $order,
+        'inv-drift'
+    );
+
+    TestRunner::assertTrue(is_array($result), 'drift detectado, se devuelve la clasificación');
+    TestRunner::assertSame('invoice_total_mismatch', $result['state'], 'estado invoice_total_mismatch');
+    TestRunner::assertSame(-5.0, (float) str_replace('total:', '', $result['code']),
+        'code con la diferencia numérica');
+    TestRunner::assertFalse($result['retriable'], 'mismatch NO es retriable');
+    TestRunner::assertTrue($result['persist'], 'mismatch SÍ se persiste');
+
+    TestRunner::assertSame('1', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
+        'marker _alegra_invoice_total_mismatch seteado en el pedido');
+
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('invoice_total_mismatch', $led['state'],
+        'queue state persistido como invoice_total_mismatch');
+    TestRunner::assertSame('0', $led['retriable'], 'retriable=0 (el cron NO debe loopear)');
+
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('NO coincide con el del pedido', $notes,
+        'el merchant recibe una nota explicando el drift');
+    TestRunner::assertStringContains('Invoice total does not match', alegra_read_log(),
+        'el logger emite error con order_total/invoice_total/difference');
+});
+
+TestRunner::test('T-REC-2 assert_invoice_total_matches_order: total coincidente limpia el marker stale', function (): void {
+    // CHANGE 3: cuando los totales coinciden dentro de la tolerancia, un marker
+    // stale (puesto por un intento previo con drift) se elimina para que un
+    // siguiente intento del cron pueda registrar el pago.
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', '5');
+    alegra_mock_seed_invoice('inv-ok', ['status' => 'open', 'total' => 100.0, 'balance' => 100.0]);
+    $order = make_payable_order(6002, 1, 'rec2@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-ok'],
+    ]);
+    // Stale marker from a previous attempt:
+    $order->update_meta_data('_alegra_invoice_total_mismatch', '1');
+    $order->save();
+
+    $result = alegra_call_private(
+        make_orders(),
+        'assert_invoice_total_matches_order',
+        $order,
+        'inv-ok'
+    );
+
+    TestRunner::assertSame(null, $result, 'totales coinciden ⇒ no se devuelve clasificación');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
+        'marker stale limpiado para que el pago pueda proceder');
+});
+
+TestRunner::test('T-REC-3 assert_invoice_total_matches_order: invoice no se puede releer ⇒ no bloquea', function (): void {
+    // CHANGE 3: si no podemos releer la factura, NO bloqueamos el pago (sería
+    // un fallo de read transient, no un drift real). Si había marker stale,
+    // también se limpia para no dejar el pedido en un limbo.
+    alegra_test_reset();
+    $order = make_payable_order(6003, 1, 'rec3@example.test', 100.0);
+    $order->update_meta_data('_alegra_invoice_total_mismatch', '1'); // stale
+    $order->save();
+    // No seed for 'inv-missing' → mock returns 404
+
+    $result = alegra_call_private(
+        make_orders(),
+        'assert_invoice_total_matches_order',
+        $order,
+        'inv-missing'
+    );
+
+    TestRunner::assertSame(null, $result, 'read failure ⇒ null (no bloquea)');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
+        'marker stale limpiado tras read failure');
 });
 
 TestRunner::test('T-PAY-1c the payment carries the gateway title in observations', function (): void {
@@ -10623,7 +10778,8 @@ TestRunner::test('T30.42 classify() marca permanente 4xx y errores de datos', fu
         TestRunner::assertTrue($x['persist'], "$http persist=true");
     }
     foreach (['customer_unresolved', 'invoice_item_unlinked', 'invoice_shipping_unlinked',
-              'invoice_fee_unlinked', 'invoice_still_draft', 'draft_invoice_not_opened'] as $code) {
+              'invoice_fee_unlinked',
+              'invoice_still_draft', 'draft_invoice_not_opened'] as $code) {
         $x = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error($code, 'data'));
         TestRunner::assertSame('failed_permanent', $x['state'], "$code ⇒ permanente");
         TestRunner::assertSame('data:' . $code, $x['code'], "$code conserva el prefijo data:");
@@ -11643,16 +11799,23 @@ TestRunner::test('T31.6 REGRESIÓN FATAL — render_stock_reconciliation_page no
  * Build a billable order (producto + contacto cacheado) that ALSO carries a
  * shipping line and/or a fee line. Used by T32.{1,2,3,6}.
  *
+ * CHANGE 2 (Phase 1 Lane A): shipping is per-method mapped; the helper
+ * creates a `WC_Order_Item_Shipping` with method_id=flat_rate/instance_id=13
+ * and seeds `alegra_connector_shipping_map` so the happy-path tests still
+ * create the invoice without a `invoice_shipping_unmapped` error.
+ *
  * @param array<string, mixed> $overrides overrides forwarded to alegra_so_billable_order()
  * @return array{0:\WC_Order, 1:float} order + shipping_total (so the test can
  *         assert the line carried the same amount).
  */
 function alegra_so_order_with_shipping(int $id, float $shipping_total, array $overrides = []): array
 {
+    update_option('alegra_connector_shipping_map', ['flat_rate:13' => '999']);
     $order = alegra_so_billable_order($id, array_merge([
         'order' => [
-            'shipping_items' => [new \WC_Order_Item([
-                'name' => 'Envío', 'quantity' => 1, 'subtotal' => $shipping_total, 'total' => $shipping_total,
+            'shipping_items' => [new \WC_Order_Item_Shipping([
+                'name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13',
+                'quantity' => 1, 'subtotal' => $shipping_total, 'total' => $shipping_total,
             ])],
         ],
     ], $overrides));
@@ -11660,6 +11823,9 @@ function alegra_so_order_with_shipping(int $id, float $shipping_total, array $ov
 }
 
 TestRunner::test('T32.1 HAPPY: pedido CON envío (total>0) crea la factura y la línea de envío viaja en el POST /invoices', function (): void {
+    // CHANGE 2 (Phase 1 Lane A): the shipping item id comes from
+    // `alegra_connector_shipping_map`, NOT from the generic "Ajuste" item —
+    // so this happy path does NOT POST /items (no find-or-create happens).
     alegra_test_reset();
     update_option('alegra_connector_push_orders_enabled', true);
     update_option('alegra_connector_open_invoice_on_paid', true);
@@ -11683,67 +11849,57 @@ TestRunner::test('T32.1 HAPPY: pedido CON envío (total>0) crea la factura y la 
     TestRunner::assertTrue($found !== null, 'hay una línea con name=Envío en el payload de la factura');
     TestRunner::assertSame(12.5, (float) ($found['price'] ?? 0),
         'el precio de la línea de envío es el shipping_total');
-    TestRunner::assertTrue((string) ($found['id'] ?? '') !== '',
-        'la línea de envío tiene un items[].id no vacío (vinculada al ítem Ajuste)');
+    TestRunner::assertSame('999', (string) ($found['id'] ?? ''),
+        'la línea de envío usa el Alegra item id del shipping_map (per-method mapping)');
 
-    // El ítem genérico fue creado (find-or-create).
-    TestRunner::assertTrue(alegra_mock_count('POST', '/items') >= 1,
-        'el helper creó el ítem genérico "Ajuste"');
+    // Sin /items POST: el envío ya está mapeado, no se crea el genérico "Ajuste"
+    // para esta línea (sí se usaría si el pedido tuviera fees).
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'),
+        'no se hizo POST /items — el envío sale del shipping_map, no del genérico');
 
     // No se añadió nota de error (flujo feliz).
     $notes = (array) $order->get_notes();
     foreach ($notes as $n) {
-        TestRunner::assertFalse(str_contains((string) $n, 'No se pudo vincular'),
-            'no hay nota de error de fallback en el flujo feliz');
+        TestRunner::assertFalse(str_contains((string) $n, 'no está mapeado'),
+            'no hay nota de error de mapping en el flujo feliz');
     }
 });
 
-TestRunner::test('T32.2 FALLBACK: POST /items falla y el envío no se vincula → la factura SE crea SIN la línea de envío (sin WP_Error)', function (): void {
-    // Bug reportado: prepare_invoice_items() devolvía WP_Error('invoice_shipping_unlinked')
-    // y la factura NUNCA se creaba. El nuevo contrato es best-effort: se loguea
-    // error + nota de pedido y la factura igual sale con el resto de las líneas.
+TestRunner::test('T32.2 STRICT: método de envío SIN mapear bloquea la factura con WP_Error(invoice_shipping_unmapped)', function (): void {
+    // CHANGE 2 (Phase 1 Lane A): an unmapped shipping method is a CONFIGURATION
+    // problem, not a transient API failure. The invoice MUST be blocked with an
+    // actionable message so the merchant can fix the map before retrying.
+    // Before CHANGE 2 the test asserted a "best-effort skip" behavior; the new
+    // contract is STRICT — there is no silent skip.
     alegra_test_reset();
     update_option('alegra_connector_push_orders_enabled', true);
     update_option('alegra_connector_open_invoice_on_paid', true);
-    // Importante: NO hay _alegra_item_id cacheado para el genérico (el helper
-    // reset limpia alegra_connector_generic_item_ids). El POST /items fallará.
-    update_option('alegra_connector_generic_item_ids', []);
-    alegra_mock_fail('POST', '/items', 400, ['error' => 'forced_for_test'], 0);
     alegra_clear_log();
 
     [$order, $ship_total] = alegra_so_order_with_shipping(32002, 8.0);
+    // El helper siembra el map para los happy-paths. Acá lo limpiamos DESPUÉS
+    // para forzar el path estricto (no map ⇒ WP_Error).
+    update_option('alegra_connector_shipping_map', []);
 
     $r = make_orders()->create_invoice($order);
-    TestRunner::assertFalse(is_wp_error($r),
-        'create_invoice NO devuelve WP_Error cuando solo el envío no se vincula');
+    TestRunner::assertInstanceOf(\WP_Error::class, $r,
+        'un envío sin mapear produce WP_Error (no se crea la factura)');
+    TestRunner::assertSame('invoice_shipping_unmapped', (string) $r->get_error_code(),
+        'código invoice_shipping_unmapped');
 
-    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
-        'la factura igual se postea aunque el envío no se haya podido vincular');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'),
+        'NO se envía la factura a Alegra cuando el envío está sin mapear');
 
-    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
-    $items = is_array($body['items'] ?? null) ? $body['items'] : [];
-    foreach ($items as $line) {
-        if (!is_array($line)) { continue; }
-        TestRunner::assertNotSame('Envío', (string) ($line['name'] ?? ''),
-            'el payload NO contiene la línea de envío cuando el genérico falló');
-    }
-
-    // Se escribió un error en el log con el código del WP_Error subyacente.
     $log = alegra_read_log();
-    TestRunner::assertStringContains('Shipping line could not be linked to an Alegra item', $log,
-        'el logger emite el error de shipping no vinculado');
-    TestRunner::assertStringContains('error_code', $log,
-        'el log incluye el campo error_code para diagnóstico');
-
-    // Y se agregó la nota localized al pedido.
-    $notes = (array) $order->get_notes();
-    $found_note = false;
-    foreach ($notes as $n) {
-        if (str_contains((string) $n, 'No se pudo vincular el envío')) { $found_note = true; break; }
-    }
-    TestRunner::assertTrue($found_note, 'se agregó order_note con el mensaje localized de fallback');
-
-    alegra_mock_clear_failures();
+    TestRunner::assertStringContains('Shipping method is not mapped to an Alegra item', $log,
+        'el logger emite el error con method_id/instance_id');
+    TestRunner::assertStringContains('flat_rate', $log,
+        'el log incluye el method_id del WC shipping method para diagnóstico');
+    $msg = wp_strip_all_tags($r->get_error_message());
+    TestRunner::assertStringContains('no está mapeado', $msg,
+        'el mensaje describe el problema en lenguaje natural');
+    TestRunner::assertStringContains('Ajustes → Envíos', $msg,
+        'el mensaje apunta al lugar donde mapear el método');
 });
 
 TestRunner::test('T32.3 FALLBACK fee: POST /items falla y el recargo no se vincula → la factura SE crea SIN la línea de fee', function (): void {
@@ -11790,23 +11946,29 @@ TestRunner::test('T32.3 FALLBACK fee: POST /items falla y el recargo no se vincu
     alegra_mock_clear_failures();
 });
 
-TestRunner::test('T32.4 PRICE LIST: POST /items para el genérico usa regular_price_list de field_mapping, NO 1 hardcoded', function (): void {
-    // El bug histórico: el helper creaba el genérico con idPriceList=1 fijo,
-    // ignorando la lista configurada por el comercio. Ahora se lee de
-    // alegra_connector_field_mapping['regular_price_list'] (default 1).
+TestRunner::test('T32.4 PRICE LIST: POST /items del genérico (para fees) usa regular_price_list de field_mapping, NO 1 hardcoded', function (): void {
+    // CHANGE 2 (Phase 1 Lane A): el genérico "Ajuste" ya NO se crea para el
+    // envío (sale del shipping_map); ahora se crea para los FEES. Esta prueba
+    // verifica que el helper sigue leyendo `regular_price_list` del
+    // `field_mapping` cuando crea el genérico en el path de fees.
     alegra_test_reset();
     update_option('alegra_connector_push_orders_enabled', true);
     update_option('alegra_connector_open_invoice_on_paid', true);
     update_option('alegra_connector_field_mapping', ['regular_price_list' => 7]);
     update_option('alegra_connector_generic_item_ids', []);
-    alegra_clear_log();
 
-    [$order] = alegra_so_order_with_shipping(32004, 3.0);
+    $order = alegra_so_billable_order(32004, [
+        'order' => [
+            'fee_items' => [new \WC_Order_Item([
+                'name' => 'Manejo', 'quantity' => 1, 'subtotal' => 3.0, 'total' => 3.0,
+            ])],
+        ],
+    ]);
 
     $r = make_orders()->create_invoice($order);
     TestRunner::assertFalse(is_wp_error($r), 'la factura se crea');
     TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
-        'se creó exactamente UN ítem genérico');
+        'se creó exactamente UN ítem genérico (para el fee)');
 
     $created = alegra_mock_requests('POST', '/items')[0]['body'] ?? [];
     TestRunner::assertSame('alegra-connector-adjustment', (string) ($created['reference'] ?? ''),
@@ -11817,11 +11979,12 @@ TestRunner::test('T32.4 PRICE LIST: POST /items para el genérico usa regular_pr
         'type sigue siendo service (enum válido para POST /items)');
 });
 
-TestRunner::test('T32.5 NON-EXPLICIT: con push_products_enabled=false (cron/automático), POST /items del genérico NO es bloqueado por el gate', function (): void {
+TestRunner::test('T32.5 NON-EXPLICIT: con push_products_enabled=false (cron/automático), POST /items del genérico (para fees) NO es bloqueado por el gate', function (): void {
     // Antes del fix: create_item() se llamaba sin run_explicit() ⇒ con el
     // toggle de productos apagado, el gate bloqueaba el POST y el helper
     // devolvía '' (flujo de error). Ahora create_item() corre dentro de
     // run_explicit() ⇒ el gate SIEMPRE permite la escritura dependiente.
+    // CHANGE 2: el genérico se crea para FEES (no para shipping).
     alegra_test_reset();
     update_option('alegra_connector_push_orders_enabled', true);
     update_option('alegra_connector_open_invoice_on_paid', true);
@@ -11831,24 +11994,30 @@ TestRunner::test('T32.5 NON-EXPLICIT: con push_products_enabled=false (cron/auto
         'el contexto arranca NO explícito (simula cron)');
     alegra_clear_log();
 
-    [$order] = alegra_so_order_with_shipping(32005, 6.5);
+    $order = alegra_so_billable_order(32005, [
+        'order' => [
+            'fee_items' => [new \WC_Order_Item([
+                'name' => 'Manejo', 'quantity' => 1, 'subtotal' => 4.0, 'total' => 4.0,
+            ])],
+        ],
+    ]);
 
     $r = make_orders()->create_invoice($order);
     TestRunner::assertFalse(is_wp_error($r),
         'la factura se crea pese a push_products_enabled=false (gate no bloquea al genérico)');
 
-    // El POST /items del genérico ocurrió: la línea de envío viaja en la factura.
+    // El POST /items del genérico ocurrió: la línea del fee viaja en la factura.
     $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
     $items = is_array($body['items'] ?? null) ? $body['items'] : [];
-    $ship_line = null;
+    $fee_line = null;
     foreach ($items as $line) {
         if (!is_array($line)) { continue; }
-        if ((string) ($line['name'] ?? '') === 'Envío') { $ship_line = $line; break; }
+        if ((string) ($line['name'] ?? '') === 'Manejo') { $fee_line = $line; break; }
     }
-    TestRunner::assertTrue($ship_line !== null,
-        'la línea de envío está presente: el genérico SÍ se creó pese al gate de productos');
-    TestRunner::assertTrue((string) ($ship_line['id'] ?? '') !== '',
-        'la línea de envío tiene id (el genérico fue creado con run_explicit)');
+    TestRunner::assertTrue($fee_line !== null,
+        'la línea de fee está presente: el genérico SÍ se creó pese al gate de productos');
+    TestRunner::assertTrue((string) ($fee_line['id'] ?? '') !== '',
+        'la línea de fee tiene id (el genérico fue creado con run_explicit)');
 
     // Tras create_invoice() el contexto vuelve a NO explícito (run_explicit
     // usa try/finally para restaurar).
@@ -11856,15 +12025,18 @@ TestRunner::test('T32.5 NON-EXPLICIT: con push_products_enabled=false (cron/auto
         'el contexto vuelve a NO explícito después de run_explicit');
 });
 
-TestRunner::test('T32.6 TRUE EMPTY: pedido SIN productos + envío no vinculable → WP_Error(invoice_no_items) y CERO POST /invoices', function (): void {
-    // Cuando la línea de envío no se puede vincular y NO hay nada más
-    // facturable, prepare_invoice_items() debe devolver invoice_no_items (la
-    // factura no se crea). Esto preserva la guarda documentada en T31.2.
+TestRunner::test('T32.6 STRICT EMPTY: pedido SIN productos + envío sin mapear → WP_Error(invoice_shipping_unmapped) y CERO POST /invoices', function (): void {
+    // CHANGE 2 (Phase 1 Lane A): cuando la línea de envío no se puede mapear
+    // (sin entrada en alegra_connector_shipping_map), prepare_invoice_items()
+    // devuelve invoice_shipping_unmapped — el código gana prioridad sobre el
+    // invoice_no_items, porque el problema es ACCIÓNABLE (mapear el método)
+    // y no "el pedido no tiene nada facturable". El pedido sin productos es
+    // el caso degenerado que ejercita la propagación del error.
     alegra_test_reset();
     update_option('alegra_connector_push_orders_enabled', true);
     update_option('alegra_connector_open_invoice_on_paid', true);
-    update_option('alegra_connector_generic_item_ids', []);
-    alegra_mock_fail('POST', '/items', 400, ['error' => 'forced_for_test'], 0);
+    // No map: el envío se bloquea.
+    update_option('alegra_connector_shipping_map', []);
 
     $order = alegra_make_order(32006, [
         'status'   => 'processing',
@@ -11874,20 +12046,301 @@ TestRunner::test('T32.6 TRUE EMPTY: pedido SIN productos + envío no vinculable 
         'billing'  => ['country' => 'CO', 'email' => 'empty@example.test'],
         'meta'     => ['_billing_alegra_contact_id' => 'c32006'],
         'items'    => [],
-        'shipping_items' => [new \WC_Order_Item([
-            'name' => 'Envío', 'quantity' => 1, 'subtotal' => 4.0, 'total' => 4.0,
+        'shipping_items' => [new \WC_Order_Item_Shipping([
+            'name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13',
+            'quantity' => 1, 'subtotal' => 4.0, 'total' => 4.0,
         ])],
     ]);
 
     $res = make_orders()->create_invoice($order);
     TestRunner::assertInstanceOf(\WP_Error::class, $res,
-        'sin productos y con envío no vinculable, create_invoice devuelve WP_Error');
-    TestRunner::assertSame('invoice_no_items', (string) $res->get_error_code(),
-        'código invoice_no_items (la guarda de prepare_invoice_items líneas 2002-2010)');
+        'sin productos y con envío sin mapear, create_invoice devuelve WP_Error');
+    TestRunner::assertSame('invoice_shipping_unmapped', (string) $res->get_error_code(),
+        'código invoice_shipping_unmapped (prioridad sobre invoice_no_items)');
+    TestRunner::assertStringContains('Envío', wp_strip_all_tags($res->get_error_message()),
+        'el mensaje nombra el nombre del método WC (display name) para guiar al comercio');
+    TestRunner::assertStringContains('Ajustes → Envíos', wp_strip_all_tags($res->get_error_message()),
+        'el mensaje apunta al lugar donde mapear el método');
     TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'),
         'NO se envió ninguna factura a Alegra');
+});
 
-    alegra_mock_clear_failures();
+// ===========================================================================
+// T34 — Phase 1 Lane A regression coverage for the 3 behavior gaps.
+//
+// Each T34.x covers a behavior added in this round that had no catching test:
+// the suite went GREEN when the behavior was reverted. These tests are
+// independent proof-it-catch regressions: revert the corresponding code line,
+// re-run, the test goes RED, restore the line, the test goes GREEN.
+//
+//   T34.1 — product self-heal push under the gate (run_explicit wrap)
+//             Orders.php L2333 — `Products::sync_to_alegra()` wrapped in
+//             `Write_Gate::run_explicit()` so an automatic-context invoice
+//             creation can still push an unlinked product.
+//
+//   T34.2 — `import_single_item_from_alegra()` excludes internal helper items
+//             Products.php — `is_internal_item()` early-return with
+//             'skipped_internal' status. Both `reference` prefix and the
+//             `alegra_connector_internal_item_ids` option path.
+//
+//   T34.3 — `ajax_create_shipping_item()` always creates a service item
+//             Admin_Dashboard.php — `unset($_POST['type']); $type = 'service';`
+//             ignores the POST value AND the option, never allowing a
+//             `type=product` shipping item to reach POST /items.
+//
+//   T34.4 — 0-cost shipping method does not require a map entry
+//             Orders.php — `if ($total <= 0) { continue; }` in
+//             `build_shipping_lines()` precedes the strict shipping_map
+//             lookup so free shipping / promotions never block the invoice.
+//
+//   T34.5 — variant with internal parent is skipped (inherited policy)
+//             Products.php — `is_internal_alegra_id($parent_alegra_id)`
+//             check before the parent-resolve / import_variation path.
+// ===========================================================================
+
+TestRunner::test('T34.1 self-heal push under the gate: an unlinked product is pushed inside run_explicit so a non-explicit create_invoice succeeds', function (): void {
+    // CHANGE 1 (Phase 1 Lane A): when the resolver falls back to pushing the
+    // product to Alegra, the call to Products::sync_to_alegra() MUST be wrapped
+    // in Write_Gate::run_explicit(). Without the wrap, the per-entity gate
+    // (push_products_enabled=false) blocks the POST and the resolver returns ''
+    // — the invoice is then blocked with invoice_item_unlinked and the
+    // self-heal never happens. The whole create_invoice() must succeed from a
+    // NON-explicit context (i.e. cron / automatic path), the product MUST
+    // receive an _alegra_item_id, and POST /invoices MUST happen exactly once.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_push_products_enabled', false); // gate would block
+    update_option('alegra_connector_shipping_map', []);              // no shipping line
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+
+    $product_id = 34011;
+    alegra_make_product($product_id, [
+        'name' => 'SelfHeal', 'sku' => 'SELFHEAL-1',
+        'regular_price' => '10', 'stock' => 5, 'manage_stock' => true,
+    ]);
+    // Deliberately NO _alegra_item_id and NO SKU match in Alegra — the
+    // resolver MUST go all the way to the last-resort push.
+
+    $order = alegra_make_order(34011, [
+        'status'   => 'processing',
+        'total'    => 10.0,
+        'currency' => 'COP',
+        'payment_method' => 'bacs',
+        'billing'  => ['country' => 'CO', 'email' => 'selfheal@example.test'],
+        'meta'     => ['_billing_alegra_contact_id' => 'c34011'],
+        'items'    => [new \WC_Order_Item([
+            'product_id' => $product_id, 'name' => 'SelfHeal',
+            'quantity' => 1, 'subtotal' => 10, 'total' => 10,
+        ])],
+    ]);
+
+    // CRITICAL: do NOT wrap in run_explicit — this is the automatic path.
+    // The fix must still let the inner push through.
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($res),
+        'create_invoice debe completarse incluso con push_products_enabled=false (auto-push usa run_explicit)');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
+        'el POST /invoices ocurrió exactamente una vez');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
+        'el self-heal emitió un POST /items (envuelto en run_explicit, gate lo deja pasar)');
+
+    // El producto ahora tiene _alegra_item_id (lo setea sync_simple_product via
+    // update_post_meta). El id exacto lo asigna el mock UUID.
+    $linked_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
+    TestRunner::assertTrue($linked_id !== '',
+        'el producto recibió _alegra_item_id vía self-heal');
+    TestRunner::assertFalse(is_wp_error($res) && (string) $res->get_error_code() === 'invoice_item_unlinked',
+        'NO se propagó invoice_item_unlinked (el push tuvo éxito)');
+});
+
+TestRunner::test('T34.2 importer excludes internal helper items by reference prefix and by explicit allow-list', function (): void {
+    // Lane C (Phase 1): internal plugin helper items must never be imported
+    // as WC products. Two ways to be flagged:
+    //   1. `reference` starts with `alegra-connector-` (reserved prefix)
+    //   2. `id` is in `alegra_connector_internal_item_ids` (legacy/override)
+    // Both paths return 'skipped_internal' BEFORE touching WC, so no wp_post
+    // is created and no wc_product is registered.
+    alegra_test_reset();
+
+    $r1 = make_products()->import_single_item_public([
+        'id' => 'helper-by-ref-1',
+        'name' => 'Helper Ref',
+        'reference' => 'alegra-connector-adjustment',
+        'type' => 'simple',
+    ]);
+    TestRunner::assertSame('skipped_internal', $r1,
+        'reference con prefijo alegra-connector- ⇒ skipped_internal');
+    TestRunner::assertSame(0, count($GLOBALS['wp_posts'] ?? []),
+        'NO se creó ningún wp_post para el ítem por prefijo');
+    TestRunner::assertSame(0, wc_get_product_id_by_sku('alegra-connector-adjustment'),
+        'NO hay WC product con el reference interno');
+
+    update_option('alegra_connector_internal_item_ids', ['helper-by-id-7']);
+
+    $r2 = make_products()->import_single_item_public([
+        'id' => 'helper-by-id-7',
+        'name' => 'Helper ID',
+        'reference' => 'SOME-LEGACY-REF',  // NO prefix
+        'type' => 'simple',
+    ]);
+    TestRunner::assertSame('skipped_internal', $r2,
+        'id en internal_item_ids (sin prefijo) ⇒ skipped_internal');
+    TestRunner::assertSame(0, count($GLOBALS['wp_posts'] ?? []),
+        'NO se creó ningún wp_post para el ítem por allow-list');
+    TestRunner::assertSame(0, wc_get_product_id_by_sku('SOME-LEGACY-REF'),
+        'NO hay WC product con el reference del helper allow-listed');
+});
+
+TestRunner::test('T34.3 ajax_create_shipping_item forces type=service and never sends inventory even when POST type=product', function (): void {
+    // PHASE 1 / service-only enforcement: shipping items are ALWAYS services
+    // in Alegra. The handler must ignore `$_POST['type']` AND the
+    // `alegra_connector_shipping_item_type` option; the POST /items body must
+    // carry `type=service` and MUST NOT carry an `inventory` key. Otherwise a
+    // shipping item would be tracked as inventory in Alegra, with all the
+    // downstream stock-movement bugs that implies.
+    //
+    // The harness does not have WC_Shipping_Zones/Metho*/Zone stubs (the
+    // handler resolves the title through them). Define minimal stubs once
+    // (guarded by class_exists so a re-run is idempotent).
+    if (!class_exists('WC_Shipping_Method')) {
+        eval('class WC_Shipping_Method {
+            public string $id = "";
+            public int $instance_id = 0;
+            public function get_instance_id(): int { return $this->instance_id; }
+            public function get_method_title(): string { return "Flat rate"; }
+        }');
+    }
+    if (!class_exists('WC_Shipping_Zone')) {
+        eval('class WC_Shipping_Zone {
+            public function get_shipping_methods(): array { return []; }
+        }');
+    }
+    if (!class_exists('WC_Shipping_Zones')) {
+        eval('class WC_Shipping_Zones {
+            public static function get_zones(): array {
+                $m = new WC_Shipping_Method();
+                $m->id = "flat_rate";
+                $m->instance_id = 99;
+                return [["shipping_methods" => [$m]]];
+            }
+            public static function get_zone($id) { return null; }
+        }');
+    }
+
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_shipping_item_type', 'product'); // even with the option set to product
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+
+    // Intentional: the POST sends type=product AND the option is product.
+    // The handler must still create a service.
+    $_POST = [
+        'method_id' => 'flat_rate',
+        'instance_id' => 99,
+        'type' => 'product',
+    ];
+
+    $resp = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+
+    TestRunner::assertTrue($resp->success,
+        'la creación del ítem de envío debe terminar en wp_send_json_success');
+
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
+        'se hizo exactamente UN POST /items');
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('service', (string) ($body['type'] ?? null),
+        'el POST /items lleva type=service pese a que POST type=product y la opción es product');
+    TestRunner::assertArrayNotHasKey('inventory', $body,
+        'el POST /items NO lleva inventory (es service, no product)');
+    TestRunner::assertSame('alegra-connector-shipping:flat_rate:99', (string) ($body['reference'] ?? ''),
+        'el reference canónico se envía igual');
+
+    // El mapa persistió el id.
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    TestRunner::assertArrayHasKey('flat_rate:99', $map,
+        'el shipping_map contiene el nuevo método mapeado');
+
+    $_POST = [];
+});
+
+TestRunner::test('T34.4 0-cost shipping method is skipped without a map entry and the invoice is still created', function (): void {
+    // CHANGE 2 (Phase 1 Lane A): free shipping / promotions (shipping_total = 0)
+    // MUST be skipped by `build_shipping_lines()` WITHOUT consulting the
+    // shipping_map. Otherwise a 0-cost method would raise
+    // invoice_shipping_unmapped even though there is nothing to invoice for
+    // shipping. The product line still travels, the invoice is POSTed, and no
+    // shipping line appears in the payload.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', true);
+    update_option('alegra_connector_open_invoice_on_paid', true);
+    update_option('alegra_connector_shipping_map', []); // explícitamente sin mapa
+    alegra_clear_log();
+
+    // Producto + envío con total=0 (free_shipping) sin mapear.
+    $order = alegra_so_billable_order(34041, [
+        'order' => [
+            'shipping_items' => [new \WC_Order_Item_Shipping([
+                'name' => 'Envío gratis', 'method_id' => 'free_shipping', 'instance_id' => '7',
+                'quantity' => 1, 'subtotal' => 0.0, 'total' => 0.0,
+            ])],
+            'total' => 10.0,
+        ],
+    ]);
+
+    $res = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($res),
+        'create_invoice completa sin error (el envío de costo cero se saltea sin exigir mapa)');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/invoices'),
+        'se posteó la factura aunque el envío no estuviera mapeado (porque era $0)');
+    TestRunner::assertFalse((bool) array_filter(
+        (array) (alegra_mock_last_request('POST', '/invoices')['body']['items'] ?? []),
+        static fn ($line) => is_array($line) && (string) ($line['name'] ?? '') === 'Envío gratis'
+    ), 'el payload NO contiene una línea de envío de costo cero');
+
+    // No se persistió invoice_shipping_unmapped.
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertNotSame('invoice_shipping_unmapped', (string) ($led['code'] ?? ''),
+        'NO se persistió invoice_shipping_unmapped (el envío de costo cero no bloquea)');
+});
+
+TestRunner::test('T34.5 variant with an internal parent is skipped: importer returns skipped_internal and no variation is created', function (): void {
+    // Lane C (Phase 1): una variación cuyo `variantParent.id` está en el
+    // allow-list de helper items debe heredar la política del padre y ser
+    // excluida: return 'skipped_internal' y NO se crea ningún `product_variation`
+    // en WC. Sin este check, un subitem "variant" entraría por el camino de
+    // `import_variation_from_alegra()` y crearía una variación colgada bajo
+    // un padre que jamás existió en WC.
+    alegra_test_reset();
+    update_option('alegra_connector_internal_item_ids', ['parent-internal-1']);
+
+    $variation_count_before = 0;
+    foreach (($GLOBALS['wp_posts'] ?? []) as $p) {
+        if (($p->post_type ?? '') === 'product_variation') { $variation_count_before++; }
+    }
+
+    $r = make_products()->import_single_item_public([
+        'id' => 'child-of-internal-1',
+        'name' => 'Child of internal parent',
+        'reference' => 'CHILD-INTERNAL-1',
+        'type' => 'variant',
+        'variantParent' => ['id' => 'parent-internal-1'],
+    ]);
+    TestRunner::assertSame('skipped_internal', $r,
+        'variation con variantParent.id interno ⇒ skipped_internal (no updated)');
+
+    $variation_count_after = 0;
+    foreach (($GLOBALS['wp_posts'] ?? []) as $p) {
+        if (($p->post_type ?? '') === 'product_variation') { $variation_count_after++; }
+    }
+    TestRunner::assertSame($variation_count_before, $variation_count_after,
+        'NO se creó ningún wp_post con post_type=product_variation');
+    TestRunner::assertSame(0, wc_get_product_id_by_sku('CHILD-INTERNAL-1'),
+        'NO existe un WC product con el SKU del variant interno');
 });
 
 exit(TestRunner::summary());

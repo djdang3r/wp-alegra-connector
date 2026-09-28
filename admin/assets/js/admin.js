@@ -62,6 +62,7 @@
             this.initIgnoreInvoice();
             this.initRepairDivergence();
             this.initInvoiceNoticeDismiss();
+            this.initShippingConfig();
         },
 
         /**
@@ -959,8 +960,114 @@
         }
     };
 
+    // ------------------------------------------------------------------
+    // Lane B (Phase 1): Envíos tab — manual WC ↔ Alegra shipping map.
+    // ------------------------------------------------------------------
+    AlegraConnector.initShippingConfig = function() {
+        // Reject the unused-vars warning while keeping the namespace tidy.
+        if (!alegraConnector || !alegraConnector.ajaxUrl) return;
+
+        // Helper: server-derived strings always go through .text() / DOM
+        // nodes (never concatenated HTML) — mirrors the rest of admin.js.
+        function setResult($span, msg, kind) {
+            $span.removeClass('success error warning').addClass(kind || '');
+            $span.css({ color: kind === 'error' ? 'var(--ac-danger)' : (kind === 'success' ? 'var(--ac-success)' : 'var(--ac-text-secondary)') });
+            $span.text(msg || '');
+        }
+
+        // "Crear ítem de envío" — runs under the merchant's explicit context
+        // (run_explicit on the server) so the Write Gate permits the POST.
+        $(document).on('click', '.ac-create-shipping-item', function() {
+            var $btn = $(this);
+            if ($btn.prop('disabled')) return;
+            var $row = $btn.closest('tr');
+            var $select = $row.find('.ac-shipping-map');
+            var $result = $row.find('.ac-shipping-item-result');
+            var methodId = $btn.data('method-id');
+            var instanceId = $btn.data('instance-id');
+            var type = $btn.data('type') || 'service';
+
+            $btn.prop('disabled', true);
+            setResult($result, S.creatingShippingItem || 'Creando ítem...', 'warning');
+
+            $.ajax({
+                url: alegraConnector.ajaxUrl,
+                type: 'POST',
+                data: {
+                    action: 'alegra_create_shipping_item',
+                    _ajax_nonce: alegraConnector.nonce,
+                    method_id: methodId,
+                    instance_id: instanceId,
+                    type: type
+                },
+                success: function(r) {
+                    $btn.prop('disabled', false);
+                    if (r && r.success && r.data) {
+                        // Update the dropdown to select the new id.
+                        var id = r.data.alegra_item_id;
+                        if ($select.find('option[value="' + id + '"]').length === 0) {
+                            $select.append(
+                                $('<option>').val(id).text(id + ' (' + (r.data.created ? 'creado' : 'vinculado') + ')')
+                            );
+                        }
+                        $select.val(id);
+                        setResult($result, r.data.message || (r.data.created ? 'Ítem creado.' : 'Ítem vinculado.'), 'success');
+                    } else {
+                        setResult($result, (r && r.data && r.data.message) || S.error, 'error');
+                    }
+                },
+                error: function() {
+                    $btn.prop('disabled', false);
+                    setResult($result, S.connectionError || 'Error de red.', 'error');
+                }
+            });
+        });
+
+        // "Actualizar lista de ítems desde Alegra" — bypass the 5-min cache.
+        $('#ac-refresh-alegra-items').on('click', function() {
+            var $btn = $(this);
+            if ($btn.prop('disabled')) return;
+            $btn.prop('disabled', true);
+            $.ajax({
+                url: alegraConnector.ajaxUrl,
+                type: 'POST',
+                data: {
+                    action: 'alegra_list_alegra_items',
+                    _ajax_nonce: alegraConnector.nonce,
+                    refresh: 1
+                },
+                success: function(r) {
+                    $btn.prop('disabled', false);
+                    if (r && r.success && r.data && Array.isArray(r.data.items)) {
+                        var items = r.data.items;
+                        $('.ac-shipping-map').each(function() {
+                            var $sel = $(this);
+                            var current = $sel.val();
+                            // Keep the placeholder.
+                            $sel.find('option').not(':first').remove();
+                            for (var i = 0; i < items.length; i++) {
+                                $sel.append(
+                                    $('<option>').val(items[i].id).text(items[i].name + ' (' + items[i].id + ')')
+                                );
+                            }
+                            $sel.val(current);
+                        });
+                        showNotice((S.shippingItemsRefreshed || 'Lista actualizada (%s ítems).').replace('%s', items.length), 'success');
+                    } else {
+                        showNotice((r && r.data && r.data.message) || S.error, 'error');
+                    }
+                },
+                error: function() {
+                    $btn.prop('disabled', false);
+                    showNotice(S.connectionError || 'Error de red.', 'error');
+                }
+            });
+        });
+    };
+
     $(document).ready(function() {
         AlegraConnector.init();
         AlegraConnector.initBulkActions();
+        AlegraConnector.initShippingConfig();
     });
 })(jQuery);

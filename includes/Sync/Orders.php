@@ -238,7 +238,16 @@ class Orders
             }
 
             if (isset($result['id'])) {
-                $this->persist_invoice_result($order, (string) $result['id'], $result);
+                $invoice_id = (string) $result['id'];
+                $this->persist_invoice_result($order, $invoice_id, $result);
+                // CHANGE 3 (Phase 1 Lane A): reconcile the created invoice total
+                // against the WC order total BEFORE the payment step runs. If
+                // they diverge by more than 0.01 the payment is BLOCKED
+                // (`_alegra_invoice_total_mismatch = 1`), a distinct queue state
+                // `invoice_total_mismatch` is persisted, and the merchant is
+                // told. A coincident total clears any stale marker from a prior
+                // attempt.
+                $mismatch = $this->assert_invoice_total_matches_order($order, $invoice_id);
                 $this->baseline_products_for_invoice($order);   // REQ-POLL-02
                 $order->add_order_note(sprintf(
                     __('Factura Alegra #%s creada.', 'alegra-connector'),
@@ -248,6 +257,7 @@ class Orders
                     'order_id' => $order_id,
                     'invoice_id' => $result['id'],
                     'number' => $result['number'] ?? 'N/A',
+                    'total_mismatch' => $mismatch !== null,
                 ]);
             }
 
@@ -1993,10 +2003,17 @@ class Orders
         // and fees were dropped and the invoice total was smaller than the
         // order total. Map them as their own invoice lines.
         //
-        // Both helpers are best-effort and ALWAYS return array (possibly empty).
-        // A shipping/fee line that cannot be linked is logged + skipped (with an
-        // order note) so the rest of the invoice can still be created.
-        $items = array_merge($items, $this->build_shipping_lines($order));
+        // CHANGE 2 (Phase 1 Lane A): shipping is STRICT per WC method. An
+        // unmapped shipping line returns WP_Error and BLOCKS the invoice with
+        // an actionable message — the merchant must map the method in the
+        // shipping settings before the invoice can be created. Fees remain
+        // best-effort (logged + skipped when the generic item can't be
+        // resolved).
+        $shipping_lines = $this->build_shipping_lines($order);
+        if (is_wp_error($shipping_lines)) {
+            return $shipping_lines;
+        }
+        $items = array_merge($items, $shipping_lines);
         $items = array_merge($items, $this->build_fee_lines($order));
 
         if ($items === []) {
@@ -2032,20 +2049,24 @@ class Orders
      *
      * `get_items('shipping')` returns the WC_Order_Item_Shipping rows. Because
      * `items[].id` is obligatory (post_invoices.md), each shipping row is linked
-     * to the shared generic "Ajuste" service item resolved find-or-create by
-     * reference (see GENERIC_ITEM_REFERENCE).
+     * to a per-method Alegra item resolved through `alegra_connector_shipping_map`
+     * keyed by `"<method_id>:<instance_id>"` (e.g. `"flat_rate:13" => "999"`).
      * The line price is pre-tax; the shipping tax is mapped like a line tax.
      *
-     * Best-effort: when the generic item cannot be resolved, the line is SKIPPED
-     * (logged + order note) instead of aborting the whole invoice. Returning
-     * `WP_Error` here used to break legitimate orders with a working invoice
-     * just because the catalog write path was temporarily failing.
+     * CHANGE 2 (Phase 1 Lane A): the lookup is STRICT per WC shipping method.
+     * If a non-zero shipping line has no entry in the map the invoice is BLOCKED
+     * with `invoice_shipping_unmapped` — silently dropping a paid shipping
+     * charge misrepresented the order total to Alegra (regression from the
+     * pre-fix best-effort path). Zero-cost methods still skip without a map.
      *
-     * @return array<int, array<string, mixed>>
+     * @return array<int, array<string, mixed>>|\WP_Error
+     *         `WP_Error('invoice_shipping_unmapped', …)` when a shipping line
+     *         has no map entry; an array of lines otherwise.
      */
-    private function build_shipping_lines(\WC_Order $order): array
+    private function build_shipping_lines(\WC_Order $order): array|\WP_Error
     {
-        $lines = [];
+        $lines      = [];
+        $ship_map   = (array) get_option('alegra_connector_shipping_map', []);
 
         foreach ($order->get_items('shipping') as $ship_item) {
             if (!$ship_item instanceof \WC_Order_Item) {
@@ -2053,31 +2074,48 @@ class Orders
             }
             $total = (float) $ship_item->get_total();
             if ($total <= 0) {
+                // 0-cost methods (free shipping / promotions) need no mapping.
                 continue;
             }
 
-            $item_id = $this->resolve_generic_item_id(
-                self::GENERIC_ITEM_REFERENCE,
-                __('Ajuste', 'alegra-connector')
-            );
+            // Per-method key. `WC_Order_Item_Shipping` exposes both; guard for
+            // missing methods so the test fixture (plain WC_Order_Item) and any
+            // future custom item type degrade to a single "default" bucket
+            // instead of crashing.
+            $method_id   = method_exists($ship_item, 'get_method_id')   ? (string) $ship_item->get_method_id()   : '';
+            $instance_id = method_exists($ship_item, 'get_instance_id') ? (string) $ship_item->get_instance_id() : '';
+            $key         = $method_id . ':' . $instance_id;
+            $item_id     = isset($ship_map[$key]) ? (string) $ship_map[$key] : '';
+
             if ($item_id === '') {
                 if ($this->logger) {
-                    $this->logger->error('Shipping line could not be linked to an Alegra item; invoicing without it', [
-                        'order_id'       => $order->get_id(),
-                        'shipping_total' => $total,
+                    $this->logger->error('Shipping method is not mapped to an Alegra item; invoice blocked', [
+                        'order_id'   => (int) $order->get_id(),
+                        'method_id'  => $method_id,
+                        'instance_id'=> $instance_id,
+                        'key'        => $key,
+                        'name'       => trim((string) $ship_item->get_name()),
+                        'total'      => $total,
                     ]);
                 }
-                $order->add_order_note(sprintf(
-                    /* translators: %s: shipping amount */
-                    __('[Alegra] No se pudo vincular el envío (%s) con un ítem de Alegra; la factura se creó sin esa línea. Revisá el log de Alegra.', 'alegra-connector'),
-                    wc_price($total)
-                ));
-                continue;
+                return new \WP_Error(
+                    'invoice_shipping_unmapped',
+                    sprintf(
+                        /* translators: %s: WooCommerce shipping method display name. */
+                        __('El método de envío "%s" no está mapeado a un ítem de Alegra. Mapealo en Ajustes → Envíos antes de facturar.', 'alegra-connector'),
+                        (string) $ship_item->get_name()
+                    )
+                );
+            }
+
+            $name = trim((string) $ship_item->get_name());
+            if ($name === '') {
+                $name = __('Envío', 'alegra-connector');
             }
 
             $line = [
                 'id'       => $item_id,
-                'name'     => __('Envío', 'alegra-connector'),
+                'name'     => $name,
                 'price'    => $total,
                 'quantity' => 1,
             ];
@@ -2278,12 +2316,23 @@ class Orders
         }
 
         // Last resort: push the product (or variation) so Alegra assigns an id.
+        //
+        // CHANGE 1 (Phase 1 Lane A): Products::sync_to_alegra() issues POST /items
+        // (an automatic write gated by `push_products_enabled`). In an automatic
+        // context the gate defaults to false and would block the push, the resolver
+        // returned '' and the invoice line became `invoice_item_unlinked`. Wrap the
+        // push in `run_explicit()` so the gate NEVER blocks this dependency of the
+        // merchant-driven invoice — same pattern already used for the generic
+        // service item (~L2212) and for tax/variant-attribute creation in the
+        // product-write path.
         $target_id = $variation_id > 0 ? $variation_id : $product_id;
         if ($target_id > 0 && function_exists('wc_get_product')) {
             $product = wc_get_product($target_id);
             if ($product instanceof \WC_Product) {
-                $sync = new Products($this->api, $this->logger);
-                $result = $sync->sync_to_alegra($product);
+                $sync   = new Products($this->api, $this->logger);
+                $result = \Alegra\Connector\Write_Gate::run_explicit(
+                    fn (): mixed => $sync->sync_to_alegra($product)
+                );
                 if (!is_wp_error($result) && isset($result['id'])) {
                     return (string) $result['id'];
                 }
@@ -2302,14 +2351,36 @@ class Orders
     /**
      * Build the `POST /payments` payload from WooCommerce data (REQ-PAY-1).
      *
-     * The amount is $order->get_total() and the date is $order->get_date_paid();
-     * the method is the single gateway→Alegra mapping (REQ-PAY-2). Values are
+     * CHANGE 4 (Phase 1 Lane A) — three gates before the amount is decided:
+     *   1. Mismatch marker (CHANGE 3): the invoice total ≠ order total. The
+     *      payment MUST NOT be recorded — a payment against a drifted invoice
+     *      would silently transfer the disagreement into Alegra's ledger.
+     *      Return [] so the caller treats this as a skip (not a failure):
+     *      `record_payment_for_invoice()` wraps it as
+     *      `['skipped' => true, 'reason' => 'total_mismatch']` and
+     *      `create_invoice_with_payment()` leaves the persisted mismatch state
+     *      in place.
+     *   2. Account configured (BUG 8 guard).
+     *   3. Invoice balance gate: if Alegra reports balance ≤ 0.01 the invoice
+     *      is already paid/overpaid; skip with a note. If the order amount
+     *      exceeds the remaining balance, CLAMP to balance (never overpay)
+     *      and log the discrepancy as an order note.
+     *
+     * The amount is $order->get_total() (which equals the invoice total after
+     * CHANGE 3 reconciliation) and the date is $order->get_date_paid(); the
+     * method is the single gateway→Alegra mapping (REQ-PAY-2). Values are
      * never invented and never read from the gateway's own panel.
      *
-     * @return array<string,mixed> Empty array when no destination account is configured.
+     * @return array<string,mixed> Empty array when no payment should be posted.
      */
     private function prepare_payment_data(\WC_Order $order, string $invoice_id): array
     {
+        // (1) CHANGE 3 marker ⇒ no payment. The mismatch is already persisted
+        // by create_invoice(); don't pretend the payment failed here.
+        if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+            return [];
+        }
+
         $account_id = (string) get_option('alegra_connector_payment_account_id', '');
         // BUG 8: '' and '0' both mean UNCONFIGURED (the settings <select> stores
         // '0' for "no account"), matching the manual path's guard.
@@ -2319,10 +2390,58 @@ class Orders
 
         $amount = (float) $order->get_total();
 
-        // REQ-PAY-1: this is a full payment against the invoice balance. If the
-        // balance Alegra reports differs, surface the discrepancy (note + log)
-        // instead of silently adjusting the amount.
-        $this->assert_full_payment_matches_balance($order, $invoice_id, $amount);
+        // (3) Balance gate. Fetch the invoice once; the legacy discrepancy
+        // logger (assert_full_payment_matches_balance) is kept for the cases
+        // where we DON'T clamp or skip, so the "balance differs from order
+        // total" note keeps its pre-CHANGE-4 semantics.
+        $invoice = $this->api->get_invoice($invoice_id);
+        $balance = (is_wp_error($invoice) || !is_array($invoice) || !isset($invoice['balance']))
+            ? null
+            : (float) $invoice['balance'];
+
+        if ($balance !== null && $balance <= 0.01) {
+            // Already paid (or overpaid) in Alegra — skip the POST and tell the
+            // merchant instead of letting Alegra reject it as an overpayment.
+            $order->add_order_note(sprintf(
+                /* translators: 1: invoice id, 2: balance reported by Alegra. */
+                __('[Alegra] La factura #%1$s ya figura saldada en Alegra (saldo %2$s); no se registró pago automático.', 'alegra-connector'),
+                $invoice_id,
+                number_format($balance, 2, '.', '')
+            ));
+            if ($this->logger) {
+                $this->logger->info('Payment skipped: invoice already paid (balance ≤ 0.01)', [
+                    'order_id'   => (int) $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                    'balance'    => $balance,
+                ]);
+            }
+            return [];
+        }
+
+        if ($balance !== null && $amount > $balance + 0.01) {
+            // Clamp to balance — never exceed it. Record the discrepancy.
+            $order->add_order_note(sprintf(
+                /* translators: 1: order total, 2: invoice id, 3: invoice balance. */
+                __('[Alegra] El total del pedido (%1$s) excede el saldo de la factura #%2$s (%3$s). Se registró el pago por el saldo de la factura.', 'alegra-connector'),
+                number_format($amount, 2, '.', ''),
+                $invoice_id,
+                number_format($balance, 2, '.', '')
+            ));
+            if ($this->logger) {
+                $this->logger->warning('Payment amount clamped to invoice balance', [
+                    'order_id'   => (int) $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                    'amount'     => $amount,
+                    'balance'    => $balance,
+                ]);
+            }
+            $amount = $balance;
+        } else {
+            // Within tolerance OR balance unknown: keep the legacy discrepancy
+            // logger (REQ-PAY-1). When we already clamped above, $amount now
+            // equals $balance so this is a no-op for that path.
+            $this->assert_full_payment_matches_balance($order, $invoice_id, $amount);
+        }
 
         $method_title = trim((string) $order->get_payment_method_title());
         $observations = $method_title !== ''
@@ -2374,6 +2493,111 @@ class Orders
         }
 
         return date('Y-m-d');
+    }
+
+    /**
+     * Reconcile the just-created Alegra invoice total against the WC order total.
+     *
+     * CHANGE 3 (Phase 1 Lane A): the two MUST be coincident — shipping lines,
+     * discounts, taxes and per-method mapping are computed on both sides, and
+     * any drift means the merchant saw one number and Alegra stored another.
+     * A drift of more than 0.01:
+     *   - persists a distinct queue state `invoice_total_mismatch`
+     *     (Invoice_Failure::persist accepts arbitrary classifications);
+     *   - sets the order meta `_alegra_invoice_total_mismatch = 1` so
+     *     `prepare_payment_data()` can short-circuit the payment;
+     *   - adds a localized order note and a `logger->error`;
+     *   - refreshes the queue badge.
+     *
+     * On a coincident total, any stale marker from a previous attempt is
+     * cleared so the payment path resumes on the next try.
+     *
+     * @return array{state:string,code:string,message:string,retriable:bool,persist:bool}|null
+     *         The persisted mismatch classification, or null when totals match
+     *         or when the invoice can't be re-read (non-blocking).
+     */
+    private function assert_invoice_total_matches_order(\WC_Order $order, string $invoice_id): ?array
+    {
+        $invoice = $this->api->get_invoice($invoice_id);
+        if (is_wp_error($invoice) || !is_array($invoice)) {
+            // Could not re-read the invoice: don't gate the payment on a transient
+            // read failure. The invoice exists; if the merchant cares they can
+            // re-run the reconcile hook.
+            if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+                $order->delete_meta_data('_alegra_invoice_total_mismatch');
+                $order->save();
+            }
+            return null;
+        }
+
+        if (!isset($invoice['total'])) {
+            // Total field absent — same defensive fallback as the read failure.
+            if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+                $order->delete_meta_data('_alegra_invoice_total_mismatch');
+                $order->save();
+            }
+            return null;
+        }
+
+        $invoice_total = (float) $invoice['total'];
+        $order_total   = (float) $order->get_total();
+        $diff          = $invoice_total - $order_total;
+
+        if (abs($diff) <= 0.01) {
+            // Coincident — clear any stale marker from a previous attempt so a
+            // subsequent cron / manual retry can resume the payment flow.
+            if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+                $order->delete_meta_data('_alegra_invoice_total_mismatch');
+                $order->save();
+            }
+            return null;
+        }
+
+        // Mismatch: BLOCK payment + record.
+        $rounded_diff = number_format($diff, 2, '.', '');
+        $message      = sprintf(
+            /* translators: 1: WC order id, 2: order total, 3: invoice id, 4: invoice total, 5: difference. */
+            __('Pedido #%1$s total WC=%2$s vs factura Alegra #%3$s total=%4$s (diff=%5$s). Pago bloqueado.', 'alegra-connector'),
+            (string) $order->get_id(),
+            number_format($order_total, 2, '.', ''),
+            $invoice_id,
+            number_format($invoice_total, 2, '.', ''),
+            $rounded_diff
+        );
+
+        $classification = [
+            'state'     => 'invoice_total_mismatch',
+            'code'      => 'total:' . $rounded_diff,
+            'message'   => $message,
+            'retriable' => false,
+            'persist'   => true,
+        ];
+        Invoice_Failure::persist($order, $classification);
+        $order->update_meta_data('_alegra_invoice_total_mismatch', '1');
+        $order->save();
+
+        $order->add_order_note(sprintf(
+            /* translators: 1: order total, 2: invoice id, 3: invoice total, 4: difference. */
+            __('[Alegra] Factura #%2$s creada pero el total (%3$s) NO coincide con el del pedido (%1$s); diferencia=%4$s. NO se registró pago. Revisá manualmente.', 'alegra-connector'),
+            number_format($order_total, 2, '.', ''),
+            $invoice_id,
+            number_format($invoice_total, 2, '.', ''),
+            $rounded_diff
+        ));
+
+        if ($this->logger) {
+            $this->logger->error('Invoice total does not match WC order total; payment blocked', [
+                'order_id'      => (int) $order->get_id(),
+                'invoice_id'    => $invoice_id,
+                'order_total'   => $order_total,
+                'invoice_total' => $invoice_total,
+                'difference'    => $diff,
+            ]);
+        }
+
+        Invoice_Queue::refresh_count();
+
+        return $classification;
     }
 
     /**

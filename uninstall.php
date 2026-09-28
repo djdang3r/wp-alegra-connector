@@ -102,6 +102,9 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_tax_mapping');
     delete_option('alegra_connector_resolved_tax_ids');
     delete_option('alegra_connector_generic_item_ids');
+    delete_option('alegra_connector_shipping_map'); // Phase 1 Lane A: per-method shipping map
+    delete_option('alegra_connector_shipping_item_type'); // Phase 1 Lane B: default type for "Crear ítem de envío"
+    delete_option('alegra_connector_internal_item_ids'); // Lane C: helper-item allow-list
     delete_option('alegra_connector_warehouse_mapping');
     delete_option('alegra_connector_category_mapping');
     delete_option('alegra_connector_warehouse_enabled');
