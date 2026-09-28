@@ -2,6 +2,51 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.1] - 2026-09-27
+
+> **Listas de precios robustas, kill-switch saneado en reconexión y UI fiel a WooCommerce.**
+> El núcleo de la release es el nuevo resolver `Price_Lists::resolve_id()`: el envío configurable y la
+> creación de ítems ya no hardcodean `idPriceList=1` — confirman la lista configurada contra
+> `GET /price-lists`, caen al primer id disponible si la configurada no existe, y bloquean el alta
+> con un mensaje accionable cuando la cuenta no expone listas. Además, una reconexión exitosa a
+> Alegra ahora limpia el kill switch (antes, el admin decía "conectado" pero todo sync seguía
+> bloqueado). Y el listado de Envíos muestra los **nombres reales de cada método**
+> ("Dosquebradas", "Pereira") en vez del genérico "Precio fijo".
+
+### Fixed
+
+- **Resolución de listas de precios (BUG 1)**: el alta de ítems de envío y la creación de ítems
+  genéricos (envío / recargo) ya no hardcodean `idPriceList=1`. El resolver compartido
+  `Price_Lists::resolve_id()` confirma la lista configurada contra `GET /price-lists`, cae al
+  primer id disponible si la configurada no existe (warning log), y bloquea con mensaje
+  accionable ("Mapeo de Campos → Listas de Precios") cuando la cuenta no expone listas.
+- **Kill switch se limpia al reconectar (BUG 2)**: `ajax_test_connection()` en la rama de éxito
+  llama a `Kill_Switch::deactivate()`. Antes, la UI mostraba "conectado" pero cada entrypoint de
+  sync seguía bloqueado por el kill switch. La rama de fallo NO toca el kill switch (un blip
+  transitorio no enmascara la razón por la que el comerciante desactivó el plugin).
+- **Listado de Envíos muestra el nombre real**: `shipping_row_from_method()` y
+  `resolve_wc_shipping_method_title()` ahora usan `$method->get_title()` con fallback a
+  `get_option('title')` y finalmente a `get_method_title()`. Antes siempre devolvían el genérico
+  ("Flat rate" / "Precio fijo"), haciendo indistinguibles varias instancias del mismo tipo.
+- **Métodos de costo variable no leen como "Gratis"**: un `flat_rate` con costo 0 ahora muestra
+  "variable" en la columna Costo. `free_shipping` y `local_pickup` siguen mostrando "Gratis".
+- **UI de Mapeo de Campos (Listas de Precios)**: se eliminó el `<option value="1">General (ID: 1)
+  …</option>` fantasma. El select se popula exclusivamente con `GET /price-lists`. Si la lista
+  guardada ya no existe en la cuenta, se renderiza deshabilitada con la leyenda "ya no existe en
+  tu cuenta — elegí otra". Si la cuenta no expone listas, se muestra aviso accionable.
+- **Transparencia en la pestaña Envíos**: nota visible con la lista de precios que se usará al
+  crear ítems (nombre + id, fallback, o "tu cuenta no expone listas"). Aviso explícito sobre
+  mapear también métodos de costo variable, ya que un cargo > 0 bloquea la factura con
+  `invoice_shipping_unmapped` si están sin mapear.
+
+### Tests
+
+- **T35.1–T35.5** (cubiertos en la fase de implementación): fallback al primer id disponible, id
+  configurado se respeta, cuenta sin listas → `wp_send_json_error` accionable, kill switch se
+  limpia al reconectar, kill switch NO se limpia si la reconexión falla.
+- **T35.6**: `shipping_row_from_method()` usa `get_title()` (con fallback a `get_option('title')`
+  y luego `get_method_title()`) — los tres casos cubiertos.
+
 ## [2.8.0] - 2026-09-27
 
 > **Envío configurable por método, facturación automática corregida y exclusión de ítems internos.**

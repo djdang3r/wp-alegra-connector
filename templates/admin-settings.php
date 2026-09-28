@@ -229,6 +229,25 @@ if ($ac_wh_enabled && $ac_wh_id !== '' && $ac_wh_id !== '0'):
 <?php esc_html_e('Mapea cada método de envío de WooCommerce a un ítem (producto o servicio) en Alegra. El plugin NO crea ítems automáticamente: usá "Crear ítem de envío" para crear uno nuevo en Alegra, o elegí uno existente del listado. Los ítems del propio plugin (referencia "alegra-connector-…") están excluidos de la lista y nunca pueden mapearse aquí.','alegra-connector');?>
 </div>
 
+<?php
+// 2.8.1: transparency on which price list will be used to create the
+// shipping item. The label is resolved the same way as ajax_create_shipping_item
+// so the merchant sees EXACTLY what will be POSTed, instead of guessing.
+?>
+<div class="ac-notice info" style="margin-bottom:12px;font-size:12px;">
+    <strong><?php esc_html_e('Lista de precios para crear ítems de envío:','alegra-connector');?></strong>
+    <?php echo esc_html($ac_pl_label);?>
+    —
+    <span style="color:var(--ac-text-muted);"><?php
+        // translators: %s is the page name in Spanish ("Mapeo de Campos").
+        echo esc_html(sprintf(__('configurable en %s.', 'alegra-connector'), __('Mapeo de Campos', 'alegra-connector')));
+    ?></span>
+</div>
+<div class="ac-notice warning" style="margin-bottom:16px;font-size:12px;">
+    <strong><?php esc_html_e('Atención — métodos de costo variable:','alegra-connector');?></strong>
+    <?php esc_html_e('Los métodos marcados como "variable" en la columna Costo (ej: "Resto de Colombia") también deben mapearse acá. Si el cliente paga envío > 0 con uno de esos métodos, la facturación bloqueará la orden con "invoice_shipping_unmapped". Mapearlos evita ese error.','alegra-connector');?>
+</div>
+
 <div class="ac-card" style="margin-bottom:16px;border-left:4px solid var(--ac-primary);">
 <div class="ac-card-header"><h2><?php esc_html_e('Métodos de envío detectados','alegra-connector');?></h2></div>
 <?php if(empty($ac_shipping_methods)):?>
@@ -263,6 +282,8 @@ $ac_cost = $ac_sm['cost'];
 <span style="color:var(--ac-text-muted);">—</span>
 <?php elseif($ac_cost > 0):?>
 <?php echo esc_html(number_format_i18n($ac_cost, 2));?>
+<?php elseif($ac_sm['method_id'] === 'flat_rate'):?>
+<span style="color:var(--ac-text-muted);font-size:11px;"><?php esc_html_e('variable','alegra-connector');?></span>
 <?php else:?>
 <span style="color:var(--ac-success);"><?php esc_html_e('Gratis','alegra-connector');?></span>
 <?php endif;?>

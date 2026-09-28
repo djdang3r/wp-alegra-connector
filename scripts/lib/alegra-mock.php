@@ -29,7 +29,7 @@ if (!defined('ALEGRA_MOCK_BASE')) {
 const ALEGRA_MOCK_ITEM_WRITE_ENUM = ['product', 'service', 'variantParent', 'kit'];
 
 $GLOBALS['alegra_mock_requests'] = [];
-    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => []];
+    $GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => [], 'price_lists' => []];
 $GLOBALS['alegra_mock_failures'] = [];
 $GLOBALS['alegra_mock_seq'] = 0;
 $GLOBALS['alegra_mock_contact_fiscal_required'] = false;
@@ -40,7 +40,7 @@ $GLOBALS['alegra_mock_invoices_stock_moved'] = [];
 function alegra_mock_reset(): void
 {
     $GLOBALS['alegra_mock_requests'] = [];
-$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => []];
+$GLOBALS['alegra_mock_state'] = ['contacts' => [], 'items' => [], 'categories' => [], 'invoices' => [], 'credit_notes' => [], 'payments' => [], 'variant_attributes' => [], 'taxes' => [], 'subscriptions' => [], 'inventory_adjustments' => [], 'price_lists' => []];
     $GLOBALS['alegra_mock_failures'] = [];
     $GLOBALS['alegra_mock_seq'] = 0;
     $GLOBALS['alegra_mock_variant_children_in_response'] = true;
@@ -180,6 +180,16 @@ function alegra_mock_seed_variant_attribute(string $id, array $data = []): void
         $data,
         ['options' => $options]
     );
+}
+
+/**
+ * Seed a price list (`GET /price-lists`). Used by the Price_Lists resolver
+ * tests (T35.*): the account has at least one row, the row has an `id`
+ * (string OR int, matching the Alegra schema change to VARCHAR/UUID).
+ */
+function alegra_mock_seed_price_list(string $id, array $data = []): void
+{
+    $GLOBALS['alegra_mock_state']['price_lists'][$id] = array_merge(['id' => $id], $data);
 }
 
 /**
@@ -773,6 +783,13 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
     }
     if ($method === 'GET' && $path === '/warehouses') {
         return alegra_mock_response(200, []);
+    }
+    if ($method === 'GET' && $path === '/price-lists') {
+        // Mirror the documented shape: a flat list of rows each carrying an
+        // `id`. Tests seed these via alegra_mock_seed_price_list(); an account
+        // without seeds is intentionally an empty array (a merchant with zero
+        // price lists), which is the actionable case the resolver surfaces.
+        return alegra_mock_response(200, array_values($GLOBALS['alegra_mock_state']['price_lists']));
     }
     if ($method === 'GET' && $path === '/contacts') {
         return alegra_mock_response(200, alegra_mock_filter_contacts($query));

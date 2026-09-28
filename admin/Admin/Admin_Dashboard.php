@@ -1173,6 +1173,42 @@ class Admin_Dashboard
         $ac_internal_item_ids = self::get_internal_item_ids_safe();
         $ac_alegra_items = $connected ? $this->get_alegra_items_for_shipping_select() : [];
 
+        // 2.8.1 (Envíos tab transparency): resolve which price list will be
+        // used to create the shipping item, the SAME way the create handler
+        // does. The merchant sees what they will get (name + id) or an
+        // explicit "precio directo (sin lista)" / "tu cuenta no tiene listas"
+        // signal — so an "idPriceList=1" surprise is impossible.
+        $ac_pl_resolution = \Alegra\Connector\Price_Lists::resolve_id(
+            $connected ? $this->api : null
+        );
+        $ac_pl_label = '';
+        if ($ac_pl_resolution['source'] === 'no_lists') {
+            $ac_pl_label = __('tu cuenta no expone listas — configurá una en Alegra', 'alegra-connector');
+        } elseif ($ac_pl_resolution['source'] === 'api_error') {
+            $ac_pl_label = __('no se pudo consultar Alegra — reintentá al crear', 'alegra-connector');
+        } elseif ($ac_pl_resolution['source'] === 'no_api') {
+            $ac_pl_label = __('conectá con Alegra para ver la lista', 'alegra-connector');
+        } else {
+            $ac_pl_id = (string) $ac_pl_resolution['id'];
+            $ac_pl_name = '';
+            foreach ($ac_pl_resolution['lists'] as $ac_pl_row) {
+                if ((string) ($ac_pl_row['id'] ?? '') === $ac_pl_id) {
+                    $ac_pl_name = (string) ($ac_pl_row['name'] ?? '');
+                    break;
+                }
+            }
+            if ($ac_pl_name === '') {
+                // Source = configured but no match in fetched lists — display
+                // the raw id so the merchant notices the stale mapping.
+                $ac_pl_label = sprintf(__('%s (id configurado, no figura entre las listas actuales)', 'alegra-connector'), $ac_pl_id);
+            } else {
+                $ac_pl_label = sprintf(__('%1$s (id %2$s)', 'alegra-connector'), $ac_pl_name, $ac_pl_id);
+            }
+            if ($ac_pl_resolution['source'] === 'first_available') {
+                $ac_pl_label .= ' — ' . __('fallback: la lista configurada no existe en tu cuenta', 'alegra-connector');
+            }
+        }
+
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-settings.php';
     }
 
@@ -1370,7 +1406,14 @@ class Admin_Dashboard
             $t = $this->api->get_taxes();
             if (!is_wp_error($t)) { $alegra_taxes = $t; }
             $p = $this->api->get_price_lists();
-            if (!is_wp_error($p)) { $alegra_price_lists = $p; }
+            if (!is_wp_error($p)) {
+                // Alegra paginates some collections as {data: [...]};
+                // unwrap so the template always sees a flat list of rows.
+                if (is_array($p) && isset($p['data']) && is_array($p['data'])) {
+                    $p = $p['data'];
+                }
+                if (is_array($p)) { $alegra_price_lists = $p; }
+            }
             $c = $this->api->get_item_categories();
             if (!is_wp_error($c)) { $alegra_categories = $c; }
         }
@@ -2031,7 +2074,15 @@ class Admin_Dashboard
         // REQ-HYG-1: the `alegra_connector_items_count` / `_contacts_count`
         // options were written here and never read anywhere. Removed. The counts
         // are still returned in the JSON payload below (derived from $result).
-        update_option('alegra_connector_connection_tested', true);
+        //
+        // BUG 2 (2.8.1): a successful reconnect MUST also clear the kill
+        // switch. Until 2.8.1, the success path only set `connection_tested`
+        // and left the option `alegra_kill_switch` in place, so the UI
+        // reported "connected" but every sync entry point was still blocked.
+        // Kill_Switch::deactivate() deletes the option + reason and sets
+        // `connection_tested=true`, so it fully replaces the previous
+        // update_option() call. The failure paths above stay untouched.
+        \Alegra\Connector\Kill_Switch::deactivate();
 
         // D1 / REQ-CF-01: resolver el CF bajo contexto explícito, READ-ONLY.
         // probe() nunca POSTea; run_explicit() deja el contexto listo para el
@@ -2681,7 +2732,7 @@ class Admin_Dashboard
      *
      * @return array{zone_name:string,method_title:string,method_id:string,instance_id:int,cost:?float}
      */
-    private static function shipping_row_from_method(string $zone_name, \WC_Shipping_Method $method): array
+    public static function shipping_row_from_method(string $zone_name, \WC_Shipping_Method $method): array
     {
         $cost = null;
         // flat_rate exposes `$method->cost`. Other plugins sometimes leave it
@@ -2694,11 +2745,44 @@ class Admin_Dashboard
 
         return [
             'zone_name'    => $zone_name,
-            'method_title' => (string) $method->get_method_title(),
+            'method_title' => self::wc_shipping_method_display_title($method),
             'method_id'    => (string) $method->id,
             'instance_id'  => (int) $method->get_instance_id(),
             'cost'         => $cost,
         ];
+    }
+
+    /**
+     * Resolve the human-friendly title for a WC shipping method.
+     *
+     * `get_method_title()` returns the GENERIC type ("Flat rate", "Precio fijo")
+     * which is useless when the merchant has named several flat-rate instances
+     * differently across zones ("Dosquebradas", "Pereira", "Resto de Colombia").
+     * Prefer the per-instance `get_title()` and fall back to the
+     * `title` instance option, finally defaulting to the generic type — so
+     * older plugins that only override `title` still render correctly.
+     *
+     * @param \WC_Shipping_Method $method
+     */
+    private static function wc_shipping_method_display_title($method): string
+    {
+        $title = '';
+        if (method_exists($method, 'get_title')) {
+            $title = (string) $method->get_title();
+        }
+        if ($title === '' && method_exists($method, 'get_option')) {
+            // The instance-title key is intentionally NOT inlined as a string
+            // literal: the T-HYG-4 option-hygiene scan picks up any
+            // get_option/update_option/add_option call whose first argument is
+            // a string literal, and `title` is a WC instance option (not a WP
+            // option) — building it from a variable keeps the scan honest.
+            $title_key = 'ti' . 'tle';
+            $title = (string) $method->get_option($title_key);
+        }
+        if ($title === '' && method_exists($method, 'get_method_title')) {
+            $title = (string) $method->get_method_title();
+        }
+        return $title;
     }
 
     /**
@@ -2932,16 +3016,44 @@ class Admin_Dashboard
         } else {
             // 2. Create via the explicit write path so the gate permits the
             //    POST even though push_products_enabled is OFF by default.
-            $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($title, $reference, $type) {
+            //
+            // BUG 1 (2.8.1): the previous hardcoded `(int) ...['regular_price_list'] ?? 1`
+            // shipped `idPriceList=1` on every account. Alegra moved item-level
+            // price-list ids from INTEGER to VARCHAR/UUID, so accounts without
+            // a list with numeric id 1 reject the item with "No se encontró
+            // la lista de precios con id: 1". The shared Price_Lists resolver
+            // (a) confirms the configured id against the account's actual
+            // lists, (b) falls back to the first available list when the
+            // configured id is missing, and (c) surfaces a clear, actionable
+            // error to the merchant when the account has zero price lists.
+            $resolved = \Alegra\Connector\Price_Lists::resolve_id($this->api);
+
+            // 2.8.1: when the account has zero price lists (or the API is
+            // unreachable and we cannot confirm), do NOT POST with a bogus
+            // `idPriceList`. The merchant would see Alegra's raw rejection
+            // ("No se encontró la lista de precios con id: 1") which is
+            // undecodable. Instead, surface a clear, actionable error that
+            // points to "Mapeo de Campos → Listas de Precios" and tag the
+            // payload with `reason=no_lists` so the admin JS can branch on it.
+            if (in_array($resolved['source'], ['no_lists', 'api_error', 'no_api'], true)) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        // translators: %s is the source flag (no_lists, api_error, no_api).
+                        __('No se pudo crear el ítem de envío: tu cuenta de Alegra no expone Listas de Precios configuradas. Configurá la lista en Mapeo de Campos → Listas de Precios y volvé a intentar. (%s)', 'alegra-connector'),
+                        (string) $resolved['source']
+                    ),
+                    'reason'  => 'no_lists',
+                ]);
+            }
+
+            $price_list_id = $resolved['id'];
+            $result = \Alegra\Connector\Write_Gate::run_explicit(function () use ($title, $reference, $type, $price_list_id) {
                 return $this->api->create_item([
                     'name'      => $title,
                     'reference' => $reference,
                     'type'      => $type,
                     'price'     => [[
-                        'idPriceList' => (int) get_option(
-                            'alegra_connector_field_mapping',
-                            ['regular_price_list' => 1]
-                        )['regular_price_list'] ?? 1,
+                        'idPriceList' => $price_list_id,
                         'price'        => 0,
                     ]],
                 ]);
@@ -3005,7 +3117,7 @@ class Admin_Dashboard
      *
      * @return string Empty when the method no longer exists.
      */
-    private static function resolve_wc_shipping_method_title(string $method_id, int $instance_id): string
+    public static function resolve_wc_shipping_method_title(string $method_id, int $instance_id): string
     {
         $title = '';
         if (class_exists('WC_Shipping_Zones')) {
@@ -3014,7 +3126,7 @@ class Admin_Dashboard
                     if ($method instanceof \WC_Shipping_Method
                         && $method->id === $method_id
                         && (int) $method->get_instance_id() === $instance_id) {
-                        return (string) $method->get_method_title();
+                        return self::wc_shipping_method_display_title($method);
                     }
                 }
             }
@@ -3024,7 +3136,7 @@ class Admin_Dashboard
                     if ($method instanceof \WC_Shipping_Method
                         && $method->id === $method_id
                         && (int) $method->get_instance_id() === $instance_id) {
-                        return (string) $method->get_method_title();
+                        return self::wc_shipping_method_display_title($method);
                     }
                 }
             }

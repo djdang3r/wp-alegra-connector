@@ -1106,12 +1106,24 @@ class Products
     }
 
     /**
-     * Alegra price-list id for the regular price (mapping default: 1 "General").
+     * Alegra price-list id for the regular price.
+     *
+     * Resolved through Price_Lists so the configured `regular_price_list`
+     * is confirmed against the account's actual lists and falls back to the
+     * first available list when missing. The previous hardcoded
+     * `(int) ... ?? 1` shipped `idPriceList=1` on every account; Alegra
+     * moved item-level price-list ids from INTEGER to VARCHAR/UUID, so
+     * accounts without a list with numeric id 1 rejected every product
+     * create with "No se encontró la lista de precios con id: 1".
+     *
+     * Like Orders::generic_item_price_list_id(), the sync path does NOT
+     * short-circuit on a "no lists" account state — the caller surfaces
+     * Alegra's own error so the failure stays consistent with every other
+     * item-write failure (no special UI-only masking).
      */
-    private function price_list_id(): int
+    private function price_list_id(): int|string
     {
-        $id = (int) $this->field_mapping('regular_price_list', '1');
-        return $id > 0 ? $id : 1;
+        return \Alegra\Connector\Price_Lists::resolve_id($this->api)['id'];
     }
 
     /**

@@ -2196,17 +2196,23 @@ class Orders
     /**
      * Configured Alegra price-list id for the shared generic service item.
      *
-     * Mirrors Products::price_list_id(): reads the merchant-configured
-     * `regular_price_list` from `alegra_connector_field_mapping`, defaulting to
-     * 1 ("General"). The previous hardcoded value caused the generic item to
-     * land on the wrong price list and made shipping/fee lines invisible to
-     * the merchant's configured catalog.
+     * Mirrors Products::price_list_id(): resolves through Price_Lists so the
+     * configured id is confirmed against the account's actual lists and
+     * falls back to the first available list when missing. The previous
+     * hardcoded `(int) ... ?? 1` shipped `idPriceList=1` on every account;
+     * Alegra moved item-level price-list ids from INTEGER to VARCHAR/UUID,
+     * so accounts without a list with numeric id 1 rejected the generic
+     * item with "No se encontró la lista de precios con id: 1".
+     *
+     * The sync path deliberately does NOT short-circuit on a "no lists"
+     * account state — the caller surfaces Alegra's own error rather than
+     * masking it with a UI-only message, so the failure is visible in the
+     * invoice retry queue and the merchant can act on the same signal they
+     * already see for every other item-write failure.
      */
-    private function generic_item_price_list_id(): int
+    private function generic_item_price_list_id(): int|string
     {
-        $map = get_option('alegra_connector_field_mapping', []);
-        $id  = is_array($map) ? (int) ($map['regular_price_list'] ?? 1) : 1;
-        return $id > 0 ? $id : 1;
+        return \Alegra\Connector\Price_Lists::resolve_id($this->api)['id'];
     }
 
     /**

@@ -119,15 +119,50 @@
         <tr>
             <th><?php esc_html_e('Precio regular a lista:','alegra-connector');?></th>
             <td>
+                <?php
+                // 2.8.1: the previous hardcoded `<option value="1">General</option>`
+                // was a phantom — it shipped `idPriceList=1` on every account,
+                // which Alegra rejected on accounts without a numeric id 1 list.
+                // Populate the select ONLY from `$alegra_price_lists` (the real
+                // GET /price-lists response). If the saved id is not in the
+                // fetched set, surface it as a disabled option so the merchant
+                // knows it is stale and must pick another one.
+                $saved_pl = (string) ($field_mapping['regular_price_list'] ?? '');
+                $saved_pl_visible = false;
+                $pl_rows = is_array($alegra_price_lists) ? $alegra_price_lists : [];
+                ?>
                 <select name="alegra_connector_field_mapping[regular_price_list]">
-                    <option value="1"><?php esc_html_e('General (ID: 1) - Lista por defecto','alegra-connector');?></option>
-                    <?php foreach($alegra_price_lists as $pl): if((int)($pl['id']??0)===1)continue;?>
-                    <option value="<?php echo esc_attr($pl['id']);?>" <?php selected(($field_mapping['regular_price_list']??'1'),$pl['id']);?>>
-                        <?php echo esc_html(($pl['name']??'Lista').' (ID: '.$pl['id'].') - '.($pl['type']??'value'));?>
-                    </option>
-                    <?php endforeach;?>
+                    <?php if(empty($pl_rows)):?>
+                        <option value=""><?php esc_html_e('-- No hay listas en tu cuenta --','alegra-connector');?></option>
+                    <?php else:?>
+                        <?php foreach($pl_rows as $pl):
+                            $pl_id = (string) ($pl['id'] ?? '');
+                            if($pl_id === ''){continue;}
+                            $is_selected = ((string) ($pl['id'] ?? '')) === $saved_pl;
+                            if($is_selected){$saved_pl_visible = true;}
+                        ?>
+                        <option value="<?php echo esc_attr($pl_id);?>" <?php selected($is_selected);?>>
+                            <?php echo esc_html(($pl['name']??__('Lista','alegra-connector')).' (ID: '.$pl_id.')');?>
+                        </option>
+                        <?php endforeach;?>
+                    <?php endif;?>
+                    <?php if($saved_pl !== '' && !$saved_pl_visible):?>
+                        <option value="<?php echo esc_attr($saved_pl);?>" selected disabled>
+                            <?php echo esc_html(sprintf(__('ID %s (ya no existe en tu cuenta — elegí otra)','alegra-connector'), $saved_pl));?>
+                        </option>
+                    <?php endif;?>
                 </select>
-                <p class="description"><?php esc_html_e('El precio regular de WooCommerce se asignara a esta lista de precios en Alegra. La lista "General" (ID 1) es la que se usa por defecto en facturas.','alegra-connector');?></p>
+                <?php if(empty($pl_rows) && $connected):?>
+                    <div class="ac-notice warning" style="margin-top:8px;">
+                        <?php esc_html_e('No hay listas de precios configuradas en tu cuenta Alegra. Sin una lista, la creación de productos/ítems de envío fallará con "No se encontró la lista de precios con id: 1". Configurá al menos una lista en Alegra y volvé a cargar esta página.','alegra-connector');?>
+                    </div>
+                <?php elseif(empty($pl_rows)):?>
+                    <div class="ac-notice info" style="margin-top:8px;">
+                        <?php esc_html_e('Conectá con Alegra para ver tus listas de precios.','alegra-connector');?>
+                    </div>
+                <?php else:?>
+                    <p class="description"><?php esc_html_e('El precio regular de WooCommerce se asignará a esta lista de precios en Alegra. La lista "General" sólo aparece si realmente existe en tu cuenta — el plugin ya no la asume.','alegra-connector');?></p>
+                <?php endif;?>
             </td>
         </tr>
     </table>

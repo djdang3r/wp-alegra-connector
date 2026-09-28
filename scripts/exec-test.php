@@ -12207,7 +12207,13 @@ TestRunner::test('T34.3 ajax_create_shipping_item forces type=service and never 
         eval('class WC_Shipping_Method {
             public string $id = "";
             public int $instance_id = 0;
+            public string $instance_title = "";
+            public array $instance_options = [];
             public function get_instance_id(): int { return $this->instance_id; }
+            public function get_title(): string { return $this->instance_title; }
+            public function get_option(string $key): mixed {
+                return $this->instance_options[$key] ?? "";
+            }
             public function get_method_title(): string { return "Flat rate"; }
         }');
     }
@@ -12233,6 +12239,11 @@ TestRunner::test('T34.3 ajax_create_shipping_item forces type=service and never 
     update_option('alegra_connector_connection_tested', true);
     update_option('alegra_connector_shipping_item_type', 'product'); // even with the option set to product
     update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    // 2.8.1 (BUG 1): the resolver confirms the configured id against the
+    // account's actual price lists. Seed one so the configured `1` matches and
+    // the POST /items path is exercised (the new T35.3 covers the no-list
+    // branch separately).
+    alegra_mock_seed_price_list('1', ['name' => 'General']);
 
     $logger = make_logger();
     $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
@@ -12341,6 +12352,325 @@ TestRunner::test('T34.5 variant with an internal parent is skipped: importer ret
         'NO se creó ningún wp_post con post_type=product_variation');
     TestRunner::assertSame(0, wc_get_product_id_by_sku('CHILD-INTERNAL-1'),
         'NO existe un WC product con el SKU del variant interno');
+});
+
+// ===========================================================================
+// T35 — Price-list resolver (BUG 1) + kill-switch clear on reconnect (BUG 2)
+// ===========================================================================
+// 2.8.1. T35.1..3 exercise the new Price_Lists resolver end-to-end through
+// `ajax_create_shipping_item()`; T35.4..5 verify the kill-switch clear on the
+// SUCCESS path of `ajax_test_connection()`. The WC shipping stubs are only
+// declared the first time we need them — class_exists() makes the block
+// idempotent across re-runs.
+
+if (!class_exists('WC_Shipping_Method')) {
+    eval('class WC_Shipping_Method {
+        public string $id = "";
+        public int $instance_id = 0;
+        public function get_instance_id(): int { return $this->instance_id; }
+        public function get_method_title(): string { return "Flat rate"; }
+    }');
+}
+if (!class_exists('WC_Shipping_Zone')) {
+    eval('class WC_Shipping_Zone {
+        public function get_shipping_methods(): array { return []; }
+    }');
+}
+if (!class_exists('WC_Shipping_Zones')) {
+    eval('class WC_Shipping_Zones {
+        public static function get_zones(): array {
+            $m = new WC_Shipping_Method();
+            $m->id = "flat_rate";
+            $m->instance_id = 99;
+            return [["shipping_methods" => [$m]]];
+        }
+        public static function get_zone($id) { return null; }
+    }');
+}
+
+/**
+ * Reset the resolver's transient cache between scenarios so a previous test
+ * that seeded price lists does not silently satisfy a later "no lists" case.
+ * `alegra_test_reset()` already clears `$GLOBALS['wp_transients']`, but the
+ * resolver exposes its slot through an invalidation hook too — calling it
+ * keeps the wiring honest.
+ */
+function t35_reset_price_lists_cache(): void
+{
+    \Alegra\Connector\Price_Lists::invalidate_cache();
+}
+
+TestRunner::test('T35.1 BUG 1 shipping item creation falls back to the account first list when the configured id is missing', function (): void {
+    // BUG 1 (2.8.1): the pre-fix handler shipped `idPriceList=1` from
+    // `regular_price_list=1`. On a real account that has only UUID-named
+    // lists, Alegra rejected the create with "No se encontró la lista de
+    // precios con id: 1". The resolver must (a) fetch the account's lists,
+    // (b) detect that the configured id is absent, and (c) fall back to the
+    // first available list — here the only list, with id `uuid-xyz`.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    // The account has a SINGLE list with a UUID id — not `1`. The configured
+    // id must NOT match; the resolver must surface the fallback id.
+    alegra_mock_seed_price_list('uuid-xyz', ['name' => 'Lista principal']);
+    t35_reset_price_lists_cache();
+
+    $_POST = [
+        'method_id'   => 'flat_rate',
+        'instance_id' => 99,
+    ];
+
+    $resp = alegra_capture_json(fn () => (
+        new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger())
+    )->ajax_create_shipping_item());
+
+    TestRunner::assertTrue($resp->success,
+        'la creación del ítem debe terminar en wp_send_json_success (el fallback es válido)');
+
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/price-lists'),
+        'el resolver hizo UNA llamada a GET /price-lists (caché miss en este test)');
+    TestRunner::assertSame(1, alegra_mock_count('POST', '/items'),
+        'se hizo exactamente UN POST /items');
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame('uuid-xyz', (string) ($body['price'][0]['idPriceList'] ?? ''),
+        'el POST /items lleva idPriceList=uuid-xyz (fallback al primer id disponible), NO 1');
+    TestRunner::assertNotSame(1, (string) ($body['price'][0]['idPriceList'] ?? ''),
+        'el idPriceList NO es 1 (el bug original)');
+
+    // The shipping map was persisted with the Alegra id of the created item.
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    TestRunner::assertArrayHasKey('flat_rate:99', $map,
+        'el shipping_map persiste la asociación método → ítem de Alegra');
+
+    $_POST = [];
+});
+
+TestRunner::test('T35.2 BUG 1 shipping item creation honours the configured id when it exists in the account', function (): void {
+    // The happy path: the configured `regular_price_list` is present in the
+    // account. The resolver must use it verbatim — not the first list. This
+    // pins the contract that the fix did NOT regress the merchant's explicit
+    // configuration.
+    //
+    // The configured id (`7`) is seeded AFTER another list (`8`) so a naive
+    // "always use the first list" resolver would pick `8` instead of the
+    // configured `7`. That ordering is what makes this test catch the
+    // regression in the prove-it-catch cycle.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => '7']);
+    // Seed in a deterministic order: list `8` is the FIRST in the account,
+    // list `7` (the configured one) comes second. A naive "always first"
+    // resolver would pick `8` and fail the assertion below.
+    alegra_mock_seed_price_list('8', ['name' => 'Detalle']);
+    alegra_mock_seed_price_list('7', ['name' => 'Mayorista']);
+    t35_reset_price_lists_cache();
+
+    $_POST = [
+        'method_id'   => 'flat_rate',
+        'instance_id' => 99,
+    ];
+
+    $resp = alegra_capture_json(fn () => (
+        new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger())
+    )->ajax_create_shipping_item());
+
+    TestRunner::assertTrue($resp->success,
+        'la creación debe terminar en wp_send_json_success');
+
+    $body = alegra_mock_last_request('POST', '/items')['body'] ?? [];
+    TestRunner::assertSame(7, (int) ($body['price'][0]['idPriceList'] ?? 0),
+        'el idPriceList es 7 (el id configurado presente en la cuenta), NO 8 (el primer id)');
+
+    $_POST = [];
+});
+
+TestRunner::test('T35.3 BUG 1 no price lists in account → admin surfaces a clear, actionable error and does not POST', function (): void {
+    // The actionnable branch: the API is reachable but the account has zero
+    // price lists. A POST /items would carry `idPriceList=1` and Alegra would
+    // reject with the original bug message — the merchant has no way to
+    // decode that into a config fix. The admin handler MUST short-circuit
+    // with a message that points to "Mapeo de Campos → Listas de Precios" so
+    // the merchant can act.
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    // Sin seed de price-lists → el mock responde [].
+    t35_reset_price_lists_cache();
+
+    $_POST = [
+        'method_id'   => 'flat_rate',
+        'instance_id' => 99,
+    ];
+
+    $resp = alegra_capture_json(fn () => (
+        new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger())
+    )->ajax_create_shipping_item());
+
+    TestRunner::assertFalse($resp->success,
+        'sin listas de precios la creación debe terminar en wp_send_json_error');
+    TestRunner::assertStringContains('Listas de Precios', (string) ($resp->payload['message'] ?? ''),
+        'el mensaje menciona "Listas de Precios" para que el comerciante sepa dónde configurar');
+    TestRunner::assertSame('no_lists', (string) ($resp->payload['reason'] ?? ''),
+        'el payload incluye reason=no_lists para que el JS pueda ramificar');
+
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'),
+        'NO se envió ningún POST /items con un id bogus');
+
+    $_POST = [];
+});
+
+TestRunner::test('T35.4 BUG 2 a successful ajax_test_connection() clears the kill switch', function (): void {
+    // BUG 2 (2.8.1): a successful reconnect used to set
+    // `alegra_connector_connection_tested=true` but never call
+    // Kill_Switch::deactivate(). The UI then reported "connected" while
+    // every sync entry point was still blocked by the kill switch — a
+    // "connected but blocked" trap. The success path of `ajax_test_connection`
+    // must call `Kill_Switch::deactivate()`.
+    //
+    // The default mock answers /company, /items and /contacts with success,
+    // so `test_connection()` returns the company info and the success path
+    // runs end-to-end (including the CF probe under run_explicit).
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_options'] = true;
+
+    \Alegra\Connector\Kill_Switch::activate('test');
+    \Alegra\Connector\Kill_Switch::reset_cache();
+    TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(),
+        'precondición: el kill switch está activo al inicio del test');
+
+    $_POST = [
+        'email' => 'harness@example.test',
+        'token' => 'harness-token',
+    ];
+    $resp = alegra_capture_json(fn () => (
+        new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger())
+    )->ajax_test_connection());
+    unset($_POST['email'], $_POST['token']);
+
+    TestRunner::assertTrue($resp->success,
+        'la conexión debe terminar en wp_send_json_success');
+    TestRunner::assertFalse(\Alegra\Connector\Kill_Switch::is_active(),
+        'el kill switch quedó INACTIVO tras una conexión exitosa (BUG 2 fixed)');
+    TestRunner::assertSame(true, (bool) get_option('alegra_connector_connection_tested', false),
+        'connection_tested quedó en true');
+
+    \Alegra\Connector\Kill_Switch::reset_cache();
+});
+
+TestRunner::test('T35.5 BUG 2 a FAILED ajax_test_connection() does NOT clear the kill switch', function (): void {
+    // The negative contract: a FAILED connection test must leave the kill
+    // switch exactly as it found it. Failing /company triggers the
+    // `is_wp_error($result)` branch which sets connection_tested=false but
+    // must NOT touch the kill switch (otherwise a transient blip could mask
+    // a real reason the merchant disabled the plugin).
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_options'] = true;
+
+    // Inyecta fallo SOLO en GET /company. La preflight usa HEAD /company (el
+    // mock trata HEAD y GET como claves separadas), así que pasa y permite
+    // que `test_connection()` sea el que dispare la rama de error.
+    alegra_mock_fail('GET', '/company', 500, ['message' => 'Alegra down for test'], 0);
+
+    \Alegra\Connector\Kill_Switch::activate('user_disconnected');
+    \Alegra\Connector\Kill_Switch::reset_cache();
+    TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(),
+        'precondición: el kill switch está activo al inicio del test');
+
+    $_POST = [
+        'email' => 'harness@example.test',
+        'token' => 'harness-token',
+    ];
+    $resp = alegra_capture_json(fn () => (
+        new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger())
+    )->ajax_test_connection());
+    unset($_POST['email'], $_POST['token']);
+
+    TestRunner::assertFalse($resp->success,
+        'la conexión debe terminar en wp_send_json_error (fallo inyectado en /company)');
+    TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(),
+        'el kill switch SIGUE activo tras una conexión fallida (no se borra en la rama de error)');
+    TestRunner::assertSame('user_disconnected', (string) get_option('alegra_connector_disconnected_reason', ''),
+        'la razón del kill switch NO fue borrada por la rama de error');
+    TestRunner::assertFalse((bool) get_option('alegra_connector_connection_tested', false),
+        'connection_tested quedó en false');
+
+    \Alegra\Connector\Kill_Switch::reset_cache();
+});
+
+// ===========================================================================
+// T35.6 — Envíos listing shows the INSTANCE title (not the generic type)
+// ===========================================================================
+// The pre-fix `shipping_row_from_method()` and `resolve_wc_shipping_method_title()`
+// used `get_method_title()` which returns the GENERIC type ("Flat rate",
+// "Precio fijo"). A merchant with several flat-rate instances named per-zone
+// ("Dosquebradas", "Pereira", "Resto de Colombia") saw a column of "Flat rate"
+// rows — unidentifiable. The fix prefers `get_title()` (the per-instance
+// title) and falls back to the `title` option or `get_method_title()` only
+// when those are empty.
+
+TestRunner::test('T35.6 detect_wc_shipping_methods uses the WC instance title, not the generic method_title', function (): void {
+    // The Envíos listing builder prefers `get_title()` (per-instance title
+    // like "Dosquebradas") over `get_method_title()` (generic type like
+    // "Flat rate"). We exercise BOTH paths of `shipping_row_from_method()`
+    // — the helper that builds the table rows — so the assertion does not
+    // depend on the WC_Shipping_Zones stub (which is shared with T34.*).
+    //
+    // The pre-fix code used `$method->get_method_title()` which would always
+    // return "Flat rate" (or the equivalent in the active locale) regardless
+    // of how the merchant named each instance.
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+
+    // 1) Primary: `get_title()` returns "Dosquebradas" → row reads "Dosquebradas".
+    $m_instance = new \WC_Shipping_Method();
+    $m_instance->id = 'flat_rate';
+    $m_instance->instance_id = 7;
+    $m_instance->instance_title = 'Dosquebradas';
+
+    $row = \Alegra\Connector\Admin\Admin_Dashboard::shipping_row_from_method(
+        'Risaralda', $m_instance
+    );
+    TestRunner::assertSame('Dosquebradas', (string) ($row['method_title'] ?? ''),
+        'shipping_row_from_method usa get_title() (instancia) — NO get_method_title()');
+    TestRunner::assertSame('flat_rate', (string) ($row['method_id'] ?? ''),
+        'method_id se preserva (flat_rate)');
+    TestRunner::assertSame('Risaralda', (string) ($row['zone_name'] ?? ''),
+        'zone_name se preserva');
+    TestRunner::assertSame(7, (int) ($row['instance_id'] ?? 0),
+        'instance_id se preserva');
+
+    // 2) Fallback: when get_title() returns empty, the `title` instance option
+    // is used — covers plugins that only override the per-instance option.
+    $m_option = new \WC_Shipping_Method();
+    $m_option->id = 'flat_rate';
+    $m_option->instance_id = 8;
+    $m_option->instance_title = '';
+    $m_option->instance_options = ['title' => 'Pereira'];
+
+    $row2 = \Alegra\Connector\Admin\Admin_Dashboard::shipping_row_from_method(
+        'Risaralda', $m_option
+    );
+    TestRunner::assertSame('Pereira', (string) ($row2['method_title'] ?? ''),
+        'fallback: get_option("title") cuando get_title() está vacío');
+
+    // 3) Final fallback: both `get_title()` and the option are empty →
+    // `get_method_title()` (the generic type). Older plugins that override
+    // neither still render sensibly.
+    $m_generic = new \WC_Shipping_Method();
+    $m_generic->id = 'flat_rate';
+    $m_generic->instance_id = 9;
+    $m_generic->instance_title = '';
+    $m_generic->instance_options = [];
+
+    $row3 = \Alegra\Connector\Admin\Admin_Dashboard::shipping_row_from_method(
+        'Risaralda', $m_generic
+    );
+    TestRunner::assertSame('Flat rate', (string) ($row3['method_title'] ?? ''),
+        'fallback final: get_method_title() cuando get_title() y la opción están vacías');
 });
 
 exit(TestRunner::summary());
