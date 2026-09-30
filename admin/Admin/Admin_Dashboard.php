@@ -4219,6 +4219,53 @@ class Admin_Dashboard
         return __('La configuración actual bloqueó la operación; no se envió a Alegra.', 'alegra-connector');
     }
 
+    /**
+     * FIX-1 (REQ-1): message for a single-order success result that carries the
+     * additive `_alegra_payment` key from create_invoice_with_payment(). When
+     * the key is absent (no account configured, no payment path at all) the
+     * legacy generic success message is preserved.
+     *
+     * @param array<string,mixed> $result The result returned by sync_entity() / create_invoice_with_payment().
+     */
+    private static function invoice_payment_message(array $result): string
+    {
+        $payment = $result['_alegra_payment'] ?? null;
+        if (!is_array($payment) || !isset($payment['state'])) {
+            return __('Sincronización completada.', 'alegra-connector');
+        }
+        $state = (string) $payment['state'];
+        if ($state === 'recorded') {
+            return __('Factura y pago registrados en Alegra.', 'alegra-connector');
+        }
+        if ($state === 'skipped') {
+            $reason = (string) ($payment['reason'] ?? '');
+            if ($reason === 'order_not_paid') {
+                return __('Factura creada, pero el pedido no figura pagado en WooCommerce; no se registró pago.', 'alegra-connector');
+            }
+            return __('Factura creada, pago NO registrado.', 'alegra-connector');
+        }
+        // state === 'missing'
+        $reason  = (string) ($payment['reason'] ?? '');
+        $message = (string) ($payment['message'] ?? '');
+        if ($reason === 'total_mismatch') {
+            return __('Factura creada, pero los totales NO coinciden; pago bloqueado.', 'alegra-connector');
+        }
+        if ($reason === 'no_account') {
+            return __('Factura creada; no hay cuenta bancaria configurada, no se registró pago.', 'alegra-connector');
+        }
+        if ($reason === 'draft_not_opened') {
+            return __('Factura creada, pero está en BORRADOR; no se registró pago automático.', 'alegra-connector');
+        }
+        if ($message !== '') {
+            return sprintf(
+                /* translators: 1: error message from Alegra */
+                __('Factura creada, pago NO registrado (%s).', 'alegra-connector'),
+                $message
+            );
+        }
+        return __('Factura creada, pago NO registrado.', 'alegra-connector');
+    }
+
     public function ajax_open_invoice(): void
     {
         \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_open_invoice_impl());
@@ -4490,9 +4537,12 @@ class Admin_Dashboard
 
         // El propio flujo persistió el ledger (resolved o fallo clasificado).
         \Alegra\Connector\Sync\Invoice_Queue::refresh_count();
+        // FIX-1 (REQ-1): reflejar el resultado del pago también en el reintento.
+        $message = self::invoice_payment_message($result);
+
         wp_send_json_success([
             'state'   => 'resolved',
-            'message' => __('Se reintentó la factura.', 'alegra-connector'),
+            'message' => $message,
         ]);
     }
 
@@ -4595,6 +4645,19 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('Configura una cuenta bancaria en Ajustes > Avanzado.', 'alegra-connector')]);
         }
 
+        // FIX-2 (REQ-2.3): si el reconciliador marcó totales inconsistentes,
+        // NO posteamos el pago y avisamos al comercio. Misma política que el
+        // orquestador automático.
+        if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+            $this->logger->warning('Payment recording blocked by invoice total mismatch', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+            ]);
+            wp_send_json_error([
+                'message' => __('Los totales de la factura y el pedido NO coinciden; revisá la factura antes de registrar el pago.', 'alegra-connector'),
+            ]);
+        }
+
         // A payment requires an OPEN invoice. This is an explicit MANUAL action
         // ("Registrar pago"), so opening a draft here is the merchant's own
         // decision — the automatic reconciliation never does it (BUG: the cron
@@ -4612,30 +4675,21 @@ class Admin_Dashboard
             }
         }
 
-        $payment_data = [
-            'date' => $order->get_date_paid() ? $order->get_date_paid()->date('Y-m-d') : date('Y-m-d'),
-            'bankAccount' => ['id' => $account_id],
-            'invoices' => [
-                [
-                    'id' => $alegra_invoice_id,
-                    'amount' => (float) $order->get_total(),
-                ],
-            ],
-            'paymentMethod' => $orders_sync->getPaymentMethodForGateway($order->get_payment_method()),
-        ];
+        // FIX-2 (REQ-2): reutilizar el orquestador balance-aware. Reemplaza el
+        // armado+POST manual: ahora el clamp, la idempotencia, las observations
+        // y el manejo de dry-run/gate viven en UN solo método.
+        $result = $orders_sync->record_payment_for_invoice($order, $alegra_invoice_id, true);
 
-        $result = $this->api->create_payment($payment_data);
-
+        // WP_Error: el POST falló — message de Alegra, sin false success.
         if (is_wp_error($result)) {
             $this->logger->error('Payment recording failed', [
                 'order_id' => $order_id,
-                'error' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message()),
+                'error' => $result->get_error_message(),
             ]);
             wp_send_json_error(['message' => sprintf(__('Error de Alegra: %s', 'alegra-connector'), $result->get_error_message())]);
         }
 
-        // Dry Run: the payment was NOT recorded. Do not save an empty payment id,
-        // do not add a success note, and tell the UI explicitly.
+        // Dry Run: el pago NO se registró. Informar sin guardar payment id.
         if (API\Client::is_dry_run_response($result)) {
             $this->logger->warning('Payment recording skipped (dry run)', [
                 'order_id'   => $order_id,
@@ -4647,8 +4701,7 @@ class Admin_Dashboard
             ]);
         }
 
-        // Write Gate (kill switch / entity disabled): the payment was NOT
-        // recorded. Report the real reason instead of a fake success.
+        // Write Gate (kill switch / entity disabled): el pago NO se registró.
         if (API\Client::is_gate_blocked_response($result)) {
             $this->logger->warning('Payment recording blocked by write gate', [
                 'order_id'   => $order_id,
@@ -4662,24 +4715,38 @@ class Admin_Dashboard
             ]);
         }
 
-        // Alegra payment ids are UUID strings.
-        $payment_id = (string) ($result['id'] ?? '');
-        $order->update_meta_data('_alegra_payment_id', $payment_id);
-        if (!empty($result['number'])) {
-            $order->update_meta_data('_alegra_payment_number', $result['number']);
+        // Skip del orquestador: motivos que NO deben postear.
+        if (is_array($result) && !empty($result['skipped'])) {
+            $reason = (string) ($result['reason'] ?? '');
+            $this->logger->info('Payment recording skipped (manual)', [
+                'order_id'   => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+                'reason'     => $reason,
+            ]);
+            // El orquestador ya dejó la nota correspondiente; acá traducimos a
+            // un mensaje de UI claro para no decir "registrado" sin haberlo hecho.
+            if ($reason === 'no_account') {
+                wp_send_json_success([
+                    'message' => __('Factura ya estaba registrada; no hay cuenta bancaria configurada.', 'alegra-connector'),
+                    'skipped' => true,
+                ]);
+            }
+            if ($reason === 'draft_not_opened') {
+                wp_send_json_success([
+                    'message' => __('La factura está en borrador y no se pudo abrir; revisala en Alegra.', 'alegra-connector'),
+                    'skipped' => true,
+                ]);
+            }
+            // Por defecto: ya saldada / clamp / total_mismatch — message genérico.
+            wp_send_json_success([
+                'message' => __('No se registró pago: la factura ya estaba saldada o el saldo no permite más cargos.', 'alegra-connector'),
+                'skipped' => true,
+                'reason'  => $reason,
+            ]);
         }
-        $order->save();
 
-        $order->add_order_note(sprintf(
-            __('Pago Alegra #%s registrado.', 'alegra-connector'),
-            $result['number'] ?? $payment_id
-        ));
-
-        $this->logger->info('Payment recorded in Alegra', [
-            'order_id' => $order_id,
-            'payment_id' => $payment_id,
-            'invoice_id' => $alegra_invoice_id,
-        ]);
+        // Éxito: el orquestador ya guardó _alegra_payment_id/number y la nota
+        // de éxito — no duplicamos acá.
 
         // D1 §2.2.1: el registro confirmado queda auditado (nota + log).
         if ($confirm
@@ -4694,6 +4761,13 @@ class Admin_Dashboard
                 'owner'      => 'adjustment',
             ]);
         }
+
+        $payment_id = (string) ($result['id'] ?? '');
+        $this->logger->info('Payment recorded in Alegra', [
+            'order_id' => $order_id,
+            'payment_id' => $payment_id,
+            'invoice_id' => $alegra_invoice_id,
+        ]);
 
         wp_send_json_success([
             'message' => __('Pago registrado en Alegra.', 'alegra-connector'),
@@ -4881,7 +4955,11 @@ class Admin_Dashboard
             ]);
         }
 
-        wp_send_json_success(['message' => __('Sincronización completada.', 'alegra-connector'), 'data' => $result]);
+        // FIX-1 (REQ-1): reflejar el resultado del pago en la UI. La clave
+        // `_alegra_payment` es ADITIVA: los callers existentes solo leen `id`.
+        $message = self::invoice_payment_message($result);
+
+        wp_send_json_success(['message' => $message, 'data' => $result]);
     }
 
     /**
@@ -4991,7 +5069,7 @@ class Admin_Dashboard
         if (empty($ids)) wp_send_json_error(['message' => __('Seleccióna al menos un elemento.', 'alegra-connector')]);
 
         $sync_controller = new \Alegra\Connector\Sync\Controller($this->api, $this->logger);
-        $synced = 0; $errors = 0; $blocked = 0;
+        $synced = 0; $errors = 0; $blocked = 0; $payment_missing = 0;
 
         foreach ($ids as $id) {
             // REQ-MAN-2: bulk "Facturar seleccionados" must also register the
@@ -5004,6 +5082,12 @@ class Admin_Dashboard
                 $blocked++;
             } else {
                 $synced++;
+                // FIX-1 (REQ-1, REQ-MAN-2): "aviso" agregado, no es error — el
+                // pedido ya está facturado, sólo falta el pago.
+                if (is_array($r) && isset($r['_alegra_payment']['state'])
+                    && in_array($r['_alegra_payment']['state'], ['missing', 'skipped'], true)) {
+                    $payment_missing++;
+                }
             }
         }
 
@@ -5016,7 +5100,21 @@ class Admin_Dashboard
             ]);
         }
 
-        wp_send_json_success(['message' => sprintf(__('%d sincronizados, %d errores.', 'alegra-connector'), $synced, $errors)]);
+        $message = sprintf(__('%d sincronizados, %d errores.', 'alegra-connector'), $synced, $errors);
+        if ($payment_missing > 0) {
+            $message .= ' ' . sprintf(
+                /* translators: %d: number of orders whose payment was not registered */
+                _n(
+                        '%d con pago NO registrado (revisalo desde el pedido).',
+                        '%d con pago NO registrado (revisalo desde cada pedido).',
+                        $payment_missing,
+                        'alegra-connector'
+                    ),
+                $payment_missing
+            );
+        }
+
+        wp_send_json_success(['message' => $message]);
     }
 
     public function ajax_import_single(): void

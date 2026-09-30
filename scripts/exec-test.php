@@ -4170,14 +4170,22 @@ TestRunner::test('T-REC-2 assert_invoice_total_matches_order: total coincidente 
         'marker stale limpiado para que el pago pueda proceder');
 });
 
-TestRunner::test('T-REC-3 assert_invoice_total_matches_order: invoice no se puede releer ⇒ no bloquea', function (): void {
-    // CHANGE 3: si no podemos releer la factura, NO bloqueamos el pago (sería
-    // un fallo de read transient, no un drift real). Si había marker stale,
-    // también se limpia para no dejar el pedido en un limbo.
+TestRunner::test('T-REC-3 assert_invoice_total_matches_order: invoice no se puede releer + marker previo ⇒ se mantiene el bloqueo', function (): void {
+    // FIX-4 (REQ-4.1): si no podemos releer la factura PERO ya había un marker
+    // puesto por un drift real, NO lo limpiamos: el pago debe seguir
+    // bloqueado y la cola debe seguir mostrando `invoice_total_mismatch`. Es
+    // un fallo de read transient — pero el marker es un hecho persistente y
+    // borrarlo abriría una ventana de 1 reintento con desajuste.
     alegra_test_reset();
     $order = make_payable_order(6003, 1, 'rec3@example.test', 100.0);
-    $order->update_meta_data('_alegra_invoice_total_mismatch', '1'); // stale
-    $order->save();
+    $order->update_meta_data('_alegra_invoice_total_mismatch', '1'); // marker previo
+    \Alegra\Connector\Sync\Invoice_Failure::persist($order, [
+        'state'     => 'invoice_total_mismatch',
+        'code'      => 'total:-5.00',
+        'message'   => 'drift previo',
+        'retriable' => false,
+        'persist'   => true,
+    ]);
     // No seed for 'inv-missing' → mock returns 404
 
     $result = alegra_call_private(
@@ -4187,9 +4195,264 @@ TestRunner::test('T-REC-3 assert_invoice_total_matches_order: invoice no se pued
         'inv-missing'
     );
 
-    TestRunner::assertSame(null, $result, 'read failure ⇒ null (no bloquea)');
+    TestRunner::assertTrue(is_array($result), 'read failure + marker previo ⇒ devuelve clasificación');
+    TestRunner::assertSame('invoice_total_mismatch', $result['state'], 'estado preservado');
+    TestRunner::assertFalse($result['retriable'], 'NO retriable (sigue bloqueado)');
+    TestRunner::assertTrue($result['persist'], 'persist=true');
+    TestRunner::assertSame('1', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
+        'marker preservado en el pedido tras read failure');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('invoice_total_mismatch', $led['state'],
+        'la cola sigue mostrando invoice_total_mismatch');
+});
+
+TestRunner::test('T-REC-3b assert_invoice_total_matches_order: invoice no se puede releer SIN marker ⇒ null (no bloquea)', function (): void {
+    // FIX-4 (REQ-4.x): read failure SIN marker previo ⇒ return null. No hay
+    // drift real que proteger; un GET fallido no debe inventar un mismatch.
+    alegra_test_reset();
+    $order = make_payable_order(6004, 1, 'rec3b@example.test', 100.0);
+    // SIN marker _alegra_invoice_total_mismatch.
+
+    $result = alegra_call_private(
+        make_orders(),
+        'assert_invoice_total_matches_order',
+        $order,
+        'inv-missing'
+    );
+
+    TestRunner::assertSame(null, $result, 'read failure + SIN marker ⇒ null (no bloquea)');
     TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
-        'marker stale limpiado tras read failure');
+        'NO se crea marker espurio en un read failure');
+});
+
+// ===========================================================================
+// T37 — 2.8.3 (Robustez de facturación y pagos)
+// ===========================================================================
+
+TestRunner::test('T37.1 create_invoice_with_payment expone _alegra_payment=recorded|missing|skipped', function (): void {
+    // FIX-1 (REQ-1): la clave `_alegra_payment` es ADITIVA — los callers sólo
+    // leen `id`. La UI debe ver el estado real del pago, no "completado"
+    // cuando el pago falló.
+    $logger = make_logger();
+
+    // 1) recorded: pago OK
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    $order_ok = make_payable_order(37001, 1, 't371-ok@example.test', 100.0);
+    $r = (new Orders(make_api($logger), $logger))->create_invoice_with_payment($order_ok);
+    TestRunner::assertFalse(is_wp_error($r), 'factura OK');
+    TestRunner::assertTrue(is_array($r['_alegra_payment'] ?? null),
+        'FIX-1: clave _alegra_payment presente');
+    TestRunner::assertSame('recorded', $r['_alegra_payment']['state'],
+        'FIX-1: pago registrado ⇒ state=recorded');
+    TestRunner::assertSame('resolved', \Alegra\Connector\Sync\Invoice_Failure::get($order_ok)['state'],
+        'FIX-1: ledger limpio tras pago OK');
+
+    // 2) missing: el POST /payments devuelve 400
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_fail('POST', '/payments', 400, ['message' => 'Alegra rechaza pago']);
+    $order_missing = make_payable_order(37002, 1, 't371-missing@example.test', 100.0);
+    $r = (new Orders(make_api($logger), $logger))->create_invoice_with_payment($order_missing);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura se crea');
+    TestRunner::assertTrue(is_array($r['_alegra_payment'] ?? null),
+        'FIX-1: clave _alegra_payment presente en missing');
+    TestRunner::assertSame('missing', $r['_alegra_payment']['state'],
+        'FIX-1: pago falló ⇒ state=missing');
+    TestRunner::assertSame('payment_missing', \Alegra\Connector\Sync\Invoice_Failure::get($order_missing)['state'],
+        'FIX-1: ledger persiste payment_missing');
+
+    // 3) skipped: cuenta configurada pero pedido NO pagado
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    $order_skipped = make_payable_order(37003, 1, 't371-skip@example.test', 100.0, ['status' => 'pending']);
+    $r = (new Orders(make_api($logger), $logger))->create_invoice_with_payment($order_skipped);
+    TestRunner::assertFalse(is_wp_error($r), 'la factura se crea sin pago');
+    TestRunner::assertTrue(is_array($r['_alegra_payment'] ?? null),
+        'FIX-1: clave _alegra_payment presente en skipped');
+    TestRunner::assertSame('skipped', $r['_alegra_payment']['state'],
+        'FIX-1: pedido no pagado ⇒ state=skipped');
+    TestRunner::assertSame('order_not_paid', $r['_alegra_payment']['reason'] ?? '',
+        'FIX-1: reason=order_not_paid');
+});
+
+TestRunner::test('T37.2 ajax_record_payment delega en record_payment_for_invoice y respeta clamp / saldo / mismatch', function (): void {
+    // FIX-2 (REQ-2): el handler "Registrar pago" reusa el orquestador balance-aware.
+    // El clamp del monto y el skip por saldo ya saldada viven en
+    // record_payment_for_invoice(); el handler sólo compone el mensaje.
+    $logger = make_logger();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api($logger), $logger);
+
+    // (a) total > saldo ⇒ clamp (amount = balance)
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('inv-clamp', ['status' => 'open', 'total' => 100.0, 'balance' => 80.0]);
+    $order_clamp = make_payable_order(37101, 1, 't372-clamp@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-clamp', '_billing_alegra_contact_id' => 'c0n-clamp'],
+    ]);
+    $_POST['order_id'] = $order_clamp->get_id();
+    $r1 = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+    TestRunner::assertTrue($r1->success, 'FIX-2: clamp ⇒ success');
+    $payment = alegra_mock_last_request('POST', '/payments')['body'] ?? [];
+    TestRunner::assertSame(80.0, (float) ($payment['invoices'][0]['amount'] ?? 0),
+        'FIX-2: el handler clampa al saldo (no supera balance)');
+
+    // (b) saldo ≤ 0.01 ⇒ sin POST + mensaje skipped
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('inv-paid', ['status' => 'open', 'total' => 100.0, 'balance' => 0.0]);
+    $order_paid = make_payable_order(37102, 1, 't372-paid@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-paid', '_billing_alegra_contact_id' => 'c0n-paid'],
+    ]);
+    $_POST['order_id'] = $order_paid->get_id();
+    $r2 = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+    TestRunner::assertTrue($r2->success, 'FIX-2: ya saldada ⇒ success (skipped)');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'),
+        'FIX-2: no se postea cuando saldo ≤ 0.01');
+    TestRunner::assertTrue(!empty($r2->payload['skipped']),
+        'FIX-2: el handler marca skipped=true');
+
+    // (c) marker _alegra_invoice_total_mismatch ⇒ bloqueo SIN llamar al orquestador
+    alegra_test_reset();
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('inv-mis', ['status' => 'open', 'total' => 100.0, 'balance' => 100.0]);
+    $order_mis = make_payable_order(37103, 1, 't372-mis@example.test', 100.0, [
+        'meta' => [
+            '_alegra_invoice_id'             => 'inv-mis',
+            '_billing_alegra_contact_id'     => 'c0n-mis',
+            '_alegra_invoice_total_mismatch' => '1',
+        ],
+    ]);
+    $_POST['order_id'] = $order_mis->get_id();
+    $r3 = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+    TestRunner::assertFalse($r3->success, 'FIX-2: mismatch ⇒ error (no success)');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/payments'),
+        'FIX-2: NO se postea cuando el reconciliador marcó mismatch');
+    TestRunner::assertStringContains('NO coinciden', (string) ($r3->payload['message'] ?? ''),
+        'FIX-2: el mensaje avisa de totales');
+
+    // (d) dry-run ⇒ success skipped + 0 POST netos
+    update_option('alegra_connector_dry_run', true);
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('inv-dr', ['status' => 'open', 'total' => 50.0, 'balance' => 50.0]);
+    $order_dr = make_payable_order(37104, 1, 't372-dr@example.test', 50.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-dr', '_billing_alegra_contact_id' => 'c0n-dr'],
+    ]);
+    $_POST['order_id'] = $order_dr->get_id();
+    $r4 = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+    TestRunner::assertTrue($r4->success, 'FIX-2: dry-run ⇒ success');
+    TestRunner::assertTrue(!empty($r4->payload['dry_run']),
+        'FIX-2: dry-run flag presente');
+    update_option('alegra_connector_dry_run', false);
+
+    // (e) gate blocked (kill switch) ⇒ error con marker
+    \Alegra\Connector\Kill_Switch::activate('test');
+    update_option('alegra_connector_payment_account_id', 'acct-1');
+    alegra_mock_seed_invoice('inv-g', ['status' => 'open', 'total' => 50.0, 'balance' => 50.0]);
+    $order_g = make_payable_order(37105, 1, 't372-gate@example.test', 50.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-g', '_billing_alegra_contact_id' => 'c0n-g'],
+    ]);
+    $_POST['order_id'] = $order_g->get_id();
+    $r5 = alegra_capture_json(fn () => $admin->ajax_record_payment());
+    unset($_POST['order_id']);
+    TestRunner::assertFalse($r5->success, 'FIX-2: gate blocked ⇒ error');
+    TestRunner::assertTrue(!empty($r5->payload['blocked']),
+        'FIX-2: blocked flag presente');
+    \Alegra\Connector\Kill_Switch::deactivate();
+});
+
+TestRunner::test('T37.3 400 de ítem/tax obsoleto: nota accionable e invalidación segura de la caché de impuestos', function (): void {
+    // FIX-3 (REQ-3): convertir el 400 estructurado en instrucción clara; la
+    // caché de impuestos sólo se invalida si get_tax($id) confirma el 404.
+    $logger = make_logger();
+
+    // (a) 400 ítem inexistente ⇒ nota accionable
+    alegra_test_reset();
+    $order = make_payable_order(37301, 1, 't373-item@example.test', 50.0);
+    alegra_mock_fail('POST', '/invoices', 400, [
+        'message' => 'El item no existe',
+        'errors'  => ['items' => [['id' => 'item-dead']]],
+    ]);
+    make_orders()->create_invoice($order);
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('item-dead', $notes,
+        'FIX-3a: la nota accionable menciona el id obsoleto');
+    TestRunner::assertStringContains('Re-sincronizá', $notes,
+        'FIX-3a: la nota da una acción concreta');
+    $cache = (array) get_option('alegra_connector_resolved_tax_ids', []);
+    TestRunner::assertSame([], array_filter($cache, fn ($v) => $v === 'item-dead'),
+        'FIX-3a: un 400 de item NO toca la caché de impuestos');
+
+    // (b) 400 tax + cache muerto ⇒ invalida Y la siguiente factura NO crea duplicado
+    alegra_test_reset();
+    update_option('alegra_connector_resolved_tax_ids', ['19' => 'tax-dead'], false);
+    $order_b = make_payable_order(37302, 1, 't373-tax@example.test', 50.0);
+    alegra_mock_seed_tax('tax-dead', ['name' => 'IVA 19%', 'percentage' => 19.0]); // aparece primero en /taxes
+    // Forzar el 400 estructurado: el payload lleva un tax id que Alegra no encuentra.
+    alegra_mock_fail('POST', '/invoices', 400, [
+        'message' => 'El impuesto no existe',
+        'errors'  => ['taxes' => [['id' => 'tax-dead']]],
+    ]);
+    // get_tax('tax-dead') devuelve 404 ⇒ la caché está muerta ⇒ se quita.
+    // (El mock devuelve 404 cuando el id no está en su state; lo borramos del state.)
+    unset($GLOBALS['alegra_mock_state']['taxes']['tax-dead']);
+    make_orders()->create_invoice($order_b);
+    $cache = (array) get_option('alegra_connector_resolved_tax_ids', []);
+    TestRunner::assertFalse(in_array('tax-dead', array_values($cache), true),
+        'FIX-3b: la caché de impuestos se invalida cuando get_tax() 404');
+    $notes_b = implode("\n", $order_b->get_notes());
+    TestRunner::assertStringContains('tax-dead', $notes_b,
+        'FIX-3b: la nota accionable menciona el id obsoleto');
+    TestRunner::assertStringContains('caché', $notes_b,
+        'FIX-3b: la nota explica la limpieza de caché');
+
+    // (c) 400 cliente (lo maneja try_self_heal_dead_client) ⇒ NO invalida caché de tax
+    alegra_test_reset();
+    update_option('alegra_connector_resolved_tax_ids', ['19' => 'tax-alive'], false);
+    $order_c = make_payable_order(37303, 1, 't373-client@example.test', 50.0);
+    alegra_mock_fail('POST', '/invoices', 400, [
+        'message' => 'Cliente inválido',
+        'errors'  => ['client' => [['id' => 'c-dead']]],
+    ]);
+    make_orders()->create_invoice($order_c);
+    $cache_c = (array) get_option('alegra_connector_resolved_tax_ids', []);
+    TestRunner::assertSame('tax-alive', (string) ($cache_c['19'] ?? ''),
+        'FIX-3c: un 400 de cliente NO invalida la caché de impuestos');
+
+    // (d) 400 genérico ⇒ no agrega nota accionable (mensaje original intacto)
+    alegra_test_reset();
+    $order_d = make_payable_order(37304, 1, 't373-gen@example.test', 50.0);
+    alegra_mock_fail('POST', '/invoices', 400, ['message' => 'Otro error']);
+    $r = make_orders()->create_invoice($order_d);
+    TestRunner::assertInstanceOf(\WP_Error::class, $r, 'FIX-3d: 400 genérico devuelve WP_Error');
+    $notes_d = implode("\n", $order_d->get_notes());
+    TestRunner::assertStringNotContains('Re-sincronizá', $notes_d,
+        'FIX-3d: un 400 genérico NO dispara la nota de item');
+    TestRunner::assertStringNotContains('caché de impuestos', $notes_d,
+        'FIX-3d: un 400 genérico NO dispara la nota de tax');
+});
+
+TestRunner::test('T37.4 reconcile_total: GET falla + sin marker previo ⇒ null (no bloquea)', function (): void {
+    // FIX-4 (REQ-4.2): read failure SIN marker previo ⇒ null. No hay drift
+    // real, no hay nada que proteger; el comportamiento legacy se preserva.
+    alegra_test_reset();
+    $order = make_payable_order(37401, 1, 't374-nomarker@example.test', 100.0);
+    // Sin marker _alegra_invoice_total_mismatch.
+
+    $result = alegra_call_private(
+        make_orders(),
+        'assert_invoice_total_matches_order',
+        $order,
+        'inv-missing'
+    );
+
+    TestRunner::assertSame(null, $result, 'FIX-4: GET falla + SIN marker ⇒ null (no bloquea)');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_total_mismatch', true),
+        'FIX-4: NO se crea marker espurio');
 });
 
 TestRunner::test('T-PAY-1c the payment carries the gateway title in observations', function (): void {

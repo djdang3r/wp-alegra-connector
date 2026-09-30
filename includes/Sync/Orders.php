@@ -191,6 +191,11 @@ class Orders
                     return $healed;
                 }
 
+                // FIX-3 (REQ-3): convertir 400 de ítem/tax obsoleto en instrucción
+                // clara, sin duplicar impuestos. Sólo corre DESPUÉS del auto-heal
+                // (que ya cubre el caso cliente) y ANTES del classify+persist.
+                $this->note_actionable_invoice_reason($order, $result, $data);
+
                 // REQ-QUEUE-09: el POST pudo haber commiteado (timeout/5xx). Re-buscar
                 // ANTES de persistir el fallo; si existe, adoptarla (no duplicar).
                 $classification = Invoice_Failure::classify($result);
@@ -564,6 +569,156 @@ class Orders
     }
 
     /**
+     * FIX-3 (REQ-3): 400 con ítem/tax obsoleto → nota accionable + invalidación
+     * SEGURA de la caché de impuestos (sólo si get_tax($id) confirma que está
+     * muerto, evita duplicar impuestos en el siguiente reintento).
+     *
+     * Detección por el error ESTRUCTURADO de Alegra
+     * (WP_Error::get_error_data()['response']) — patrón mirror de
+     * try_self_heal_dead_client().
+     *
+     * No-op cuando:
+     *   - el código HTTP no es 400;
+     *   - el error no menciona ítem/tax en el cuerpo estructurado;
+     *   - el caso de cliente (lo maneja try_self_heal_dead_client antes).
+     */
+    private function note_actionable_invoice_reason(\WC_Order $order, \WP_Error $error, array $data): void
+    {
+        $reason = $this->actionable_invoice_reason($error, $data);
+        if ($reason === null) {
+            return;
+        }
+
+        if ($reason['kind'] === 'tax') {
+            // FIX-3.2: la caché sólo se invalida si get_tax() confirma el 404
+            // (doble verificación — no tocar la caché por un 400 genérico).
+            $invalidated = $this->invalidate_tax_cache_if_dead($reason['id']);
+            $this->logger->warning('Stale Alegra tax id detected on invoice creation', [
+                'order_id'    => (int) $order->get_id(),
+                'tax_id'      => $reason['id'],
+                'invalidated' => $invalidated,
+            ]);
+            $note = $invalidated
+                ? sprintf(
+                    /* translators: %s: stale Alegra tax id */
+                    __('[Alegra] El impuesto cacheado (#%s) ya no existe en Alegra. Se limpió la caché de impuestos; reintentá la factura.', 'alegra-connector'),
+                    $reason['id']
+                )
+                : sprintf(
+                    /* translators: %s: Alegra tax id that was rejected */
+                    __('[Alegra] Alegra rechazó el impuesto #%s en esta factura. Revisá el mapeo de impuestos.', 'alegra-connector'),
+                    $reason['id']
+                );
+            $order->add_order_note($note);
+            return;
+        }
+
+        if ($reason['kind'] === 'item') {
+            // FIX-3: nota accionable; sin invalidación (los ítems no se cachean).
+            $order->add_order_note(sprintf(
+                /* translators: %s: Alegra item id that was rejected */
+                __('[Alegra] Algunos IDs de productos (#%s) ya no existen en Alegra. Re-sincronizá los productos desde el pedido antes de reintentar.', 'alegra-connector'),
+                $reason['id']
+            ));
+            if ($this->logger) {
+                $this->logger->warning('Stale Alegra item id detected on invoice creation', [
+                    'order_id' => (int) $order->get_id(),
+                    'item_id'  => $reason['id'],
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Inspect the structured error body for item/tax not-found references.
+     *
+     * Mirrors try_self_heal_dead_client()'s use of
+     * `$error->get_error_data()['response']` to stay robust against
+     * translations of the human message.
+     *
+     * @return array{kind:string,id:string}|null Null when nothing actionable.
+     */
+    private function actionable_invoice_reason(\WP_Error $error, array $data): ?array
+    {
+        $code = (int) (($error->get_error_data()['code'] ?? 0));
+        if ($code !== 400) {
+            return null;
+        }
+
+        $body = $error->get_error_data()['response'] ?? [];
+        if (!is_array($body)) {
+            return null;
+        }
+
+        // The auto-heal handles the CLIENT case — don't duplicate its work.
+        if (isset($body['client'])) {
+            return null;
+        }
+
+        $errors = is_array($body['errors'] ?? null) ? $body['errors'] : [];
+
+        $tax_id = $this->first_error_id($errors['taxes'] ?? null);
+        if ($tax_id !== '') {
+            return ['kind' => 'tax', 'id' => $tax_id];
+        }
+        $item_id = $this->first_error_id($errors['items'] ?? null);
+        if ($item_id !== '') {
+            return ['kind' => 'item', 'id' => $item_id];
+        }
+
+        return null;
+    }
+
+    /**
+     * Pick the first id from an `errors.taxes[]` / `errors.items[]` style array.
+     */
+    private function first_error_id(mixed $entries): string
+    {
+        if (!is_array($entries)) {
+            return '';
+        }
+        foreach ($entries as $entry) {
+            if (is_array($entry) && !empty($entry['id'])) {
+                return (string) $entry['id'];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Drop the cache entries pointing at a dead Alegra tax id.
+     *
+     * Returns true when at least one entry was removed. Only drops entries
+     * when get_tax() confirms the id is dead (404), so a transient API blip
+     * doesn't blow away the cache and force a duplicate-create.
+     */
+    private function invalidate_tax_cache_if_dead(string $tax_id): bool
+    {
+        $cache = (array) get_option('alegra_connector_resolved_tax_ids', []);
+        if ($cache === []) {
+            return false;
+        }
+        $removed = false;
+        foreach ($cache as $key => $cached_id) {
+            if ((string) $cached_id !== $tax_id) {
+                continue;
+            }
+            $check = $this->api->get_tax($tax_id);
+            if (is_wp_error($check)) {
+                unset($cache[$key]);
+                $removed = true;
+            } else {
+                // Cache is correct (tax is alive) — nothing to do.
+                return false;
+            }
+        }
+        if ($removed) {
+            update_option('alegra_connector_resolved_tax_ids', $cache, false);
+        }
+        return $removed;
+    }
+
+    /**
      * FIX-3: factura `open` existente del pedido (evita doble conteo).
      *
      * @return array<string,mixed>|null
@@ -668,10 +823,24 @@ class Orders
             // REQ-QUEUE-08: la factura subió pero el pago no ⇒ estado distinto,
             // retriable (el sweep de pagos o el reintento manual lo recuperan).
             if (is_wp_error($payment) || API\Client::write_was_blocked($payment)) {
+                $reason = is_wp_error($payment)
+                    ? (string) $payment->get_error_code()
+                    : (string) ($payment['reason'] ?? 'blocked');
+                $message = is_wp_error($payment) ? wp_strip_all_tags($payment->get_error_message()) : '';
+                // FIX-1 (REQ-1.1): expone el resultado del pago a los callers (UI)
+                // para que no muestren "completado" cuando el pago falló. La clave
+                // es ADITIVA — los callers existentes sólo leen `id`, así que es
+                // seguro añadirla.
+                $invoice_result['_alegra_payment'] = [
+                    'state'   => 'missing',
+                    'reason'  => $reason,
+                    'message' => $message,
+                ];
+
                 $c = [
                     'state'     => 'payment_missing',
-                    'code'      => is_wp_error($payment) ? (string) $payment->get_error_code() : (string) ($payment['reason'] ?? 'blocked'),
-                    'message'   => is_wp_error($payment) ? wp_strip_all_tags($payment->get_error_message()) : '',
+                    'code'      => $reason,
+                    'message'   => $message,
                     'retriable' => true,
                     'persist'   => true,
                 ];
@@ -683,6 +852,11 @@ class Orders
                         'code'     => $c['code'],
                     ]);
                 }
+            } else {
+                // FIX-1 (REQ-1.2): pago OK → estado `recorded`. La limpieza del
+                // ledger la hace record_payment_for_invoice() en su rama de éxito
+                // (cubre auto, manual y reconcile_payment_only).
+                $invoice_result['_alegra_payment'] = ['state' => 'recorded'];
             }
         } elseif (!in_array($payment_account, ['', '0'], true)
             && (string) $order->get_meta('_alegra_payment_id', true) === '') {
@@ -694,6 +868,11 @@ class Orders
                 '[Alegra] El pedido no figura pagado en WooCommerce; se creó la factura pero no se registró pago.',
                 'alegra-connector'
             ));
+            // FIX-1 (REQ-1.3): cuenta configurada + pedido NO pagado ⇒ `skipped`.
+            $invoice_result['_alegra_payment'] = [
+                'state'  => 'skipped',
+                'reason' => 'order_not_paid',
+            ];
         }
 
         return $invoice_result;
@@ -713,11 +892,16 @@ class Orders
      * hooks) must NEVER open it: they skip and tell the merchant. Only an
      * explicit manual action passes $allow_open_draft = true.
      *
+     * FIX-2 (REQ-2): now PUBLIC so the manual "Registrar pago" button reuses
+     * the same balance-aware orchestrator (idempotency + draft open + clamp +
+     * observations). Manual callers pass $allow_open_draft = true.
+     *
      * @param bool $allow_open_draft Manual actions pass true; automatic ones false.
      *
-     * @return array|\WP_Error The payment payload, or a WP_Error when the POST failed.
+     * @return array|\WP_Error The payment payload, a ['skipped' => true, ...]
+     *                        marker, or a WP_Error when the POST failed.
      */
-    private function record_payment_for_invoice(\WC_Order $order, string $invoice_id, bool $allow_open_draft = false): array|\WP_Error
+    public function record_payment_for_invoice(\WC_Order $order, string $invoice_id, bool $allow_open_draft = false): array|\WP_Error
     {
         if ($invoice_id === '') {
             return new \WP_Error('missing_invoice', __('No hay una factura de Alegra vinculada.', 'alegra-connector'));
@@ -822,6 +1006,12 @@ class Orders
             'order_id' => $order->get_id(),
             'payment_id' => $payment_result['id'] ?? 'unknown',
         ]);
+
+        // FIX-1 (REQ-1.2): limpiar el ledger en la rama de éxito del pago. Se
+        // hace acá (no en create_invoice_with_payment) para cubrir TODOS los
+        // caminos — auto, manual y reconcile_payment_only — y no dejar un
+        // payment_missing huérfano en el cron de reconcile.
+        Invoice_Failure::clear($order);
 
         return $payment_result;
     }
@@ -2526,21 +2716,68 @@ class Orders
     {
         $invoice = $this->api->get_invoice($invoice_id);
         if (is_wp_error($invoice) || !is_array($invoice)) {
-            // Could not re-read the invoice: don't gate the payment on a transient
-            // read failure. The invoice exists; if the merchant cares they can
-            // re-run the reconcile hook.
-            if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
-                $order->delete_meta_data('_alegra_invoice_total_mismatch');
-                $order->save();
+            // FIX-4 (REQ-4): read-failure con marcador previo ⇒ el pago SIGUE
+            // bloqueado (no borrar el meta a ciegas). Devolvemos la clasificación
+            // persistida para que la cola muestre el estado correcto.
+            // Sin marcador previo ⇒ `return null` (no bloquea; preserva el
+            // comportamiento legacy).
+            $had_marker = (string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1';
+            if ($had_marker) {
+                $this->logger->warning('Could not re-read invoice; keeping prior mismatch marker', [
+                    'order_id'   => (int) $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                    'error'      => is_wp_error($invoice) ? $invoice->get_error_message() : 'not_array',
+                ]);
+                $persisted = Invoice_Failure::get($order);
+                if ($persisted['state'] === 'invoice_total_mismatch') {
+                    return [
+                        'state'     => 'invoice_total_mismatch',
+                        'code'      => (string) ($persisted['code'] ?? 'total:unknown'),
+                        'message'   => (string) ($persisted['message'] ?? ''),
+                        'retriable' => false,
+                        'persist'   => true,
+                    ];
+                }
+                // Marked but the queue was cleared (e.g. cron cleaned it up):
+                // return a minimal classification so the caller still sees the
+                // state. Do NOT delete the marker here — the read failed.
+                return [
+                    'state'     => 'invoice_total_mismatch',
+                    'code'      => 'total:unknown',
+                    'message'   => '',
+                    'retriable' => false,
+                    'persist'   => true,
+                ];
             }
             return null;
         }
 
         if (!isset($invoice['total'])) {
-            // Total field absent — same defensive fallback as the read failure.
-            if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
-                $order->delete_meta_data('_alegra_invoice_total_mismatch');
-                $order->save();
+            // Total field absent — same defensive fallback as the read failure:
+            // if there's a prior marker, KEEP it; otherwise don't block.
+            $had_marker = (string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1';
+            if ($had_marker) {
+                $this->logger->warning('Invoice re-read but no total field; keeping prior mismatch marker', [
+                    'order_id'   => (int) $order->get_id(),
+                    'invoice_id' => $invoice_id,
+                ]);
+                $persisted = Invoice_Failure::get($order);
+                if ($persisted['state'] === 'invoice_total_mismatch') {
+                    return [
+                        'state'     => 'invoice_total_mismatch',
+                        'code'      => (string) ($persisted['code'] ?? 'total:unknown'),
+                        'message'   => (string) ($persisted['message'] ?? ''),
+                        'retriable' => false,
+                        'persist'   => true,
+                    ];
+                }
+                return [
+                    'state'     => 'invoice_total_mismatch',
+                    'code'      => 'total:unknown',
+                    'message'   => '',
+                    'retriable' => false,
+                    'persist'   => true,
+                ];
             }
             return null;
         }

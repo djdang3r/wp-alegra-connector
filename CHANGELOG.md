@@ -2,6 +2,90 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.3] - 2026-09-30
+
+> **Robustez de facturación y pagos: el comerciante SIEMPRE ve el resultado real del pago
+> (no más "completado" cuando el pago falló), "Registrar pago" reusa el mismo orquestador
+> balance-aware que el pago automático, los 400 de ítem/tax obsoleto se traducen en una nota
+> accionable, y la reconciliación ya no abre una ventana de 1 reintento con desajuste de
+> totales.** Cero regresiones en los caminos de error actuales; suite 2647/0 + `SMOKE OK`.
+
+### Fixed
+
+- **T1 — Resultado del pago reflejado en la UI (FIX-1, REQ-1)**.
+  `Orders::create_invoice_with_payment()` añade una clave **aditiva** `_alegra_payment`
+  (`recorded` | `missing` | `skipped`) al array de retorno, junto con `reason` + `message`
+  cuando aplica. Los callers existentes sólo leen `id`, así que la clave es 100% compatible.
+  `Orders::record_payment_for_invoice()` limpia el ledger (`Invoice_Failure::clear($order)`)
+  en su **propia** rama de éxito — no en `create_invoice_with_payment()` — para cubrir
+  TODOS los caminos: automático, manual y `reconcile_payment_only`. Resultado:
+  - Factura OK + pago OK → "Factura y pago registrados en Alegra." + ledger limpio.
+  - Factura OK + pago falla → "Factura creada, pago NO registrado (<motivo>)." + estado
+    `payment_missing` persistido.
+  - Cuenta configurada + pedido no pagado → "Factura creada, pero el pedido no figura
+    pagado en WooCommerce; no se registró pago." (sin falsa promesa de éxito).
+  - Los tres handlers AJAX de éxito (`ajax_sync_single`, `ajax_retry_invoice`,
+    `ajax_bulk_sync`) muestran el mensaje correcto y, en bulk, agregan un conteo
+    "N con pago NO registrado (revisalo desde el pedido)" como **aviso**, no como error.
+
+- **T2 — "Registrar pago" reusa el orquestador balance-aware (FIX-2, REQ-2)**.
+  `Orders::record_payment_for_invoice()` pasa a `public` y `ajax_record_payment_impl`
+  ahora delega en él (`$allow_open_draft = true`). Se conservan **todos** los guards
+  previos: idempotencia por `_alegra_payment_id`, confirmación de doble-descuento con
+  ajuste de inventario, `account_id` configurado, transición `draft → open` con nota
+  cuando abre un borrador, y nota de ajuste confirmado. **Se elimina** el armado+POST
+  manual que duplicaba el `record_payment_for_invoice` (clamp, idempotencia, observations
+  y dry-run/gate), y la nota+save de éxito duplicados. **Nuevo** pre-check de
+  `_alegra_invoice_total_mismatch` en el handler (FIX-2 REQ-2.3): si está seteado,
+  NO postea el pago y avisa al comerciante con el mismo mensaje claro que usa el
+  orquestador automático. El handler ahora ramifica el retorno del orquestador en
+  cuatro caminos: `array OK` / `WP_Error` / `skipped` (con motivo `no_account`,
+  `draft_not_opened`, ya saldada, etc.) / marker de bloqueo (`is_dry_run_response`,
+  `is_gate_blocked_response`).
+
+- **T3 — IDs obsoletos (ítem/tax) traducidos a nota accionable (FIX-3, REQ-3)**.
+  Nuevo helper `actionable_invoice_reason(\WP_Error $e, array $data): ?array` que
+  inspecciona el cuerpo de error **estructurado** de Alegra
+  (`WP_Error::get_error_data()['response']`) — patrón mirror de
+  `try_self_heal_dead_client()` para no romperse con traducciones del mensaje humano.
+  Se invoca en la rama de fallo de `create_invoice()` **después** del auto-heal
+  (que ya cubre el caso cliente; acá no se duplica). Comportamiento:
+  - 400 + ítem obsoleto → nota "[Alegra] Algunos IDs de productos (#X) ya no existen
+    en Alegra. Re-sincronizá los productos desde el pedido antes de reintentar."
+  - 400 + tax obsoleto + cache muerto (verificado con `get_tax($id)` 404) → invalida
+    `alegra_connector_resolved_tax_ids` **solo** en ese caso, y la siguiente factura
+    **no** crea un impuesto duplicado.
+  - 400 + tax obsoleto + cache vivo → nota accionable sin invalidar.
+  - 400 genérico → mensaje intacto (sin regresión).
+
+- **T4 — Reconciliación: el marcador `_alegra_invoice_total_mismatch` ya NO se borra
+  a ciegas tras un fallo de lectura (FIX-4, REQ-4)**.
+  `assert_invoice_total_matches_order()` ahora distingue tres casos:
+  1. GET falla **y había** marcador previo → se mantiene el meta, se devuelve la
+     clasificación `invoice_total_mismatch` (persistida) para que la cola muestre el
+     estado, y el pago **sigue bloqueado**. Sin la ventana de 1 reintento con desajuste.
+  2. GET falla **y NO había** marcador → `return null` (no bloquea; preserva el
+     comportamiento legacy — un GET fallido no inventa un mismatch espurio).
+  3. GET OK + totales coinciden → limpia (igual que antes).
+  Además: el caso "GET OK pero sin campo `total`" recibe el mismo tratamiento.
+
+### Tests
+
+- **T37.1** — `_alegra_payment` se expone correctamente en los 3 estados (`recorded`,
+  `missing`, `skipped`) + no-regresión de los caminos de error.
+- **T37.2** — `ajax_record_payment` clampa al saldo, NO postea si ya está saldada,
+  NO postea con mismatch, devuelve marker de dry-run / gate, y pre-checkea el
+  marcador de mismatch.
+- **T37.3** — (a) 400 ítem → nota accionable; (b) 400 tax + cache muerto → invalida
+  y la próxima factura NO duplica el impuesto; (c) 400 cliente → NO invalida; (d) 400
+  genérico → mensaje intacto.
+- **T37.4** — Marcador `_alegra_invoice_total_mismatch` se mantiene tras read failure
+  + pago sigue bloqueado + cola sigue mostrando `invoice_total_mismatch`; read failure
+  SIN marcador → `null` (no bloquea).
+- **T-REC-3 (actualizado)** — ahora afirma que con marcador previo el meta se mantiene
+  (`'1'`) y la clasificación se preserva; antes decía "no bloquea".
+- Suite: `EXEC-TEST OK: 2647 assertions passed, 0 failed` + `SMOKE OK`.
+
 ## [2.8.2] - 2026-09-27
 
 > **Detección de "drift" entre WooCommerce y Alegra en la pestaña Envíos + acciones de sincronización por fila.**
