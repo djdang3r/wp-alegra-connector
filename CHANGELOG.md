@@ -2,6 +2,50 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.4] - 2026-10-02
+
+> **Hotfix: el fatídico `TypeError` en la pantalla de configuración de Envíos.** Cuando el
+> `shipping_map` guardaba el id de un ítem numérico de Alegra como **entero** (típico de haber
+> sido escrito por un camino de código anterior al sanitizador), el fetch previo de
+> `build_shipping_drift_report()` reventaba contra la firma estricta
+> `Client::get_item(string $id)` con `int 579` y la pestaña completa dejaba de renderizar.
+> Se re-encasta el id dentro del loop de fetch y se cubre con un test de regresión dedicado
+> (`T37 2.8.4`). Sin cambios de comportamiento: la misma fila, la misma clasificación, la misma
+> caché de 5 minutos. Suite 2653/0 + `SMOKE OK`.
+
+### Fixed
+
+- **`build_shipping_drift_report()` reventaba la página de Envíos con `TypeError` cuando el
+  `shipping_map` llevaba un id numérico como `int`**. PHP coacciona las claves-string numéricas
+  a `int` en `$to_fetch[$iid] = true`, así que `array_keys($to_fetch)` devolvía un `int` y la
+  firma estricta `Client::get_item(string $id)` (en `includes/API/Client.php:351`) lo
+  rechazaba con un `TypeError` no atrapado dentro de `render_settings_page()`. El síntoma en
+  producción era la pestaña **Ajustes → Alegra Connector → Envíos** totalmente inaccesible.
+  El fix re-encasta dentro del loop de fetch:
+  ```php
+  foreach (array_keys($to_fetch) as $item_id) {
+      // `$to_fetch` se keyed numérico por id, así que PHP coacciona claves-string
+      // numéricas a int; `array_keys()` devuelve entonces un int y la firma estricta
+      // `Client::get_item(string)` tira TypeError. Re-encastamos.
+      $item_id = (string) $item_id;
+      $resp = $this->api->get_item($item_id);
+  ```
+  Cero cambios de comportamiento: la misma clasificación (`ok` / `name_mismatch` / `unmapped`
+  / `orphan` / `unverified`), la misma caché de 5 minutos, los mismos helpers. Sólo se
+  garantiza que `array_keys` → `Client::get_item` no se vuelva a cruzar con un `int`.
+
+### Tests
+
+- **T37 (2.8.4)** — `build_shipping_drift_report()` ya no tira `TypeError` con un map
+  numérico almacenado como `int`, y `Client::get_item()` recibe el id como `string`. Se
+  instala un stub `ClienteAPI\Client@anonymous` que registra `(get_debug_type($id), $id)` por
+  cada llamada, se pasa `['flat_rate:101' => 579]`, y se afirma que (a) no hay excepción,
+  (b) `get_debug_type($id) === 'string'`, (c) `$id === '579'`, y (d) la fila clasifica
+  `ok` porque el stub devuelve `name='Bogotá'` que coincide con el título de la instancia
+  WC. Verificado **rojo sin el fix** (revert temporal de la línea de cast, corrida,
+  confirmación del TypeError en `/admin/Admin/Admin_Dashboard.php:3284`) y **verde con el
+  fix** restituido.
+
 ## [2.8.3] - 2026-09-30
 
 > **Robustez de facturación y pagos: el comerciante SIEMPRE ve el resultado real del pago

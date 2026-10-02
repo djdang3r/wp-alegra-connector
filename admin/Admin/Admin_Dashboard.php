@@ -3281,6 +3281,10 @@ class Admin_Dashboard
             }
             $fetched_any = false;
             foreach (array_keys($to_fetch) as $item_id) {
+                // `$to_fetch` is keyed by id, so PHP coerces numeric ids to int
+                // keys; `array_keys()` then hands back an int and the strictly
+                // typed `Client::get_item(string)` throws a TypeError. Re-cast.
+                $item_id = (string) $item_id;
                 $resp = $this->api->get_item($item_id);
                 if (is_wp_error($resp)) {
                     $item_info[$item_id] = ['error' => $resp->get_error_message()];

@@ -13280,4 +13280,97 @@ TestRunner::test('T36.4 2.8.2 ajax_create_shipping_item seeds price from the WC 
         'POST /items lleva price = 0 cuando el método tiene cost vacío (variable)');
 });
 
+// ---------------------------------------------------------------------------
+// 2.8.4 hotfix — Settings page ("Envíos") TypeError regression.
+//
+// Production fatal:
+//     TypeError: Alegra\Connector\API\Client::get_item():
+//         Argument #1 ($id) must be of type string, int given
+//       at admin/Admin/Admin_Dashboard.php:3284 (build_shipping_drift_report)
+//
+// Root cause: the shipping map may carry a numeric Alegra item id (e.g. 579)
+// as an int. The build_shipping_drift_report() pre-fetch loop string-casts
+// the map value (`$iid = (string) $item_id`) and stores it under
+// `$to_fetch[$iid] = true` — but PHP coerces numeric string keys back to
+// int, so `$to_fetch[579]` lands as `int 579`. `array_keys($to_fetch)` then
+// hands back an int, and Admin_Dashboard (declare(strict_types=1)) passes it
+// to the strictly typed Client::get_item(string $id) → uncaught TypeError
+// during render_settings_page() → the entire settings page is unreachable.
+//
+// Fix: re-cast inside the fetch loop. This test exercises that path with a
+// numeric id stored as an int, installs a stub API client that records the
+// runtime type of the get_item() argument, and asserts (a) the call does
+// not throw and (b) the dashboard passes the id back as a string.
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T37 2.8.4 build_shipping_drift_report does not TypeError on numeric map id and re-casts to string', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+
+    // One detected WC method so the drift report has a row to walk.
+    $m = new \WC_Shipping_Method();
+    $m->id = 'flat_rate';
+    $m->instance_id = 101;
+    $m->instance_title = 'Bogotá';
+    $GLOBALS['alegra_test_shipping_zones'] = [
+        ['zone_name' => 'Colombia', 'shipping_methods' => [$m]],
+    ];
+
+    // Stub API client. We need a Client subclass so the Admin_Dashboard
+    // type hint (?API\Client) is satisfied, and we override get_item() to
+    // record the actual runtime type of the id the dashboard passes in.
+    // The parent constructor reads api_url/email/token from options —
+    // alegra_test_reset() seeds those.
+    $stub = new class(make_logger()) extends \Alegra\Connector\API\Client {
+        /** @var array<int, array{0:string,1:string}> */
+        public array $calls = [];
+        public function get_item(string $id): array|\WP_Error
+        {
+            $this->calls[] = [get_debug_type($id), $id];
+            return ['id' => $id, 'name' => 'Bogotá'];
+        }
+    };
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $api_ref = new ReflectionProperty(\Alegra\Connector\Admin\Admin_Dashboard::class, 'api');
+    $api_ref->setAccessible(true);
+    $api_ref->setValue($admin, $stub);
+
+    // Production repro: the shipping map stores the Alegra item id as an
+    // INT — exactly what happens when the option was first written by code
+    // paths that did not run through sanitize_shipping_map().
+    $map = ['flat_rate:101' => 579];
+
+    // TestRunner::test wraps the closure in try/catch(Throwable); reaching
+    // the line below means build_shipping_drift_report() did not throw —
+    // that is assertion (a).
+    $report = $admin->build_shipping_drift_report(
+        \Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(),
+        $map
+    );
+
+    TestRunner::assertTrue(is_array($report) && isset($report['rows']),
+        'build_shipping_drift_report() returns its shape without a TypeError');
+
+    // Assertion (b): the dashboard re-cast the int id back to string before
+    // calling get_item(). get_debug_type() returns "string" / "int" / etc.
+    TestRunner::assertCount(1, $stub->calls,
+        'exactly one get_item() call for the single unique numeric map id');
+    TestRunner::assertSame('string', $stub->calls[0][0],
+        'Client::get_item() received the id as `string`, not `int`');
+    TestRunner::assertSame('579', $stub->calls[0][1],
+        'Client::get_item() received the numeric id in human-readable form');
+
+    // Sanity: the row still classifies correctly. The stub returns
+    // name="Bogotá" which matches the WC method title → `ok`.
+    $by_key = [];
+    foreach (($report['rows'] ?? []) as $r) {
+        $by_key[(string) ($r['key'] ?? '')] = $r;
+    }
+    TestRunner::assertSame('ok', (string) ($by_key['flat_rate:101']['status'] ?? ''),
+        'numeric map id resolves to `ok` when the Alegra name matches');
+    TestRunner::assertSame('579', (string) ($by_key['flat_rate:101']['mapped_item_id'] ?? ''),
+        'mapped_item_id preserves the original numeric id as a string');
+});
+
 exit(TestRunner::summary());
