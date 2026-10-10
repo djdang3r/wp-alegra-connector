@@ -2,6 +2,42 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.7] - 2026-10-10
+
+> **Hotfix: el selector de mapeo de Envíos vuelve a listar los ítems de envío y ahora
+> muestra SOLO los ítems del plugin.** Alegra rechaza `limit > 30` en `GET /items`, y tres
+> listados del plugin pedían 100/200: el selector de Envíos quedaba vacío, la auditoría de
+> integridad fallaba y el fetch de hijos de variante no traía nada. Además, con la
+> "Opción 1" el desplegable de Envíos deja de ofrecer el catálogo normal del comerciante.
+
+### Fixed
+
+- **Envíos: el selector de mapeo vuelve a listar los ítems de envío (dropdown vacío).**
+  `get_alegra_items_for_shipping_select()` pedía `GET /items` con `limit=100`, pero Alegra
+  rechaza `limit > 30` (`get_items.md`: "Si este valor es mayor que 30, la aplicación
+  retorna error."), así que la respuesta era un error y el selector quedaba vacío. Ahora
+  pagina en páginas de 30 (hasta 100 páginas × 30 = 3000 ítems) y **no cachea una lista
+  vacía si la API falló**, de modo que el selector se recupera solo cuando la API vuelve.
+- **Envíos (Opción 1): el selector lista ÚNICAMENTE los ítems de envío del plugin.** El
+  desplegable es ahora una lista de inclusión: solo aparecen los ítems cuyo `reference` usa
+  el prefijo reservado `alegra-connector-shipping:*`. El catálogo normal del comerciante, el
+  genérico `alegra-connector-adjustment` y la allow-list interna ya nunca se ofrecen, así
+  que no se puede mapear un método de envío a un ítem que no sea un servicio de envío.
+- **Auditoría de integridad: `Inventory_Integrity_Report` pagina a ≤30.** El reporte pedía
+  `GET /items` con un `limit` igual al tope global (`DEFAULT_LIMIT=200`), que Alegra
+  rechaza (`limit > 30`). Ahora ese valor es el **objetivo** y la paginación se hace de a 30
+  (`order_field=id`, `ASC`), sin emitir nunca una request con `limit > 30`.
+- **Productos: el fetch de hijos de variante respeta el tope.** `Products` pedía
+  `GET /items` con `limit=100` al resolver los hijos de un variante; ahora usa `limit=30`.
+
+### Tests
+
+- **Guarda de regresión.** El mock (`scripts/lib/alegra-mock.php`) ahora rechaza `GET /items`
+  con `limit > 30` (400, "El campo limit no puede ser mayor a 30"), igual que Alegra, para
+  que una regresión a `limit=100` rompa la suite en vez de vaciar un listado en producción.
+  Los tests T51/T52/T60.x (`I4`, `I4b`, `I5`) pinnean el tope y el comportamiento del
+  selector.
+
 ## [2.8.6] - 2026-10-10
 
 ### Added
