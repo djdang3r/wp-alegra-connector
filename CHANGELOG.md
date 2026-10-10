@@ -2,6 +2,27 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.6] - 2026-10-10
+
+### Added
+
+- **Import de Productos: filtro Categoria con seleccion multiple.** El modal de import
+  permite elegir varias categorias de Alegra en una sola corrida. Con 1 categoria el
+  comportamiento es identico al anterior (`idItemCategory` a la API); con varias se omite
+  el filtro server-side y se saltea client-side lo que no pertenece al conjunto
+  (`itemCategory.id`), reutilizando el patron del filtro `variantParent`. Sin categorias
+  se trae todo el catalogo.
+- **Setup de Envíos: mostrar y auto-mapear los items de envío existentes.** El selector de
+  mapeo de la pestaña Envíos ahora **muestra** los items de envío que ya existen en Alegra
+  (`alegra-connector-shipping:*`, antes ocultos por el prefijo reservado), manteniendo
+  ocultos los demás helpers (`alegra-connector-adjustment`, …) y la allow-list
+  `alegra_connector_internal_item_ids`. Además, al abrir Envíos el plugin **auto-rellena
+  solo los mapeos vacíos** de los métodos cuyo item canónico ya existe (resuelto por
+  `reference`), de forma idempotente, sin pisar nunca un mapeo manual/previo, sin
+  auto-mapear internos y sin escribir nada si no hay conexión. La lista y el mapa
+  `reference => id` se construyen en un único pase de `GET /items` (sin llamadas extra) y
+  se invalidan juntos al crear/refrescar un item.
+
 ## [2.8.5] - 2026-10-09
 
 > **Integridad de inventario: el plugin deja de barrer bajo la alfombra los eventos de
