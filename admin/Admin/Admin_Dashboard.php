@@ -2370,11 +2370,15 @@ class Admin_Dashboard
      * Sanitize the product-import filters posted from the Products modal.
      *
      * Invalid input degrades to "all" and never throws. Shape:
-     *   [idItemCategory => string, status => default|active|inactive,
-     *    inventariable => bool, query => string, type => ''|simple|kit|variantParent]
+     *   [idItemCategory => string, idItemCategories => string[],
+     *    status => default|active|inactive, inventariable => bool,
+     *    query => string, type => ''|simple|kit|variantParent]
+     *
+     * `idItemCategory` is kept for legacy consumers and equals the first
+     * selected category; `idItemCategories` is the canonical multi-value list.
      *
      * @param array<string,mixed> $raw
-     * @return array{idItemCategory:string,status:string,inventariable:bool,query:string,type:string}
+     * @return array{idItemCategory:string,idItemCategories:array<int,string>,status:string,inventariable:bool,query:string,type:string}
      */
     private function sanitize_item_filters(array $raw): array
     {
@@ -2388,13 +2392,56 @@ class Admin_Dashboard
             $type = '';
         }
 
+        $cats = $this->normalize_item_categories($raw);
+
         return [
-            'idItemCategory' => isset($raw['idItemCategory']) ? sanitize_text_field((string) $raw['idItemCategory']) : '',
-            'status'         => $status,
-            'inventariable'  => filter_var($raw['inventariable'] ?? false, FILTER_VALIDATE_BOOLEAN),
-            'query'          => isset($raw['query']) ? sanitize_text_field((string) $raw['query']) : '',
-            'type'           => $type,
+            'idItemCategory'   => $cats[0] ?? '',
+            'idItemCategories' => $cats,
+            'status'           => $status,
+            'inventariable'    => filter_var($raw['inventariable'] ?? false, FILTER_VALIDATE_BOOLEAN),
+            'query'            => isset($raw['query']) ? sanitize_text_field((string) $raw['query']) : '',
+            'type'             => $type,
         ];
+    }
+
+    /**
+     * Normalize the category filter to a sanitized, deduplicated list.
+     *
+     * Accepts `idItemCategories` (array) and falls back to a single
+     * `idItemCategory` (string). Each id is sanitized, emptied entries are
+     * dropped, duplicates are removed (order preserved) and the list is capped
+     * at 50. Non-array `idItemCategories` is discarded without throwing.
+     *
+     * @param array<string,mixed> $raw
+     * @return array<int,string>
+     */
+    private function normalize_item_categories(array $raw): array
+    {
+        $out = [];
+        if (isset($raw['idItemCategories']) && is_array($raw['idItemCategories'])) {
+            foreach ($raw['idItemCategories'] as $id) {
+                if (!is_string($id) && !is_int($id) && !is_float($id)) {
+                    continue;
+                }
+                $id = sanitize_text_field((string) $id);
+                if ($id === '' || in_array($id, $out, true)) {
+                    continue;
+                }
+                $out[] = $id;
+                if (count($out) >= 50) {
+                    break;
+                }
+            }
+        }
+
+        if ($out === [] && isset($raw['idItemCategory']) && is_string($raw['idItemCategory'])) {
+            $single = sanitize_text_field($raw['idItemCategory']);
+            if ($single !== '') {
+                $out[] = $single;
+            }
+        }
+
+        return array_values($out);
     }
 
     /**
@@ -3616,15 +3663,24 @@ class Admin_Dashboard
      * ajax_sync_start passes false so that, with no filters, the total is
      * byte-for-byte the same as before this feature.
      *
-     * @param array{idItemCategory?:string,status?:string,inventariable?:bool,query?:string,type?:string} $f
+     * @param array{idItemCategory?:string,idItemCategories?:array<int,string>,status?:string,inventariable?:bool,query?:string,type?:string} $f
      * @return array<string,string>
      */
     private function build_item_filter_params(array $f, bool $include_default_status = true): array
     {
         $p = [];
 
-        if (($f['idItemCategory'] ?? '') !== '') {
-            $p['idItemCategory'] = (string) $f['idItemCategory'];
+        // The multi-category list is the canonical source. A PRESENCE check (not
+        // truthiness) matters: an explicit `[]` must behave like "no category",
+        // while a single category still maps to the documented `idItemCategory`.
+        $cats = array_key_exists('idItemCategories', $f)
+            ? array_values(array_filter((array) $f['idItemCategories'], 'strlen'))
+            : ((($f['idItemCategory'] ?? '') !== '') ? [(string) $f['idItemCategory']] : []);
+
+        // Only ONE category is a documented server-side filter; with several the
+        // whole catalog is walked and the page loop discards the rest.
+        if (count($cats) === 1) {
+            $p['idItemCategory'] = (string) $cats[0];
         }
 
         if (in_array($f['status'] ?? 'default', ['active', 'inactive'], true)) {
@@ -3899,6 +3955,14 @@ class Admin_Dashboard
             $index   = -1;
             $products_sync = new Sync\Products($this->api, $this->logger);
 
+            // Client-side multi-category filter: with more than one category the
+            // API filter is omitted, so the whole catalog is walked and items
+            // outside the selected set are discarded here. `itemCategory.id` is
+            // the COMMERCIAL item category (never `category.id`). The `?? []` is
+            // mandatory: `alegra_batch_state` may not carry the key (count(null)
+            // is a TypeError on PHP 8).
+            $catSet = array_flip((array) ($filters['idItemCategories'] ?? []));
+
             foreach ($items as $item) {
                 $index++;
                 if ($index < $offset) { continue; }        // C6: saltear sin tocar contadores
@@ -3912,6 +3976,12 @@ class Admin_Dashboard
                 // this value for the `type` query param, so the whole catalog is
                 // walked and non-variantParent items are discarded here.
                 if (($filters['type'] ?? '') === 'variantParent' && $item_type !== 'variantParent') {
+                    $state['skipped'] = ($state['skipped'] ?? 0) + 1;
+                    continue;
+                }
+
+                // Multi-category skip (mirror of the variantParent skip above).
+                if (count($catSet) > 1 && !isset($catSet[(string) ($item['itemCategory']['id'] ?? '')])) {
                     $state['skipped'] = ($state['skipped'] ?? 0) + 1;
                     continue;
                 }

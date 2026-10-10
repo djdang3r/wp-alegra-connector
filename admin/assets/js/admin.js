@@ -417,6 +417,7 @@
             $('#ac-filter-status').val('default');
             $('#ac-filter-inventariable').val('');
             $('#ac-filter-query').val('');
+            $('#ac-filter-category').val([]);
             $('#ac-filter-variant-note').hide();
             var fromZero = !!($btn && $btn.data('from-zero'));
             $('#ac-filter-from-zero-block').toggle(fromZero);
@@ -475,8 +476,21 @@
 
             function collectFilters() {
                 var f = {};
-                var cat = $('#ac-filter-category').val();
-                if (cat) { f.idItemCategory = cat; }
+                // #ac-filter-category is a multi-select: .val() yields an array
+                // (or null when nothing is selected). Drop the neutral `''`
+                // ("Todas") entry so it never mixes with a real selection.
+                var rawCat = $('#ac-filter-category').val();
+                var cats = (rawCat === null || typeof rawCat === 'undefined')
+                    ? []
+                    : (Array.isArray(rawCat) ? rawCat : [rawCat]);
+                var catIds = [];
+                for (var i = 0; i < cats.length; i++) {
+                    if (cats[i] !== '' && cats[i] !== null && typeof cats[i] !== 'undefined') {
+                        catIds.push(cats[i]);
+                    }
+                }
+                if (catIds.length === 1) { f.idItemCategory = catIds[0]; }
+                else if (catIds.length > 1) { f.idItemCategories = catIds; }
                 var type = $('#ac-filter-type').val();
                 if (type) { f.type = type; }
                 var status = $('#ac-filter-status').val();

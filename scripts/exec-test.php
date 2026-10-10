@@ -3590,6 +3590,74 @@ TestRunner::test('T21.7 the categories endpoint caps at 10 pages and flags more'
     TestRunner::assertTrue((bool) ($resp->payload['has_more'] ?? false), 'more pages must be flagged');
 });
 
+TestRunner::test('T21.8 sanitize_item_filters normalizes multiple categories', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $f = alegra_call_private($admin, 'sanitize_item_filters', [
+        'idItemCategories' => ['c2', 'c1', 'c1', ''],
+    ]);
+    TestRunner::assertSame(['c2', 'c1'], $f['idItemCategories'], 'categories are sanitized, deduped and ordered');
+    TestRunner::assertSame('c2', $f['idItemCategory'], 'the first category is mirrored for legacy consumers');
+
+    $single = alegra_call_private($admin, 'sanitize_item_filters', ['idItemCategory' => 'c9']);
+    TestRunner::assertSame(['c9'], $single['idItemCategories'], 'a single category is promoted to a list');
+    TestRunner::assertSame('c9', $single['idItemCategory'], 'the single category stays put');
+
+    $none = alegra_call_private($admin, 'sanitize_item_filters', []);
+    TestRunner::assertSame([], $none['idItemCategories'], 'no category yields an empty list');
+    TestRunner::assertSame('', $none['idItemCategory'], 'no category yields an empty string');
+
+    // A non-array idItemCategories is discarded without error.
+    $bad = alegra_call_private($admin, 'sanitize_item_filters', ['idItemCategories' => 'not-an-array']);
+    TestRunner::assertSame([], $bad['idItemCategories'], 'a non-array idItemCategories is discarded');
+
+    // The list is capped at 50 entries.
+    $many = [];
+    for ($i = 1; $i <= 60; $i++) { $many[] = 'c' . $i; }
+    $capped = alegra_call_private($admin, 'sanitize_item_filters', ['idItemCategories' => $many]);
+    TestRunner::assertSame(50, count($capped['idItemCategories']), 'the list is capped at 50');
+});
+
+TestRunner::test('T21.9 build_item_filter_params emits the category only for a single selection', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $one = alegra_call_private($admin, 'build_item_filter_params', ['idItemCategories' => ['c9']], false);
+    TestRunner::assertSame('c9', $one['idItemCategory'] ?? null, 'one category is sent to the API');
+
+    $two = alegra_call_private($admin, 'build_item_filter_params', ['idItemCategories' => ['c9', 'c10']], false);
+    TestRunner::assertArrayNotHasKey('idItemCategory', $two, 'multiple categories are filtered client-side');
+
+    $empty_list = alegra_call_private($admin, 'build_item_filter_params', ['idItemCategories' => []], false);
+    TestRunner::assertArrayNotHasKey('idItemCategory', $empty_list, 'an explicit empty list sends no category');
+
+    $empty_single = alegra_call_private($admin, 'build_item_filter_params', ['idItemCategory' => ''], false);
+    TestRunner::assertArrayNotHasKey('idItemCategory', $empty_single, 'an empty single category sends no category');
+});
+
+TestRunner::test('T21.10 ajax_sync_page imports only the selected categories when multiple', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('c1-1', ['name' => 'C1 A', 'itemCategory' => ['id' => 'c1'], 'status' => 'active']);
+    alegra_mock_seed_item('c1-2', ['name' => 'C1 B', 'itemCategory' => ['id' => 'c1'], 'status' => 'active']);
+    alegra_mock_seed_item('c2-1', ['name' => 'C2 A', 'itemCategory' => ['id' => 'c2'], 'status' => 'active']);
+    alegra_mock_seed_item('c3-1', ['name' => 'C3 A', 'itemCategory' => ['id' => 'c3'], 'status' => 'active']);
+
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'page' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 4,
+        'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'filters' => ['idItemCategories' => ['c1', 'c2'], 'idItemCategory' => 'c1'],
+    ], 600);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn() => $admin->ajax_sync_page());
+
+    TestRunner::assertTrue($resp->success, 'the page must respond successfully');
+    TestRunner::assertSame(3, (int) ($resp->payload['imported'] ?? 0), 'only items of the selected categories are imported');
+    TestRunner::assertSame(1, (int) ($resp->payload['skipped'] ?? 0), 'the out-of-set category is skipped');
+});
+
 // ===========================================================================
 // T22 — Preserve WooCommerce fields on import (import-filters)
 // ===========================================================================

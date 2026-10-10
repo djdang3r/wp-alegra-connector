@@ -298,10 +298,11 @@ if ($total_pages > 1) {
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;">
             <label style="display:block;font-size:13px;">
                 <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Categoría', 'alegra-connector'); ?></span>
-                <select id="ac-filter-category" style="width:100%;">
-                    <option value=""><?php esc_html_e('Todas', 'alegra-connector'); ?></option>
+                <select id="ac-filter-category" multiple size="6" style="width:100%;">
+                    <option value="" disabled><?php esc_html_e('Todas', 'alegra-connector'); ?></option>
                 </select>
                 <span id="ac-filter-category-note" style="display:block;font-size:11px;color:var(--ac-text-muted);margin-top:3px;"></span>
+                <span style="display:block;font-size:11px;color:var(--ac-text-muted);margin-top:2px;"><?php esc_html_e('Ctrl/Cmd para elegir varias. Sin selección se traen todas.', 'alegra-connector'); ?></span>
             </label>
 
             <label style="display:block;font-size:13px;">
