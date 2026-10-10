@@ -115,6 +115,23 @@ class Admin_Dashboard
         return $pid ? (int)$pid : null;
     }
 
+    /**
+     * Whether the four advanced admin sections (Importar, Documentación,
+     * Asistente, Reconciliación de stock) are hidden.
+     *
+     * Contract: `true` = ocultar (hide). Defaults to hidden so a fresh install
+     * shows only the day-to-day screens. Flip the option off from Configuración
+     * ("Mostrar secciones avanzadas"), or override in code with
+     * `add_filter('alegra_connector_hide_advanced_menus', '__return_false')`.
+     */
+    private function advanced_menus_hidden(): bool
+    {
+        return (bool) apply_filters(
+            'alegra_connector_hide_advanced_menus',
+            (bool) get_option('alegra_connector_hide_advanced_menus', true)
+        );
+    }
+
     public function add_admin_menu(): void
     {
         add_menu_page(
@@ -199,14 +216,16 @@ class Admin_Dashboard
             [$this, 'render_webhooks_page']
         );
 
-        add_submenu_page(
-            'alegra-connector',
-            __('Importar', 'alegra-connector'),
-            __('Importar', 'alegra-connector'),
-            'manage_woocommerce',
-            'alegra-connector-import',
-            [$this, 'render_import_page']
-        );
+        if (! $this->advanced_menus_hidden()) {
+            add_submenu_page(
+                'alegra-connector',
+                __('Importar', 'alegra-connector'),
+                __('Importar', 'alegra-connector'),
+                'manage_woocommerce',
+                'alegra-connector-import',
+                [$this, 'render_import_page']
+            );
+        }
 
         add_submenu_page(
             'alegra-connector',
@@ -217,14 +236,16 @@ class Admin_Dashboard
             [$this, 'render_settings_page']
         );
 
-        add_submenu_page(
-            'alegra-connector',
-            __('Documentación', 'alegra-connector'),
-            __('Documentación', 'alegra-connector'),
-            'manage_woocommerce',
-            'alegra-connector-docs',
-            [$this, 'render_docs_page']
-        );
+        if (! $this->advanced_menus_hidden()) {
+            add_submenu_page(
+                'alegra-connector',
+                __('Documentación', 'alegra-connector'),
+                __('Documentación', 'alegra-connector'),
+                'manage_woocommerce',
+                'alegra-connector-docs',
+                [$this, 'render_docs_page']
+            );
+        }
 
         add_submenu_page(
             'alegra-connector',
@@ -235,14 +256,16 @@ class Admin_Dashboard
             [$this, 'render_monitor_page']
         );
 
-        add_submenu_page(
-            'alegra-connector',
-            __('Asistente', 'alegra-connector'),
-            __('Asistente', 'alegra-connector'),
-            'manage_woocommerce',
-            'alegra-connector-wizard',
-            [$this, 'render_wizard_page']
-        );
+        if (! $this->advanced_menus_hidden()) {
+            add_submenu_page(
+                'alegra-connector',
+                __('Asistente', 'alegra-connector'),
+                __('Asistente', 'alegra-connector'),
+                'manage_woocommerce',
+                'alegra-connector-wizard',
+                [$this, 'render_wizard_page']
+            );
+        }
 
         // T6.3/T6.6: pantalla de la cola de facturas fallidas + badge con el
         // conteo cacheado (REQ-QUEUE-03/07). El título lleva el badge.
@@ -257,14 +280,16 @@ class Admin_Dashboard
 
         // REQ-RECON-01: informe de divergencia WC↔Alegra con causa + reparación
         // explícita. Read-only hasta que el comerciante repara.
-        add_submenu_page(
-            'alegra-connector',
-            __('Reconciliación de stock', 'alegra-connector'),
-            __('Reconciliación de stock', 'alegra-connector'),
-            'manage_woocommerce',
-            'alegra-connector-stock-reconciliation',
-            [$this, 'render_stock_reconciliation_page']
-        );
+        if (! $this->advanced_menus_hidden()) {
+            add_submenu_page(
+                'alegra-connector',
+                __('Reconciliación de stock', 'alegra-connector'),
+                __('Reconciliación de stock', 'alegra-connector'),
+                'manage_woocommerce',
+                'alegra-connector-stock-reconciliation',
+                [$this, 'render_stock_reconciliation_page']
+            );
+        }
     }
 
     /**
@@ -287,6 +312,18 @@ class Admin_Dashboard
     {
         $value = sanitize_text_field($value);
         return $value === '' ? (string) get_option($option, '') : $value;
+    }
+
+    /**
+     * Sanitize the "Mostrar secciones avanzadas" checkbox.
+     *
+     * The checkbox is the INVERSE of the stored flag: checked means "show the
+     * advanced sections", so the flag must be false; an absent (unchecked) value
+     * means "keep them hidden", so the flag is true. Normalises to bool.
+     */
+    public static function sanitize_hide_advanced_menus(mixed $value): bool
+    {
+        return ! rest_sanitize_boolean($value);
     }
 
     /**
@@ -507,6 +544,13 @@ class Admin_Dashboard
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_auto_complete_order', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images', ['sanitize_callback' => 'rest_sanitize_boolean']);
+        // 2.8.x: hide the 4 advanced submenus by default. The settings checkbox is
+        // the INVERSE (checked = show), so the sanitizer normalises to hide=true.
+        register_setting('alegra_connector_settings', 'alegra_connector_hide_advanced_menus', [
+            'type'              => 'boolean',
+            'sanitize_callback' => [self::class, 'sanitize_hide_advanced_menus'],
+            'default'           => true,
+        ]);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_inactive_products', ['sanitize_callback' => 'rest_sanitize_boolean']);
         register_setting('alegra_connector_settings', 'alegra_connector_sync_images_mode', ['sanitize_callback' => 'sanitize_text_field']);
         // Same masking rule as the API token: empty submission keeps the stored secret.

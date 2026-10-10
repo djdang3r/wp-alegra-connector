@@ -2,6 +2,64 @@
 
 All notable changes to Alegra Connector.
 
+## [Unreleased]
+
+> **Integridad de inventario: el plugin deja de barrer bajo la alfombra los eventos de
+> factura borrada (`delete-invoice`), avisa cuando el comerciante aplica una devolución/
+> nota crédito, suma una guarda anti-doble-return que re-baselina a Alegra (fuente de
+> verdad) sin empujar nunca un delta negativo sospechoso, agrega una auditoría read-only
+> de integridad de stock y oculta por defecto 4 secciones avanzadas del menú.** Sin
+> cambios de versión (release fuera de alcance). Suite 2776/0 + `SMOKE OK`.
+
+### Added
+
+- **C1 — Auditoría read-only de integridad de inventario.** Nuevo
+  `Sync\Inventory_Integrity_Report` (`build()` / `render_text()`) y el script ops
+  `scripts/audit-inventory-integrity.php`
+  (`wp eval-file scripts/audit-inventory-integrity.php` o `wp alegra-audit-inventory`).
+  Reporta los gates del sync, la comparación `WC stock` vs `availableQuantity` de Alegra
+  por producto vinculado (`OK` / `DIVERGENT`) y el ledger de divergencias. No escribe
+  stock, no emite ajustes y no toma locks; ante un error de la API degrada a un reporte
+  parcial con warning (nunca lanza). `scripts/` no viaja en el ZIP (`.distignore`):
+  es ops-only.
+- **C3 — Observabilidad de notas crédito.** Nuevo `Sync\Credit_Note_Watcher`: una sola
+  `GET /credit-notes` por corrida, nota idempotente en el pedido vinculado
+  (`_alegra_credit_note_seen`, HPOS-safe) y cero escrituras de stock. Corre desde el cron
+  existente, envuelto en try/catch para no tumbar el cron.
+- **C7 — Secciones avanzadas ocultas por defecto.** Importar, Documentación, Asistente y
+  Reconciliación de stock son ocultables vía `alegra_connector_hide_advanced_menus`
+  (default `true` = ocultar), con toggle en Configuración ("Mostrar secciones avanzadas")
+  y override por el filtro `alegra_connector_hide_advanced_menus`. No bloquea el acceso
+  por URL.
+
+### Fixed
+
+- **C2 — `delete-invoice` deja de ser silencioso.** El webhook rutea a
+  `Handlers::handle_delete_invoice()`: busca el pedido por `_alegra_invoice_id`, agrega una
+  nota idempotente (`_alegra_invoice_deleted_notified`, leída por la API CRUD) y **nunca**
+  re-fetchea la factura borrada ni cambia el estado del pedido.
+- **C4 — Guarda anti-doble-return con re-baseline a Alegra.** Cuando el baseline está stale
+  porque Alegra ganó stock (`A > S` con `W < S`), el poll ya no empuja un delta negativo
+  (devolución duplicada): registra la divergencia, re-baselina a Alegra y deja que WC
+  converja sin starvation. El caso `S === ''` y el combo `preserve=inventory` quedan fuera
+  de alcance (documentado).
+
+### Docs
+
+- **C5 — Invariantes, gates y runbook de inventario** en `docs/DOCUMENTACION.md`: un solo
+  escritor, una sola dirección por dueño, factura≠stock, los gates que matan de hambre al
+  sync, cómo correr la auditoría / re-baselinar / actuar ante una divergencia, y las
+  limitaciones de la guarda C4.
+
+### Tests
+
+- **T38–T54** — regresiones pinneadas al síntoma: menús avanzados (default/flag/override),
+  `delete-invoice` (dispatch, idempotencia HPOS, e2e por el Receiver, selección), guarda C4
+  (no push + convergencia + regresiones de venta/B.2/invoice-owner), nota crédito
+  (1 request, idempotencia, kill switch, cron seguro) y auditoría de integridad
+  (1 OK + 1 divergente, read-only sin writer/lock, error de API ⇒ reporte parcial).
+  Suite 2776/0 + `SMOKE OK`.
+
 ## [2.8.4] - 2026-10-02
 
 > **Hotfix: el fatídico `TypeError` en la pantalla de configuración de Envíos.** Cuando el

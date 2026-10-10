@@ -572,8 +572,34 @@ Alegra Connector ← menu principal (posicion 30)
 | Pedidos | `alegra-connector-orders` | Lista con facturacion, detalle con pagos |
 | Mapeo | `alegra-connector-mapping` | Tax classes → Alegra taxes |
 | Logs | `alegra-connector-logs` | Visor filtrable |
-| Importar | `alegra-connector-import` | CSV upload + API import |
+| Webhooks | `alegra-connector-webhooks` | Inspector de entregas + selector de eventos |
+| Cola de facturas | `alegra-connector-invoice-queue` | Reintentos de facturacion |
 | Configuracion | `alegra-connector-settings` | 5 tabs de settings |
+| Importar *(avanzada, oculta por defecto)* | `alegra-connector-import` | CSV upload + API import |
+| Documentacion *(avanzada, oculta por defecto)* | `alegra-connector-docs` | Esta misma guia dentro del admin |
+| Asistente *(avanzada, oculta por defecto)* | `alegra-connector-wizard` | Wizard de puesta en marcha |
+| Reconciliacion de stock *(avanzada, oculta por defecto)* | `alegra-connector-stock-reconciliation` | Revision de divergencias WC↔Alegra |
+
+#### Secciones avanzadas y la bandera `alegra_connector_hide_advanced_menus`
+
+Las 4 paginas marcadas como **avanzadas** (Importar, Documentacion, Asistente y
+Reconciliacion de stock) **estan ocultas por defecto**: una instalacion nueva solo
+muestra el dia a dia. No se bloquea el acceso por URL ni se desregistran sus AJAX;
+solo dejan de registrarse los submenus.
+
+Para mostrarlas:
+
+- **Desde Configuracion** (recomendado): tildar **"Mostrar secciones avanzadas"**
+  (la opcion guardada es la inversa: tildado ⇒ `false`, destildado ⇒ `true`).
+- **Por codigo** (override del filtro, gana sobre la opcion):
+
+  ```php
+  add_filter('alegra_connector_hide_advanced_menus', '__return_false');  // mostrar las 4
+  add_filter('alegra_connector_hide_advanced_menus', '__return_true');   // ocultar (default)
+  ```
+
+Contrato: `true` = ocultar. Default: `true`.
+
 
 ### Estadisticas
 
@@ -626,6 +652,80 @@ define('WP_DEBUG_LOG', true);
 
 Los errores PHP apareceran en `wp-content/debug.log`
 Los logs del plugin en `wp-content/uploads/alegra-logs/`
+
+---
+
+## 12 Integridad de Inventario
+
+### Invariantes
+
+- **Un solo escritor de stock.** Ninguna pagina de factura ni webhook escribe
+  `_stock`/`_manage_stock`/`_stock_status`. El unico escritor es `Inventory_Writer`
+  (`includes/Sync/Inventory_Writer.php`).
+- **Una sola direccion por dueno.** El stock se reconcilia con un unico dueno
+  (`Inventory_Pusher::owner()`): `invoice` (Alegra factura y descuenta) o
+  `adjustment` (el plugin empuja un ajuste). Nunca ambos a la vez.
+- **Factura ≠ stock.** Emitir o borrar una factura no toca por si mismo el stock de
+  WooCommerce: el efecto de inventario de Alegra llega por el poll
+  (`Dashboard → "Sincronizar inventario ahora"`) y WC converge a Alegra.
+- **Observabilidad read-only.** El diagnostico de integridad, el ledger de
+  divergencias y el inspector de webhooks solo leen; no escriben ni toman locks.
+
+### Gates que pueden "matar de hambre" al sync
+
+Si el inventario no se actualiza, revisar en orden estas opciones (todas ya
+existentes; no hay opciones nuevas). `Inventory_Integrity_Report::read_gates()`
+reporta estas seis:
+
+| Gate | Opcion | Efecto cuando esta off |
+|------|--------|------------------------|
+| Fuente | `alegra_connector_inventory_source` | `woocommerce` ⇒ Alegra no manda stock |
+| Pull habilitado | `alegra_connector_inventory_sync_enabled` | El poll Alegra→WC no corre |
+| Push habilitado | `alegra_connector_push_inventory_enabled` | WC→Alegra no empuja ajustes |
+| Migracion manage_stock | `alegra_connector_inventory_manage_stock_enabled` | Productos legacy `manage_stock=no` no se tocan |
+| Preservar campos | `alegra_connector_import_preserve_fields` | Con `inventory` el stock lo maneja el comerciante |
+| Dueno | `alegra_connector_stock_owner` | `invoice` ⇒ el plugin no empuja ajustes |
+
+Aparte de esos seis gates, el **kill switch** (`alegra_kill_switch`) detiene la
+sincronizacion por completo. No es un gate mas: se lee por separado en
+`Kill_Switch::is_active()` y no forma parte del resultado de `read_gates()`.
+
+### Runbook: auditoria e integridad
+
+**Correr la auditoria (read-only).** El script `scripts/audit-inventory-integrity.php`
+no viaja en el ZIP (`.distignore` excluye `scripts/`); se corre desde la raiz de
+WordPress:
+
+```bash
+wp eval-file scripts/audit-inventory-integrity.php
+wp eval-file scripts/audit-inventory-integrity.php -- --limit=50
+wp alegra-audit-inventory
+```
+
+Imprime: los gates, la comparacion `WC stock` vs `availableQuantity` por producto
+vinculado (`OK` / `DIVERGENT`) y el ledger de divergencias. No escribe nada.
+
+**Re-baselinar el inventario.** Para re-anclar el baseline y dejar que WC converja
+al valor de Alegra: **Alegra Connector → Dashboard → "Sincronizar inventario ahora"**
+(o el boton equivalente en Configuracion → Sincronizacion). Re-lee Alegra y deja el
+baseline `_alegra_stock_synced` alineado.
+
+**Ante una divergencia (`DIVERGENT`):**
+1. Confirmar en Alegra el `availableQuantity` real del item.
+2. Revisar la causa en el ledger (Reconciliacion de stock): `baseline_ausente`,
+   `divergencia_dueno`, `reembolso`, `factura_fallida`, `factura_pendiente`.
+3. Correr "Sincronizar inventario ahora" para reconverger.
+4. Si el dueno es `invoice`, el ajuste manual de WC es esperado (el plugin no empuja).
+
+### Limitaciones conocidas de la guarda anti-doble-return
+
+La guarda que evita empujar un delta negativo cuando el baseline quedo stale cubre
+el caso `A > S` con `W < S` (Alegra gano stock, p.ej. una nota credito). **No** cubre:
+
+- el caso **`S === ''`** (producto nunca baselinado): ese camino queda fuera de
+  alcance y sin cambios;
+- el combo **`preserve=inventory`** (el comerciante administra el stock): mismo
+  comportamiento preexistente que la convergencia por baseline viejo.
 
 ---
 

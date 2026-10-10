@@ -13373,4 +13373,509 @@ TestRunner::test('T37 2.8.4 build_shipping_drift_report does not TypeError on nu
         'mapped_item_id preserves the original numeric id as a string');
 });
 
+// ===========================================================================
+// 2.8.x Wave 1 — C7: advanced menus hidden by default
+// ===========================================================================
+echo "\n2.8.x Wave 1 — C7 advanced menus\n";
+
+TestRunner::test('T38 2.8.x advanced_menus_hidden default true', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    // Option absent ⇒ hidden (default true).
+    TestRunner::assertTrue(
+        (bool) alegra_call_private($admin, 'advanced_menus_hidden'),
+        'an absent option must default to hidden (true)'
+    );
+
+    // Explicitly stored false ⇒ shown (hidden = false).
+    update_option('alegra_connector_hide_advanced_menus', false);
+    TestRunner::assertFalse(
+        (bool) alegra_call_private($admin, 'advanced_menus_hidden'),
+        'option=false must mean the advanced menus are shown'
+    );
+
+    // A PHP override (filter) wins over the stored option. NOTE: the harness's
+    // apply_filters() reads $GLOBALS['wp_filters'] while add_filter() writes to
+    // $GLOBALS['wp_actions'] (a stub gap; wp-stubs.php is out of scope here), so
+    // we register the filter directly in the registry apply_filters() consumes —
+    // exactly the shape a production add_filter() would have produced.
+    delete_option('alegra_connector_hide_advanced_menus');
+    $GLOBALS['wp_filters']['alegra_connector_hide_advanced_menus'][10][] = [
+        'cb' => static fn () => false,
+        'args' => 1,
+    ];
+    TestRunner::assertFalse(
+        (bool) alegra_call_private($admin, 'advanced_menus_hidden'),
+        'a false filter override must force the advanced menus visible'
+    );
+});
+
+TestRunner::test('T39 2.8.x the 4 advanced submenus are hidden by default and shown when the flag is off', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $advanced = [
+        'alegra-connector-import',
+        'alegra-connector-docs',
+        'alegra-connector-wizard',
+        'alegra-connector-stock-reconciliation',
+    ];
+
+    // Default: the 4 advanced slugs are NOT registered.
+    $admin->add_admin_menu();
+    $slugs = array_map(static fn ($p) => (string) ($p['slug'] ?? ''), (array) $GLOBALS['alegra_test_admin_pages']);
+    TestRunner::assertSame([], array_values(array_intersect($advanced, $slugs)), 'the 4 advanced submenus must be hidden by default');
+    TestRunner::assertTrue(in_array('alegra-connector-webhooks', $slugs, true), 'webhooks must stay visible by default');
+    TestRunner::assertTrue(in_array('alegra-connector-invoice-queue', $slugs, true), 'the invoice queue must stay visible by default');
+
+    // Flag off: all 4 appear, with the usual capability and placement.
+    update_option('alegra_connector_hide_advanced_menus', false);
+    $GLOBALS['alegra_test_admin_pages'] = [];
+    $admin->add_admin_menu();
+    $pages = (array) $GLOBALS['alegra_test_admin_pages'];
+    $slugs2 = array_map(static fn ($p) => (string) ($p['slug'] ?? ''), $pages);
+    foreach ($advanced as $slug) {
+        TestRunner::assertTrue(in_array($slug, $slugs2, true), "$slug must appear when the flag is off");
+    }
+    $found = null;
+    foreach ($pages as $page) {
+        if (($page['slug'] ?? '') === 'alegra-connector-import') { $found = $page; break; }
+    }
+    TestRunner::assertSame('submenu', $found['type'] ?? null, 'the advanced pages stay submenus of the Alegra menu');
+    TestRunner::assertSame('manage_woocommerce', $found['cap'] ?? null, 'the advanced page keeps manage_woocommerce');
+    TestRunner::assertTrue(in_array('alegra-connector-webhooks', $slugs2, true), 'webhooks stay visible when the flag is off');
+});
+
+TestRunner::test('T40 2.8.x hide-advanced-menus sanitizer + settings/seed/uninstall wiring', function (): void {
+    alegra_test_reset();
+    $S = \Alegra\Connector\Admin\Admin_Dashboard::class;
+
+    // The checkbox means "show advanced"; the stored flag means "hide".
+    TestRunner::assertFalse($S::sanitize_hide_advanced_menus('1'), 'a checked box must store hide=false (shown)');
+    TestRunner::assertFalse($S::sanitize_hide_advanced_menus(1), 'a truthy checkbox must store hide=false');
+    TestRunner::assertTrue($S::sanitize_hide_advanced_menus(''), 'an unchecked/absent box must store hide=true');
+
+    // register_settings wires the option to the inverse sanitizer.
+    $admin_src = cfg2_source('admin/Admin/Admin_Dashboard.php');
+    TestRunner::assertStringContains("register_setting('alegra_connector_settings', 'alegra_connector_hide_advanced_menus'", $admin_src, 'the flag must be registered');
+    TestRunner::assertStringContains('sanitize_hide_advanced_menus', $admin_src, 'the flag must use the inverse sanitizer');
+
+    // The settings template renders the checkbox with the inverted mapping.
+    $tpl = cfg2_source('templates/admin-settings.php');
+    TestRunner::assertStringContains('name="alegra_connector_hide_advanced_menus"', $tpl, 'the settings page must expose the checkbox');
+    TestRunner::assertStringContains("get_option('alegra_connector_hide_advanced_menus', true) === false", $tpl, 'the box is checked only when hiding is disabled');
+
+    // Activation seeds the default (hidden = true) and uninstall deletes it.
+    TestRunner::assertStringContains("'alegra_connector_hide_advanced_menus' => true", cfg2_source('alegra-connector.php'), 'activation must seed hide=true');
+    TestRunner::assertStringContains("delete_option('alegra_connector_hide_advanced_menus')", cfg2_source('uninstall.php'), 'uninstall must delete the flag');
+});
+
+// ===========================================================================
+// 2.8.x Wave 1 — C2: delete-invoice dispatch + handler
+// ===========================================================================
+echo "\n2.8.x Wave 1 — C2 delete-invoice\n";
+
+TestRunner::test('T41 2.8.x delete-invoice routes to a handler (no Unhandled event)', function (): void {
+    alegra_test_reset();
+    $spy = new class extends \Alegra\Connector\Logger\Logger {
+        /** @var string[] */
+        public array $seen = [];
+        public function info(string $message, array $context = []): void { $this->seen[] = $message; }
+        public function warning(string $message, array $context = []): void { $this->seen[] = $message; }
+        public function error(string $message, array $context = []): void { $this->seen[] = $message; }
+    };
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($spy), $spy);
+
+    alegra_make_order(5001, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-del-1']]);
+    $handlers->process_event('delete-invoice', ['invoice' => ['id' => 'inv-del-1']]);
+
+    TestRunner::assertFalse(in_array('Unhandled webhook event', $spy->seen, true), 'delete-invoice must not fall through to the default branch');
+    $notes = array_values(array_filter(wc_get_order(5001)->get_notes(), static fn ($n) => str_contains((string) $n, 'eliminada en Alegra')));
+    TestRunner::assertSame(1, count($notes), 'the routed handler must add its order note');
+});
+
+TestRunner::test('T42 2.8.x handle_delete_invoice notes once, is idempotent, HPOS-safe, never changes status', function (): void {
+    alegra_test_reset();
+    $logger = make_logger();
+    $handlers = new \Alegra\Connector\Webhooks\Handlers(new Client($logger), $logger);
+    $deleted_notes = static fn (int $oid): int => count(array_filter(
+        wc_get_order($oid)->get_notes(),
+        static fn ($n) => str_contains((string) $n, 'eliminada en Alegra')
+    ));
+
+    alegra_make_order(5100, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-del-2']]);
+    $payload = ['invoice' => ['id' => 'inv-del-2']];
+
+    // First delivery.
+    $handlers->process_event('delete-invoice', $payload);
+    $order = wc_get_order(5100);
+    TestRunner::assertSame(1, $deleted_notes(5100), 'the first delivery must add exactly one note');
+    TestRunner::assertSame('inv-del-2', (string) $order->get_meta('_alegra_invoice_deleted_notified', true), 'the idempotency meta must hold the invoice id (CRUD read)');
+    TestRunner::assertSame('processing', $order->get_status(), 'the order status must NEVER change');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/invoices/inv-del-2'), 'a delete event must NOT re-fetch the (now gone) invoice');
+
+    // Replay of the same id ⇒ idempotent (CRUD-visible meta).
+    $handlers->process_event('delete-invoice', $payload);
+    TestRunner::assertSame(1, $deleted_notes(5100), 'a replayed delete must not add a second note (CRUD idempotency)');
+    TestRunner::assertSame('inv-del-2', (string) wc_get_order(5100)->get_meta('_alegra_invoice_deleted_notified', true), 'the meta must survive across calls');
+    TestRunner::assertSame('', (string) get_post_meta(5100, '_alegra_invoice_deleted_notified', true), 'the meta lives in the CRUD store, not postmeta (why get_post_meta breaks idempotency)');
+
+    // No linked order ⇒ silent no-op (must not throw).
+    $handlers->process_event('delete-invoice', ['invoice' => ['id' => 'inv-del-orphan']]);
+    TestRunner::assertTrue(true, 'an orphan delete must not throw');
+
+    // Bare payload (no `invoice` wrapper) resolves the same way.
+    alegra_make_order(5101, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-del-3']]);
+    $handlers->process_event('delete-invoice', ['id' => 'inv-del-3']);
+    TestRunner::assertSame(1, $deleted_notes(5101), 'a bare payload id must still resolve the order');
+});
+
+TestRunner::test('T43 2.8.x delete-invoice end-to-end through the Receiver (ACK 200 + note)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'replay-token');
+    alegra_make_order(5200, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-e2e-del']]);
+
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = (string) json_encode(['subject' => 'delete-invoice', 'message' => ['invoice' => ['id' => 'inv-e2e-del']]]);
+
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'replay-token']));
+    TestRunner::assertSame(200, $res->get_status(), 'the delivery must be ACKed with 200');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/invoices/inv-e2e-del'), 'the delivery must not re-fetch the deleted invoice');
+    $notes = array_values(array_filter(wc_get_order(5200)->get_notes(), static fn ($n) => str_contains((string) $n, 'eliminada en Alegra')));
+    TestRunner::assertSame(1, count($notes), 'the receiver must run the delete handler exactly once');
+    TestRunner::assertSame('processing', wc_get_order(5200)->get_status(), 'the receiver path must not change the order status');
+});
+
+TestRunner::test('T44 2.8.x a deselected delete-invoice is ignored (event_not_selected)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_webhook_token', 'replay-token');
+    alegra_make_order(5300, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-sel-del']]);
+
+    $selected = array_values(array_diff(Client::get_webhook_events(), ['delete-invoice']));
+    update_option(\Alegra\Connector\Webhooks\Receiver::EVENTS_OPTION, $selected, false);
+
+    $logger = make_logger();
+    $receiver = new \Alegra\Connector\Webhooks\Receiver(new Client($logger), $logger);
+    $body = (string) json_encode(['subject' => 'delete-invoice', 'message' => ['invoice' => ['id' => 'inv-sel-del']]]);
+
+    $res = $receiver->handle(new WP_REST_Request($body, [], ['token' => 'replay-token']));
+    TestRunner::assertSame(200, $res->get_status(), 'a deselected event is still ACKed (never feed the 10-strike deletion)');
+    TestRunner::assertSame('event_not_selected', (string) ($res->get_data()['reason'] ?? ''), 'the receiver must short-circuit on the selection gate');
+    $notes = array_values(array_filter(wc_get_order(5300)->get_notes(), static fn ($n) => str_contains((string) $n, 'eliminada en Alegra')));
+    TestRunner::assertSame(0, count($notes), 'a deselected delete must never reach the handler');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/invoices/inv-sel-del'), 'a deselected event must not call the API either');
+});
+
+// ===========================================================================
+// 2.8.x Wave 2 — C4: stale-baseline guard (no negative push, WC reconverges)
+// ===========================================================================
+echo "\n2.8.x Wave 2 — C4 stale-baseline guard\n";
+
+/**
+ * Spy on the API's inventory-adjustment writer WITHOUT hardcoding a URL path:
+ * the guard's whole point is that `create_inventory_adjustment()` is never
+ * reached. The mock's request log cannot prove that (a guard-red run would POST),
+ * so the assertion rides on the method call itself.
+ */
+function alegra_make_adjustment_spy(?Logger $logger = null): \Alegra\Connector\API\Client
+{
+    return new class($logger ?? make_logger()) extends Client {
+        /** @var array<int, array> */
+        public array $adjustments = [];
+        public function create_inventory_adjustment(array $data): array|\WP_Error
+        {
+            $this->adjustments[] = $data;
+            return ['id' => 'spy-adjustment'];
+        }
+    };
+}
+
+TestRunner::test('T45 2.8.x C4 stale baseline (W<S<A) never pushes and WC converges to A', function (): void {
+    alegra_test_reset();
+    // owner=adjustment (push_orders off), linked, manage_stock, NO pending.
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-c4', ['name' => 'C4', 'reference' => 'C4', 'inventory' => ['availableQuantity' => 13]]);
+    alegra_make_product(4500, ['name' => 'C4', 'sku' => 'C4', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(4500, '_alegra_item_id', 'it-c4');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(4500, 10);   // stale S=10
+
+    $spy = alegra_make_adjustment_spy();
+    (new Products($spy, make_logger()))->sync_inventory_from_alegra();
+
+    TestRunner::assertCount(0, $spy->adjustments, 'the stale-baseline guard must never reach create_inventory_adjustment()');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'no negative adjustment may reach Alegra');
+    TestRunner::assertSame(13, wc_get_product(4500)->get_stock_quantity(), 'WC must converge to Alegra (A=13), not stay stuck at 7');
+    TestRunner::assertSame(13, \Alegra\Connector\Sync\Inventory_Pusher::synced(4500), 'the baseline must be re-anchored to A=13');
+    $div = get_option(\Alegra\Connector\Sync\Stock_Divergence::OPTION, []);
+    TestRunner::assertArrayHasKey('4500', $div, 'the divergence must be recorded for the audit trail');
+    TestRunner::assertSame(13, (int) ($div['4500']['a'] ?? 0), 'the recorded divergence carries the Alegra value (A=13)');
+    TestRunner::assertSame(10, (int) ($div['4500']['s'] ?? 0), 'the recorded divergence keeps the stale baseline (S=10)');
+});
+
+TestRunner::test('T46 2.8.x C4 guard regressions: normal sale pushes, B.2 rescues, invoice-owner untouched', function (): void {
+    // (a) Normal pending sale: W=7, S=10, A==S=10 ⇒ the guard does NOT fire; out 3.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-r-a', ['name' => 'RA', 'reference' => 'RA', 'inventory' => ['availableQuantity' => 10]]);
+    alegra_make_product(4600, ['name' => 'RA', 'sku' => 'RA', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(4600, '_alegra_item_id', 'it-r-a');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(4600, 10);
+    $spy_a = alegra_make_adjustment_spy();
+    (new Products($spy_a, make_logger()))->sync_inventory_from_alegra();
+    TestRunner::assertCount(1, $spy_a->adjustments, 'a normal sale (A==S) must still push exactly one adjustment');
+    TestRunner::assertSame('out', $spy_a->adjustments[0]['items'][0]['type'] ?? null, 'the pushed line is an "out"');
+    TestRunner::assertSame(3, (int) ($spy_a->adjustments[0]['items'][0]['quantity'] ?? 0), 'the pushed delta is 3');
+
+    // (b) B.2 rescue: W==A, S stale ⇒ re-baseline, no push.
+    alegra_test_reset();
+    update_option('alegra_connector_push_orders_enabled', false);
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-r-b', ['name' => 'RB', 'reference' => 'RB', 'inventory' => ['availableQuantity' => 7]]);
+    alegra_make_product(4601, ['name' => 'RB', 'sku' => 'RB', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(4601, '_alegra_item_id', 'it-r-b');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(4601, 10);
+    $spy_b = alegra_make_adjustment_spy();
+    (new Products($spy_b, make_logger()))->sync_inventory_from_alegra();
+    TestRunner::assertCount(0, $spy_b->adjustments, 'B.2 (W==A) must rescue without pushing');
+    TestRunner::assertSame(7, \Alegra\Connector\Sync\Inventory_Pusher::synced(4601), 'B.2 converges the baseline to W=A=7');
+    TestRunner::assertSame(7, wc_get_product(4601)->get_stock_quantity(), 'B.2 keeps WC at 7');
+
+    // (c) owner=invoice: the guard is gated by can_push; no write, divergence only.
+    alegra_test_reset();
+    update_option('alegra_connector_stock_owner', 'invoice');
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_mock_seed_item('it-r-c', ['name' => 'RC', 'reference' => 'RC', 'inventory' => ['availableQuantity' => 13]]);
+    alegra_make_product(4602, ['name' => 'RC', 'sku' => 'RC', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(4602, '_alegra_item_id', 'it-r-c');
+    \Alegra\Connector\Sync\Inventory_Pusher::set_synced(4602, 10);
+    $spy_c = alegra_make_adjustment_spy();
+    (new Products($spy_c, make_logger()))->sync_inventory_from_alegra();
+    TestRunner::assertCount(0, $spy_c->adjustments, 'with owner=invoice the poll must never emit an adjustment');
+    TestRunner::assertSame(7, wc_get_product(4602)->get_stock_quantity(), 'owner=invoice keeps the merchant-managed WC stock');
+    $div_c = get_option(\Alegra\Connector\Sync\Stock_Divergence::OPTION, []);
+    TestRunner::assertArrayHasKey('4602', $div_c, 'owner=invoice still records the divergence');
+});
+
+// ===========================================================================
+// 2.8.x Wave 2 — C3: Credit_Note_Watcher (read-only) + cron wiring
+// ===========================================================================
+echo "\n2.8.x Wave 2 — C3 credit-note watcher\n";
+
+TestRunner::test('T47 2.8.x Credit_Note_Watcher notes a linked order once with ONE request', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-1'] = ['id' => 'cn-1', 'invoices' => [['id' => 'inv-cn-1']]];
+    alegra_make_order(4700, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-cn-1']]);
+
+    $spy = alegra_make_adjustment_spy();
+    $watcher = new \Alegra\Connector\Sync\Credit_Note_Watcher($spy, make_logger());
+    $r = $watcher->run();
+
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/credit-notes'), 'exactly ONE GET /credit-notes per run');
+    TestRunner::assertSame(1, (int) ($r['noted'] ?? 0), 'the linked order must get exactly one note');
+    $order = wc_get_order(4700);
+    $notes = array_values(array_filter($order->get_notes(), static fn ($n) => str_contains((string) $n, 'cn-1')));
+    TestRunner::assertSame(1, count($notes), 'the order note references the credit note id');
+    $seen = $order->get_meta(\Alegra\Connector\Sync\Credit_Note_Watcher::SEEN_META, true);
+    TestRunner::assertTrue(is_array($seen) && in_array('cn-1', array_map('strval', $seen), true), 'the seen meta records the credit note id');
+    TestRunner::assertSame('processing', $order->get_status(), 'the watcher must never change the order status');
+    TestRunner::assertCount(0, $spy->adjustments, 'the watcher must never write stock');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'no inventory adjustment from the watcher');
+    $req = alegra_mock_last_request('GET', '/credit-notes');
+    TestRunner::assertSame('30', (string) ($req['query']['limit'] ?? ''), 'the request is bounded to 30');
+    TestRunner::assertTrue((string) ($req['query']['date'] ?? '') !== '', 'the request carries a date window');
+
+    // Re-run ⇒ idempotent: no second note, still one request per run.
+    $r2 = $watcher->run();
+    TestRunner::assertSame(0, (int) ($r2['noted'] ?? 0), 'the re-run must not note again');
+    TestRunner::assertSame(1, count(array_filter(wc_get_order(4700)->get_notes(), static fn ($n) => str_contains((string) $n, 'cn-1'))), 'still exactly one note after the re-run');
+    TestRunner::assertSame(2, alegra_mock_count('GET', '/credit-notes'), 'one request per run (2 runs ⇒ 2 requests)');
+});
+
+TestRunner::test('T48 2.8.x Credit_Note_Watcher is silent without a matching linked order', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-2'] = ['id' => 'cn-2', 'invoices' => [['id' => 'inv-no-order']]];
+    alegra_make_order(4750, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-other']]);
+
+    $r = (new \Alegra\Connector\Sync\Credit_Note_Watcher(make_api(), make_logger()))->run();
+    TestRunner::assertSame(0, (int) ($r['noted'] ?? 0), 'no linked order ⇒ no note');
+    TestRunner::assertSame([], wc_get_order(4750)->get_notes(), 'the unmatched order must stay note-free');
+    TestRunner::assertSame('', (string) wc_get_order(4750)->get_meta(\Alegra\Connector\Sync\Credit_Note_Watcher::SEEN_META, true), 'no seen meta written');
+
+    // A credit note without invoice links is a no-op.
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-3'] = ['id' => 'cn-3', 'invoices' => []];
+    $r2 = (new \Alegra\Connector\Sync\Credit_Note_Watcher(make_api(), make_logger()))->run();
+    TestRunner::assertSame(0, (int) ($r2['noted'] ?? 0), 'a credit note without invoice links is a no-op');
+});
+
+TestRunner::test('T49 2.8.x Credit_Note_Watcher honors the kill switch', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-4'] = ['id' => 'cn-4', 'invoices' => [['id' => 'inv-cn-4']]];
+    alegra_make_order(4760, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-cn-4']]);
+
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $r = (new \Alegra\Connector\Sync\Credit_Note_Watcher(make_api(), make_logger()))->run();
+    \Alegra\Connector\Kill_Switch::deactivate();
+
+    TestRunner::assertSame('kill_switch', (string) ($r['skipped'] ?? ''), 'the watcher reports the kill switch skip');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/credit-notes'), 'the kill switch must stop the request entirely');
+    TestRunner::assertSame([], wc_get_order(4760)->get_notes(), 'no note while the kill switch is active');
+});
+
+TestRunner::test('T50 2.8.x the cron runs the credit-note watcher safely and after inventory', function (): void {
+    // (a) Watcher runs from the cron body and notes the linked order.
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_sync_customers', false);
+    update_option('alegra_connector_sync_categories', false);
+    update_option('alegra_connector_sync_orders', false);
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-cron'] = ['id' => 'cn-cron', 'invoices' => [['id' => 'inv-cron-1']]];
+    alegra_make_order(4800, ['status' => 'processing', 'meta' => ['_alegra_invoice_id' => 'inv-cron-1']]);
+
+    make_controller()->run_cron_sync();
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/credit-notes'), 'the cron must trigger exactly one watcher query');
+    $notes = array_values(array_filter(wc_get_order(4800)->get_notes(), static fn ($n) => str_contains((string) $n, 'cn-cron')));
+    TestRunner::assertSame(1, count($notes), 'the cron-driven watcher notes the order');
+
+    // (b) A watcher exception must NOT break the cron.
+    alegra_test_reset();
+    update_option('alegra_connector_sync_products', false);
+    update_option('alegra_connector_sync_customers', false);
+    update_option('alegra_connector_sync_categories', false);
+    update_option('alegra_connector_sync_orders', false);
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    $throwing = new class(make_logger()) extends Client {
+        public function get_credit_notes(array $params = []): array|\WP_Error
+        {
+            throw new \RuntimeException('boom-cn');
+        }
+    };
+    (new Controller($throwing, make_logger()))->run_cron_sync();
+    TestRunner::assertTrue(true, 'a watcher exception must not propagate out of the cron');
+
+    // (c) Kill switch ⇒ the cron short-circuits before the watcher.
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_state']['credit_notes']['cn-kill'] = ['id' => 'cn-kill', 'invoices' => [['id' => 'inv-kill']]];
+    \Alegra\Connector\Kill_Switch::activate('test');
+    make_controller()->run_cron_sync();
+    \Alegra\Connector\Kill_Switch::deactivate();
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/credit-notes'), 'the kill switch must stop the cron before the watcher');
+});
+
+// ===========================================================================
+// 2.8.x Wave 3 — C1: Inventory_Integrity_Report (read-only audit) + C1.2 ops
+// ===========================================================================
+echo "\n2.8.x Wave 3 — C1 inventory integrity audit\n";
+
+TestRunner::test('T51 2.8.x Inventory_Integrity_Report compares WC stock vs Alegra (1 ok, 1 divergent)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+
+    // Product A: WC == Alegra (OK). Product B: WC=7 vs Alegra=13 (divergent).
+    alegra_make_product(6001, ['name' => 'AOK', 'sku' => 'AOK', 'stock' => 5, 'manage_stock' => true]);
+    update_post_meta(6001, '_alegra_item_id', 'it-ok');
+    alegra_make_product(6002, ['name' => 'ADIV', 'sku' => 'ADIV', 'stock' => 7, 'manage_stock' => true]);
+    update_post_meta(6002, '_alegra_item_id', 'it-div');
+    alegra_mock_seed_item('it-ok', ['name' => 'AOK', 'reference' => 'AOK', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 5]]);
+    alegra_mock_seed_item('it-div', ['name' => 'ADIV', 'reference' => 'ADIV', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 13]]);
+
+    $spy = alegra_make_adjustment_spy();
+    $report = new \Alegra\Connector\Sync\Inventory_Integrity_Report($spy, make_logger());
+    $built = $report->build();
+
+    TestRunner::assertTrue(is_array($built), 'build() returns an array');
+
+    TestRunner::assertSame(1, (int) ($built['summary']['ok'] ?? -1), 'exactly one product is OK (W==A)');
+    TestRunner::assertSame(1, (int) ($built['summary']['divergent'] ?? -1), 'exactly one product is divergent (W!=A)');
+    TestRunner::assertSame(2, (int) ($built['summary']['total'] ?? -1), 'two linked products compared');
+
+    $by = [];
+    foreach (($built['products'] ?? []) as $row) {
+        $by[(int) ($row['product_id'] ?? 0)] = $row;
+    }
+    TestRunner::assertSame('ok', (string) ($by[6001]['status'] ?? ''), 'W==A is classified ok');
+    TestRunner::assertSame('divergent', (string) ($by[6002]['status'] ?? ''), 'W!=A is classified divergent');
+    TestRunner::assertSame(7, (int) ($by[6002]['wc_stock'] ?? -1), 'the divergent row carries WC=7');
+    TestRunner::assertSame(13, (int) ($by[6002]['alegra_stock'] ?? -1), 'the divergent row carries Alegra=13');
+
+    // Gates reported (existing option names only).
+    TestRunner::assertArrayHasKey('gates', $built, 'the report carries the sync gates');
+    TestRunner::assertSame('alegra', (string) ($built['gates']['inventory_source'] ?? ''), 'gate inventory_source');
+    TestRunner::assertSame(true, (bool) ($built['gates']['inventory_sync_enabled'] ?? false), 'gate inventory_sync_enabled');
+    TestRunner::assertSame(true, (bool) ($built['gates']['push_inventory_enabled'] ?? false), 'gate push_inventory_enabled');
+    TestRunner::assertSame(false, (bool) ($built['gates']['inventory_manage_stock_enabled'] ?? true), 'gate inventory_manage_stock_enabled');
+    TestRunner::assertArrayHasKey('import_preserve_fields', $built['gates'], 'gate import_preserve_fields');
+    TestRunner::assertSame('auto', (string) ($built['gates']['stock_owner'] ?? ''), 'gate stock_owner');
+    TestRunner::assertArrayHasKey('divergences', $built, 'the report carries the recorded divergences');
+
+    $text = $report->render_text();
+    TestRunner::assertStringContains('it-div', $text, 'the rendered text lists the divergent item id');
+    TestRunner::assertTrue(str_contains(strtoupper($text), 'DIVERGENT'), 'the rendered text marks the divergence');
+});
+
+TestRunner::test('T52 2.8.x Inventory_Integrity_Report is read-only (no writer, no adjustment, no lock, no option write)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(6100, ['name' => 'RO', 'sku' => 'RO', 'stock' => 3, 'manage_stock' => true]);
+    update_post_meta(6100, '_alegra_item_id', 'it-ro');
+    alegra_mock_seed_item('it-ro', ['name' => 'RO', 'reference' => 'RO', 'inventory' => ['unit' => 'unit', 'availableQuantity' => 9]]);
+
+    $spy = alegra_make_adjustment_spy();
+    $report = new \Alegra\Connector\Sync\Inventory_Integrity_Report($spy, make_logger());
+
+    $report->build();
+    $report->render_text();
+
+    TestRunner::assertCount(0, $spy->adjustments, 'the audit must never call create_inventory_adjustment()');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'no adjustment POST reaches Alegra');
+    $locks = array_values(array_filter(array_keys($GLOBALS['wp_options']), static fn ($k) => str_starts_with((string) $k, 'alegra_lock_')));
+    TestRunner::assertSame([], $locks, 'the audit must not acquire any lock');
+    TestRunner::assertSame(3, wc_get_product(6100)->get_stock_quantity(), 'the audit must not write WC stock');
+    TestRunner::assertSame('', (string) \Alegra\Connector\Sync\Inventory_Pusher::synced(6100), 'the audit must not touch the stock baseline meta');
+
+    // Source-scan: the report must not reference any write/lock primitive.
+    $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'includes/Sync/Inventory_Integrity_Report.php');
+    foreach (['Inventory_Writer', 'run_inventory_sync', 'push_delta', 'acquire_lock', 'create_inventory_adjustment'] as $forbidden) {
+        TestRunner::assertStringNotContains($forbidden, $src, "the report source must not reference $forbidden");
+    }
+});
+
+TestRunner::test('T53 2.8.x Inventory_Integrity_Report degrades on API error (partial report + warning, no throw)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_inventory_source', 'alegra');
+    alegra_make_product(6200, ['name' => 'ERR', 'sku' => 'ERR', 'stock' => 4, 'manage_stock' => true]);
+    update_post_meta(6200, '_alegra_item_id', 'it-err');
+    alegra_mock_fail('GET', '/items', 500, ['message' => 'boom']);
+
+    $report = new \Alegra\Connector\Sync\Inventory_Integrity_Report(make_api(), make_logger());
+    $built = $report->build();  // must not throw the API error
+
+    TestRunner::assertTrue(is_array($built), 'the report returns an array on API error');
+    TestRunner::assertSame([], $built['products'], 'no product rows on API error');
+    TestRunner::assertTrue(!empty($built['warnings']), 'the report carries a warning');
+    $text = $report->render_text();
+    TestRunner::assertTrue(str_contains(strtolower($text), 'warning'), 'the rendered text surfaces the warning');
+});
+
+TestRunner::test('T54 2.8.x audit-inventory-integrity.php is a read-only ops wrapper (not shipped)', function (): void {
+    $path = $GLOBALS['alegra_plugin_root'] . 'scripts/audit-inventory-integrity.php';
+    TestRunner::assertTrue(is_file($path), 'the ops script must exist');
+
+    $src = (string) file_get_contents($path);
+    TestRunner::assertStringContains('wp eval-file scripts/audit-inventory-integrity.php', $src, 'the header documents the wp eval-file usage');
+    TestRunner::assertStringContains("WP_CLI::add_command('alegra-audit-inventory'", $src, 'the script registers the WP-CLI command');
+    TestRunner::assertStringContains('Inventory_Integrity_Report', $src, 'the script instantiates the report');
+    TestRunner::assertStringContains('render_text', $src, 'the script prints render_text()');
+    foreach (['create_inventory_adjustment', 'Inventory_Writer', 'run_inventory_sync', 'push_delta', 'acquire_lock'] as $forbidden) {
+        TestRunner::assertStringNotContains($forbidden, $src, "the ops script must not use $forbidden");
+    }
+
+    $distignore = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . '.distignore');
+    TestRunner::assertStringContains('scripts/', $distignore, 'scripts/ must be excluded from the release ZIP');
+});
+
 exit(TestRunner::summary());

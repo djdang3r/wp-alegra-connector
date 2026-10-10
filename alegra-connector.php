@@ -486,6 +486,9 @@ final class Alegra_Connector
             // `alegra-connector-` are excluded automatically; this option is the
             // documented override for items that don't use the prefix.
             'alegra_connector_internal_item_ids' => [],
+            // 2.8.x: hide the 4 advanced admin sections (Importar, Documentación,
+            // Asistente, Reconciliación de stock) by default.
+            'alegra_connector_hide_advanced_menus' => true,
         ];
 
         // AC-81: options that are only ever read in admin/cron context must not
@@ -540,6 +543,8 @@ final class Alegra_Connector
             'alegra_connector_shipping_map',
             'alegra_connector_shipping_item_type',
             'alegra_connector_internal_item_ids',
+            // 2.8.x: only read by the admin menu registration.
+            'alegra_connector_hide_advanced_menus',
         ];
 
         foreach ($defaults as $key => $value) {

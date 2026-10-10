@@ -274,6 +274,26 @@ class Controller
             }
         }
 
+        // Credit-note watcher (C3): detección READ-ONLY de devoluciones/NC
+        // aplicadas en Alegra; nota el pedido vinculado una sola vez. Corre
+        // DESPUÉS del bloque de inventario y FUERA de cualquier lock de
+        // productos: reutiliza la infraestructura del cron sin tocar stock ni
+        // estados de pedido. Guardado por kill switch y try/catch para que una
+        // excepción del watcher jamás tumbe la sincronización.
+        if (!Kill_Switch::is_active()) {
+            try {
+                $watcher = new Credit_Note_Watcher($this->api, $this->logger);
+                $watched = $watcher->run();
+                if (!empty($watched['noted'])) {
+                    $result['credit_notes'] = (int) $watched['noted'];
+                }
+            } catch (\Throwable $e) {
+                $this->logger->error('Credit note watcher failed', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         if (get_option('alegra_connector_sync_customers', false)) {
             $step++;
             Heartbeat::set($run_id, ['step' => 'customers', 'message' => __('Importando clientes desde Alegra...', 'alegra-connector'), 'step_num' => $step, 'total_steps' => $total_steps]);

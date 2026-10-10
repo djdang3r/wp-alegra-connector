@@ -534,6 +534,13 @@ $ac_catalog = \Alegra\Connector\Billing_Fields::CATALOG;
 <h2><?php esc_html_e('Configuración Avanzada','alegra-connector');?></h2>
 
 <table class="form-table">
+<!-- 2.8.x: reveal the 4 advanced sections (Importar, Documentación, Asistente,
+     Reconciliación de stock) hidden by default. Stored INVERTED: checked = show
+     = option false. -->
+<tr><th><?php esc_html_e('Menú:','alegra-connector');?></th><td>
+<label><input type="checkbox" name="alegra_connector_hide_advanced_menus" value="1" <?php checked(get_option('alegra_connector_hide_advanced_menus', true) === false);?>> <?php esc_html_e('Mostrar secciones avanzadas (Importar, Documentación, Asistente, Reconciliación de stock)','alegra-connector');?></label>
+<p class="description"><?php esc_html_e('Desmarcado (por defecto) esas 4 secciones quedan ocultas en el menú. Marcalo para mostrarlas.','alegra-connector');?></p></td></tr>
+
 <!-- Conflict Resolution (customers only) -->
 <tr><th><?php esc_html_e('Resolucion de conflictos de clientes:','alegra-connector');?></th><td>
 <select name="alegra_connector_conflict_resolution">
