@@ -2083,7 +2083,8 @@ class Products
             if ($alegra_parent !== '') {
                 $fetched = $this->api->get_items([
                     'variantParent_id' => $alegra_parent,
-                    'limit'            => 100,
+                    // Alegra rejects `limit > 30` on GET /items (documented).
+                    'limit'            => 30,
                 ]);
                 if (!is_wp_error($fetched) && is_array($fetched)) {
                     $children = $fetched;
