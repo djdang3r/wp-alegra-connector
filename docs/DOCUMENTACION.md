@@ -600,6 +600,51 @@ Para mostrarlas:
 
 Contrato: `true` = ocultar. Default: `true`.
 
+#### Filtro de Categoria en el import de Productos
+
+En la pagina **Productos**, el boton de importar abre un modal de filtros. El filtro
+**Categoria** es de **seleccion multiple** (`<select multiple>`, elegir varias con
+Ctrl/Cmd). El comportamiento segun cuantas categorias elijas:
+
+- **0 categorias:** se importa todo el catalogo (sin filtro de categoria), igual que antes.
+- **1 categoria:** se manda `idItemCategory` a la API de Alegra; es el camino de siempre
+  (mismos parametros, mismo total y misma paginacion).
+- **2 o mas categorias:** la API solo filtra por una categoria, asi que se **omite el
+  filtro server-side** y se recorre el catalogo salteando client-side los items que no
+  pertenecen al conjunto (se compara `itemCategory.id`, la categoria comercial del item).
+
+> Con **varias** categorias el **total del progreso es el del catalogo completo** (no la
+> suma de las categorias elegidas), porque el motor recorre todos los items y descarta los
+> que no corresponden; es el mismo criterio que ya usa el filtro **Con variantes**
+> (`variantParent`). Los items descartados cuentan como *salteados*, no como importados.
+
+#### Mapeo de Envios: mostrar y auto-mapear los items existentes
+
+La pestana **Envios** (dentro de Configuracion) mapea cada metodo de envio de WooCommerce
+a un item de Alegra. Dos comportamientos se agregaron para no obligar a recrear items que
+ya existen:
+
+- **El selector muestra los items de envio que ya existen en Alegra.** Antes el desplegable
+  ocultaba TODO item con el prefijo reservado `alegra-connector-`; ahora se **exceptua** el
+  prefijo de los items de envio (`alegra-connector-shipping:<metodo>:<instancia>`), que son
+  justamente los mapeables. Se siguen ocultando los demas helpers (`alegra-connector-adjustment`,
+  etc.) y cualquier id de la allow-list `alegra_connector_internal_item_ids`.
+- **Auto-relleno del mapeo al abrir Envios.** El vinculo de cada metodo es determinístico
+  (`reference = alegra-connector-shipping:<method_id>:<instance_id>`). Al renderizar la
+  pestana, cada metodo cuyo mapeo este **vacio** y cuyo item canonico ya exista en Alegra se
+  mapea solo, y el `<select>` queda con ese item seleccionado. Es **idempotente** y
+  **solo rellena vacios**: nunca pisa un mapeo manual o previo, nunca auto-mapea un item de
+  la allow-list / interno, y es un **no-op si no hay conexion** (no escribe nada).
+
+Detalles de implementacion (para quien toque el codigo):
+
+- La lista (`[id => name]`) y el mapa `reference => id` se construyen en el **mismo pase**
+  sobre `GET /items` y se cachean en transients hermanos con el mismo TTL (fuente unica de
+  verdad); resolver el mapa **no** dispara llamadas extra a la API.
+- `Admin_Dashboard::clear_alegra_items_cache()` borra **ambos** transients y se invoca tras
+  crear un item, de modo que crear/refrescar nunca sirve un mapa de references stale.
+- El auto-relleno persiste el mapa **una sola vez** (`update_option(..., false)`) y solo
+  cuando hubo cambios.
 
 ### Estadisticas
 
