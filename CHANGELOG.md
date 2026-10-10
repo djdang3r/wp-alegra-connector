@@ -2,14 +2,14 @@
 
 All notable changes to Alegra Connector.
 
-## [Unreleased]
+## [2.8.5] - 2026-10-09
 
 > **Integridad de inventario: el plugin deja de barrer bajo la alfombra los eventos de
 > factura borrada (`delete-invoice`), avisa cuando el comerciante aplica una devolución/
 > nota crédito, suma una guarda anti-doble-return que re-baselina a Alegra (fuente de
 > verdad) sin empujar nunca un delta negativo sospechoso, agrega una auditoría read-only
-> de integridad de stock y oculta por defecto 4 secciones avanzadas del menú.** Sin
-> cambios de versión (release fuera de alcance). Suite 2776/0 + `SMOKE OK`.
+> de integridad de stock y oculta por defecto 4 secciones avanzadas del menú.** Suite
+> 2776/0 + `SMOKE OK`.
 
 ### Added
 
