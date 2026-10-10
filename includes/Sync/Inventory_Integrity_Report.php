@@ -65,23 +65,45 @@ final class Inventory_Integrity_Report
             return $this->package($gates, $products, count($products), $warnings);
         }
 
-        $items = $this->api->get_items([
-            'start'           => 0,
-            'limit'           => max(1, $limit),
-            'mode'            => 'advanced',
-            'order_field'     => 'id',
-            'order_direction' => 'ASC',
-        ]);
-
-        if (is_wp_error($items)) {
-            $warnings[] = 'Error de la API de Alegra al listar ítems: ' . $items->get_error_message();
-            $this->logger?->warning('Inventory integrity audit: no se pudo listar ítems', [
-                'error' => $items->get_error_message(),
+        // Alegra rejects `limit > 30` on GET /items (documented: "Si este valor
+        // es mayor que 30, la aplicación retorna error."). `$limit` is therefore
+        // the OVERALL cap (DEFAULT_LIMIT=200), never a single request size:
+        // fetch in pages of at most 30, ordered by id ASC, until we reach the
+        // cap or the catalogue is exhausted. Never issue a request with limit>30.
+        $target    = max(1, $limit);
+        $page_size = min(30, $target);
+        $items     = [];
+        $fetch_error = null;
+        while (count($items) < $target) {
+            $want  = min($page_size, $target - count($items));
+            $batch = $this->api->get_items([
+                'start'           => count($items),
+                'limit'           => $want,
+                'mode'            => 'advanced',
+                'order_field'     => 'id',
+                'order_direction' => 'ASC',
             ]);
-            $items = [];
+
+            if (is_wp_error($batch)) {
+                $fetch_error = $batch;
+                break;
+            }
+            if (!is_array($batch) || $batch === []) {
+                break; // catalogue exhausted (or empty)
+            }
+            foreach ($batch as $item) {
+                $items[] = $item;
+            }
+            if (count($batch) < $want) {
+                break; // short page ⇒ end of catalogue
+            }
         }
-        if (!is_array($items)) {
-            $items = [];
+
+        if ($fetch_error !== null) {
+            $warnings[] = 'Error de la API de Alegra al listar ítems: ' . $fetch_error->get_error_message();
+            $this->logger?->warning('Inventory integrity audit: no se pudo listar ítems', [
+                'error' => $fetch_error->get_error_message(),
+            ]);
         }
 
         $missing = 0;
