@@ -1397,6 +1397,28 @@ class Products
                         $local_pending = false;
                     }
 
+                    // (C4/B.2b) Guarda anti doble-return: el baseline S quedó
+                    // stale porque ALEGRA GANÓ stock (p.ej. nota crédito)
+                    // ⇒ A > S. Sin push local en vuelo y con W < S, empujar el
+                    // delta negativo sería una devolución DUPLICADA (Alegra ya
+                    // la aplicó). Se confía en Alegra (fuente de verdad):
+                    // registrar la divergencia, re-baselinar a A y soltar el
+                    // `local_pending` para que el flujo caiga a la sección (C),
+                    // que escribe WC=A y deja converger (sin starvation).
+                    // `$p === ''` evita pisar un push de venta en vuelo (simetría
+                    // con B.2). NO hay `continue` ni `push_delta` acá.
+                    if ($local_pending && $can_push && $p === '' && $s !== '' && $has_a
+                        && $w < (int) $s && $a > (int) $s) {
+                        Stock_Divergence::record($product_id, [
+                            'w' => $w, 'a' => $a, 's' => $s,
+                            'cause' => Stock_Divergence::divergence_cause($owner, $s),
+                            'at' => time(),
+                        ]);
+                        Inventory_Pusher::set_synced($product_id, $a);
+                        $s = $a;
+                        $local_pending = false;
+                    }
+
                     if ($local_pending) {
                         if ($can_push) {
                             if ($s === '') {

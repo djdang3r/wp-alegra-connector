@@ -51,6 +51,10 @@ class Handlers
                 $this->handle_invoice_event($data);
                 break;
 
+            case 'delete-invoice':
+                $this->handle_delete_invoice($data);
+                break;
+
             default:
                 if ($this->logger) $this->logger->info('Unhandled webhook event', ['event' => $event]);
                 break;
@@ -232,6 +236,65 @@ class Handlers
             $order->update_status('completed');
             if ($this->logger) $this->logger->info('Webhook: Order completed from paid invoice', [
                 'order_id' => $order_id,
+                'invoice_id' => $alegra_invoice_id,
+            ]);
+        }
+    }
+
+    /**
+     * Handle a `delete-invoice` event.
+     *
+     * The invoice no longer exists in Alegra, so it is NEVER re-fetched: the
+     * payload's id is the authoritative link. Records a one-time order note,
+     * idempotent through a CRUD meta (`$order->get_meta`, never `get_post_meta`,
+     * which reads a different store under HPOS). The order status is left
+     * untouched — a deleted invoice does not prove the WC order was cancelled —
+     * and stock is never written here.
+     */
+    private function handle_delete_invoice(array $data): void
+    {
+        $invoice = $data['invoice'] ?? $data;
+        if (!is_array($invoice)) return;
+        $alegra_invoice_id = (string) ($invoice['id'] ?? '');
+        if ($alegra_invoice_id === '') return;
+
+        // HPOS-safe order lookup (same pattern as handle_invoice_event).
+        $found = wc_get_orders([
+            'meta_key'   => '_alegra_invoice_id',
+            'meta_value' => $alegra_invoice_id,
+            'limit'      => 1,
+            'return'     => 'ids',
+        ]);
+        $order_id = !empty($found) ? (int) $found[0] : 0;
+        if (!$order_id) {
+            if ($this->logger) {
+                $this->logger->info('Webhook: Invoice deleted in Alegra, no linked order', [
+                    'invoice_id' => $alegra_invoice_id,
+                ]);
+            }
+            return;
+        }
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return;
+        }
+
+        // Idempotency read through the order CRUD API.
+        if ($order->get_meta('_alegra_invoice_deleted_notified', true) === $alegra_invoice_id) {
+            return;
+        }
+
+        // CRUD write/save so the marker is visible to get_meta on HPOS too.
+        $order->update_meta_data('_alegra_invoice_deleted_notified', $alegra_invoice_id);
+        $order->save();
+        $order->add_order_note(sprintf(
+            __('[Alegra] Factura #%s eliminada en Alegra.', 'alegra-connector'),
+            $alegra_invoice_id
+        ));
+
+        if ($this->logger) {
+            $this->logger->info('Webhook: Invoice deleted in Alegra, order note added', [
+                'order_id'   => $order_id,
                 'invoice_id' => $alegra_invoice_id,
             ]);
         }
