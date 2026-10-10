@@ -2935,12 +2935,15 @@ class Admin_Dashboard
     /**
      * Return the (cached) Alegra items list for the shipping dropdowns.
      *
-     * Filters out the plugin's OWN helper items (reference starting with the
-     * reserved `alegra-connector-` prefix) EXCEPT the shipping items
-     * (`alegra-connector-shipping:*`), which are exactly the items the
-     * merchant must be able to map a WC method to. Items on the explicit
-     * internal allow-list are always excluded so the merchant can never
-     * accidentally map a WC shipping method to one of its own helper items.
+     * Option 1: the dropdown lists ONLY the plugin's own shipping service items
+     * — those whose reference uses the reserved prefix
+     * `alegra-connector-shipping:*` (e.g.
+     * `alegra-connector-shipping:flat_rate:5`). They are exactly the items the
+     * merchant must be able to map a WC method to. Every other Alegra item —
+     * arbitrary catalogue products, the generic `alegra-connector-adjustment`,
+     * and items on the explicit internal allow-list — is NEVER offered, so the
+     * merchant cannot accidentally map a WC shipping method to something that
+     * is not a shipping service.
      *
      * Returns an array of `[id => name]` suitable for `<option>` rendering.
      * The cache TTL is short (5 min) so a freshly created item becomes
@@ -2974,13 +2977,18 @@ class Admin_Dashboard
         // reference => id, collected in the same pagination pass as $rows.
         $refMap = [];
         $start = 0;
-        $per_page = 100;
-        // Cap the pagination at 30 pages × 100 = 3000 items; the dropdown is
-        // a human UI and more items would hurt more than help. If a store
-        // has more, the AJAX refresh with a search filter will narrow it.
-        for ($page = 0; $page < 30; $page++) {
+        $per_page = 30;
+        // Alegra rejects `limit > 30` on GET /items (documented: "Si este valor
+        // es mayor que 30, la aplicación retorna error."), so 30 is both our
+        // page size and the API ceiling. Cap the pagination at 100 pages × 30 =
+        // 3000 items; the dropdown is a human UI and more items would hurt more
+        // than help. If a store has more, the AJAX refresh with a search filter
+        // will narrow it.
+        $fetch_error = false;
+        for ($page = 0; $page < 100; $page++) {
             $batch = $this->api->get_items(['start' => $start, 'limit' => $per_page]);
             if (is_wp_error($batch)) {
+                $fetch_error = true;
                 break;
             }
             if (!is_array($batch) || empty($batch)) {
@@ -2994,28 +3002,24 @@ class Admin_Dashboard
                 if ($id === '') {
                     continue;
                 }
-                // Exclude items whose reference starts with the plugin's
-                // reserved prefix (helper items the merchant cannot pick).
-                // EXCEPTION: the shipping items themselves
-                // (`alegra-connector-shipping:*`) ARE the mappable items, so
-                // they must stay in the list — otherwise the merchant can
-                // never map a method to an item that already exists in Alegra.
+                // Option 1: the dropdown is an INCLUSION list — only the
+                // plugin's own shipping service items (`reference` starting
+                // with the reserved `alegra-connector-shipping:` prefix) are
+                // mappable. Every other Alegra item is skipped, which also
+                // filters out the generic `alegra-connector-adjustment` and the
+                // merchant's normal catalogue products (no prefix match).
                 $reference = (string) ($item['reference'] ?? '');
-                if ($reference !== ''
-                    && str_starts_with($reference, 'alegra-connector-')
-                    && !str_starts_with($reference, 'alegra-connector-shipping:')) {
-                    continue;
+                if (!str_starts_with($reference, 'alegra-connector-shipping:')) {
+                    continue; // only the plugin's shipping items are mappable
                 }
-                // Exclude items the merchant marked internal via the
-                // allow-list option.
+                // Exclude items the merchant marked internal via the allow-list
+                // option, so a shipping item on the allow-list is still hidden.
                 if (in_array($id, $internal, true)) {
                     continue;
                 }
                 // Same pass: remember the canonical reference of every shipping
                 // item so B2 can resolve `reference => id` without an extra call.
-                if (str_starts_with($reference, 'alegra-connector-shipping:')) {
-                    $refMap[$reference] = $id;
-                }
+                $refMap[$reference] = $id;
                 $name = (string) ($item['name'] ?? $id);
                 $rows[$id] = $name;
             }
@@ -3027,6 +3031,16 @@ class Admin_Dashboard
 
         // Stable, human-friendly ordering by name.
         asort($rows, SORT_LOCALE_STRING);
+
+        // Do NOT cache an empty list when the fetch errored: the API may be
+        // momentarily down / rate-limited, and caching `[]` for the 5-min TTL
+        // would leave the merchant with an empty mapping dropdown (and unable
+        // to map an existing item) long after the API recovered. Returning
+        // without writing the transient lets the next render retry. A partial
+        // result (some rows) keeps the current behaviour and is cached.
+        if ($fetch_error && $rows === []) {
+            return [];
+        }
 
         // Single source of truth: the list and the reference map are ALWAYS
         // written together, with the same TTL, so they cannot drift.
