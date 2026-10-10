@@ -798,6 +798,17 @@ function alegra_mock_route(string $method, string $path, array $query, mixed $bo
         $filtered = alegra_mock_filter_items($query);
         $start = (int) ($query['start'] ?? 0);
         $limit = (int) ($query['limit'] ?? 30);
+        // Real Alegra rejects `limit > 30` on GET /items (get_items.md: "Si
+        // este valor es mayor que 30, la aplicación retorna error."), for BOTH
+        // simple and advanced mode. Mirror it here so a regression to
+        // limit=100 fails the suite instead of silently emptying a listing
+        // (the shipping-dropdown incident) — or any other listing — in prod.
+        if ($limit > 30) {
+            return alegra_mock_response(400, [
+                'code'    => 400,
+                'message' => 'El campo limit no puede ser mayor a 30',
+            ]);
+        }
         // `metadata=true` wraps the list as {metadata:{total}, data:[]}, as the
         // documented endpoint does. Used by ajax_sync_start for the exact total.
         // FIX-13: the inventory poll calls GET /items WITHOUT metadata, so

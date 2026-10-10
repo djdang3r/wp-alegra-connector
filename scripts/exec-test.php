@@ -13853,6 +13853,9 @@ TestRunner::test('T51 2.8.x Inventory_Integrity_Report compares WC stock vs Aleg
 
     $spy = alegra_make_adjustment_spy();
     $report = new \Alegra\Connector\Sync\Inventory_Integrity_Report($spy, make_logger());
+    // Exercise the DEFAULT cap (200): the report now paginates GET /items in
+    // pages of ≤ 30, so it never trips Alegra's `limit > 30` rejection (the
+    // harness enforces that cap now, exactly like the real API).
     $built = $report->build();
 
     TestRunner::assertTrue(is_array($built), 'build() returns an array');
@@ -13883,6 +13886,15 @@ TestRunner::test('T51 2.8.x Inventory_Integrity_Report compares WC stock vs Aleg
     $text = $report->render_text();
     TestRunner::assertStringContains('it-div', $text, 'the rendered text lists the divergent item id');
     TestRunner::assertTrue(str_contains(strtoupper($text), 'DIVERGENT'), 'the rendered text marks the divergence');
+
+    // Every GET /items the report issued (build + render_text) must respect the
+    // Alegra cap: limit ≤ 30, never > 30.
+    $max = 0;
+    foreach (alegra_mock_requests('GET', '/items') as $req) {
+        $max = max($max, (int) ($req['query']['limit'] ?? 0));
+    }
+    TestRunner::assertTrue($max > 0, 'the report issues an explicit GET /items limit');
+    TestRunner::assertTrue($max <= 30, 'the report never asks GET /items for limit > 30 (max=' . $max . ')');
 });
 
 TestRunner::test('T52 2.8.x Inventory_Integrity_Report is read-only (no writer, no adjustment, no lock, no option write)', function (): void {
@@ -13895,8 +13907,17 @@ TestRunner::test('T52 2.8.x Inventory_Integrity_Report is read-only (no writer, 
     $spy = alegra_make_adjustment_spy();
     $report = new \Alegra\Connector\Sync\Inventory_Integrity_Report($spy, make_logger());
 
+    // Exercise the DEFAULT cap (200); the report paginates at ≤ 30 internally,
+    // so it never trips Alegra's `limit > 30` rejection.
     $report->build();
     $report->render_text();
+
+    $max = 0;
+    foreach (alegra_mock_requests('GET', '/items') as $req) {
+        $max = max($max, (int) ($req['query']['limit'] ?? 0));
+    }
+    TestRunner::assertTrue($max > 0, 'el reporte emite un limit explícito en GET /items');
+    TestRunner::assertTrue($max <= 30, 'el reporte nunca pide GET /items con limit > 30 (max=' . $max . ')');
 
     TestRunner::assertCount(0, $spy->adjustments, 'the audit must never call create_inventory_adjustment()');
     TestRunner::assertSame(0, alegra_mock_count('POST', '/inventory-adjustments'), 'no adjustment POST reaches Alegra');
@@ -13995,7 +14016,7 @@ function t60_admin(): \Alegra\Connector\Admin\Admin_Dashboard
     return new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
 }
 
-TestRunner::test('T60.1 A: the dropdown lists existing shipping items and hides other alegra-connector-* helpers + the allow-list', function (): void {
+TestRunner::test('T60.1 A: the dropdown lists ONLY the plugin shipping items and hides the rest of the catalogue + the allow-list', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_connection_tested', true);
 
@@ -14009,7 +14030,7 @@ TestRunner::test('T60.1 A: the dropdown lists existing shipping items and hides 
     $items = $admin->get_alegra_items_for_shipping_select();
 
     TestRunner::assertArrayHasKey('7001', $items, 'A: el ítem de envío existente aparece en el selector');
-    TestRunner::assertArrayHasKey('8002', $items, 'A: un ítem normal sigue apareciendo');
+    TestRunner::assertArrayNotHasKey('8002', $items, 'Opción 1: un ítem normal del catálogo NO aparece (solo envíos del plugin)');
     TestRunner::assertArrayNotHasKey('8001', $items, 'E2: el genérico alegra-connector-adjustment NO aparece');
     TestRunner::assertArrayNotHasKey('8003', $items, 'E1: un ítem en la allow-list NO aparece');
     TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'A: el listado hace UN GET /items');
@@ -14127,7 +14148,7 @@ TestRunner::test('T60.5 B2: skips internals/generic/manual items (E1/E2/A5)', fu
 
     $items = $admin->get_alegra_items_for_shipping_select(true);
     TestRunner::assertArrayNotHasKey('7001', $items, 'E1: el ítem allow-listed tampoco aparece en el selector');
-    TestRunner::assertArrayHasKey('8001', $items, 'A5: el ítem manual SÍ es elegible de la lista');
+    TestRunner::assertArrayNotHasKey('8001', $items, 'Opción 1: el ítem manual del catálogo ya NO es elegible');
     TestRunner::assertArrayNotHasKey('8002', $items, 'E2: el genérico no aparece');
 });
 
@@ -14215,21 +14236,83 @@ TestRunner::test('T60.8 I3: creating a shipping item invalidates BOTH the list a
 TestRunner::test('T60.9 I4: a large catalogue is listed and resolved in the same single pass (no N+1)', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_connection_tested', true);
+    // 3050 items, HALF of them the plugin's shipping items. Option 1 keeps ONLY
+    // the shipping items in the returned list, while the fetch still paginates
+    // 100 pages × 30 = 3000 items (the non-shipping rows are read and dropped).
     for ($i = 0; $i < 3050; $i++) {
+        $is_shipping = ($i % 2 === 0);
         alegra_mock_seed_item('it' . $i, [
             'name' => 'Item ' . $i,
-            'reference' => 'alegra-connector-shipping:flat_rate:' . $i,
+            'reference' => $is_shipping
+                ? 'alegra-connector-shipping:flat_rate:' . $i
+                : 'PROD-' . $i,
         ]);
     }
 
     $admin = t60_admin();
     $list = $admin->get_alegra_items_for_shipping_select();
-    TestRunner::assertSame(3000, count($list), 'I4: el listado satura el tope de 30 páginas × 100');
-    TestRunner::assertSame(30, alegra_mock_count('GET', '/items'), 'I4: exactamente 30 GET /items (paginación del listado, sin llamadas extra)');
+    // Pages 0..99 fetch it0..it2999; even indices 0..2998 ⇒ 1500 shipping items.
+    TestRunner::assertSame(1500, count($list), 'I4: solo vuelven los ítems de envío (1500 de los 3000 leídos)');
+    TestRunner::assertSame(100, alegra_mock_count('GET', '/items'), 'I4: exactamente 100 GET /items (paginación del listado a 30/página, sin llamadas extra)');
 
     $refMap = $admin->get_shipping_reference_map();
-    TestRunner::assertSame(3000, count($refMap), 'I4: el ref-map se construyó en el MISMO pase (3000 references)');
-    TestRunner::assertSame(30, alegra_mock_count('GET', '/items'), 'I4: resolver el ref-map NO agregó GET /items');
+    TestRunner::assertSame(1500, count($refMap), 'I4: el ref-map se construyó en el MISMO pase (1500 references)');
+    TestRunner::assertSame(100, alegra_mock_count('GET', '/items'), 'I4: resolver el ref-map NO agregó GET /items');
+});
+
+TestRunner::test('T60.14 I4b: the shipping dropdown never asks GET /items for limit > 30 (Alegra cap)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    // 50 items (40 shipping + 10 catalogue) force a SECOND page, so we observe
+    // real pagination instead of a single accidental call. Alegra rejects
+    // `limit > 30` on GET /items (get_items.md: "Si este valor es mayor que 30,
+    // la aplicación retorna error."), so the dropdown must page in chunks of ≤30.
+    for ($i = 0; $i < 50; $i++) {
+        $is_shipping = ($i % 5 < 4); // 40 shipping + 10 catalogue
+        alegra_mock_seed_item('cap' . $i, [
+            'name' => 'Cap ' . $i,
+            'reference' => $is_shipping
+                ? 'alegra-connector-shipping:flat_rate:' . $i
+                : 'PROD-' . $i,
+        ]);
+    }
+
+    $admin = t60_admin();
+    $admin->get_alegra_items_for_shipping_select(true);
+
+    $requests = alegra_mock_requests('GET', '/items');
+    TestRunner::assertTrue(count($requests) >= 2, 'I4b: 50 ítems ⇒ al menos 2 páginas (no una sola llamada)');
+
+    $max = 0;
+    foreach ($requests as $req) {
+        $max = max($max, (int) ($req['query']['limit'] ?? 0));
+    }
+    TestRunner::assertTrue($max > 0, 'I4b: el listado envía un limit explícito');
+    TestRunner::assertTrue($max <= 30, 'I4b: ningún GET /items pide limit > 30 (máximo observado=' . $max . ')');
+
+    // Option 1 filter: only the plugin's shipping items come back, cached from
+    // the same pass (no extra GET /items).
+    $items = $admin->get_alegra_items_for_shipping_select();
+    TestRunner::assertSame(40, count($items), 'I4b: solo los ítems de envío del plugin vuelven en la lista (Opción 1)');
+    TestRunner::assertSame(count($requests), alegra_mock_count('GET', '/items'), 'I4b: leer la lista cacheada no dispara GET /items extra');
+});
+
+TestRunner::test('T60.15 I5: an errored empty fetch is NOT cached, so the dropdown recovers when the API does', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'Envío Fijo', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+
+    // First pass: GET /items errors once (400 → the client does NOT retry).
+    alegra_mock_fail('GET', '/items', 400, ['message' => 'limit inválido'], 1);
+    $admin = t60_admin();
+    $first = $admin->get_alegra_items_for_shipping_select(true);
+    TestRunner::assertSame([], $first, 'I5: la API con error ⇒ lista vacía (degrada sin romper)');
+    TestRunner::assertFalse(is_array(get_transient('alegra_connector_shipping_items_cache')), 'I5: NO se cachea la lista vacía tras un error');
+    TestRunner::assertFalse(is_array(get_transient('alegra_connector_shipping_references_cache')), 'I5: tampoco se cachea el ref-map vacío tras un error');
+
+    // Second pass: the API works again → the item reappears without waiting the TTL.
+    $second = $admin->get_alegra_items_for_shipping_select();
+    TestRunner::assertArrayHasKey('7001', $second, 'I5: la API se recupera ⇒ el ítem reaparece sin esperar el TTL');
 });
 
 TestRunner::test('T60.10 A1/A2: no methods ⇒ no-op; methods without items ⇒ nothing to auto-map', function (): void {
