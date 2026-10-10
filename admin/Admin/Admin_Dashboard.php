@@ -1240,6 +1240,16 @@ class Admin_Dashboard
         $ac_internal_item_ids = self::get_internal_item_ids_safe();
         $ac_alegra_items = $connected ? $this->get_alegra_items_for_shipping_select() : [];
 
+        // B2 (2.8.x): auto-fill EMPTY mappings for methods whose canonical
+        // shipping item already exists in Alegra (e.g. after a reinstall, or
+        // when the map was never populated). Only-when-missing keeps it
+        // idempotent and never overwrites a manual/previous mapping. It is a
+        // no-op when disconnected: the reference map is empty and nothing is
+        // written.
+        if ($connected) {
+            $this->autofill_shipping_map_from_references($ac_shipping_methods, $ac_shipping_map);
+        }
+
         // 2.8.2: drift detection. Computed for every render that has the
         // connection ready — `build_shipping_drift_report()` is a no-op for
         // the per-row API call when $this->api is null, so a disconnected
@@ -2771,6 +2781,15 @@ class Admin_Dashboard
     private const SHIPPING_ITEMS_CACHE_TTL = 300; // 5 min — short enough to reflect recent edits
 
     /**
+     * Cache key for the `reference => id` map of the existing shipping items,
+     * built in the SAME pass as the dropdown list above. Kept as a separate
+     * transient so callers that only need id/name do not pay for it, but it is
+     * ALWAYS written together with (and cleared together with) the list so the
+     * two can never drift. See `get_shipping_reference_map()`.
+     */
+    private const SHIPPING_REFERENCES_CACHE_KEY = 'alegra_connector_shipping_references_cache';
+
+    /**
      * Detect every WC shipping method across all zones (plus zone 0 / "Rest
      * of the world") so the Envíos tab can render a row per method.
      *
@@ -2916,14 +2935,21 @@ class Admin_Dashboard
     /**
      * Return the (cached) Alegra items list for the shipping dropdowns.
      *
-     * Filters out items the plugin owns (reference starting with the
-     * reserved prefix) AND items the merchant added to the explicit
-     * internal allow-list, so the merchant can never accidentally map a
-     * WC shipping method to one of its own helper items.
+     * Filters out the plugin's OWN helper items (reference starting with the
+     * reserved `alegra-connector-` prefix) EXCEPT the shipping items
+     * (`alegra-connector-shipping:*`), which are exactly the items the
+     * merchant must be able to map a WC method to. Items on the explicit
+     * internal allow-list are always excluded so the merchant can never
+     * accidentally map a WC shipping method to one of its own helper items.
      *
      * Returns an array of `[id => name]` suitable for `<option>` rendering.
      * The cache TTL is short (5 min) so a freshly created item becomes
      * selectable within a page refresh.
+     *
+     * In the SAME pass it also collects the canonical `reference => id` map of
+     * every shipping item and caches it in a sibling transient. Both transients
+     * are written together (single source of truth) so a caller can resolve a
+     * method's existing item by reference without any extra Alegra call.
      *
      * @param bool $force_refresh Bypass the cache (used by the AJAX refresh button).
      * @return array<string,string> alegra item id => display name (UTF-8, escaped on output)
@@ -2945,6 +2971,8 @@ class Admin_Dashboard
         $this->api->reload_credentials();
         $internal = self::get_internal_item_ids_safe();
         $rows = [];
+        // reference => id, collected in the same pagination pass as $rows.
+        $refMap = [];
         $start = 0;
         $per_page = 100;
         // Cap the pagination at 30 pages × 100 = 3000 items; the dropdown is
@@ -2968,14 +2996,25 @@ class Admin_Dashboard
                 }
                 // Exclude items whose reference starts with the plugin's
                 // reserved prefix (helper items the merchant cannot pick).
+                // EXCEPTION: the shipping items themselves
+                // (`alegra-connector-shipping:*`) ARE the mappable items, so
+                // they must stay in the list — otherwise the merchant can
+                // never map a method to an item that already exists in Alegra.
                 $reference = (string) ($item['reference'] ?? '');
-                if ($reference !== '' && str_starts_with($reference, 'alegra-connector-')) {
+                if ($reference !== ''
+                    && str_starts_with($reference, 'alegra-connector-')
+                    && !str_starts_with($reference, 'alegra-connector-shipping:')) {
                     continue;
                 }
                 // Exclude items the merchant marked internal via the
                 // allow-list option.
                 if (in_array($id, $internal, true)) {
                     continue;
+                }
+                // Same pass: remember the canonical reference of every shipping
+                // item so B2 can resolve `reference => id` without an extra call.
+                if (str_starts_with($reference, 'alegra-connector-shipping:')) {
+                    $refMap[$reference] = $id;
                 }
                 $name = (string) ($item['name'] ?? $id);
                 $rows[$id] = $name;
@@ -2989,9 +3028,128 @@ class Admin_Dashboard
         // Stable, human-friendly ordering by name.
         asort($rows, SORT_LOCALE_STRING);
 
+        // Single source of truth: the list and the reference map are ALWAYS
+        // written together, with the same TTL, so they cannot drift.
         set_transient(self::SHIPPING_ITEMS_CACHE_KEY, $rows, self::SHIPPING_ITEMS_CACHE_TTL);
+        set_transient(self::SHIPPING_REFERENCES_CACHE_KEY, $refMap, self::SHIPPING_ITEMS_CACHE_TTL);
 
         return $rows;
+    }
+
+    /**
+     * Return the (cached) `reference => id` map of the existing Alegra shipping
+     * items, used by B2 to auto-fill empty mappings without an extra call.
+     *
+     * It is built in the SAME pass as `get_alegra_items_for_shipping_select()`
+     * and cached in a sibling transient. It is NEVER derived from the `[id =>
+     * name]` list (which does not carry references). When the map transient is
+     * missing — e.g. a partial cache eviction or a store upgraded from a build
+     * that predates it — the list is force-refreshed once, which rebuilds BOTH
+     * transients in a single pass.
+     *
+     * @param bool $force_refresh Rebuild from Alegra even if the map is cached.
+     * @return array<string,string> canonical reference => alegra item id
+     */
+    public function get_shipping_reference_map(bool $force_refresh = false): array
+    {
+        if (!$this->api) {
+            return [];
+        }
+        if (!get_option('alegra_connector_connection_tested')) {
+            return [];
+        }
+
+        if (!$force_refresh) {
+            $cached = get_transient(self::SHIPPING_REFERENCES_CACHE_KEY);
+            if (is_array($cached)) {
+                return $cached;
+            }
+        }
+
+        // Missing/stale map: rebuild via the list pass (writes both transients).
+        $this->get_alegra_items_for_shipping_select(true);
+
+        $rebuilt = get_transient(self::SHIPPING_REFERENCES_CACHE_KEY);
+        return is_array($rebuilt) ? $rebuilt : [];
+    }
+
+    /**
+     * Drop the cached shipping-items list AND its sibling reference map.
+     *
+     * Every write that can change the item catalog (create, refresh) must call
+     * this so neither transient serves a stale value — clearing only the list
+     * would leave a stale `reference => id` map behind.
+     */
+    public function clear_alegra_items_cache(): void
+    {
+        delete_transient(self::SHIPPING_ITEMS_CACHE_KEY);
+        delete_transient(self::SHIPPING_REFERENCES_CACHE_KEY);
+    }
+
+    /**
+     * B2 (2.8.x): auto-fill EMPTY shipping-map entries from the canonical
+     * `reference => id` map of the items already in Alegra.
+     *
+     * For every detected WC method it computes the canonical reference
+     * `alegra-connector-shipping:<method_id>:<instance_id>` and, ONLY when the
+     * method's current map entry is empty, sets it to the matching item id.
+     * It never overwrites an existing entry (manual or previous), and it skips
+     * ids on the internal allow-list.
+     *
+     * The map is persisted ONCE (autoload=no) when at least one entry was
+     * filled. Returns whether anything changed, so a caller (and the tests) can
+     * observe idempotency: a second call over the now-populated map is a no-op.
+     *
+     * @param array<int,array{method_id?:string,instance_id?:int}> $methods detected WC methods
+     * @param array<string,string>                                  $map     current map, updated in place
+     * @return bool True when the map changed and was persisted.
+     */
+    public function autofill_shipping_map_from_references(array $methods, array &$map): bool
+    {
+        if (!get_option('alegra_connector_connection_tested')) {
+            return false;
+        }
+
+        $refMap = $this->get_shipping_reference_map();
+        if (empty($refMap)) {
+            return false;
+        }
+
+        $internal = self::get_internal_item_ids_safe();
+        $changed = false;
+
+        foreach ($methods as $method) {
+            $method_id = (string) ($method['method_id'] ?? '');
+            if ($method_id === '') {
+                continue;
+            }
+            $instance_id = (int) ($method['instance_id'] ?? 0);
+            $key = self::shipping_key($method_id, $instance_id);
+
+            // Never overwrite an existing mapping — only fill empties.
+            if (!empty($map[$key])) {
+                continue;
+            }
+
+            $reference = 'alegra-connector-shipping:' . $method_id . ':' . $instance_id;
+            if (!isset($refMap[$reference])) {
+                continue;
+            }
+
+            $candidate = (string) $refMap[$reference];
+            if ($candidate === '' || in_array($candidate, $internal, true)) {
+                continue;
+            }
+
+            $map[$key] = $candidate;
+            $changed = true;
+        }
+
+        if ($changed) {
+            update_option('alegra_connector_shipping_map', $map, false);
+        }
+
+        return $changed;
     }
 
     /**
@@ -3229,9 +3387,10 @@ class Admin_Dashboard
         $map[$key] = $alegra_item_id;
         update_option('alegra_connector_shipping_map', $map, false);
 
-        // 4. The cache for the Alegra items dropdown is now stale; drop it
-        //    so a subsequent refresh sees the new item.
-        delete_transient(self::SHIPPING_ITEMS_CACHE_KEY);
+        // 4. The cache for the Alegra items dropdown is now stale; drop BOTH
+        //    the list and its reference map so a subsequent refresh sees the
+        //    new item and can resolve it by reference.
+        $this->clear_alegra_items_cache();
 
         wp_send_json_success([
             'alegra_item_id' => $alegra_item_id,

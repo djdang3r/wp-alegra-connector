@@ -13946,4 +13946,364 @@ TestRunner::test('T54 2.8.x audit-inventory-integrity.php is a read-only ops wra
     TestRunner::assertStringContains('scripts/', $distignore, 'scripts/ must be excluded from the release ZIP');
 });
 
+// ===========================================================================
+// 2.8.x — shipping-map-existing-items (plan: A/B)
+// ===========================================================================
+// A  : the Envíos dropdown shows the shipping items that ALREADY exist in
+//      Alegra (`alegra-connector-shipping:*`), still hiding every other
+//      `alegra-connector-*` helper and the internal allow-list.
+// B1 : the canonical `reference => id` map is built in the SAME pass as the
+//      list and cached in a sibling transient (never derived from [id=>name]).
+// B2 : on the Envíos render, EMPTY map entries are auto-filled from that map
+//      (only-when-missing, never overwriting, skipping internals, no-op when
+//      disconnected).
+//
+// Scenario-matrix mapping (plan IDs → assertions below):
+//   A1/T60.10  A2/T60.10  A3/T60.3   A4/T60.4   A5/T60.5
+//   B1/T60.2   B2/T60.4   B3/T60.4   B4/T36.1 (existing drift orphan)  B5/T60.4
+//   C1/T60.6   C2/T60.6   C3/T60.6
+//   D1/T60.7   D2/T60.7
+//   E1/T60.1+T60.5      E2/T60.1+T60.5
+//   N1,N2/T60.11 (N1 also T34.3)
+//   G1/T34.4 (existing 0-cost skip)   G2/T32.2 (existing strict block)  G3/T32.2
+//   H1/T60.6   H2/T60.6
+//   I1/T60.3   I2/T60.3   I3/T60.8   I4/T60.9
+//   J1/T60.3 (persist) + T60.13 (sanitizer keeps it)   J2/T60.3
+//
+// The WC shipping stubs live earlier in this file (guard class_exists); these
+// tests only override `$GLOBALS['alegra_test_shipping_zones']`.
+echo "\n2.8.x — shipping-map-existing-items (A/B)\n";
+
+function t60_method(string $id, int $instance, string $title, $cost = ''): \WC_Shipping_Method
+{
+    $m = new \WC_Shipping_Method();
+    $m->id = $id;
+    $m->instance_id = $instance;
+    $m->instance_title = $title;
+    $m->cost = $cost;
+    return $m;
+}
+
+function t60_set_methods(array $methods, string $zone_name = 'Zona Test'): void
+{
+    $GLOBALS['alegra_test_shipping_zones'] = [['zone_name' => $zone_name, 'shipping_methods' => $methods]];
+    $GLOBALS['alegra_test_shipping_zone_0'] = null;
+}
+
+function t60_admin(): \Alegra\Connector\Admin\Admin_Dashboard
+{
+    return new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+}
+
+TestRunner::test('T60.1 A: the dropdown lists existing shipping items and hides other alegra-connector-* helpers + the allow-list', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+
+    alegra_mock_seed_item('7001', ['name' => 'Envío Fijo', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('8001', ['name' => 'Ajuste', 'reference' => 'alegra-connector-adjustment']);
+    alegra_mock_seed_item('8002', ['name' => 'Producto Normal', 'reference' => '']);
+    alegra_mock_seed_item('8003', ['name' => 'Interno', 'reference' => '']);
+    update_option('alegra_connector_internal_item_ids', ['8003']);
+
+    $admin = t60_admin();
+    $items = $admin->get_alegra_items_for_shipping_select();
+
+    TestRunner::assertArrayHasKey('7001', $items, 'A: el ítem de envío existente aparece en el selector');
+    TestRunner::assertArrayHasKey('8002', $items, 'A: un ítem normal sigue apareciendo');
+    TestRunner::assertArrayNotHasKey('8001', $items, 'E2: el genérico alegra-connector-adjustment NO aparece');
+    TestRunner::assertArrayNotHasKey('8003', $items, 'E1: un ítem en la allow-list NO aparece');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'A: el listado hace UN GET /items');
+
+    $refMap = $admin->get_shipping_reference_map();
+    TestRunner::assertSame('7001', (string) ($refMap['alegra-connector-shipping:flat_rate:5'] ?? ''), 'B1: el ítem de envío tiene su reference canónico en el mapa');
+    TestRunner::assertArrayNotHasKey('alegra-connector-adjustment', $refMap, 'B1: el adjustment no entra al mapa de references');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'B1: resolver el ref-map no dispara un GET extra');
+});
+
+TestRunner::test('T60.2 B1: the reference map is built in the same pass and served from cache (no extra GET)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'A', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('7002', ['name' => 'B', 'reference' => 'alegra-connector-shipping:flat_rate:7']);
+
+    $admin = t60_admin();
+    $admin->get_alegra_items_for_shipping_select();
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'B1: el listado hace UN GET /items');
+
+    $refMap = $admin->get_shipping_reference_map();
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'B1: el ref-map sale del MISMO pase (0 GET extra)');
+    TestRunner::assertSame(
+        ['alegra-connector-shipping:flat_rate:5' => '7001', 'alegra-connector-shipping:flat_rate:7' => '7002'],
+        $refMap,
+        'B1: el mapa tiene las 2 references con sus ids'
+    );
+
+    // Partial eviction: the list survives but the ref-map is gone → rebuilt
+    // with ONE pass (which rewrites both transients).
+    delete_transient('alegra_connector_shipping_references_cache');
+    $refMap2 = $admin->get_shipping_reference_map();
+    TestRunner::assertSame(2, alegra_mock_count('GET', '/items'), 'B1: un ref-map faltante fuerza UNA reconstrucción (1 pase)');
+    TestRunner::assertSame($refMap, $refMap2, 'B1: el mapa reconstruido es idéntico');
+
+    // clear_alegra_items_cache() drops BOTH transients.
+    $admin->get_alegra_items_for_shipping_select();
+    $admin->clear_alegra_items_cache();
+    TestRunner::assertFalse(get_transient('alegra_connector_shipping_items_cache'), 'clear_alegra_items_cache borra el listado');
+    TestRunner::assertFalse(get_transient('alegra_connector_shipping_references_cache'), 'clear_alegra_items_cache borra el ref-map');
+});
+
+TestRunner::test('T60.3 B2: auto-fill maps empty entries, persists once and is idempotent (A3/I1/I2/J1/J2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'Dosquebradas', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('7002', ['name' => 'Pereira', 'reference' => 'alegra-connector-shipping:flat_rate:7']);
+
+    t60_set_methods([
+        t60_method('flat_rate', 5, 'Dosquebradas', '12000'),
+        t60_method('flat_rate', 7, 'Pereira', '9000'),
+    ]);
+    update_option('alegra_connector_shipping_map', []); // A3/I2: mapa vacío (reinstalar)
+
+    $admin = t60_admin();
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    $changed = $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+
+    TestRunner::assertTrue($changed, 'A3: auto-fill reporta cambios');
+    TestRunner::assertSame('7001', (string) ($map['flat_rate:5'] ?? ''), 'A3/I2: flat_rate:5 mapeado al ítem existente');
+    TestRunner::assertSame('7002', (string) ($map['flat_rate:7'] ?? ''), 'A3/I2: flat_rate:7 mapeado al ítem existente');
+    TestRunner::assertSame($map, (array) get_option('alegra_connector_shipping_map', []), 'J1: el mapa se persistió');
+
+    // Idempotent: a second render reads the persisted map and changes nothing.
+    $map2 = (array) get_option('alegra_connector_shipping_map', []);
+    $changed2 = $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map2);
+    TestRunner::assertFalse($changed2, 'I1/J2: un segundo auto-fill es no-op');
+    TestRunner::assertSame($map, $map2, 'I1: el mapa queda intacto en el segundo render');
+});
+
+TestRunner::test('T60.4 B2: never overwrites an existing entry; mixed methods map only the existing items (A4/B2/B3/B5)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'Con Ítem', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+
+    t60_set_methods([
+        t60_method('flat_rate', 5, 'Con Ítem', '1000'),
+        t60_method('flat_rate', 7, 'Sin Ítem', '1000'),
+    ]);
+
+    // B2/B5: a manual/previous mapping for :5 wins. B3: a mapping to a deleted
+    // item (:9) is non-empty and must not be "fixed".
+    update_option('alegra_connector_shipping_map', [
+        'flat_rate:5' => '9001',
+        'flat_rate:9' => 'deleted-item',
+    ]);
+
+    $admin = t60_admin();
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    $changed = $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+
+    TestRunner::assertSame('9001', (string) ($map['flat_rate:5'] ?? ''), 'B2/B5: un mapeo existente NO se pisa');
+    TestRunner::assertArrayNotHasKey('flat_rate:7', $map, 'A4: un método sin ítem queda sin mapear (para crear)');
+    TestRunner::assertSame('deleted-item', (string) ($map['flat_rate:9'] ?? ''), 'B3: un mapeo a un ítem borrado no se toca');
+    TestRunner::assertFalse($changed, 'A4/B3: sin claves vacías que rellenar, no hay cambios');
+});
+
+TestRunner::test('T60.5 B2: skips internals/generic/manual items (E1/E2/A5)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+
+    alegra_mock_seed_item('7001', ['name' => 'Interno', 'reference' => 'alegra-connector-shipping:flat_rate:5']); // E1
+    alegra_mock_seed_item('8001', ['name' => 'Manual', 'reference' => '']);                                      // A5
+    alegra_mock_seed_item('8002', ['name' => 'Ajuste', 'reference' => 'alegra-connector-adjustment']);            // E2
+
+    update_option('alegra_connector_internal_item_ids', ['7001']);
+    t60_set_methods([t60_method('flat_rate', 5, 'Zona A', '1000')]);
+
+    $admin = t60_admin();
+    $map = [];
+    $changed = $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+
+    TestRunner::assertFalse($changed, 'E1: el único ítem canónico está allow-listed ⇒ no se auto-mapea');
+    TestRunner::assertSame([], $map, 'E1/E2/A5: nada se auto-mapea');
+
+    $items = $admin->get_alegra_items_for_shipping_select(true);
+    TestRunner::assertArrayNotHasKey('7001', $items, 'E1: el ítem allow-listed tampoco aparece en el selector');
+    TestRunner::assertArrayHasKey('8001', $items, 'A5: el ítem manual SÍ es elegible de la lista');
+    TestRunner::assertArrayNotHasKey('8002', $items, 'E2: el genérico no aparece');
+});
+
+TestRunner::test('T60.6 B2: distinct references per instance; rename matches by reference and drift flags mismatch (C1/C2/C3/H1/H2)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'Dosquebradas', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('7002', ['name' => 'Pereira', 'reference' => 'alegra-connector-shipping:flat_rate:7']);
+    alegra_mock_seed_item('7003', ['name' => 'Nombre Viejo', 'reference' => 'alegra-connector-shipping:flat_rate:40']);
+
+    t60_set_methods([
+        t60_method('flat_rate', 5, 'Dosquebradas', '1000'),
+        t60_method('flat_rate', 7, 'Pereira', '1000'),
+        t60_method('flat_rate', 40, 'Nombre Nuevo', '1000'), // C3: renombrado en WC
+    ]);
+
+    $admin = t60_admin();
+    $map = [];
+    $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+
+    TestRunner::assertSame('7001', (string) ($map['flat_rate:5'] ?? ''), 'C1/C2: instance 5 → su propio ítem');
+    TestRunner::assertSame('7002', (string) ($map['flat_rate:7'] ?? ''), 'C1/C2: instance 7 → su propio ítem (no se cruzan)');
+    TestRunner::assertSame('7003', (string) ($map['flat_rate:40'] ?? ''), 'C3: matchea por reference aunque el nombre cambió');
+
+    $report = $admin->build_shipping_drift_report(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+    $by = [];
+    foreach (($report['rows'] ?? []) as $r) { $by[(string) ($r['key'] ?? '')] = $r; }
+    TestRunner::assertSame('ok', (string) ($by['flat_rate:5']['status'] ?? ''), 'H1: nombre coincide ⇒ drift OK');
+    TestRunner::assertSame('name_mismatch', (string) ($by['flat_rate:40']['status'] ?? ''), 'H2: nombre difiere ⇒ drift name_mismatch');
+    TestRunner::assertSame(0, alegra_mock_count('PUT', '/items/7003'), 'H2: el auto-fill NO hace PUT /items (no renombra)');
+});
+
+TestRunner::test('T60.7 B2: no-op when disconnected (D1) and degrades safely when GET /items fails (D2)', function (): void {
+    // D1: not connected.
+    alegra_test_reset();
+    alegra_mock_seed_item('7001', ['name' => 'X', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    t60_set_methods([t60_method('flat_rate', 5, 'X', '1000')]);
+    $admin = t60_admin();
+    $map = [];
+    $changed = $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+    TestRunner::assertFalse($changed, 'D1: desconectado ⇒ no-op');
+    TestRunner::assertSame([], $map, 'D1: no se escribe nada');
+    TestRunner::assertSame(false, get_option('alegra_connector_shipping_map', false), 'D1: la opción del mapa no se toca');
+
+    // D2: connected but GET /items fails.
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    t60_set_methods([t60_method('flat_rate', 5, 'X', '1000')]);
+    alegra_mock_fail('GET', '/items', 500, ['message' => 'boom']);
+    $admin2 = t60_admin();
+    $map2 = [];
+    $changed2 = $admin2->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map2);
+    TestRunner::assertFalse($changed2, 'D2: API caída ⇒ no se auto-mapea (degrada sin romper)');
+    TestRunner::assertSame([], $map2, 'D2: el mapa queda vacío');
+});
+
+TestRunner::test('T60.8 I3: creating a shipping item invalidates BOTH the list and the reference map', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    alegra_mock_seed_price_list('1', ['name' => 'General']);
+    t60_set_methods([t60_method('flat_rate', 99, 'Nuevo', '1000')]);
+
+    $admin = t60_admin();
+    $admin->get_alegra_items_for_shipping_select();
+    TestRunner::assertTrue(is_array(get_transient('alegra_connector_shipping_items_cache')), 'I3: el listado queda cacheado');
+    TestRunner::assertTrue(is_array(get_transient('alegra_connector_shipping_references_cache')), 'I3: el ref-map queda cacheado');
+
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 99];
+    $resp = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+    $_POST = [];
+
+    TestRunner::assertTrue($resp->success, 'I3: crear el ítem devuelve success');
+    TestRunner::assertFalse(get_transient('alegra_connector_shipping_items_cache'), 'I3: crear invalida el listado');
+    TestRunner::assertFalse(get_transient('alegra_connector_shipping_references_cache'), 'I3: crear invalida TAMBIÉN el ref-map');
+
+    $created_id = (string) ($resp->payload['alegra_item_id'] ?? '');
+    $items = $admin->get_alegra_items_for_shipping_select(true);
+    $refMap = $admin->get_shipping_reference_map();
+    TestRunner::assertArrayHasKey($created_id, $items, 'I3: el ítem creado aparece en el selector tras invalidar');
+    TestRunner::assertSame($created_id, (string) ($refMap['alegra-connector-shipping:flat_rate:99'] ?? ''), 'I3: el ítem creado aparece en el ref-map');
+});
+
+TestRunner::test('T60.9 I4: a large catalogue is listed and resolved in the same single pass (no N+1)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    for ($i = 0; $i < 3050; $i++) {
+        alegra_mock_seed_item('it' . $i, [
+            'name' => 'Item ' . $i,
+            'reference' => 'alegra-connector-shipping:flat_rate:' . $i,
+        ]);
+    }
+
+    $admin = t60_admin();
+    $list = $admin->get_alegra_items_for_shipping_select();
+    TestRunner::assertSame(3000, count($list), 'I4: el listado satura el tope de 30 páginas × 100');
+    TestRunner::assertSame(30, alegra_mock_count('GET', '/items'), 'I4: exactamente 30 GET /items (paginación del listado, sin llamadas extra)');
+
+    $refMap = $admin->get_shipping_reference_map();
+    TestRunner::assertSame(3000, count($refMap), 'I4: el ref-map se construyó en el MISMO pase (3000 references)');
+    TestRunner::assertSame(30, alegra_mock_count('GET', '/items'), 'I4: resolver el ref-map NO agregó GET /items');
+});
+
+TestRunner::test('T60.10 A1/A2: no methods ⇒ no-op; methods without items ⇒ nothing to auto-map', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    $GLOBALS['alegra_test_shipping_zones'] = [];
+    $GLOBALS['alegra_test_shipping_zone_0'] = null;
+    $admin = t60_admin();
+
+    $map = [];
+    TestRunner::assertSame([], \Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), 'A1: sin métodos de envío en WC');
+    TestRunner::assertFalse($admin->autofill_shipping_map_from_references([], $map), 'A1: sin métodos ⇒ no-op');
+    TestRunner::assertSame([], $map, 'A1: nada se escribe');
+
+    t60_set_methods([t60_method('flat_rate', 5, 'X', '1000')]);
+    $map2 = [];
+    TestRunner::assertFalse($admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map2), 'A2: sin ítems en Alegra ⇒ no-op');
+    TestRunner::assertSame([], $map2, 'A2: el método queda "Sin mapear" para crear');
+});
+
+TestRunner::test('T60.11 N1/N2: create-or-link is idempotent — an existing canonical item is linked, never duplicated', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_test_caps']['manage_woocommerce'] = true;
+    update_option('alegra_connector_connection_tested', true);
+    update_option('alegra_connector_field_mapping', ['regular_price_list' => 1]);
+    alegra_mock_seed_price_list('1', ['name' => 'General']);
+    alegra_mock_seed_item('5555', ['name' => 'Envío Fijo', 'reference' => 'alegra-connector-shipping:flat_rate:13']);
+    t60_set_methods([t60_method('flat_rate', 13, 'Envío Fijo', '1000')]);
+
+    $_POST = ['method_id' => 'flat_rate', 'instance_id' => 13];
+    $admin = t60_admin();
+    $resp = alegra_capture_json(fn () => $admin->ajax_create_shipping_item());
+    $_POST = [];
+
+    TestRunner::assertTrue($resp->success, 'N2: linkear un ítem existente devuelve success');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/items'), 'N2: NO se crea un ítem duplicado');
+    TestRunner::assertFalse((bool) ($resp->payload['created'] ?? true), 'N2: created=false (se vinculó, no se creó)');
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    TestRunner::assertSame('5555', (string) ($map['flat_rate:13'] ?? ''), 'N2: el mapa apunta al ítem existente');
+});
+
+TestRunner::test('T60.12 wiring: render_settings_page auto-fills and the template keeps the shipping select mapping', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'render_settings_page');
+    TestRunner::assertStringContains('autofill_shipping_map_from_references', $src, 'render_settings_page llama al auto-fill');
+    TestRunner::assertStringContains('get_alegra_items_for_shipping_select', $src, 'render_settings_page sigue trayendo el listado');
+    TestRunner::assertTrue(
+        strpos($src, 'get_alegra_items_for_shipping_select') < strpos($src, 'autofill_shipping_map_from_references'),
+        'el listado se resuelve antes del auto-fill (misma fuente de verdad)'
+    );
+
+    $tpl = cfg2_source('templates/admin-settings.php');
+    TestRunner::assertStringContains('class="ac-shipping-map"', $tpl, 'el template mantiene el <select> de mapeo');
+    TestRunner::assertStringContains('selected($ac_mapped', $tpl, 'el template marca como seleccionado el ítem mapeado');
+});
+
+TestRunner::test('T60.13 J1: saving the settings keeps the auto-filled (numeric) mappings', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    alegra_mock_seed_item('7001', ['name' => 'A', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('7002', ['name' => 'B', 'reference' => 'alegra-connector-shipping:flat_rate:7']);
+    t60_set_methods([
+        t60_method('flat_rate', 5, 'A', '1000'),
+        t60_method('flat_rate', 7, 'B', '1000'),
+    ]);
+
+    $admin = t60_admin();
+    $map = (array) get_option('alegra_connector_shipping_map', []);
+    $admin->autofill_shipping_map_from_references(\Alegra\Connector\Admin\Admin_Dashboard::detect_wc_shipping_methods(), $map);
+
+    // The settings save runs the option through sanitize_shipping_map(); the
+    // auto-filled entries must survive it unchanged.
+    $saved = \Alegra\Connector\Admin\Admin_Dashboard::sanitize_shipping_map($map);
+    TestRunner::assertSame('7001', (string) ($saved['flat_rate:5'] ?? ''), 'J1: el mapeo auto-rellenado sobrevive al guardar');
+    TestRunner::assertSame('7002', (string) ($saved['flat_rate:7'] ?? ''), 'J1: el mapeo auto-rellenado sobrevive al guardar');
+});
+
 exit(TestRunner::summary());

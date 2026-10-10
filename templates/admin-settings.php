@@ -226,7 +226,7 @@ if ($ac_wh_enabled && $ac_wh_id !== '' && $ac_wh_id !== '0'):
 <div class="ac-tab-content" id="tab-shipping" style="display:none;">
 <h2><?php esc_html_e('Configuración de Envíos','alegra-connector');?></h2>
 <div class="ac-notice info" style="margin-bottom:16px;">
-<?php esc_html_e('Mapea cada método de envío de WooCommerce a un ítem (producto o servicio) en Alegra. El plugin NO crea ítems automáticamente: usá "Crear ítem de envío" para crear uno nuevo en Alegra, o elegí uno existente del listado. Los ítems del propio plugin (referencia "alegra-connector-…") están excluidos de la lista y nunca pueden mapearse aquí.','alegra-connector');?>
+<?php esc_html_e('Mapea cada método de envío de WooCommerce a un ítem (producto o servicio) en Alegra. El plugin NO crea ítems automáticamente: usá "Crear ítem de envío" para crear uno nuevo en Alegra, o elegí uno existente del listado. Los ítems auxiliares del propio plugin (referencia "alegra-connector-…") están excluidos de la lista, salvo los ítems de envío ("alegra-connector-shipping:*"), que sí se listan y se pueden mapear.','alegra-connector');?>
 </div>
 
 <?php
