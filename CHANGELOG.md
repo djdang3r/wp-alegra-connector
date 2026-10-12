@@ -2,6 +2,57 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.9] - 2026-10-12
+
+> **Importación de productos robusta: cancelar / detener / reanudar nunca deja un
+> lock ni un estado colgado.** El cancel libera el lock per-type y borra todo el
+> residuo; el arranque se auto-sana con un *age gate* (un run vivo o un lock
+> fresco en vuelo nunca se pisa); y hay una acción permanente **"Liberar
+> importación"** + banner persistente en Productos para destrabar sin SSH. El
+> Monitor suma una tarjeta read-only **"Diagnóstico de importación"**.
+
+### Added
+
+- **Acción "Liberar importación" (`admin-ajax` `alegra_release_import`).** Escape
+  hatch permanente para cuando una importación queda trabada (se cerró el
+  navegador, la página fataló, el Cancel nunca llegó al servidor). Libera los
+  cuatro locks per-type, borra `alegra_batch_state` / `alegra_sync_progress` /
+  `alegra_sync_cancelled`, cierra los runs chunked abandonados y marca `stale`
+  cualquier run chunked que siga `running`. **No** toca el kill switch (eso es
+  "Detener Todos", una acción distinta y más pesada).
+- **Banner persistente de residuo de importación en Productos.** Renderizado
+  server-side (`import_residue_status()`), sobrevive al reload y ofrece
+  **Reanudar / Cancelar / Liberar**. Aparece cuando hay batch state, un run vivo,
+  un run stale o un lock retenido.
+- **Monitor: tarjeta "Diagnóstico de importación" (read-only).** Muestra el modo
+  de sync, el estado de importación/residuo, el cursor vs. total, los cuatro locks
+  per-type (con su expiración), el kill switch y un botón "Liberar importación".
+  Los valores del servidor se inyectan con `.text()` (nunca HTML concatenado) y
+  el panel no escribe nada.
+
+### Fixed
+
+- **Cancelar una importación deja CERO residuo.** Antes el cancel seteaba
+  `alegra_sync_cancelled` y dejaba el lock per-type tomado, así que un nuevo
+  arranque era rechazado ("Ya hay una importación en curso") hasta que venciera el
+  TTL. Ahora libera el lock del tipo y borra todos los transients de importación:
+  se puede reimportar al instante.
+- **Arranque auto-sanador con age gate.** `ajax_sync_start()` cierra los runs
+  chunked abandonados (`Runs::mark_abandoned(180)`) antes de chequear el lock. Si
+  el lock no se puede adquirir, solo lo recupera cuando es **probablemente viejo**:
+  un run genuinamente vivo (`has_genuinely_live_run()`, heartbeat fresco) o un lock
+  con menos de 180 s **nunca** se libera, para no pisar un arranque en vuelo (el
+  bug D-D que el lock previene).
+- **"Detener Todos" también libera los locks de importación.** El barrido previo
+  solo borraba transients `_transient_alegra_%`; los `alegra_lock_*` son options,
+  así que sobrevivían y rebloqueaban las importaciones.
+
+### Tests
+
+- **Exec-test:** nuevo bloque task-4 (cancel sin residuo, `force_release_sync_lock`,
+  `ajax_release_import`, self-heal con age gate, lock vivo vs. fresco) y task-5
+  (diagnóstico read-only, payload del Monitor y cableado del panel/botón).
+
 ## [2.8.8] - 2026-10-12
 
 > **Perf: la pestaña Envíos / Configuración deja de recorrer todo el catálogo.**
