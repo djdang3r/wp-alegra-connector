@@ -2,6 +2,34 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.8] - 2026-10-12
+
+> **Perf: la pestaña Envíos / Configuración deja de recorrer todo el catálogo.**
+> `get_alegra_items_for_shipping_select()` acota la consulta server-side con
+> `query=alegra-connector-shipping` en vez de paginar el catálogo entero.
+
+### Fixed
+
+- **Envíos / Configuración: el selector de mapeo ya no recorre todo el catálogo.**
+  `get_alegra_items_for_shipping_select()` pedía `GET /items` paginando hasta 100
+  páginas × 30 ítems (~hasta 3000 lecturas) solo para descartar client-side lo que
+  no era un ítem de envío, así que cada miss de caché abría la Configuración lento.
+  Ahora la consulta se acota **server-side** con el parámetro documentado
+  `query=alegra-connector-shipping` (Alegra matchea `name` O `reference` como
+  subcadena); como solo los ítems de envío del plugin llevan el prefijo reservado
+  `alegra-connector-shipping:`, la API devuelve únicamente esas filas. La
+  paginación baja de 100 a 10 páginas (≤ 10 × 30 = 300 ítems), de modo que la
+  página hace **≤ 2 requests** en el caso normal. El filtro client-side por prefijo
+  se mantiene como la verificación precisa de la Opción 1.
+
+### Tests
+
+- **I4 reescrito como guarda de regresión de performance.** T60.9 ya no simula
+  3050 ítems para verificar 1500 de envío; ahora siembra un catálogo grande
+  (3000 productos) + un puñado de ítems de envío y verifica que vuelven solo esos,
+  que se hacen **≤ 2 `GET /items`** y que cada request lleva
+  `query=alegra-connector-shipping` con `limit ≤ 30`.
+
 ## [2.8.7] - 2026-10-10
 
 > **Hotfix: el selector de mapeo de Envíos vuelve a listar los ítems de envío y ahora
