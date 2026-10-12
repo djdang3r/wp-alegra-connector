@@ -51,6 +51,18 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     </div>
 </div>
 
+<!-- task-7: last completed products import (read-only) -->
+<div class="ac-card" style="margin-bottom:16px;">
+    <div class="ac-card-header">
+        <h2><?php esc_html_e('Último import de productos', 'alegra-connector'); ?></h2>
+    </div>
+    <div id="ac-monitor-last-import">
+        <div class="ac-empty-state">
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Sin datos todavía.', 'alegra-connector'); ?></p>
+        </div>
+    </div>
+</div>
+
 <!-- Active processes -->
 <div class="ac-card" style="margin-bottom:16px;">
     <div class="ac-card-header">
@@ -254,6 +266,17 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             return $wrap.append($('<div>').addClass('ac-empty-state').append($('<p>').css('color', 'var(--ac-text-muted)').text(S.diagNoData)));
         }
 
+        // task-7: visible config-honesty warning — "Solo Tiempo Real" + Alegra
+        // inventory means stock is never pulled automatically. Message comes
+        // from the localize payload; .text() keeps it injection-safe.
+        if (d.realtime_inventory_warning) {
+            $wrap.append(
+                $('<div>').addClass('ac-notice').addClass('error')
+                    .css({ padding: '8px 10px', margin: '0 0 8px 0', fontWeight: '500' })
+                    .text(S.realtimeInventoryWarning)
+            );
+        }
+
         $wrap.append(diagRow(S.diagSyncMode, $('<span>').text(d.sync_method_label || d.sync_method || '')));
 
         var residue = d.residue || {};
@@ -282,6 +305,27 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         return $wrap;
     }
 
+    // task-7: read-only "Último import de productos" card. Server values go
+    // through .text()/diagRow — never concatenated into HTML.
+    function renderLastImport(s) {
+        if (!s) {
+            return $('<div>').addClass('ac-empty-state').append(
+                $('<p>').css('color', 'var(--ac-text-muted)').text(S.lastImportNoData)
+            );
+        }
+        var img = s.images || {};
+        var $wrap = $('<div>').css({ padding: '4px 0' });
+        var fecha = s.at ? new Date(s.at * 1000).toLocaleString() : '';
+        $wrap.append(diagRow(S.lastImportDate, $('<span>').text(fecha)));
+        $wrap.append(diagRow(S.lastImportCreated, $('<span>').text(s.imported || 0)));
+        $wrap.append(diagRow(S.lastImportUpdated, $('<span>').text(s.updated || 0)));
+        $wrap.append(diagRow(S.lastImportSkipped, $('<span>').text(s.skipped || 0)));
+        $wrap.append(diagRow(S.lastImportImages, $('<span>').text((img.ok || 0) + ' / ' + (img.deferred || 0) + ' / ' + (img.failed || 0))));
+        $wrap.append(diagRow(S.lastImportErrors, $('<span>').text(s.errors || 0)));
+        $wrap.append(diagRow(S.lastImportTotal, $('<span>').text(s.total_items || 0)));
+        return $wrap;
+    }
+
     function refresh() {
         $.ajax({
             url: alegraConnector.ajaxUrl,
@@ -297,6 +341,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 $('#ac-monitor-recent-list').html(renderRecent(d.recent));
                 $('#ac-monitor-webhooks-list').html(renderRecent(d.recent_webhooks));
                 $('#ac-monitor-diag').empty().append(renderDiag(d.diagnostics));
+                $('#ac-monitor-last-import').empty().append(renderLastImport(d.last_import_summary));
             },
             error: function() {
                 // Show the failure once per streak so a flaky request does not

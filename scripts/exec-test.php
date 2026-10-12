@@ -14708,4 +14708,155 @@ TestRunner::test('T60.13 J1: saving the settings keeps the auto-filled (numeric)
     TestRunner::assertSame('7002', (string) ($saved['flat_rate:7'] ?? ''), 'J1: el mapeo auto-rellenado sobrevive al guardar');
 });
 
+// ===========================================================================
+// === task-7: last products import summary + realtime inventory warning ====
+// ===========================================================================
+echo "\nT72 — Post-import summary + realtime inventory config warning\n";
+
+TestRunner::test('T72.1 products completion persists alegra_connector_last_import_summary with every key', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_item('it-s1', ['name' => 'S1', 'reference' => 'SS1', 'status' => 'active']);
+    alegra_mock_seed_item('it-s2', ['name' => 'S2', 'reference' => 'SS2', 'status' => 'active']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 2, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 2, 'blocked' => 1, 'download' => 0, 'sideload' => 0, 'deferred' => 3], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'debe estar done');
+
+    $s = get_option('alegra_connector_last_import_summary', false);
+    TestRunner::assertTrue(is_array($s), 'el resumen debe persistirse como array');
+    foreach (['run_id', 'type', 'at', 'imported', 'updated', 'skipped', 'errors', 'total_items', 'images'] as $k) {
+        TestRunner::assertArrayHasKey($k, (array) $s, 'clave del resumen ' . $k);
+    }
+    TestRunner::assertSame($rid, (int) ($s['run_id'] ?? 0), 'run_id');
+    TestRunner::assertSame('products', (string) ($s['type'] ?? ''), 'type');
+    TestRunner::assertTrue((int) ($s['at'] ?? 0) > 0, 'at es un timestamp');
+    TestRunner::assertSame((int) ($resp->payload['imported'] ?? -1), (int) ($s['imported'] ?? -2), 'imported coincide con el payload');
+    TestRunner::assertSame((int) ($resp->payload['total_items'] ?? -1), (int) ($s['total_items'] ?? -2), 'total_items coincide con el payload');
+    TestRunner::assertArrayHasKey('ok', (array) $s['images'], 'images.ok');
+    TestRunner::assertArrayHasKey('deferred', (array) $s['images'], 'images.deferred');
+    TestRunner::assertArrayHasKey('failed', (array) $s['images'], 'images.failed');
+    TestRunner::assertSame(2, (int) ($s['images']['ok'] ?? -1), 'images.ok');
+    TestRunner::assertSame(3, (int) ($s['images']['deferred'] ?? -1), 'images.deferred');
+    TestRunner::assertSame(1, (int) ($s['images']['failed'] ?? -1), 'images.failed = blocked+download+sideload');
+});
+
+TestRunner::test('T72.2 non-products completion does NOT write the products summary', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_contact('c-x', ['name' => 'X', 'email' => 'x@example.test']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'customers', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'debe estar done');
+    TestRunner::assertFalse(get_option('alegra_connector_last_import_summary', false), 'customers no escribe el resumen de productos');
+});
+
+TestRunner::test('T72.3 ajax_monitor_status expone last_import_summary', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+    TestRunner::assertArrayHasKey('last_import_summary', $resp->payload, 'la clave existe');
+    TestRunner::assertSame(null, $resp->payload['last_import_summary'], 'sin resumen => null');
+
+    $sample = [
+        'run_id' => 9, 'type' => 'products', 'at' => 1700000000,
+        'imported' => 5, 'updated' => 2, 'skipped' => 1, 'errors' => 0, 'total_items' => 8,
+        'images' => ['ok' => 4, 'deferred' => 1, 'failed' => 2],
+    ];
+    update_option('alegra_connector_last_import_summary', $sample, false);
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+    TestRunner::assertSame($sample, $resp2->payload['last_import_summary'], 'el payload expone el resumen tal cual');
+});
+
+TestRunner::test('T72.4 la tarjeta Último import de productos y su render están cableados', function (): void {
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('Último import de productos', $tpl, 'el título de la tarjeta existe');
+    TestRunner::assertStringContains('ac-monitor-last-import', $tpl, 'el contenedor existe');
+    TestRunner::assertStringContains('renderLastImport', $tpl, 'el render existe');
+    TestRunner::assertStringContains('renderLastImport(d.last_import_summary)', $tpl, 'refresh usa el payload');
+    TestRunner::assertStringContains('Sin datos todavía.', $tpl, 'placeholder sin datos');
+});
+
+TestRunner::test('T72.5 el aviso de Solo Tiempo Real se muestra en el diagnóstico', function (): void {
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('realtime_inventory_warning', $tpl, 'el render lee el flag del servidor');
+    TestRunner::assertStringContains('S.realtimeInventoryWarning', $tpl, 'el texto viene del localize');
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    $expected = "Estás en 'Solo Tiempo Real': el inventario NO se sincroniza automáticamente. Elegí 'Periódica + Tiempo Real' si querés que el stock de WooCommerce se actualice desde Alegra.";
+    TestRunner::assertSame($expected, (string) ($strings['realtimeInventoryWarning'] ?? ''), 'el mensaje exacto en español');
+    foreach (['lastImportTitle', 'lastImportNoData', 'lastImportCreated', 'lastImportUpdated', 'lastImportSkipped', 'lastImportErrors', 'lastImportTotal', 'lastImportImages', 'lastImportDate'] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string del resumen ' . $k);
+    }
+});
+
+TestRunner::test('T72.6 realtime_inventory_warning sólo con real-time + inventory_source=alegra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'real-time');
+    update_option('alegra_connector_inventory_source', 'alegra');
+    $d = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertSame(true, $d['realtime_inventory_warning'], 'real-time + alegra => warning');
+    TestRunner::assertSame('alegra', $d['inventory_source'], 'expone inventory_source');
+
+    update_option('alegra_connector_inventory_source', 'woocommerce');
+    $d2 = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertSame(false, $d2['realtime_inventory_warning'], 'real-time + woocommerce => sin warning');
+
+    update_option('alegra_connector_inventory_source', 'alegra');
+    update_option('alegra_connector_sync_method', 'both');
+    $d3 = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertSame(false, $d3['realtime_inventory_warning'], 'both no dispara el warning (sólo real-time)');
+});
+
+TestRunner::test('T72.7 uninstall borra el resumen y el write es autoload=false', function (): void {
+    TestRunner::assertStringContains("delete_option('alegra_connector_last_import_summary')", cfg2_source('uninstall.php'), 'uninstall borra el resumen');
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'record_last_import_summary');
+    TestRunner::assertStringContains("'alegra_connector_last_import_summary'", $src, 'el helper escribe la opción');
+    TestRunner::assertStringContains(', false)', $src, 'autoload=false');
+});
+
+TestRunner::test('T72.8 el resumen NO infla images: iguala el payload aunque la página final cuente imágenes', function (): void {
+    alegra_test_reset();
+    // Sync images ON so the update path runs import_product_images().
+    update_option('alegra_connector_sync_images', true);
+    // The harness only imports images on the UPDATE path (wc_get_product() does
+    // not know a post created by wp_insert_post), so pre-link an existing WC
+    // product. A blocked (private) host increments `blocked` WITHOUT any
+    // network call: is_allowed_image_url() fails and import_product_image()
+    // returns early (SSRF guard, default mode).
+    alegra_make_product(10, ['name' => 'Con imagen']);
+    update_post_meta(10, '_alegra_item_id', 'itm-img');
+    \Alegra\Connector\Entity_Map::map('item', 'itm-img', 'product', 10);
+    alegra_mock_seed_item('itm-img', [
+        'name' => 'Con imagen', 'type' => 'simple',
+        'images' => [['url' => 'http://10.0.0.5/x.png', 'favorite' => true]],
+    ]);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 1, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect',
+        'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+    TestRunner::assertSame(true, $resp->payload['done'] ?? null, 'debe estar done');
+    TestRunner::assertSame(1, (int) ($resp->payload['images']['failed'] ?? 0), 'la página final cuenta exactamente 1 imagen bloqueada');
+
+    $s = get_option('alegra_connector_last_import_summary', false);
+    TestRunner::assertTrue(is_array($s), 'el resumen debe persistirse');
+    TestRunner::assertSame((int) $resp->payload['images']['ok'], (int) $s['images']['ok'], 'images.ok NO se infla (summary == payload)');
+    TestRunner::assertSame((int) $resp->payload['images']['deferred'], (int) $s['images']['deferred'], 'images.deferred NO se infla (summary == payload)');
+    TestRunner::assertSame((int) $resp->payload['images']['failed'], (int) $s['images']['failed'], 'images.failed NO se infla: el resumen iguala el payload de completado');
+});
+
 exit(TestRunner::summary());

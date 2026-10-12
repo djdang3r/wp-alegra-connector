@@ -1001,6 +1001,18 @@ class Admin_Dashboard
             'diagExpires'           => __('expira en %ss', 'alegra-connector'),
             'diagNoData'            => __('Sin datos de diagnóstico.', 'alegra-connector'),
             'diagReleaseConfirm'    => __('¿Liberar los bloqueos de importación para poder reimportar?', 'alegra-connector'),
+            // task-7: Monitor "Último import de productos" card.
+            'lastImportTitle'       => __('Último import de productos', 'alegra-connector'),
+            'lastImportNoData'      => __('Sin datos todavía.', 'alegra-connector'),
+            'lastImportDate'        => __('Fecha', 'alegra-connector'),
+            'lastImportCreated'     => __('Creados', 'alegra-connector'),
+            'lastImportUpdated'     => __('Actualizados', 'alegra-connector'),
+            'lastImportSkipped'     => __('Salteados', 'alegra-connector'),
+            'lastImportImages'      => __('Imágenes (ok/diferidas/fallidas)', 'alegra-connector'),
+            'lastImportErrors'      => __('Errores', 'alegra-connector'),
+            'lastImportTotal'       => __('Total', 'alegra-connector'),
+            // task-7: config-honesty warning in the diagnostics panel.
+            'realtimeInventoryWarning' => __('Estás en \'Solo Tiempo Real\': el inventario NO se sincroniza automáticamente. Elegí \'Periódica + Tiempo Real\' si querés que el stock de WooCommerce se actualice desde Alegra.', 'alegra-connector'),
             'confirmReimport'       => __('Esto reimporta TODO el catálogo desde cero y limpia el punto de reanudación. ¿Continuar?', 'alegra-connector'),
             'startingFromZero'      => __('Empezando de cero...', 'alegra-connector'),
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
@@ -4349,6 +4361,10 @@ class Admin_Dashboard
             // terminó es `products`.
             if ($type === 'products') {
                 delete_option('alegra_connector_products_import_cursor');
+                // task-7: persist a read-only summary of the last products
+                // import for the Monitor card. Purely additive observability;
+                // it never touches the import/upsert flow.
+                self::record_last_import_summary($run_id, $state);
             }
             delete_transient('alegra_batch_state');
         } else {
@@ -5818,7 +5834,8 @@ class Admin_Dashboard
      *   sync_method:string,sync_method_label:string,
      *   residue:array,cursor:int,import_total:int,
      *   locks:array<string,array{held:bool,expires:?int,expires_in:?int}>,
-     *   kill_switch:array{active:bool,reason:string,label:string}
+     *   kill_switch:array{active:bool,reason:string,label:string},
+     *   inventory_source:string,realtime_inventory_warning:bool
      * }
      */
     public static function import_diagnostics(): array
@@ -5839,6 +5856,8 @@ class Admin_Dashboard
             $locks[$type] = $lock;
         }
 
+        $inventory_source = (string) get_option('alegra_connector_inventory_source', 'alegra');
+
         return [
             'sync_method'       => $method,
             'sync_method_label' => self::sync_method_label($method),
@@ -5851,7 +5870,65 @@ class Admin_Dashboard
                 'reason' => \Alegra\Connector\Kill_Switch::reason(),
                 'label'  => $kill_active ? __('Activo', 'alegra-connector') : __('Inactivo', 'alegra-connector'),
             ],
+            // task-7: config-honesty warning. "Solo Tiempo Real" + inventory from
+            // Alegra means the stock is never pulled by the periodic sync, which
+            // surprises merchants. Read-only flag; no behaviour changes.
+            'inventory_source'           => $inventory_source,
+            'realtime_inventory_warning' => ($method === 'real-time' && $inventory_source === 'alegra'),
         ];
+    }
+
+    /**
+     * task-7: persist a read-only summary of the last COMPLETED products import
+     * so the Monitor can render "Último import de productos" without SSH or DB
+     * access.
+     *
+     * Purely additive observability: it records the counters the chunked run
+     * already accumulated and never mutates import/upsert/image behaviour.
+     * Autoload=false because it is only read on the Monitor page.
+     *
+     * @param array<string,mixed> $state The chunked batch state at completion.
+     */
+    private static function record_last_import_summary(int $run_id, array $state): void
+    {
+        // task-8: `$state['images']` ALREADY merged the final page's
+        // Sync\Products::image_stats() inside ajax_sync_page() before the done
+        // branch. Re-merging here double-counted the final page and made the
+        // summary diverge from the completion payload. Mirror the payload
+        // (see the `$images` build in ajax_sync_page): use the state as-is and
+        // only backfill `failed` when the accumulator did not carry it.
+        $images = is_array($state['images'] ?? null) ? $state['images'] : [];
+        if (!isset($images['failed'])) {
+            $images['failed'] = (int) ($images['blocked'] ?? 0) + (int) ($images['download'] ?? 0) + (int) ($images['sideload'] ?? 0);
+        }
+        $failed = (int) $images['failed'];
+
+        update_option('alegra_connector_last_import_summary', [
+            'run_id'      => $run_id,
+            'type'        => 'products',
+            'at'          => time(),
+            'imported'    => (int) ($state['imported'] ?? 0),
+            'updated'     => (int) ($state['updated'] ?? 0),
+            'skipped'     => (int) ($state['skipped'] ?? 0),
+            'errors'      => (int) ($state['errors'] ?? 0),
+            'total_items' => (int) ($state['total_items'] ?? 0),
+            'images'      => [
+                'ok'       => (int) ($images['ok'] ?? 0),
+                'deferred' => (int) ($images['deferred'] ?? 0),
+                'failed'   => $failed,
+            ],
+        ], false);
+    }
+
+    /**
+     * task-7: read-only last-products-import summary for the Monitor payload.
+     *
+     * @return array<string,mixed>|null
+     */
+    public static function last_import_summary(): ?array
+    {
+        $summary = get_option('alegra_connector_last_import_summary', null);
+        return is_array($summary) ? $summary : null;
     }
 
     public function ajax_register_webhooks(): void
@@ -6627,6 +6704,8 @@ class Admin_Dashboard
             'kill_switch_reason' => \Alegra\Connector\Kill_Switch::reason(),
             // task-5: read-only import diagnostics for the Monitor panel.
             'diagnostics' => self::import_diagnostics(),
+            // task-7: last completed products import (read-only Monitor card).
+            'last_import_summary' => self::last_import_summary(),
         ]);
     }
 
