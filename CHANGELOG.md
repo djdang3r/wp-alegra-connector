@@ -2,6 +2,42 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.10] - 2026-10-12
+
+> **Monitor: resumen del último import de productos + aviso de configuración.**
+> El Monitor suma una tarjeta read-only **"Último import de productos"** con los
+> contadores del último import chunked completado (creados / actualizados /
+> salteados / imágenes ok·diferidas·fallidas / errores / total). Además avisa
+> cuando estás en **"Solo Tiempo Real"** con inventario desde Alegra: en ese modo
+> el stock **no** se sincroniza automáticamente.
+
+### Added
+
+- **Monitor: tarjeta "Último import de productos" (read-only).** Muestra fecha,
+  creados, actualizados, salteados, imágenes (ok / diferidas / fallidas), errores
+  y total del último import de productos completado. Se lee de la option
+  `alegra_connector_last_import_summary`, escrita al completarse un import chunked
+  (keys `run_id`/`type`/`at`/`imported`/`updated`/`skipped`/`errors`/`total_items`
+  e `images{ok,deferred,failed}`) y borrada en `uninstall.php`.
+- **Monitor: aviso de configuración "Solo Tiempo Real".** Cuando
+  `sync_method = real-time` y `inventory_source = alegra`, el panel de diagnóstico
+  muestra el aviso: en "Solo Tiempo Real" el inventario NO se sincroniza
+  automáticamente; elegí "Periódica + Tiempo Real" si querés que el stock se
+  actualice desde Alegra. Solo mensaje informativo; no cambia el comportamiento.
+
+### Fixed
+
+- **Dedup del conteo de imágenes en el resumen del último import.** La página
+  final ya venía mergeada dentro del estado del run antes del branch `done`;
+  re-mergearla duplicaba el último lote y desviaba el resumen del payload de
+  finalización. Ahora se usa el estado tal cual y solo se rellena `failed` cuando
+  el acumulador no lo traía.
+
+### Tests
+
+- **Exec-test:** bloque task-7 (resumen del último import, dedup de imágenes y
+  aviso `realtime_inventory_warning` del payload de diagnóstico).
+
 ## [2.8.9] - 2026-10-12
 
 > **Importación de productos robusta: cancelar / detener / reanudar nunca deja un
