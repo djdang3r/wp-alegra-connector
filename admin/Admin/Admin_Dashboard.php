@@ -988,6 +988,19 @@ class Admin_Dashboard
             // task-4: persistent import banner ("Liberar").
             'releaseDone'           => __('Importación liberada. Ya podés reimportar.', 'alegra-connector'),
 
+            // task-5: Monitor "Diagnóstico de importación" panel.
+            'diagSyncMode'          => __('Modo de sync', 'alegra-connector'),
+            'diagImportState'       => __('Estado de importación', 'alegra-connector'),
+            'diagCursor'            => __('Cursor', 'alegra-connector'),
+            'diagLocks'             => __('Locks de importación', 'alegra-connector'),
+            'diagKillSwitch'        => __('Kill switch', 'alegra-connector'),
+            'diagTypeProducts'      => __('Productos', 'alegra-connector'),
+            'diagTypeCustomers'     => __('Clientes', 'alegra-connector'),
+            'diagTypeOrders'        => __('Pedidos', 'alegra-connector'),
+            'diagTypeCategories'    => __('Categorías', 'alegra-connector'),
+            'diagExpires'           => __('expira en %ss', 'alegra-connector'),
+            'diagNoData'            => __('Sin datos de diagnóstico.', 'alegra-connector'),
+            'diagReleaseConfirm'    => __('¿Liberar los bloqueos de importación para poder reimportar?', 'alegra-connector'),
             'confirmReimport'       => __('Esto reimporta TODO el catálogo desde cero y limpia el punto de reanudación. ¿Continuar?', 'alegra-connector'),
             'startingFromZero'      => __('Empezando de cero...', 'alegra-connector'),
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
@@ -5776,6 +5789,71 @@ class Admin_Dashboard
         return $out;
     }
 
+    /**
+     * Human label for the inbound sync method option (Monitor diagnostics).
+     */
+    public static function sync_method_label(string $method): string
+    {
+        switch ($method) {
+            case 'cron':
+                return __('Periódica', 'alegra-connector');
+            case 'real-time':
+                return __('Tiempo Real', 'alegra-connector');
+            case 'both':
+                return __('Tiempo Real + Periódica', 'alegra-connector');
+            default:
+                return __('Desactivada', 'alegra-connector');
+        }
+    }
+
+    /**
+     * READ-ONLY diagnostics for the Monitor "Diagnóstico de importación" panel.
+     *
+     * Gives a merchant with no SSH/DB access a single view of what could block
+     * an import: sync method, import residue (via the shared
+     * import_residue_status()), the products cursor, the per-type locks and the
+     * kill switch. It never writes anything.
+     *
+     * @return array{
+     *   sync_method:string,sync_method_label:string,
+     *   residue:array,cursor:int,import_total:int,
+     *   locks:array<string,array{held:bool,expires:?int,expires_in:?int}>,
+     *   kill_switch:array{active:bool,reason:string,label:string}
+     * }
+     */
+    public static function import_diagnostics(): array
+    {
+        $method  = (string) get_option('alegra_connector_sync_method', 'cron');
+        $residue = self::import_residue_status();
+        $residue['label'] = $residue['active']
+            ? __('Pendiente / reanudable', 'alegra-connector')
+            : __('Sin importación pendiente', 'alegra-connector');
+
+        $kill_active = \Alegra\Connector\Kill_Switch::is_active();
+
+        $locks = [];
+        foreach (self::import_locks_status() as $type => $lock) {
+            $lock['label'] = $lock['held']
+                ? __('Tomado', 'alegra-connector')
+                : __('Libre', 'alegra-connector');
+            $locks[$type] = $lock;
+        }
+
+        return [
+            'sync_method'       => $method,
+            'sync_method_label' => self::sync_method_label($method),
+            'residue'           => $residue,
+            'cursor'            => (int) get_option('alegra_connector_products_import_cursor', 0),
+            'import_total'      => (int) get_option('alegra_connector_products_import_total', 0),
+            'locks'             => $locks,
+            'kill_switch'       => [
+                'active' => $kill_active,
+                'reason' => \Alegra\Connector\Kill_Switch::reason(),
+                'label'  => $kill_active ? __('Activo', 'alegra-connector') : __('Inactivo', 'alegra-connector'),
+            ],
+        ];
+    }
+
     public function ajax_register_webhooks(): void
     {
         \Alegra\Connector\Write_Gate::run_explicit(fn () => $this->ajax_register_webhooks_impl());
@@ -6547,6 +6625,8 @@ class Admin_Dashboard
             'sync_method' => (string) get_option('alegra_connector_sync_method', 'cron'),
             'kill_switch_active' => \Alegra\Connector\Kill_Switch::is_active(),
             'kill_switch_reason' => \Alegra\Connector\Kill_Switch::reason(),
+            // task-5: read-only import diagnostics for the Monitor panel.
+            'diagnostics' => self::import_diagnostics(),
         ]);
     }
 

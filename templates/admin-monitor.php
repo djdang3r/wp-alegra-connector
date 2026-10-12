@@ -35,6 +35,22 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
     </button>
 </div>
 
+<!-- task-5: read-only import diagnostics -->
+<div class="ac-card" style="margin-bottom:16px;border-left:4px solid var(--ac-warning);">
+    <div class="ac-card-header">
+        <h2><?php esc_html_e('Diagnóstico de importación', 'alegra-connector'); ?></h2>
+        <button type="button" class="ac-btn ac-btn-xs ac-btn-danger" id="alegra-diag-release" style="margin-left:auto;">
+            <span class="dashicons dashicons-controls-back" style="font-size:12px;width:12px;height:12px;"></span>
+            <?php esc_html_e('Liberar importación', 'alegra-connector'); ?>
+        </button>
+    </div>
+    <div id="ac-monitor-diag">
+        <div class="ac-empty-state">
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Cargando diagnóstico...', 'alegra-connector'); ?></p>
+        </div>
+    </div>
+</div>
+
 <!-- Active processes -->
 <div class="ac-card" style="margin-bottom:16px;">
     <div class="ac-card-header">
@@ -224,6 +240,48 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         return html;
     }
 
+    // task-5: read-only import diagnostics. Server values are injected with
+    // .text() — never concatenated into HTML.
+    function diagRow(label, $value) {
+        return $('<div>').css({ display: 'flex', gap: '10px', padding: '5px 0', borderBottom: '1px solid var(--ac-border-light)' })
+            .append($('<span>').css({ minWidth: '170px', color: 'var(--ac-text-secondary)', fontSize: '12px' }).text(label))
+            .append($('<span>').css({ fontSize: '13px', flex: '1' }).append($value));
+    }
+
+    function renderDiag(d) {
+        var $wrap = $('<div>').css({ padding: '4px 0' });
+        if (!d) {
+            return $wrap.append($('<div>').addClass('ac-empty-state').append($('<p>').css('color', 'var(--ac-text-muted)').text(S.diagNoData)));
+        }
+
+        $wrap.append(diagRow(S.diagSyncMode, $('<span>').text(d.sync_method_label || d.sync_method || '')));
+
+        var residue = d.residue || {};
+        $wrap.append(diagRow(S.diagImportState, $('<span>').text(residue.label || '')));
+
+        $wrap.append(diagRow(S.diagCursor, $('<span>').text((d.cursor || 0) + ' / ' + (d.import_total || 0))));
+
+        var typeLabels = { products: S.diagTypeProducts, customers: S.diagTypeCustomers, orders: S.diagTypeOrders, categories: S.diagTypeCategories };
+        var $locks = $('<div>');
+        var locks = d.locks || {};
+        for (var key in locks) {
+            if (!Object.prototype.hasOwnProperty.call(locks, key)) continue;
+            var lock = locks[key] || {};
+            var line = (typeLabels[key] || key) + ': ' + (lock.label || '');
+            if (lock.held && lock.expires_in != null) {
+                line += ' (' + fmt(S.diagExpires, lock.expires_in) + ')';
+            }
+            $locks.append($('<div>').css({ padding: '2px 0' }).text(line));
+        }
+        $wrap.append(diagRow(S.diagLocks, $locks));
+
+        var ks = d.kill_switch || {};
+        var ksTxt = (ks.label || '') + (ks.active && ks.reason ? ' (' + ks.reason + ')' : '');
+        $wrap.append(diagRow(S.diagKillSwitch, $('<span>').text(ksTxt)));
+
+        return $wrap;
+    }
+
     function refresh() {
         $.ajax({
             url: alegraConnector.ajaxUrl,
@@ -238,6 +296,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 $('#ac-monitor-cron-list').html(renderCron(d.cron, d.sync_method));
                 $('#ac-monitor-recent-list').html(renderRecent(d.recent));
                 $('#ac-monitor-webhooks-list').html(renderRecent(d.recent_webhooks));
+                $('#ac-monitor-diag').empty().append(renderDiag(d.diagnostics));
             },
             error: function() {
                 // Show the failure once per streak so a flaky request does not
@@ -285,6 +344,27 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 error: function() {
                     showNotice(S.connectionError, 'error');
                     $btn.prop('disabled', false).text(S.stopAll);
+                }
+            });
+        });
+
+        // task-5: release import locks from the diagnostics panel.
+        $(document).on('click', '#alegra-diag-release', function() {
+            if (!confirm(S.diagReleaseConfirm)) return;
+            var $btn = $(this).prop('disabled', true);
+            $.ajax({
+                url: alegraConnector.ajaxUrl,
+                type: 'POST',
+                data: { action: 'alegra_release_import', _ajax_nonce: monitorNonce },
+                success: function(r) {
+                    if (r.success) showNotice(r.data.message || S.releaseDone, 'success');
+                    else showNotice(r.data.message || S.error, 'error');
+                    $btn.prop('disabled', false);
+                    refresh();
+                },
+                error: function() {
+                    showNotice(S.connectionError, 'error');
+                    $btn.prop('disabled', false);
                 }
             });
         });

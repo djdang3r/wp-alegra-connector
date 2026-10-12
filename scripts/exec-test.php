@@ -7733,6 +7733,99 @@ TestRunner::test('T72.1 un lock FRESCO sin run vivo NO se libera (in-flight star
 });
 
 // ===========================================================================
+// === task-5: Monitor "Diagnóstico de importación" (read-only) ==============
+// ===========================================================================
+
+TestRunner::test('T71.1 sync_method_label covers every documented method', function (): void {
+    $label = [\Alegra\Connector\Admin\Admin_Dashboard::class, 'sync_method_label'];
+    TestRunner::assertSame('Periódica', $label('cron'), 'cron → Periódica');
+    TestRunner::assertSame('Tiempo Real', $label('real-time'), 'real-time → Tiempo Real');
+    TestRunner::assertSame('Tiempo Real + Periódica', $label('both'), 'both → Tiempo Real + Periódica');
+    TestRunner::assertSame('Desactivada', $label('disabled'), 'disabled → Desactivada');
+    TestRunner::assertSame('Desactivada', $label('whatever'), 'unknown → Desactivada');
+});
+
+TestRunner::test('T71.2 import_locks_status reports held/expiry per type', function (): void {
+    alegra_test_reset();
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'x', 'expires' => time() + 120], '', 'no');
+
+    $locks = \Alegra\Connector\Admin\Admin_Dashboard::import_locks_status();
+
+    TestRunner::assertTrue($locks['products']['held'], 'products tomado');
+    TestRunner::assertTrue($locks['products']['expires_in'] !== null && $locks['products']['expires_in'] > 0 && $locks['products']['expires_in'] <= 120, 'expires_in positivo');
+    TestRunner::assertFalse($locks['customers']['held'], 'customers libre');
+    TestRunner::assertSame(null, $locks['customers']['expires_in'], 'libre no tiene expiración');
+});
+
+TestRunner::test('T71.3 import_diagnostics is read-only and reports every field', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'both');
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    update_option('alegra_connector_products_import_total', 3000, false);
+
+    // Clean store: no residue, every lock free.
+    $d = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertSame('both', $d['sync_method'], 'método crudo');
+    TestRunner::assertSame('Tiempo Real + Periódica', $d['sync_method_label'], 'etiqueta del método');
+    TestRunner::assertSame(1500, $d['cursor'], 'cursor de products');
+    TestRunner::assertSame(3000, $d['import_total'], 'total de products');
+    TestRunner::assertFalse($d['locks']['products']['held'], 'products libre');
+    TestRunner::assertSame('Libre', $d['locks']['products']['label'], 'etiqueta Libre');
+    TestRunner::assertFalse($d['residue']['active'], 'sin residuo');
+    TestRunner::assertFalse($d['kill_switch']['active'], 'kill switch inactivo');
+    TestRunner::assertSame('Inactivo', $d['kill_switch']['label'], 'etiqueta inactivo');
+
+    // A held lock is residue (reason 'lock') and must be reported but untouched.
+    add_option('alegra_lock_alegra_sync_running_customers', ['token' => 'x', 'expires' => time() + 90], '', 'no');
+    $d2 = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertTrue($d2['locks']['customers']['held'], 'customers tomado');
+    TestRunner::assertSame('Tomado', $d2['locks']['customers']['label'], 'etiqueta Tomado');
+    TestRunner::assertTrue($d2['residue']['active'], 'un lock retenido es residuo');
+    TestRunner::assertSame('lock', $d2['residue']['reason'], 'razón lock');
+    TestRunner::assertTrue(get_option('alegra_lock_alegra_sync_running_customers', false) !== false, 'no libera el lock');
+    TestRunner::assertSame(1500, (int) get_option('alegra_connector_products_import_cursor', 0), 'no toca el cursor');
+
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => 7], 600);
+    \Alegra\Connector\Kill_Switch::activate('emergency_stop');
+    $d3 = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertTrue($d3['residue']['active'], 'con batch state hay residuo');
+    TestRunner::assertSame('batch_state', $d3['residue']['reason'], 'razón batch_state');
+    TestRunner::assertTrue($d3['kill_switch']['active'], 'kill switch activo');
+    TestRunner::assertSame('Activo', $d3['kill_switch']['label'], 'etiqueta activo');
+    TestRunner::assertSame('emergency_stop', $d3['kill_switch']['reason'], 'razón del kill switch');
+});
+
+TestRunner::test('T71.4 ajax_monitor_status incluye diagnostics sin romper el payload existente', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_method', 'cron');
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+
+    TestRunner::assertTrue($resp->success, 'monitor responde success');
+    foreach (['running', 'cron', 'recent', 'recent_webhooks', 'sync_method', 'kill_switch_active', 'kill_switch_reason'] as $k) {
+        TestRunner::assertArrayHasKey($k, $resp->payload, 'payload existente ' . $k);
+    }
+    TestRunner::assertArrayHasKey('diagnostics', $resp->payload, 'nuevo bloque diagnostics');
+    TestRunner::assertSame('cron', $resp->payload['diagnostics']['sync_method'], 'diagnostics.sync_method');
+    TestRunner::assertSame('Periódica', $resp->payload['diagnostics']['sync_method_label'], 'diagnostics.sync_method_label');
+    TestRunner::assertArrayHasKey('locks', $resp->payload['diagnostics'], 'diagnostics.locks');
+    TestRunner::assertArrayHasKey('residue', $resp->payload['diagnostics'], 'diagnostics.residue');
+    TestRunner::assertArrayHasKey('kill_switch', $resp->payload['diagnostics'], 'diagnostics.kill_switch');
+});
+
+TestRunner::test('T71.5 la tarjeta de diagnóstico y el botón Liberar están cableados', function (): void {
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('Diagnóstico de importación', $tpl, 'la tarjeta existe');
+    TestRunner::assertStringContains('ac-monitor-diag', $tpl, 'el contenedor del panel existe');
+    TestRunner::assertStringContains('alegra-diag-release', $tpl, 'el botón Liberar existe');
+    TestRunner::assertStringContains('alegra_release_import', $tpl, 'el botón llama al handler existente');
+    TestRunner::assertStringContains('renderDiag', $tpl, 'el render del panel existe');
+    // .text()-safe rendering of server data.
+    TestRunner::assertStringContains("$('#ac-monitor-diag')", $tpl, 'el refresh actualiza el panel');
+});
+
+// ===========================================================================
 // === logs-monitor-import (2.5.0) — Fase 3: chunked con presupuesto propio ===
 // ===========================================================================
 
