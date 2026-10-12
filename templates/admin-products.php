@@ -86,6 +86,34 @@ $post_type_filter = isset($_GET['post_type_filter']) ? sanitize_text_field($_GET
 </div>
 
 <?php
+// task-4: persistent import banner. Rendered server-side so it survives a
+// reload (the progress modal is transient). Gives a permanent entry point to
+// resume / cancel / release a stuck or interrupted import.
+$ac_import_residue = $ac_import_residue ?? ['active' => false, 'reason' => '', 'type' => 'products', 'run_id' => 0, 'live' => false, 'lock' => false];
+if (!empty($ac_import_residue['active'])):
+    $ac_res_reason = (string) ($ac_import_residue['reason'] ?? '');
+    $ac_res_type   = (string) ($ac_import_residue['type'] ?? 'products');
+    if ($ac_res_reason === 'live_run') {
+        $ac_res_msg = __('Hay una importación en curso o interrumpida. Podés esperar, cancelarla o liberar el bloqueo.', 'alegra-connector');
+    } elseif ($ac_res_reason === 'lock') {
+        $ac_res_msg = __('Una importación anterior dejó un bloqueo activo. Liberalo para poder reimportar.', 'alegra-connector');
+    } else {
+        $ac_res_msg = __('Una importación quedó pausada o interrumpida. Podés reanudarla, cancelarla o liberar el bloqueo.', 'alegra-connector');
+    }
+?>
+<div id="alegra-import-residue-banner" class="ac-notice warning"
+     data-type="<?php echo esc_attr($ac_res_type); ?>"
+     data-reason="<?php echo esc_attr($ac_res_reason); ?>"
+     style="margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <span class="ac-badge warning"><?php esc_html_e('Importación pendiente', 'alegra-connector'); ?></span>
+    <span style="flex:1;min-width:220px;"><?php echo esc_html($ac_res_msg); ?></span>
+    <button type="button" class="ac-btn ac-btn-primary ac-btn-xs alegra-import-resume"><?php esc_html_e('Reanudar', 'alegra-connector'); ?></button>
+    <button type="button" class="ac-btn ac-btn-xs alegra-import-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
+    <button type="button" class="ac-btn ac-btn-xs alegra-import-release"><?php esc_html_e('Liberar', 'alegra-connector'); ?></button>
+</div>
+<?php endif; ?>
+
+<?php
 $ac_cursor = (int) get_option('alegra_connector_products_import_cursor', 0);
 $ac_import_total = (int) get_option('alegra_connector_products_import_total', 0);
 if ($ac_cursor > 0): ?>

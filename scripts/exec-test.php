@@ -7365,7 +7365,9 @@ TestRunner::test('T28.215 cancel del botón cierra cancelled (D1)', function ():
     alegra_capture_json(fn () => $admin->ajax_cancel_sync());
     TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status($rid), 'cancel debe cerrar cancelled');
     TestRunner::assertFalse(get_transient('alegra_batch_state'), 'el state debe borrarse');
-    TestRunner::assertTrue((bool) get_transient('alegra_sync_cancelled'), 'el flag debe quedar');
+    // task-4: cancel leaves ZERO residue — the old behavior set the flag and
+    // left the per-type lock held, which trapped the merchant until TTL.
+    TestRunner::assertFalse(get_transient('alegra_sync_cancelled'), 'no debe quedar el flag de cancelación');
 });
 
 TestRunner::test('T28.216 customers avanza el cursor (D2)', function (): void {
@@ -7473,7 +7475,13 @@ TestRunner::test('T28.222 customers done NO borra el cursor de products (B-A)', 
 
 TestRunner::test('T28.223 start concurrente rechazado por el lock (D-D)', function (): void {
     alegra_test_reset();
+    alegra_clear_heartbeat_cache();
     update_option('alegra_connector_connection_tested', true);
+    // task-4: a bare lock with NO live run is now self-healed, so to keep
+    // asserting the atomicity contract this test seeds a genuinely-live owner
+    // (running chunked run + fresh heartbeat) holding the per-type lock.
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Heartbeat::set($rid, ['step' => 'products', 'message' => 'vivo']);
     add_option('alegra_lock_alegra_sync_running_products', ['token' => 'other', 'expires' => time() + 300], '', 'no');
     $_POST['sync_type'] = 'products';
     $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
@@ -7482,6 +7490,7 @@ TestRunner::test('T28.223 start concurrente rechazado por el lock (D-D)', functi
     TestRunner::assertFalse($resp->success, 'el lock de otro proceso debe rechazar');
     TestRunner::assertStringContains('importación en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje');
     TestRunner::assertFalse(get_transient('alegra_batch_state'), 'no debe crear state');
+    alegra_clear_heartbeat_cache();
 
     $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_sync_start');
     $acquire = strpos($src, 'acquire_sync_lock_public');
@@ -7529,6 +7538,198 @@ TestRunner::test('T28.224 el lock se libera ANTES del wp_send_json (observer)', 
     $GLOBALS['alegra_test_json_observer'] = null;
     TestRunner::assertFalse($resp2->success, 'el WP_Error responde error');
     TestRunner::assertSame(null, $snapshot2, 'el lock debe estar libre en el instante del send de error');
+});
+
+// ===========================================================================
+// === task-4: import cancel / stop / resume robustness ======================
+// ===========================================================================
+
+/**
+ * Heartbeat keeps a per-request static cache that alegra_test_reset() does not
+ * clear. Run ids restart at 1 after every reset, so a cached heartbeat from a
+ * previous test would make a brand-new run look alive. Tests that reason about
+ * liveness clear it explicitly (start and end).
+ */
+function alegra_clear_heartbeat_cache(): void
+{
+    $ref = new ReflectionProperty(\Alegra\Connector\Heartbeat::class, 'cache');
+    $ref->setAccessible(true);
+    $ref->setValue(null, []);
+}
+
+TestRunner::test('T70.1 force_release_sync_lock borra el lock sin token', function (): void {
+    alegra_test_reset();
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'dead', 'expires' => time() + 300], '', 'no');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'el lock debe borrarse sin exigir token');
+    TestRunner::assertTrue(\Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products') !== false, 'se puede re-adquirir tras liberar');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T70.2 cancel deja CERO residuo: sin lock, state, progress ni flag', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => $rid], 600);
+    set_transient('alegra_sync_progress', ['imported' => 5], 600);
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'x', 'expires' => time() + 300], '', 'no');
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_cancel_sync());
+
+    TestRunner::assertTrue($resp->success, 'cancel responde success');
+    TestRunner::assertSame('cancelled', \Alegra\Connector\Runs::status($rid), 'la fila queda cancelled');
+    TestRunner::assertFalse((bool) get_option('alegra_lock_alegra_sync_running_products', false), 'el lock debe liberarse');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'el state debe borrarse');
+    TestRunner::assertFalse(get_transient('alegra_sync_progress'), 'el progress debe borrarse');
+    TestRunner::assertFalse(get_transient('alegra_sync_cancelled'), 'no debe quedar el flag de cancelación');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T70.3 ajax_release_import libera los 4 locks y cierra los runs chunked', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    foreach (['products', 'customers', 'orders', 'categories'] as $t) {
+        add_option('alegra_lock_alegra_sync_running_' . $t, ['token' => 't-' . $t, 'expires' => time() + 300], '', 'no');
+    }
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $chunked = (int) $wpdb->insert_id;
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'manual_import', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $manual = (int) $wpdb->insert_id;
+    set_transient('alegra_batch_state', ['type' => 'products'], 600);
+    set_transient('alegra_sync_progress', ['imported' => 1], 600);
+    set_transient('alegra_sync_cancelled', 1, 120);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_release_import());
+
+    TestRunner::assertTrue($resp->success, 'release responde success');
+    foreach (['products', 'customers', 'orders', 'categories'] as $t) {
+        TestRunner::assertFalse((bool) get_option('alegra_lock_alegra_sync_running_' . $t, false), 'lock ' . $t . ' liberado');
+    }
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'state borrado');
+    TestRunner::assertFalse(get_transient('alegra_sync_progress'), 'progress borrado');
+    TestRunner::assertFalse(get_transient('alegra_sync_cancelled'), 'flag de cancel borrado');
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($chunked), 'el chunked running queda stale');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($manual), 'el manual running NO se toca');
+    TestRunner::assertFalse(\Alegra\Connector\Kill_Switch::is_active(), 'release NO activa el kill switch');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T70.4 sync_start self-heal: lock muerto sin run vivo se libera y arranca', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_connection_tested', true);
+    // task-6: a STALE-but-not-expired lock. acquired_at = expires - 300, so
+    // expires = now + 60 means acquired 240s ago (> the 180s abandoned grace)
+    // while still inside the 300s TTL. A freshly-acquired lock is NOT a dead
+    // lock (it may belong to an in-flight starter) and is covered by T72.1.
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'dead', 'expires' => time() + 60], '', 'no');
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => 4242], 600);
+
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+
+    TestRunner::assertTrue($resp->success, 'el lock muerto no debe bloquear');
+    TestRunner::assertTrue((int) ($resp->payload['run_id'] ?? 0) > 0, 'debe crear un run nuevo');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T70.5 sync_start bloquea cuando hay un run VIVO (heartbeat fresco)', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_connection_tested', true);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Heartbeat::set($rid, ['step' => 'products', 'message' => 'vivo']);
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'live', 'expires' => time() + 300], '', 'no');
+
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+
+    TestRunner::assertFalse($resp->success, 'un run vivo debe bloquear');
+    TestRunner::assertStringContains('importación en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje de rechazo');
+    TestRunner::assertTrue(get_option('alegra_lock_alegra_sync_running_products', false) !== false, 'el lock vivo NO se fuerza');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T70.6 import_residue_status detecta lock, state y run vivo/stale', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    TestRunner::assertFalse(\Alegra\Connector\Admin\Admin_Dashboard::import_residue_status()['active'], 'sin residuo no hay banner');
+
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'x', 'expires' => time() + 300], '', 'no');
+    $lock_only = \Alegra\Connector\Admin\Admin_Dashboard::import_residue_status();
+    TestRunner::assertTrue($lock_only['active'], 'un lock retenido activa el banner');
+    TestRunner::assertSame('lock', $lock_only['reason'], 'la razón es lock');
+    delete_option('alegra_lock_alegra_sync_running_products');
+
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $rid = (int) $wpdb->insert_id;
+    TestRunner::assertSame('stale_run', \Alegra\Connector\Admin\Admin_Dashboard::import_residue_status()['reason'], 'run sin heartbeat es stale_run');
+    \Alegra\Connector\Heartbeat::set($rid, ['step' => 'products', 'message' => 'vivo']);
+    $live = \Alegra\Connector\Admin\Admin_Dashboard::import_residue_status();
+    TestRunner::assertSame('live_run', $live['reason'], 'heartbeat fresco es live_run');
+    TestRunner::assertTrue($live['live'], 'marca live');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T70.7 el banner persistente y sus handlers están cableados', function (): void {
+    $tpl = cfg2_source('templates/admin-products.php');
+    TestRunner::assertStringContains('alegra-import-residue-banner', $tpl, 'el template renderiza el banner');
+    TestRunner::assertStringContains('alegra-import-resume', $tpl, 'botón Reanudar');
+    TestRunner::assertStringContains('alegra-import-cancel', $tpl, 'botón Cancelar');
+    TestRunner::assertStringContains('alegra-import-release', $tpl, 'botón Liberar');
+
+    $js = cfg2_source('admin/assets/js/admin.js');
+    TestRunner::assertStringContains('alegra_release_import', $js, 'el JS llama a release');
+    TestRunner::assertStringContains('alegra-import-residue-banner', $js, 'el JS cablea el banner');
+
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    TestRunner::assertStringContains('wp_ajax_alegra_release_import', $ctor, 'el handler está registrado');
+});
+
+TestRunner::test('T70.8 kill_all libera los locks de importación y conserva el kill switch', function (): void {
+    alegra_test_reset();
+    foreach (['products', 'customers', 'orders', 'categories'] as $t) {
+        add_option('alegra_lock_alegra_sync_running_' . $t, ['token' => 'k-' . $t, 'expires' => time() + 300], '', 'no');
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_kill_all());
+
+    TestRunner::assertTrue($resp->success, 'kill_all responde success');
+    foreach (['products', 'customers', 'orders', 'categories'] as $t) {
+        TestRunner::assertFalse((bool) get_option('alegra_lock_alegra_sync_running_' . $t, false), 'lock ' . $t . ' liberado');
+    }
+    TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(), 'kill_all sigue activando el kill switch');
+});
+
+TestRunner::test('T72.1 un lock FRESCO sin run vivo NO se libera (in-flight starter)', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_connection_tested', true);
+    // Fresh lock: acquired 0s ago (expires = now + 300). NO run row, NO
+    // heartbeat — indistinguishable from another request that just acquired
+    // the lock and has not yet created its run. The self-heal must NOT stomp it.
+    add_option('alegra_lock_alegra_sync_running_products', ['token' => 'fresh', 'expires' => time() + 300], '', 'no');
+
+    $_POST['sync_type'] = 'products';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+
+    TestRunner::assertFalse($resp->success, 'un lock fresco debe rechazar (in-flight starter)');
+    TestRunner::assertStringContains('importación en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje de rechazo');
+    TestRunner::assertTrue(get_option('alegra_lock_alegra_sync_running_products', false) !== false, 'el lock fresco NO debe borrarse');
+    alegra_clear_heartbeat_cache();
 });
 
 // ===========================================================================

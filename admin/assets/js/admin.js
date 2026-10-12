@@ -63,6 +63,7 @@
             this.initRepairDivergence();
             this.initInvoiceNoticeDismiss();
             this.initShippingConfig();
+            this.initImportResidueBanner();
         },
 
         /**
@@ -399,6 +400,51 @@
                     });
                 };
                 } // end doSync
+            });
+        },
+
+        // -------------------------------------------------------------------
+        // task-4: persistent import-residue banner (Products page).
+        //
+        // Resume re-triggers the existing chunked sync flow (the quick-sync
+        // button, which opens the filter modal). Cancel calls the existing
+        // cancel handler. Release force-releases the stuck locks server-side.
+        // -------------------------------------------------------------------
+        initImportResidueBanner: function() {
+            var $banner = $('#alegra-import-residue-banner');
+            if (!$banner.length) { return; }
+
+            $banner.on('click', '.alegra-import-resume', function() {
+                var type = $banner.data('type') || 'products';
+                var $trigger = $('.alegra-quick-sync[data-type="' + type + '"]').first();
+                if (!$trigger.length) { $trigger = $('.alegra-quick-sync[data-type="products"]').first(); }
+                if ($trigger.length) { $trigger.trigger('click'); }
+            });
+
+            $banner.on('click', '.alegra-import-cancel', function() {
+                var $btn = $(this).prop('disabled', true);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_cancel_sync', _ajax_nonce: alegraConnector.nonce },
+                    success: function(r) {
+                        showNotice(safeMsg(r, S.syncCancelled), 'warning');
+                        setTimeout(function() { location.reload(); }, 800);
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false); }
+                });
+            });
+
+            $banner.on('click', '.alegra-import-release', function() {
+                var $btn = $(this).prop('disabled', true);
+                $.ajax({
+                    url: alegraConnector.ajaxUrl, type: 'POST',
+                    data: { action: 'alegra_release_import', _ajax_nonce: alegraConnector.nonce },
+                    success: function(r) {
+                        showNotice(safeMsg(r, S.releaseDone), 'success');
+                        setTimeout(function() { location.reload(); }, 800);
+                    },
+                    error: function() { showNotice(S.connectionError, 'error'); $btn.prop('disabled', false); }
+                });
             });
         },
 

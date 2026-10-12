@@ -614,6 +614,26 @@ class Controller
     }
 
     /**
+     * Force-release a sync lock for a type, ignoring token ownership.
+     *
+     * Admin stop/cancel/release flows must be able to clear a lock whose owner
+     * (a closed browser, a fataled request) can no longer release it — otherwise
+     * the merchant is stuck until the 300 s TTL. Unlike release_sync_lock(),
+     * this requires NO token and also clears the in-request re-entrant registry
+     * entry for that key, so a subsequent acquire from the same request starts
+     * from a clean state. It never touches other types' locks.
+     *
+     * @param string $type One of: 'products', 'customers', 'orders', 'categories'.
+     */
+    public static function force_release_sync_lock(string $type): void
+    {
+        $key = 'alegra_sync_running_' . $type;
+
+        unset(self::$held_sync_locks[$key]);
+        delete_option('alegra_lock_' . $key);
+    }
+
+    /**
      * Test-only: clear the re-entrant lock registry between tests.
      *
      * The registry is request-scoped in production, but the harness runs many

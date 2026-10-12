@@ -69,6 +69,8 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_sync_pending_start', [$this, 'ajax_sync_pending_start']);
         add_action('wp_ajax_alegra_sync_pending_page', [$this, 'ajax_sync_pending_page']);
         add_action('wp_ajax_alegra_cancel_sync', [$this, 'ajax_cancel_sync']);
+        // task-4: permanent "release import" escape hatch (no kill switch).
+        add_action('wp_ajax_alegra_release_import', [$this, 'ajax_release_import']);
         add_action('wp_ajax_alegra_register_webhooks', [$this, 'ajax_register_webhooks']);
         add_action('wp_ajax_alegra_delete_webhooks', [$this, 'ajax_delete_webhooks']);
         add_action('wp_ajax_alegra_cleanup_duplicate_images', [$this, 'ajax_cleanup_duplicate_images']);
@@ -983,6 +985,9 @@ class Admin_Dashboard
             // su fase dueña (T5.2b/T6.4b/T6.4a) y acá sólo se consumen.
             'pausedResuming'        => __('Pausado por tiempo; continúa con la próxima página...', 'alegra-connector'),
             'resumingFrom'          => __('Reanudando desde el ítem %s...', 'alegra-connector'),
+            // task-4: persistent import banner ("Liberar").
+            'releaseDone'           => __('Importación liberada. Ya podés reimportar.', 'alegra-connector'),
+
             'confirmReimport'       => __('Esto reimporta TODO el catálogo desde cero y limpia el punto de reanudación. ¿Continuar?', 'alegra-connector'),
             'startingFromZero'      => __('Empezando de cero...', 'alegra-connector'),
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
@@ -1909,6 +1914,11 @@ class Admin_Dashboard
 
         $header_color = 'green';
         $connected = (bool) get_option('alegra_connector_connection_tested');
+
+        // task-4: persistent import banner — a permanent entry point to resume,
+        // cancel or release a stuck/interrupted import (not only the transient
+        // progress modal).
+        $ac_import_residue = self::import_residue_status();
 
         include ALEGRA_CONNECTOR_PATH . 'templates/admin-products.php';
     }
@@ -3920,15 +3930,43 @@ class Admin_Dashboard
         // cancelado al instante por la rama de cancel de `ajax_sync_page`.
         delete_transient('alegra_sync_cancelled');
 
+        // task-4: self-heal BEFORE the checks. Close abandoned chunked runs
+        // (browser closed / request killed) so a dead owner never blocks a new
+        // import.
+        \Alegra\Connector\Runs::mark_abandoned(180);
+
         // D-D (Oracle): `ajax_sync_start` debe ser ATÓMICO. Sin lock, dos arranques
         // concurrentes (doble clic / dos pestañas) pasan AMBOS el read-check de
         // abajo y llaman `Run_Context::begin()` + `set_transient()`: el segundo
         // pisa el `run_id`/`start` del primero y deja un run `running` huérfano.
         // Se toma el MISMO lock per-type que usa `ajax_sync_page` y se mantiene
         // durante: lectura del estado + begin() + set_transient().
+        //
+        // task-4 / task-6: if the lock cannot be acquired, only reclaim it when
+        // it is PROVABLY stale. A FRESH lock may belong to an in-flight starter
+        // (a request that acquired the lock but has not yet created its run row
+        // or its first heartbeat); "no live run" is NOT enough to reclaim it —
+        // doing so would let two starts proceed and clobber each other (the D-D
+        // bug the lock exists to prevent). The lock's age comes from
+        // `expires - 300` (the TTL acquire_sync_lock uses). An EXPIRED lock is
+        // already reclaimed by acquire_lock(); this gate covers the 180-300s
+        // stale window. `has_genuinely_live_run($type)` is scoped to the same
+        // entity so a live run of a different type never over-blocks.
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($type);
         if ($lock === false) {
-            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+            $lock_option = 'alegra_lock_alegra_sync_running_' . $type;
+            $existing    = get_option($lock_option);
+            $acquired_at = (is_array($existing) && isset($existing['expires']))
+                ? ((int) $existing['expires'] - 300)
+                : PHP_INT_MAX;
+            if (self::has_genuinely_live_run($type) || (time() - $acquired_at) < 180) {
+                wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+            }
+            \Alegra\Connector\Sync\Controller::force_release_sync_lock($type);
+            $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public($type);
+            if ($lock === false) {
+                wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+            }
         }
 
         try {
@@ -5542,10 +5580,200 @@ class Admin_Dashboard
             \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Cancelado por el usuario');
         }
 
-        set_transient('alegra_sync_cancelled', 1, 120);
+        // task-4: cancel must leave ZERO residue. The previous version set
+        // `alegra_sync_cancelled` and left the per-type lock held, so a new
+        // start was rejected ("Ya hay una importación en curso") until the TTL.
+        // Now the lock is force-released for the state's type and every import
+        // transient is deleted, so the merchant can immediately re-import.
+        $type = is_array($state) ? (string) ($state['type'] ?? 'products') : 'products';
+        \Alegra\Connector\Sync\Controller::force_release_sync_lock($type);
+
         delete_transient('alegra_sync_progress');
         delete_transient('alegra_batch_state');
+        delete_transient('alegra_sync_cancelled');
         wp_send_json_success(['message' => __('Sincronización cancelada', 'alegra-connector')]);
+    }
+
+    /**
+     * AJAX: force-release every import lock and clear all import residue.
+     *
+     * The permanent escape hatch when an import is stuck (browser died, page
+     * fataled, the Cancel button never reached the server). It clears the four
+     * per-type sync locks, the batch state/progress/cancel transients, closes
+     * abandoned chunked runs and marks any still-`running` chunked run `stale`.
+     * It deliberately does NOT touch the kill switch (that is "Detener Todos",
+     * a different, heavier action).
+     */
+    public function ajax_release_import(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) wp_send_json_error();
+
+        foreach (['products', 'customers', 'orders', 'categories'] as $type) {
+            \Alegra\Connector\Sync\Controller::force_release_sync_lock($type);
+        }
+
+        delete_transient('alegra_batch_state');
+        delete_transient('alegra_sync_progress');
+        delete_transient('alegra_sync_cancelled');
+
+        // Close heartbeat-expired chunked runs, then force any remainder that
+        // is still `running` (younger than the grace window) to `stale`: the
+        // admin explicitly asked to release, so age must not keep them alive.
+        \Alegra\Connector\Runs::mark_abandoned(180);
+
+        global $wpdb;
+        $table     = $wpdb->prefix . 'alegra_runs';
+        $running   = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM $table WHERE status = 'running' AND run_type = 'chunked_import' LIMIT 50"
+        ));
+        foreach ((array) $running as $row) {
+            $run_id = (int) ($row->id ?? 0);
+            if ($run_id <= 0) {
+                continue;
+            }
+            $wpdb->update($table, [
+                'status'         => 'stale',
+                'finished_at'    => current_time('mysql'),
+                'error_summary'  => __('Importación liberada por el administrador', 'alegra-connector'),
+            ], ['id' => $run_id]);
+        }
+
+        $this->log('warning', 'Import locks released by user');
+
+        wp_send_json_success(['message' => __('Importación liberada. Ya podés reimportar.', 'alegra-connector')]);
+    }
+
+    /**
+     * True when a run is genuinely live: still `running` AND with a fresh
+     * heartbeat (TTL 120 s). A run whose browser died keeps its `running` row
+     * until mark_abandoned() closes it, so the heartbeat is the real liveness
+     * signal.
+     *
+     * When $type is given, only runs that can own that entity's per-type lock
+     * count: a chunked run owns the lock of the entity in its batch state, and
+     * a cron/manual/webhook run can hold any per-type lock. This avoids
+     * over-blocking a start because an unrelated live run exists.
+     *
+     * @param string|null $type Entity type ('products'|'customers'|...) or null for any.
+     */
+    public static function has_genuinely_live_run(?string $type = null): bool
+    {
+        $batch      = get_transient('alegra_batch_state');
+        $batch_type = is_array($batch) ? (string) ($batch['type'] ?? '') : '';
+        $batch_run  = is_array($batch) ? (int) ($batch['run_id'] ?? 0) : 0;
+
+        foreach (\Alegra\Connector\Runs::currently_running() as $run) {
+            $rid = (int) ($run->id ?? 0);
+            if (\Alegra\Connector\Heartbeat::get($rid) === null) {
+                continue;
+            }
+            if ($type === null) {
+                return true;
+            }
+            if ((string) ($run->run_type ?? '') === 'chunked_import') {
+                if ($rid === $batch_run && $batch_type === $type) {
+                    return true;
+                }
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Detect leftover import residue for the persistent Products-page banner.
+     *
+     * Returns the first applicable reason (priority: batch state → live run →
+     * stale run → held lock) plus the inferred type/run_id. Read-only: it does
+     * NOT mark runs stale, so a stale run stays visible (and releasable).
+     *
+     * @return array{active:bool,reason:string,type:string,run_id:int,live:bool,lock:bool}
+     */
+    public static function import_residue_status(): array
+    {
+        $type   = 'products';
+        $run_id = 0;
+        $live   = false;
+        $reason = '';
+
+        $state = get_transient('alegra_batch_state');
+        if (is_array($state)) {
+            $reason = 'batch_state';
+            $type   = (string) ($state['type'] ?? 'products');
+            $run_id = (int) ($state['run_id'] ?? 0);
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_runs';
+        $rows  = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM $table WHERE status = 'running' AND run_type = 'chunked_import' LIMIT 50"
+        ));
+        foreach ((array) $rows as $row) {
+            $rid = (int) ($row->id ?? 0);
+            if ($rid <= 0) {
+                continue;
+            }
+            if ($run_id === 0) {
+                $run_id = $rid;
+            }
+            if (\Alegra\Connector\Heartbeat::get($rid) !== null) {
+                $live = true;
+                if ($reason === '') {
+                    $reason = 'live_run';
+                }
+            } elseif ($reason === '') {
+                $reason = 'stale_run';
+            }
+        }
+
+        $lock_held = false;
+        foreach (self::import_locks_status() as $lock) {
+            if (!empty($lock['held'])) {
+                $lock_held = true;
+                break;
+            }
+        }
+        if ($reason === '' && $lock_held) {
+            $reason = 'lock';
+        }
+
+        return [
+            'active' => $reason !== '',
+            'reason' => $reason,
+            'type'   => $type,
+            'run_id' => $run_id,
+            'live'   => $live,
+            'lock'   => $lock_held,
+        ];
+    }
+
+    /**
+     * Per-type import lock state (held + expiry) for the diagnostics panel.
+     *
+     * Read-only: it inspects the `alegra_lock_alegra_sync_running_<type>`
+     * options without touching them. `expires_in` is seconds until the lock's
+     * TTL reclaims it (null when the lock is free).
+     *
+     * @return array<string, array{held:bool,expires:?int,expires_in:?int}>
+     */
+    public static function import_locks_status(): array
+    {
+        $now = time();
+        $out = [];
+        foreach (['products', 'customers', 'orders', 'categories'] as $type) {
+            $lock_option = 'alegra_lock_alegra_sync_running_' . $type;
+            $value       = get_option($lock_option, false);
+            $held        = is_array($value);
+            $expires     = ($held && isset($value['expires'])) ? (int) $value['expires'] : null;
+            $out[$type] = [
+                'held'       => $held,
+                'expires'    => $expires,
+                'expires_in' => $expires !== null ? max(0, $expires - $now) : null,
+            ];
+        }
+        return $out;
     }
 
     public function ajax_register_webhooks(): void
@@ -6352,6 +6580,13 @@ class Admin_Dashboard
 
         // Activate kill switch
         \Alegra\Connector\Kill_Switch::activate('emergency_stop');
+
+        // task-4: also release the per-type import locks. The transient sweep
+        // below only removes `_transient_alegra_%`; the `alegra_lock_*` options
+        // are options, not transients, so they survived and re-blocked imports.
+        foreach (['products', 'customers', 'orders', 'categories'] as $type) {
+            \Alegra\Connector\Sync\Controller::force_release_sync_lock($type);
+        }
 
         // Clear all batch transients
         global $wpdb;
