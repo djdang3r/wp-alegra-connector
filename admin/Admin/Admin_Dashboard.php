@@ -2980,13 +2980,28 @@ class Admin_Dashboard
         $per_page = 30;
         // Alegra rejects `limit > 30` on GET /items (documented: "Si este valor
         // es mayor que 30, la aplicación retorna error."), so 30 is both our
-        // page size and the API ceiling. Cap the pagination at 100 pages × 30 =
-        // 3000 items; the dropdown is a human UI and more items would hurt more
-        // than help. If a store has more, the AJAX refresh with a search filter
-        // will narrow it.
+        // page size and the API ceiling.
+        //
+        // PERF (Configuración slowness): narrow the fetch SERVER-SIDE with the
+        // documented `query` param — it matches items whose `name` OR
+        // `reference` CONTAINS the given text. Only the plugin's own shipping
+        // items carry the reserved `alegra-connector-shipping:` prefix, so
+        // Alegra returns just those few rows instead of us paginating the WHOLE
+        // catalogue (formerly up to 100 pages × 30) on every cache miss merely
+        // to drop the non-shipping rows client-side.
+        //
+        // The narrowed result set is tiny, but keep a defensive cap so a
+        // pathological account can never loop forever: 10 pages × 30 = 300
+        // shipping items. The client-side prefix check below stays as the
+        // precise Option-1 filter (the server `query` is only a coarse narrowing).
+        $query = 'alegra-connector-shipping';
         $fetch_error = false;
-        for ($page = 0; $page < 100; $page++) {
-            $batch = $this->api->get_items(['start' => $start, 'limit' => $per_page]);
+        for ($page = 0; $page < 10; $page++) {
+            $batch = $this->api->get_items([
+                'start' => $start,
+                'limit' => $per_page,
+                'query' => $query,
+            ]);
             if (is_wp_error($batch)) {
                 $fetch_error = true;
                 break;

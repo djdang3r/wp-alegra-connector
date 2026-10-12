@@ -14233,31 +14233,56 @@ TestRunner::test('T60.8 I3: creating a shipping item invalidates BOTH the list a
     TestRunner::assertSame($created_id, (string) ($refMap['alegra-connector-shipping:flat_rate:99'] ?? ''), 'I3: el ítem creado aparece en el ref-map');
 });
 
-TestRunner::test('T60.9 I4: a large catalogue is listed and resolved in the same single pass (no N+1)', function (): void {
+TestRunner::test('T60.9 I4: a large catalogue is NOT walked — GET /items is narrowed server-side by `query` (Configuración slowness fix)', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_connection_tested', true);
-    // 3050 items, HALF of them the plugin's shipping items. Option 1 keeps ONLY
-    // the shipping items in the returned list, while the fetch still paginates
-    // 100 pages × 30 = 3000 items (the non-shipping rows are read and dropped).
-    for ($i = 0; $i < 3050; $i++) {
-        $is_shipping = ($i % 2 === 0);
-        alegra_mock_seed_item('it' . $i, [
-            'name' => 'Item ' . $i,
-            'reference' => $is_shipping
-                ? 'alegra-connector-shipping:flat_rate:' . $i
-                : 'PROD-' . $i,
+    // REGRESSION (Configuración slowness): a big catalogue + a handful of the
+    // plugin's shipping items. The dropdown must narrow server-side with
+    // `query=alegra-connector-shipping` (documented: name OR reference substring)
+    // so Alegra returns only the shipping items. Before the fix it paginated the
+    // WHOLE catalogue (100 pages × 30) on every cache miss just to drop the
+    // non-shipping rows client-side.
+    for ($i = 0; $i < 3000; $i++) {
+        alegra_mock_seed_item('prod' . $i, [
+            'name'     => 'Producto ' . $i,
+            'reference' => 'PROD-' . $i,
         ]);
     }
+    alegra_mock_seed_item('8001', ['name' => 'Ajuste', 'reference' => 'alegra-connector-adjustment']);
+    alegra_mock_seed_item('7001', ['name' => 'Fijo', 'reference' => 'alegra-connector-shipping:flat_rate:5']);
+    alegra_mock_seed_item('7002', ['name' => 'Pereira', 'reference' => 'alegra-connector-shipping:flat_rate:7']);
 
     $admin = t60_admin();
-    $list = $admin->get_alegra_items_for_shipping_select();
-    // Pages 0..99 fetch it0..it2999; even indices 0..2998 ⇒ 1500 shipping items.
-    TestRunner::assertSame(1500, count($list), 'I4: solo vuelven los ítems de envío (1500 de los 3000 leídos)');
-    TestRunner::assertSame(100, alegra_mock_count('GET', '/items'), 'I4: exactamente 100 GET /items (paginación del listado a 30/página, sin llamadas extra)');
+    $list = $admin->get_alegra_items_for_shipping_select(true);
 
+    // (a) Only the shipping items come back (Option-1 semantics preserved).
+    TestRunner::assertCount(2, $list, 'I4: solo vuelven los 2 ítems de envío del plugin');
+    TestRunner::assertArrayHasKey('7001', $list, 'I4: el ítem de envío :5 aparece');
+    TestRunner::assertArrayHasKey('7002', $list, 'I4: el ítem de envío :7 aparece');
+    TestRunner::assertArrayNotHasKey('8001', $list, 'I4: el genérico adjustment NO aparece');
+    TestRunner::assertArrayNotHasKey('prod0', $list, 'I4: ningún ítem del catálogo aparece');
+
+    // (b) The catalogue is NOT walked: at most 2 GET /items calls.
+    $calls = alegra_mock_count('GET', '/items');
+    TestRunner::assertTrue($calls <= 2, 'I4: el catálogo NO se recorre — a lo sumo 2 GET /items (observado=' . $calls . ')');
+
+    // Every GET /items must carry the server-side narrowing param.
+    foreach (alegra_mock_requests('GET', '/items') as $req) {
+        TestRunner::assertSame(
+            'alegra-connector-shipping',
+            (string) ($req['query']['query'] ?? ''),
+            'I4: cada GET /items acota con query=alegra-connector-shipping'
+        );
+        TestRunner::assertTrue(
+            (int) ($req['query']['limit'] ?? 0) <= 30,
+            'I4: ningún GET /items pide limit > 30'
+        );
+    }
+
+    // The reference map is still built in the SAME pass (no extra GET /items).
     $refMap = $admin->get_shipping_reference_map();
-    TestRunner::assertSame(1500, count($refMap), 'I4: el ref-map se construyó en el MISMO pase (1500 references)');
-    TestRunner::assertSame(100, alegra_mock_count('GET', '/items'), 'I4: resolver el ref-map NO agregó GET /items');
+    TestRunner::assertSame('7001', (string) ($refMap['alegra-connector-shipping:flat_rate:5'] ?? ''), 'I4: el ref-map se construye en el mismo pase');
+    TestRunner::assertSame($calls, alegra_mock_count('GET', '/items'), 'I4: resolver el ref-map NO agrega GET /items');
 });
 
 TestRunner::test('T60.14 I4b: the shipping dropdown never asks GET /items for limit > 30 (Alegra cap)', function (): void {
