@@ -96,6 +96,8 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_remove_shipping_mapping', [$this, 'ajax_remove_shipping_mapping']);
         // task-9: read-only image-import diagnostic probe (Monitor panel).
         add_action('wp_ajax_alegra_probe_images', [$this, 'ajax_probe_images']);
+        // task-15: non-destructive "Reparar imágenes" (Monitor panel), chunked.
+        add_action('wp_ajax_alegra_repair_images', [$this, 'ajax_repair_images']);
     }
 
     /**
@@ -1050,6 +1052,18 @@ class Admin_Dashboard
             'diagProbeLive'         => __('viva', 'alegra-connector'),
             'diagProbeStale'        => __('muerta', 'alegra-connector'),
             'diagProbeNone'         => __('ninguna', 'alegra-connector'),
+            // task-15: non-destructive "Reparar imágenes" (Monitor panel).
+            'repairImagesButton'    => __('Reparar imágenes', 'alegra-connector'),
+            'repairImagesConfirm'   => __('¿Reparar las imágenes rotas de los productos importados? No se borran productos ni archivos; sólo se limpian referencias muertas y se reimportan imágenes.', 'alegra-connector'),
+            'repairImagesRunning'   => __('Reparando imágenes...', 'alegra-connector'),
+            'repairImagesDone'      => __('Reparación de imágenes completada.', 'alegra-connector'),
+            'repairImagesBusy'      => __('Ya hay una reparación de imágenes en curso. Esperá a que termine.', 'alegra-connector'),
+            'repairImagesTitle'     => __('Reparación de imágenes', 'alegra-connector'),
+            'repairImagesNoData'    => __('Sin reparaciones todavía.', 'alegra-connector'),
+            'repairProcessed'       => __('Procesados', 'alegra-connector'),
+            'repairRefsCleaned'     => __('Refs limpiadas', 'alegra-connector'),
+            'repairImagesDownloaded'=> __('Imágenes bajadas', 'alegra-connector'),
+            'repairStillMissing'    => __('Aún sin imagen', 'alegra-connector'),
 
             // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
             'cfVerifying'           => __('Verificando...', 'alegra-connector'),
@@ -6049,6 +6063,227 @@ class Admin_Dashboard
         }
 
         wp_send_json_success(self::build_image_probe_report($this->api));
+    }
+
+    /**
+     * task-15: repair broken image references on imported products (chunked).
+     *
+     * Client-driven cursor: the Monitor JS calls this repeatedly with an
+     * increasing `offset` until the response says `done`. Each call processes
+     * one chunk. Idempotent — re-running is always safe. NON-DESTRUCTIVE: it
+     * never deletes a product or an attachment.
+     *
+     * Concurrency (Oracle 3a): one run holds a lock (acquired on start,
+     * released on done/error) so a double-click or two admins cannot interleave.
+     * Summary (Oracle 3c): totals are accumulated across chunks and the
+     * ACCUMULATED values are persisted, so the Monitor card survives a reload
+     * with the run total — not the last chunk's partials.
+     */
+    public function ajax_repair_images(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        $offset = max(0, (int) ($_POST['offset'] ?? 0));
+        $chunk  = 20;
+
+        // (3a) Run-scoped lock. Acquired on the first chunk and REFRESHED on
+        // every chunk (Oracle: a full-catalog run exceeds a single TTL) so the
+        // lock lives as long as the active run; released on done/error. The
+        // token transient shares the TTL and is refreshed alongside. The lock
+        // option name is built by Controller, so no hard-coded literal appears.
+        $lock_token = (string) get_transient('alegra_repair_images_lock_token');
+        if ($offset === 0) {
+            $lock_token = (string) \Alegra\Connector\Sync\Controller::acquire_lock('repair_images', 600);
+            if ($lock_token === '') {
+                wp_send_json_error(['message' => __('Ya hay una reparación de imágenes en curso. Esperá a que termine.', 'alegra-connector')]);
+            }
+        } elseif ($lock_token !== ''
+            && \Alegra\Connector\Sync\Controller::refresh_lock('repair_images', $lock_token, 600)) {
+            // Still ours: extended for the next chunk.
+        } else {
+            // Token lost/lapsed: re-acquire (fails only if another run holds it).
+            $lock_token = (string) \Alegra\Connector\Sync\Controller::acquire_lock('repair_images', 600);
+            if ($lock_token === '') {
+                wp_send_json_error(['message' => __('Ya hay una reparación de imágenes en curso. Esperá a que termine.', 'alegra-connector')]);
+            }
+        }
+        set_transient('alegra_repair_images_lock_token', $lock_token, 600);
+        if ($offset === 0) {
+            delete_transient('alegra_repair_images_progress');
+        }
+
+        try {
+            $result = self::repair_images_chunk($offset, $chunk, $this->api, $this->logger);
+        } catch (\Throwable $e) {
+            // (3a) release on error so a crashed chunk does not wedge the lock.
+            if ($lock_token !== '') {
+                \Alegra\Connector\Sync\Controller::release_lock('repair_images', $lock_token);
+            }
+            delete_transient('alegra_repair_images_lock_token');
+            $this->log('error', 'Image repair chunk failed', ['error' => $e->getMessage(), 'offset' => $offset]);
+            wp_send_json_error(['message' => __('Error al reparar imágenes.', 'alegra-connector')]);
+        }
+
+        $done = !empty($result['done']);
+
+        // (3c) Accumulate totals across chunks (LOW: the progress transient uses
+        // an hour-long TTL so a slow inter-chunk gap never loses the totals).
+        $progress = get_transient('alegra_repair_images_progress');
+        if (!is_array($progress)) {
+            $progress = ['processed' => 0, 'referenced_cleaned' => 0, 'images_downloaded' => 0, 'still_missing' => 0, 'errors' => 0];
+        }
+        foreach (['processed', 'referenced_cleaned', 'images_downloaded', 'still_missing', 'errors'] as $k) {
+            $progress[$k] = (int) ($progress[$k] ?? 0) + (int) ($result[$k] ?? 0);
+        }
+
+        if ($done) {
+            $progress['done'] = true;
+            $progress['at']   = time();
+            set_transient('alegra_repair_images_summary', $progress, DAY_IN_SECONDS);
+            delete_transient('alegra_repair_images_progress');
+            if ($lock_token !== '') {
+                \Alegra\Connector\Sync\Controller::release_lock('repair_images', $lock_token);
+            }
+            delete_transient('alegra_repair_images_lock_token');
+            $result['totals'] = $progress;
+        } else {
+            set_transient('alegra_repair_images_progress', $progress, HOUR_IN_SECONDS);
+        }
+
+        wp_send_json_success($result);
+    }
+
+    /**
+     * One chunk of the image repair over imported products.
+     *
+     * Exposed as a static so the execution harness can drive it with a canned
+     * client. Processes every product that carries `_alegra_item_id`.
+     *
+     * @return array{done:bool,offset:int,next_offset:int,processed:int,referenced_cleaned:int,images_downloaded:int,still_missing:int,errors:int,message:string}
+     */
+    public static function repair_images_chunk(int $offset, int $chunk, ?API\Client $api, ?Logger\Logger $logger): array
+    {
+        $page = self::linked_products_page($offset, $chunk);
+        $ids  = $page['ids'];
+
+        $products = new \Alegra\Connector\Sync\Products($api, $logger);
+
+        $processed  = 0;
+        $cleaned    = 0;
+        $downloaded = 0;
+        $still_missing = 0;
+        $errors     = 0;
+
+        foreach ($ids as $product_id) {
+            $product_id = (int) $product_id;
+            $alegra_id  = (string) get_post_meta($product_id, '_alegra_item_id', true);
+            if ($alegra_id === '') {
+                continue;   // defensive: only imported products are repairable
+            }
+            $processed++;
+
+            // Fetch the item's current images. A failure/empty response leaves
+            // the product's dead refs cleaned but adds no false reference.
+            $images = [];
+            if ($api !== null) {
+                $item = $api->get_item($alegra_id);
+                if (is_array($item) && isset($item['images']) && is_array($item['images'])) {
+                    $images = $item['images'];
+                }
+            }
+
+            try {
+                $r = $products->repair_product_images($product_id, $images);
+            } catch (\Throwable $e) {
+                $errors++;
+                if ($logger !== null) {
+                    $logger->warning('Image repair failed for product', [
+                        'product_id' => $product_id,
+                        'error'      => $e->getMessage(),
+                    ]);
+                }
+                continue;
+            }
+
+            $cleaned    += (int) ($r['referenced_cleaned'] ?? 0);
+            $downloaded += (int) ($r['images_downloaded'] ?? 0);
+            if (!empty($r['still_missing'])) {
+                $still_missing++;
+            }
+        }
+
+        // `scanned` is the raw page size (all products); a short page means we
+        // reached the end of the catalog.
+        $done = $page['scanned'] < $chunk;
+
+        return [
+            'done'               => $done,
+            'offset'             => $offset,
+            'next_offset'        => $offset + $chunk,
+            'processed'          => $processed,
+            'referenced_cleaned' => $cleaned,
+            'images_downloaded'  => $downloaded,
+            'still_missing'      => $still_missing,
+            'errors'             => $errors,
+            'message'            => $done
+                ? __('Reparación de imágenes completada.', 'alegra-connector')
+                : __('Reparando imágenes...', 'alegra-connector'),
+        ];
+    }
+
+    /**
+     * One page of product ids that carry `_alegra_item_id`.
+     *
+     * Pages `wc_get_products` and keeps only linked products, so the cursor is
+     * the same in production and in the execution harness (a raw page shorter
+     * than the chunk means the end of the catalog). Non-linked products are
+     * skipped, never repaired.
+     *
+     * Includes `draft` products: inactive Alegra items are imported as drafts,
+     * so they must be repairable too. `return => 'ids'` avoids hydrating every
+     * WC_Product. The loop tolerates both ids (production) and objects (the
+     * harness stub ignores `return`).
+     *
+     * @return array{ids:int[],scanned:int}
+     */
+    private static function linked_products_page(int $offset, int $chunk): array
+    {
+        if ($chunk <= 0 || !function_exists('wc_get_products')) {
+            return ['ids' => [], 'scanned' => 0];
+        }
+
+        $page     = intdiv(max(0, $offset), $chunk) + 1;
+        $products = wc_get_products([
+            'limit'  => $chunk,
+            'page'   => $page,
+            'status' => ['publish', 'draft'],
+            'return' => 'ids',
+        ]);
+        if (empty($products)) {
+            return ['ids' => [], 'scanned' => 0];
+        }
+
+        $ids = [];
+        foreach ((array) $products as $product) {
+            if (is_object($product) && method_exists($product, 'get_id')) {
+                $pid = (int) $product->get_id();
+            } elseif (is_numeric($product)) {
+                $pid = (int) $product;
+            } else {
+                continue;
+            }
+            if ($pid <= 0) {
+                continue;
+            }
+            if ((string) get_post_meta($pid, '_alegra_item_id', true) !== '') {
+                $ids[] = $pid;
+            }
+        }
+
+        return ['ids' => $ids, 'scanned' => count($products)];
     }
 
     /**

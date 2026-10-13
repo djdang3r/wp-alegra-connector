@@ -545,6 +545,30 @@ class Controller
     }
 
     /**
+     * Extend a lock's TTL without changing ownership (token-guarded).
+     *
+     * Used by long, chunked admin operations (e.g. image repair) whose total
+     * runtime exceeds a single lock TTL: each chunk refreshes the lock so it
+     * lives as long as the active run. It NEVER clobbers another run's lock —
+     * the stored token must still match. Returns false when the lock is gone or
+     * owned by someone else (the caller should then re-acquire or abort).
+     *
+     * @param string $key   Same key passed to acquire_lock().
+     * @param string $token Token returned by acquire_lock().
+     * @return bool true when the lock is still ours and was extended.
+     */
+    public static function refresh_lock(string $key, string $token, int $ttl = 300): bool
+    {
+        $option   = 'alegra_lock_' . $key;
+        $existing = get_option($option);
+        if (!is_array($existing) || (string) ($existing['token'] ?? '') !== $token) {
+            return false;
+        }
+        update_option($option, ['token' => $token, 'expires' => time() + $ttl], 'no');
+        return true;
+    }
+
+    /**
      * Per-request registry of sync locks held by THIS process, with a nesting
      * depth. The cron controller and the admin AJAX handler both hold the
      * per-type lock and then call the entity import method, which holds the

@@ -2945,8 +2945,25 @@ class Products
      * task-10: an attachment id is only a valid dedup target when it is a LIVE
      * WordPress attachment. A stale id (deleted product / previous install)
      * must never short-circuit the download.
+     *
+     * task-15 (Oracle): offloaded media (S3/CDN, "remove local files") resolves
+     * `get_attached_file()` to an empty string or a URL; that must count as LIVE
+     * (the local-presence check only applies to genuine local absolute paths).
+     * A `alegra_connector_attachment_is_live` filter lets offload users override
+     * the verdict outright.
      */
     private static function attachment_is_live(int $attachment_id): bool
+    {
+        $live = self::attachment_is_live_unfiltered($attachment_id);
+        $file = $attachment_id > 0 ? get_attached_file($attachment_id) : '';
+        // Offload (S3/CDN) users may override the verdict entirely.
+        return (bool) apply_filters('alegra_connector_attachment_is_live', $live, $attachment_id, $file);
+    }
+
+    /**
+     * task-10/task-15: the default liveness verdict (before the filter).
+     */
+    private static function attachment_is_live_unfiltered(int $attachment_id): bool
     {
         if ($attachment_id <= 0) {
             return false;
@@ -2961,13 +2978,36 @@ class Products
         if ($status !== 'inherit' || get_post_type($attachment_id) !== 'attachment') {
             return false;
         }
-        // When the underlying file can be resolved it must still exist; when the
-        // path is unknown (empty) a valid attachment post is enough.
+
         $file = get_attached_file($attachment_id);
-        if (is_string($file) && $file !== '' && !file_exists($file)) {
+        // Only a LOCAL absolute path that is actually missing is "dead". An empty
+        // path or a non-local path (URL / stream wrapper / relative) is treated
+        // as live so offloaded media is never misdetected.
+        if (is_string($file) && $file !== '' && self::is_local_attachment_path($file) && !file_exists($file)) {
             return false;
         }
+
         return true;
+    }
+
+    /**
+     * task-15 (Oracle): whether the resolved attached-file value is a LOCAL
+     * absolute filesystem path. Offloaded media resolves to '' or a URL
+     * (http/s3/...), which must never be treated as "missing locally".
+     */
+    private static function is_local_attachment_path(string $path): bool
+    {
+        if ($path === '') {
+            return false;
+        }
+        // A scheme (http://, https://, s3://, phar://, ...) or URL-like value.
+        if (preg_match('#^[a-z][a-z0-9+.\-]*://#i', $path)) {
+            return false;
+        }
+        // Absolute POSIX path or Windows drive path.
+        return str_starts_with($path, '/')
+            || str_starts_with($path, '\\')
+            || (bool) preg_match('#^[A-Za-z]:[\\\\/]#', $path);
     }
 
     /**
@@ -3108,6 +3148,167 @@ class Products
     public function import_single_item_public(array $item, int $run_id = 0): bool|string
     {
         return $this->import_single_item_from_alegra($item, $run_id);
+    }
+
+    /**
+     * task-15: repair the image references of ONE imported product
+     * (NON-DESTRUCTIVE).
+     *
+     * It (1) drops dead image metas — a `_thumbnail_id` pointing at a
+     * non-existent attachment and dead ids inside `_product_image_gallery` —
+     * and (2) re-runs the EXISTING image import path ONLY when the product
+     * actually needs it (a dead ref was cleaned or it still has no live image).
+     * A HEALTHY product (live image, nothing cleaned) is left untouched, so its
+     * featured image is never reverted or changed.
+     *
+     * Oracle (MEDIUM 2): if the product already has a LIVE `_thumbnail_id`, it
+     * is snapshotted before the re-import and restored afterwards, so the
+     * import can never re-assert a different featured image on a working
+     * product (the import still fixes a MISSING/DEAD featured and the gallery).
+     *
+     * The re-import obeys the plugin configuration: it is skipped when
+     * `alegra_connector_sync_images` is off and uses
+     * `alegra_connector_sync_images_mode` (so a merchant on `favorite` /
+     * `except_favorite` keeps their exclusion; `all`/`except_favorite` exercise
+     * the 2.8.12 dedup fix naturally).
+     *
+     * It NEVER deletes posts/attachments, NEVER touches `_alegra_item_id` and
+     * NEVER writes any product field other than the image metas. It does NOT
+     * reset the shared image counters (repair-local delta only).
+     *
+     * @param array $images Alegra item images (same shape the importer consumes).
+     * @return array{referenced_cleaned:int,images_downloaded:int,images_failed:int,still_missing:bool}
+     */
+    public function repair_product_images(int $product_id, array $images): array
+    {
+        $cleaned      = self::clean_dead_image_refs($product_id);
+        $needs_import = $cleaned > 0 || !self::product_has_live_image($product_id);
+
+        // Snapshot a LIVE featured image (after cleanup removed any dead one) so
+        // the re-import cannot re-assert it to a different image.
+        $preserved_thumbnail = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($preserved_thumbnail > 0 && !self::attachment_is_live($preserved_thumbnail)) {
+            $preserved_thumbnail = 0;
+        }
+
+        // Read the shared counters as a delta instead of resetting them: the
+        // static registry is shared with any concurrent/looping import.
+        $before = self::image_stats();
+        if ($needs_import
+            && !empty($images)
+            && get_option('alegra_connector_sync_images', true)) {
+            $mode = (string) get_option('alegra_connector_sync_images_mode', 'favorite');
+            $this->import_product_images($product_id, $images, $mode);
+        }
+        $after = self::image_stats();
+
+        // Restore a working featured image the import may have replaced.
+        if ($preserved_thumbnail > 0) {
+            self::restore_preserved_thumbnail($product_id, $preserved_thumbnail);
+        }
+
+        return [
+            'referenced_cleaned' => $cleaned,
+            'images_downloaded'  => max(0, (int) ($after['ok'] ?? 0) - (int) ($before['ok'] ?? 0)),
+            'images_failed'      => max(0, (int) ($after['failed'] ?? 0) - (int) ($before['failed'] ?? 0)),
+            'still_missing'      => !self::product_has_live_image($product_id),
+        ];
+    }
+
+    /**
+     * task-15 (Oracle MEDIUM 2): restore a pre-existing LIVE featured image that
+     * an image re-import may have re-asserted to a different attachment.
+     * Idempotent and non-destructive: only writes `_thumbnail_id` back to its
+     * own previous value, and only when it is still a live attachment.
+     */
+    private static function restore_preserved_thumbnail(int $product_id, int $preserved_id): void
+    {
+        if ($preserved_id <= 0 || !self::attachment_is_live($preserved_id)) {
+            return;
+        }
+        $current = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($current !== $preserved_id) {
+            update_post_meta($product_id, '_thumbnail_id', $preserved_id);
+        }
+    }
+
+    /**
+     * task-15: remove dead image references from a product (non-destructive).
+     *
+     * Deletes `_thumbnail_id` when it points at a dead attachment and rewrites
+     * `_product_image_gallery` keeping only live ids. Returns the number of
+     * dead references removed. The attachment posts themselves are NEVER
+     * deleted (out of scope).
+     */
+    private static function clean_dead_image_refs(int $product_id): int
+    {
+        $cleaned = 0;
+
+        $thumb = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($thumb > 0 && !self::attachment_is_live($thumb)) {
+            delete_post_meta($product_id, '_thumbnail_id');
+            $cleaned++;
+        }
+
+        $raw = get_post_meta($product_id, '_product_image_gallery', true);
+        if (is_array($raw)) {
+            $raw = implode(',', array_map('strval', $raw));
+        }
+        $raw = (string) $raw;
+        if ($raw !== '') {
+            $ids = [];
+            foreach (explode(',', $raw) as $part) {
+                $id = (int) trim($part);
+                if ($id > 0) {
+                    $ids[] = $id;
+                }
+            }
+            $ids = array_values(array_unique($ids));
+
+            $live = [];
+            foreach ($ids as $id) {
+                if (self::attachment_is_live($id)) {
+                    $live[] = $id;
+                } else {
+                    $cleaned++;
+                }
+            }
+
+            if (count($live) !== count($ids)) {
+                if (empty($live)) {
+                    delete_post_meta($product_id, '_product_image_gallery');
+                } else {
+                    update_post_meta($product_id, '_product_image_gallery', implode(',', $live));
+                }
+            }
+        }
+
+        return $cleaned;
+    }
+
+    /**
+     * task-15: true when the product still has at least one LIVE image
+     * reference (featured or gallery). Read-only.
+     */
+    private static function product_has_live_image(int $product_id): bool
+    {
+        $thumb = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($thumb > 0 && self::attachment_is_live($thumb)) {
+            return true;
+        }
+
+        $raw = get_post_meta($product_id, '_product_image_gallery', true);
+        if (is_array($raw)) {
+            $raw = implode(',', array_map('strval', $raw));
+        }
+        foreach (explode(',', (string) $raw) as $part) {
+            $id = (int) trim($part);
+            if ($id > 0 && self::attachment_is_live($id)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function import_product_image(int $product_id, string $image_url): void

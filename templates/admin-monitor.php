@@ -57,8 +57,33 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             <span class="dashicons dashicons-images-alt2" style="font-size:12px;width:12px;height:12px;"></span>
             <?php esc_html_e('Probar imágenes (1 producto)', 'alegra-connector'); ?>
         </button>
+        <!-- task-15: non-destructive image repair (chunked, resumable). -->
+        <button type="button" class="ac-btn ac-btn-xs ac-btn-danger" id="alegra-repair-images" style="margin-left:6px;">
+            <span class="dashicons dashicons-update" style="font-size:12px;width:12px;height:12px;"></span>
+            <?php esc_html_e('Reparar imágenes', 'alegra-connector'); ?>
+        </button>
         <div id="ac-monitor-image-probe" style="margin-top:8px;font-size:12px;color:var(--ac-text-secondary);">
             <p style="color:var(--ac-text-muted);"><?php esc_html_e('Prueba de solo lectura: no descarga ni importa imágenes.', 'alegra-connector'); ?></p>
+        </div>
+        <?php $ac_repair = get_transient('alegra_repair_images_summary'); $ac_repair = is_array($ac_repair) ? $ac_repair : null; ?>
+        <div id="ac-monitor-image-repair" style="margin-top:8px;font-size:12px;color:var(--ac-text-secondary);">
+            <div style="font-weight:600;"><?php esc_html_e('Reparación de imágenes', 'alegra-connector'); ?></div>
+            <div>
+                <?php esc_html_e('Procesados', 'alegra-connector'); ?>:
+                <span id="ac-repair-processed"><?php echo esc_html((int) ($ac_repair['processed'] ?? 0)); ?></span>
+            </div>
+            <div>
+                <?php esc_html_e('Refs limpiadas', 'alegra-connector'); ?>:
+                <span id="ac-repair-cleaned"><?php echo esc_html((int) ($ac_repair['referenced_cleaned'] ?? 0)); ?></span>
+            </div>
+            <div>
+                <?php esc_html_e('Imágenes bajadas', 'alegra-connector'); ?>:
+                <span id="ac-repair-downloaded"><?php echo esc_html((int) ($ac_repair['images_downloaded'] ?? 0)); ?></span>
+            </div>
+            <div>
+                <?php esc_html_e('Aún sin imagen', 'alegra-connector'); ?>:
+                <span id="ac-repair-missing"><?php echo esc_html((int) ($ac_repair['still_missing'] ?? 0)); ?></span>
+            </div>
         </div>
     </div>
 </div>
@@ -532,6 +557,57 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                     $out.empty().append($('<div>').css('color', 'var(--ac-danger)').text(S.connectionError));
                 }
             });
+        });
+
+        // task-15: non-destructive image repair. Client-driven chunked loop;
+        // the server is stateless per chunk and idempotent. Results are painted
+        // into the summary card with .text() only.
+        $(document).on('click', '#alegra-repair-images', function() {
+            if (!confirm(S.repairImagesConfirm)) return;
+            var $btn = $(this).prop('disabled', true);
+            var totals = { processed: 0, referenced_cleaned: 0, images_downloaded: 0, still_missing: 0, errors: 0 };
+            var chunk = 20;
+
+            function paint() {
+                $('#ac-repair-processed').text(totals.processed);
+                $('#ac-repair-cleaned').text(totals.referenced_cleaned);
+                $('#ac-repair-downloaded').text(totals.images_downloaded);
+                $('#ac-repair-missing').text(totals.still_missing);
+            }
+
+            function step(offset) {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    data: { action: 'alegra_repair_images', _ajax_nonce: monitorNonce, offset: offset },
+                    success: function(r) {
+                        if (!r || !r.success) {
+                            $btn.prop('disabled', false);
+                            showNotice((r && r.data && r.data.message) || S.error, 'error');
+                            return;
+                        }
+                        var d = r.data || {};
+                        totals.processed += (d.processed || 0);
+                        totals.referenced_cleaned += (d.referenced_cleaned || 0);
+                        totals.images_downloaded += (d.images_downloaded || 0);
+                        totals.still_missing += (d.still_missing || 0);
+                        totals.errors += (d.errors || 0);
+                        paint();
+                        if (d.done) {
+                            $btn.prop('disabled', false);
+                            showNotice(d.message || S.repairImagesDone, 'success');
+                        } else {
+                            step(d.next_offset != null ? d.next_offset : (offset + chunk));
+                        }
+                    },
+                    error: function() {
+                        $btn.prop('disabled', false);
+                        showNotice(S.connectionError, 'error');
+                    }
+                });
+            }
+
+            step(0);
         });
 
         // Run cron now

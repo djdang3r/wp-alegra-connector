@@ -15512,4 +15512,335 @@ TestRunner::test('T75.2 la UI renderiza el desglose con .text() y strings nuevos
     }
 });
 
+// ===========================================================================
+// === task-15: "Reparar imágenes" (non-destructive image repair) ===========
+// ===========================================================================
+echo "\nT76 — Reparar imágenes (limpieza de refs muertas + reimport de imágenes)\n";
+
+/** Crea un attachment vivo en el harness (wp_posts + postmeta). */
+function alegra_make_live_attachment(int $id): int
+{
+    $GLOBALS['wp_posts'][$id] = (object) ['ID' => $id, 'post_type' => 'attachment', 'post_status' => 'inherit'];
+    return $id;
+}
+
+TestRunner::test('T76.1 repair_product_images limpia un _thumbnail_id muerto', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'R1']);
+    update_post_meta(10, '_thumbnail_id', 9999);   // 9999 no existe
+
+    $r = make_products()->repair_product_images(10, []);
+
+    TestRunner::assertSame('', (string) get_post_meta(10, '_thumbnail_id', true), 'el thumb muerto se borra');
+    TestRunner::assertSame(1, (int) $r['referenced_cleaned'], 'una ref limpiada');
+    TestRunner::assertTrue((bool) $r['still_missing'], 'sin imagen viva tras limpiar');
+});
+
+TestRunner::test('T76.2 repair_product_images quita la galería muerta y conserva la viva', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'R2']);
+    $live = alegra_make_live_attachment(7200);
+    update_post_meta(10, '_product_image_gallery', $live . ',7201');  // 7201 muerto
+
+    $r = make_products()->repair_product_images(10, []);
+
+    TestRunner::assertSame((string) $live, (string) get_post_meta(10, '_product_image_gallery', true), 'sólo queda la viva');
+    TestRunner::assertSame(1, (int) $r['referenced_cleaned'], 'una ref muerta limpiada');
+    TestRunner::assertFalse((bool) $r['still_missing'], 'queda una imagen viva');
+});
+
+TestRunner::test('T76.3 una dedup muerta se re-descarga (dedup bypasseado) y limpia el mapa', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'R3']);
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');   // dedup-aware branch
+
+    $url  = 'https://cdn3.alegra.com/dead.png';
+    $hash = md5($url);
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', 9999);
+    update_post_meta(9999, '_alegra_image_url_hash', $hash);
+    update_post_meta(10, '_thumbnail_id', 9999);   // apunta a la dedup muerta
+
+    $r = make_products()->repair_product_images(10, [
+        ['id' => 'i1', 'url' => $url, 'favorite' => true],
+    ]);
+
+    // El harness no puede descargar (download_url devuelve WP_Error): lo que se
+    // prueba es que NO deduplica hacia el ghost y reintenta la descarga (T74.1).
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa muerto se elimina (no deduplica)');
+    TestRunner::assertTrue((int) $r['images_failed'] >= 1, 'intenta la descarga (no dedup)');
+    TestRunner::assertSame('', (string) get_post_meta(10, '_thumbnail_id', true), 'el thumb muerto se borró');
+    TestRunner::assertTrue((bool) $r['still_missing'], 'sigue sin imagen (descarga falló en el harness)');
+});
+
+TestRunner::test('T76.4 una dedup VIVA se resuelve sin re-descargar ni fallar', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'R4']);
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');   // dedup-aware branch
+
+    $url  = 'https://cdn3.alegra.com/live.png';
+    $hash = md5($url);
+    $att  = alegra_make_live_attachment(7300);
+    update_post_meta($att, '_alegra_image_url_hash', $hash);
+    update_post_meta($att, '_alegra_image_url', $url);
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $att);
+
+    $r = make_products()->repair_product_images(10, [['id' => 'i1', 'url' => $url, 'favorite' => true]]);
+
+    TestRunner::assertSame(0, (int) $r['images_failed'], 'dedup viva: no falla la descarga');
+    TestRunner::assertSame(0, (int) $r['images_downloaded'], 'dedup viva: no re-descarga');
+    TestRunner::assertSame($att, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa vivo se conserva');
+});
+
+TestRunner::test('T76.5 ajax_repair_images cierra un producto sin imágenes sin falsa referencia', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'NoImg']);
+    update_post_meta(10, '_alegra_item_id', 'it-noimg');
+    update_post_meta(10, '_thumbnail_id', 8888);            // muerto
+    alegra_make_product(11, ['name' => 'NoLink']);          // sin _alegra_item_id
+    alegra_mock_seed_item('it-noimg', ['name' => 'NoImg', 'reference' => 'SNI']);   // sin 'images'
+
+    $_POST['offset'] = 0;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+
+    TestRunner::assertTrue($resp->success, 'responde success');
+    $d = $resp->payload;
+    TestRunner::assertTrue((bool) $d['done'], 'un solo chunk termina');
+    TestRunner::assertSame(1, (int) $d['processed'], 'procesó SÓLO el producto vinculado');
+    TestRunner::assertSame(1, (int) $d['referenced_cleaned'], 'limpió el thumb muerto');
+    TestRunner::assertSame(1, (int) $d['still_missing'], 'queda sin imagen');
+    TestRunner::assertSame(0, (int) $d['images_downloaded'], 'no bajó nada');
+    TestRunner::assertSame('', (string) get_post_meta(10, '_thumbnail_id', true), 'sin falsa referencia');
+});
+
+TestRunner::test('T76.6 la reparación no contiene borrados destructivos (source-scan)', function (): void {
+    foreach (['repair_product_images', 'clean_dead_image_refs'] as $m) {
+        $src = alegra_method_source(\Alegra\Connector\Sync\Products::class, $m);
+        TestRunner::assertStringNotContains('wp_delete_post', $src, $m . ' no borra posts');
+        TestRunner::assertStringNotContains('wp_delete_attachment', $src, $m . ' no borra attachments');
+    }
+    $chunk = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'repair_images_chunk');
+    TestRunner::assertStringNotContains('wp_delete_post', $chunk, 'chunk no borra posts');
+    TestRunner::assertStringNotContains('wp_delete_attachment', $chunk, 'chunk no borra attachments');
+});
+
+TestRunner::test('T76.7 el handler y la UI de reparación están cableados', function (): void {
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    TestRunner::assertStringContains('wp_ajax_alegra_repair_images', $ctor, 'acción registrada');
+
+    $ajax = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_repair_images');
+    TestRunner::assertStringContains('check_ajax_referer', $ajax, 'verifica nonce');
+    TestRunner::assertStringContains('manage_woocommerce', $ajax, 'verifica capability');
+
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('alegra-repair-images', $tpl, 'botón Reparar imágenes');
+    TestRunner::assertStringContains('alegra_repair_images', $tpl, 'acción AJAX');
+    TestRunner::assertStringContains('ac-monitor-image-repair', $tpl, 'contenedor del resumen');
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    foreach ([
+        'repairImagesButton', 'repairImagesRunning', 'repairImagesDone', 'repairImagesTitle',
+        'repairProcessed', 'repairRefsCleaned', 'repairImagesDownloaded', 'repairStillMissing',
+    ] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
+    }
+});
+
+TestRunner::test('T76.8 un producto sano NO se toca ni cambia su destacada (config)', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Healthy']);
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+
+    $live = alegra_make_live_attachment(7600);
+    update_post_meta(10, '_thumbnail_id', $live);
+    $before = (string) get_post_meta(10, '_thumbnail_id', true);
+
+    // URL fresca (sin dedup): si el import corriera, intentaría descargar y fallaría.
+    $r = make_products()->repair_product_images(10, [['id' => 'i1', 'url' => 'https://cdn3.alegra.com/fresh.png', 'favorite' => true]]);
+
+    TestRunner::assertSame($before, (string) get_post_meta(10, '_thumbnail_id', true), 'destacada intacta');
+    TestRunner::assertSame(0, (int) $r['referenced_cleaned'], 'nada que limpiar');
+    TestRunner::assertSame(0, (int) $r['images_failed'], 'no intenta importar (producto sano)');
+    TestRunner::assertFalse((bool) $r['still_missing'], 'tiene imagen viva');
+});
+
+TestRunner::test('T76.9 el modo configurado se obedece (favorite no deduplica)', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Cfg']);
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+
+    $url  = 'https://cdn3.alegra.com/cfg.png';
+    $hash = md5($url);
+    $att  = alegra_make_live_attachment(7500);
+    update_post_meta($att, '_alegra_image_url_hash', $hash);
+    update_post_meta($att, '_alegra_image_url', $url);
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $att);
+    update_post_meta(10, '_thumbnail_id', 9998);   // muerto → needs_import
+
+    $r = make_products()->repair_product_images(10, [['id' => 'i1', 'url' => $url, 'favorite' => true]]);
+
+    // favorite usa import_product_image() (sin dedup) → intenta descargar y falla,
+    // en vez de resolver la dedup viva como haría el modo `all`.
+    TestRunner::assertTrue((int) $r['images_failed'] >= 1, 'favorite NO usa dedup');
+    TestRunner::assertSame($att, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa vivo queda intacto');
+});
+
+TestRunner::test('T76.10 attachment_is_live: offload (no-local / filtro) cuenta como viva', function (): void {
+    alegra_test_reset();
+    $loc = static fn (string $p): bool => (bool) alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'is_local_attachment_path', $p);
+    TestRunner::assertFalse($loc('https://cdn.example.com/x.jpg'), 'URL no es local');
+    TestRunner::assertFalse($loc('s3://bucket/x.jpg'), 'stream no es local');
+    TestRunner::assertFalse($loc(''), 'vacío no es local');
+    TestRunner::assertTrue($loc('/var/www/wp-content/uploads/x.jpg'), 'absoluto POSIX es local');
+    TestRunner::assertTrue($loc('C:\\uploads\\x.jpg'), 'absoluto Windows es local');
+
+    // Un filtro de offload mantiene una ref que la lógica por defecto llamaría muerta.
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Offload']);
+    update_post_meta(10, '_thumbnail_id', 9997);   // sin post → dead por defecto
+    $GLOBALS['wp_filters']['alegra_connector_attachment_is_live'][10][] = [
+        'cb' => static fn ($live, $id) => ((int) $id === 9997) ? true : $live,
+        'args' => 3,
+    ];
+
+    $r = make_products()->repair_product_images(10, []);
+
+    TestRunner::assertSame(9997, (int) get_post_meta(10, '_thumbnail_id', true), 'el filtro mantiene la ref offload');
+    TestRunner::assertSame(0, (int) $r['referenced_cleaned'], 'no la limpia');
+    TestRunner::assertFalse((bool) $r['still_missing'], 'cuenta como viva');
+});
+
+TestRunner::test('T76.11 el lock de reparación rechaza un segundo run', function (): void {
+    alegra_test_reset();
+    $held = \Alegra\Connector\Sync\Controller::acquire_lock('repair_images', 300);
+    TestRunner::assertTrue(is_string($held) && $held !== '', 'lock tomado para el test');
+
+    $_POST['offset'] = 0;
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+
+    TestRunner::assertFalse($resp->success, 'un segundo run debe rechazarse');
+    TestRunner::assertStringContains('en curso', (string) ($resp->payload['message'] ?? ''), 'mensaje de lock');
+
+    \Alegra\Connector\Sync\Controller::release_lock('repair_images', (string) $held);
+});
+
+TestRunner::test('T76.12 el resumen persiste el total acumulado entre chunks', function (): void {
+    alegra_test_reset();
+    // 21 productos vinculados: página 1 (20) no termina, página 2 (1) termina.
+    for ($i = 1; $i <= 21; $i++) {
+        $pid = 100 + $i;
+        alegra_make_product($pid, ['name' => 'P' . $i]);
+        update_post_meta($pid, '_alegra_item_id', 'it-acc-' . $i);
+        alegra_mock_seed_item('it-acc-' . $i, ['name' => 'P' . $i, 'reference' => 'SA' . $i]);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $_POST['offset'] = 0;
+    $r1 = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+    TestRunner::assertFalse((bool) $r1->payload['done'], 'el primer chunk no termina');
+    TestRunner::assertSame(20, (int) $r1->payload['processed'], 'procesó la primera página');
+
+    $_POST['offset'] = 20;
+    $r2 = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+    TestRunner::assertTrue((bool) $r2->payload['done'], 'el segundo chunk termina');
+
+    $summary = get_transient('alegra_repair_images_summary');
+    TestRunner::assertSame(21, (int) ($summary['processed'] ?? 0), 'el resumen persiste el total acumulado (21)');
+});
+
+TestRunner::test('T76.13 linked_products_page incluye drafts y pide ids (source-scan)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'linked_products_page');
+    TestRunner::assertStringContains("'publish', 'draft'", $src, 'incluye drafts');
+    TestRunner::assertStringContains("'return' => 'ids'", $src, 'pide ids sin hidratar');
+});
+
+TestRunner::test('T76.14 el lock se refresca por chunk (sin abort falso) y se libera al terminar', function (): void {
+    alegra_test_reset();
+    // 41 productos → 3 chunks (20/20/1): 2 no-finales + 1 final.
+    for ($i = 1; $i <= 41; $i++) {
+        $pid = 300 + $i;
+        alegra_make_product($pid, ['name' => 'L' . $i]);
+        update_post_meta($pid, '_alegra_item_id', 'it-lock-' . $i);
+        alegra_mock_seed_item('it-lock-' . $i, ['name' => 'L' . $i, 'reference' => 'SL' . $i]);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $_POST['offset'] = 0;
+    $r1 = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+    TestRunner::assertTrue($r1->success, 'chunk 1 ok');
+    TestRunner::assertFalse((bool) $r1->payload['done'], 'chunk 1 no termina');
+    $lock1 = get_option('alegra_lock_repair_images');
+    TestRunner::assertTrue(is_array($lock1) && !empty($lock1['token']), 'lock tomado y con token');
+    $token = (string) $lock1['token'];
+
+    // Simula el paso del tiempo: el lock está por vencer pero sigue válido.
+    update_option('alegra_lock_repair_images', ['token' => $token, 'expires' => time() + 5], 'no');
+
+    $_POST['offset'] = 20;
+    $r2 = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+    TestRunner::assertTrue($r2->success, 'chunk 2 NO aborta con "en curso"');
+    TestRunner::assertFalse((bool) $r2->payload['done'], 'chunk 2 no termina');
+    $lock2 = get_option('alegra_lock_repair_images');
+    TestRunner::assertTrue(is_array($lock2), 'el lock sigue vivo');
+    TestRunner::assertSame($token, (string) $lock2['token'], 'mismo token (no se pisa)');
+    TestRunner::assertTrue((int) $lock2['expires'] > time() + 300, 'el lock se extendió (refresh por chunk)');
+
+    $_POST['offset'] = 40;
+    $r3 = alegra_capture_json(fn () => $admin->ajax_repair_images());
+    unset($_POST['offset']);
+    TestRunner::assertTrue((bool) $r3->payload['done'], 'chunk 3 termina');
+    TestRunner::assertFalse(get_option('alegra_lock_repair_images', false), 'el lock se libera al terminar');
+    TestRunner::assertFalse(get_transient('alegra_repair_images_lock_token'), 'el token se libera');
+});
+
+TestRunner::test('T76.15 un featured VIVO + galería muerta: conserva la destacada y limpia la galería', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Mix']);
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+
+    $live = alegra_make_live_attachment(7700);
+    update_post_meta(10, '_thumbnail_id', $live);
+    update_post_meta(10, '_product_image_gallery', '7701');   // muerto
+
+    $r = make_products()->repair_product_images(10, [['id' => 'i1', 'url' => 'https://cdn3.alegra.com/mix.png', 'favorite' => true]]);
+
+    TestRunner::assertSame($live, (int) get_post_meta(10, '_thumbnail_id', true), 'la destacada viva NO cambia');
+    TestRunner::assertSame('', (string) get_post_meta(10, '_product_image_gallery', true), 'la galería muerta se limpia');
+    TestRunner::assertSame(1, (int) $r['referenced_cleaned'], 'una ref limpiada');
+    TestRunner::assertFalse((bool) $r['still_missing'], 'sigue con imagen viva');
+});
+
+TestRunner::test('T76.16 el helper de preservación restaura la destacada que el import re-afirmaría', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Preserve']);
+    $live = alegra_make_live_attachment(7800);
+
+    // Simula que el import re-afirmó OTRA imagen destacada (mutación observable).
+    update_post_meta(10, '_thumbnail_id', 5555);
+    alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'restore_preserved_thumbnail', 10, $live);
+    TestRunner::assertSame($live, (int) get_post_meta(10, '_thumbnail_id', true), 'restaura la destacada viva');
+
+    // Y el repair path invoca la preservación.
+    $src = alegra_method_source(\Alegra\Connector\Sync\Products::class, 'repair_product_images');
+    TestRunner::assertStringContains('restore_preserved_thumbnail', $src, 'repair preserva la destacada');
+});
+
+TestRunner::test('T76.17 el acumulador de progreso cubre la corrida (TTL alto)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_repair_images');
+    TestRunner::assertStringContains('alegra_repair_images_progress', $src, 'usa el acumulador entre chunks');
+    TestRunner::assertStringContains('HOUR_IN_SECONDS', $src, 'el acumulador usa un TTL horario (no 600)');
+});
+
 exit(TestRunner::summary());
