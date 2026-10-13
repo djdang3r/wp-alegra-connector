@@ -2964,6 +2964,135 @@ class Products
         return (bool) $term;
     }
 
+    // =======================================================================
+    // Bulk wipe (reset total) — discovery + safe deletion.
+    //
+    // "Borrador masivo": delete every IMPORTED product (_alegra_item_id) +
+    // its variations + its images (files included) + the plugin's references
+    // (metas via post deletion, Entity_Map rows, tombstones). It must NEVER
+    // touch orders, customers, invoices, payments, options, coupons, terms,
+    // non-imported products, or non-image files.
+    // =======================================================================
+
+    /**
+     * Todo 1: the authoritative wipe id set.
+     *
+     * Every `product`/`product_variation` post that carries a non-empty
+     * `_alegra_item_id`. Read-only (writes nothing); the caller persists it.
+     * The JOIN + `post_type IN (...)` is what keeps foreign/non-imported
+     * products out of the wipe (M3).
+     *
+     * @return int[]
+     */
+    public function wipe_build_id_set(): array
+    {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            "SELECT DISTINCT pm.post_id
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_alegra_item_id'
+               AND pm.meta_value <> ''
+               AND p.post_type IN ('product', 'product_variation')
+             ORDER BY pm.post_id ASC"
+        );
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * Todo 2: one keyset page of the wipe set by `post_id` (NEVER OFFSET).
+     *
+     * @return int[]
+     */
+    private function wipe_ids_page(int $after_id, int $limit): array
+    {
+        global $wpdb;
+
+        $ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT pm.post_id
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_alegra_item_id'
+               AND pm.meta_value <> ''
+               AND p.post_type IN ('product', 'product_variation')
+               AND pm.post_id > %d
+             ORDER BY pm.post_id ASC
+             LIMIT %d",
+            $after_id,
+            max(1, $limit)
+        ));
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * Todo 1 (H2): every image id a product owns — its featured + its gallery
+     * — PLUS the same refs of each of its variations (`get_children()`).
+     * Deduplicated. Buyers of a variable product see the children's images, so
+     * leaving them behind would orphan files.
+     *
+     * @return int[]
+     */
+    private function wipe_collect_image_ids(\WC_Product $product): array
+    {
+        $ids = self::product_image_refs($product);
+
+        if (method_exists($product, 'get_children')) {
+            foreach ((array) $product->get_children() as $child_id) {
+                $child = wc_get_product((int) $child_id);
+                if ($child instanceof \WC_Product) {
+                    $ids = array_merge($ids, self::product_image_refs($child));
+                }
+            }
+        }
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * The product's own image references: featured (`_thumbnail_id`) + gallery.
+     * Reads postmeta directly (mirrors `WC_Product::get_image_id()` and is
+     * observable in every environment, including the execution harness).
+     *
+     * @return int[]
+     */
+    private static function product_image_refs(\WC_Product $product): array
+    {
+        $ids = [];
+
+        $thumb = (int) get_post_meta($product->get_id(), '_thumbnail_id', true);
+        if ($thumb > 0) {
+            $ids[] = $thumb;
+        }
+
+        $raw = get_post_meta($product->get_id(), '_product_image_gallery', true);
+        foreach (self::parse_gallery_ids($raw) as $gallery_id) {
+            $ids[] = $gallery_id;
+        }
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * Cast a raw column to a list of positive, de-duplicated, sorted ints.
+     *
+     * @param mixed $ids
+     * @return int[]
+     */
+    private static function normalize_id_list(mixed $ids): array
+    {
+        $out = [];
+        foreach ((array) $ids as $id) {
+            $id = (int) $id;
+            if ($id > 0) {
+                $out[$id] = true;
+            }
+        }
+        return array_map('intval', array_keys($out));
+    }
+
     /**
      * Hosts allowed as a source for product images when the restriction mode is
      * ON (AC-68).

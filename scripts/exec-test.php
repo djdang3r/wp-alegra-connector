@@ -16686,4 +16686,45 @@ TestRunner::test('T85.2 un attachment trashed o con archivo local faltante SIGUE
     TestRunner::assertFalse($is_live(999999), 'post inexistente ⇒ dead');
 });
 
+// ===========================================================================
+// === products-bulk-wipe: "Borrador masivo (reset total)" ===================
+// ===========================================================================
+echo "\nT86 — Bulk wipe (reset total) — discovery\n";
+
+TestRunner::test('T86.1 el set del wipe incluye productos+variaciones con _alegra_item_id y las imágenes de los hijos', function (): void {
+    alegra_test_reset();
+
+    // Imported simple product.
+    alegra_seed_linked_product(10, 'it-p');
+    update_post_meta(10, '_thumbnail_id', 8001);
+    update_post_meta(10, '_product_image_gallery', '8002');
+
+    // Imported variable product with two variations; only one carries an item id.
+    alegra_make_variable_product(20, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        21 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+        22 => ['variation_attributes' => ['attribute_color' => 'Azul']],
+    ]);
+    update_post_meta(20, '_alegra_item_id', 'it-var');
+    update_post_meta(21, '_alegra_item_id', 'it-var-child');   // child IS imported
+    update_post_meta(21, '_thumbnail_id', 8010);               // child image (H2)
+    update_post_meta(22, '_thumbnail_id', 8011);               // child image WITHOUT item id (H2)
+
+    // Foreign, non-imported product — must survive the set.
+    alegra_make_product(30, ['name' => 'Foreign']);
+    update_post_meta(30, '_thumbnail_id', 8030);
+
+    $products = make_products();
+
+    $set = $products->wipe_build_id_set();
+    sort($set);
+    TestRunner::assertSame([10, 20, 21], $set, 'set = importados (producto + variación con item id), sin el ajeno');
+
+    $images = alegra_call_private($products, 'wipe_collect_image_ids', wc_get_product(20));
+    sort($images);
+    TestRunner::assertSame([8010, 8011], $images, 'imágenes del producto = las de sus variaciones (H2)');
+
+    // Read-only: the set never mutates the catalog.
+    TestRunner::assertTrue(get_post_meta(10, '_alegra_item_id', true) === 'it-p', 'discovery no toca metas');
+});
+
 exit(TestRunner::summary());

@@ -151,6 +151,8 @@ function alegra_test_reset(): void
     $GLOBALS['wp_users']      = [];
     $GLOBALS['wp_terms']      = [];
     $GLOBALS['wp_term_meta']  = [];
+    $GLOBALS['wp_theme_mods'] = [];
+    $GLOBALS['alegra_lookup_tables'] = ['wc_product_meta_lookup' => [], 'wp_wc_product_attributes_lookup' => []];
     $GLOBALS['wp_actions']    = [];
     $GLOBALS['wp_filters']    = [];
     $GLOBALS['wp_did_action'] = [];

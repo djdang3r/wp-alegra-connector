@@ -93,8 +93,10 @@ $GLOBALS['wp_postmeta']   = [];
 $GLOBALS['wp_usermeta']   = [];
 $GLOBALS['wp_posts']      = [];
 $GLOBALS['wp_users']      = [];
-$GLOBALS['wp_terms']      = [];
+$GLOBALS['wp_terms']       = [];
 $GLOBALS['wp_term_meta']  = [];
+$GLOBALS['wp_theme_mods'] = [];
+$GLOBALS['alegra_lookup_tables'] = ['wc_product_meta_lookup' => [], 'wp_wc_product_attributes_lookup' => []];
 $GLOBALS['wp_actions']    = [];
 $GLOBALS['wp_filters']    = [];
 $GLOBALS['wp_did_action'] = [];
@@ -868,6 +870,28 @@ function wc_clear_notices() { $GLOBALS['wc_notices'] = []; }
 function get_post($post_id) { return $GLOBALS['wp_posts'][(int) $post_id] ?? null; }
 function wp_is_post_revision($post_id) { return false; }
 function get_post_type($post_id) { return $GLOBALS['wp_posts'][(int) $post_id]->post_type ?? ''; }
+
+/**
+ * Resolve a post's type for the bulk-wipe SQL emulation. Products built with
+ * `alegra_make_product()` live in `wc_products`, not `wp_posts`, so a raw SQL
+ * JOIN on wp_posts would miss them. Production products ARE wp_posts; this
+ * helper lets the fake $wpdb answer the wipe discovery queries the same way.
+ */
+function alegra_stub_post_type(int $id): string
+{
+    if (isset($GLOBALS['wp_posts'][$id])) {
+        return (string) ($GLOBALS['wp_posts'][$id]->post_type ?? '');
+    }
+    if (isset($GLOBALS['wc_products'][$id])) {
+        return $GLOBALS['wc_products'][$id] instanceof WC_Product_Variation ? 'product_variation' : 'product';
+    }
+    return '';
+}
+function get_theme_mod($name, $default = false)
+{
+    return $GLOBALS['wp_theme_mods'][$name] ?? $default;
+}
+function set_theme_mod($name, $value) { $GLOBALS['wp_theme_mods'][$name] = $value; }
 /**
  * get_post_status() — mirrors real WordPress.
  *
@@ -2088,6 +2112,31 @@ class Alegra_Mock_Wpdb
     public function get_results($query, $output = null)
     {
         $query = (string) $query;
+
+        // Bulk-wipe discovery: `SELECT DISTINCT pm.post_id … INNER JOIN posts
+        // … WHERE meta_key='_alegra_item_id' AND post_type IN (…) [AND post_id >
+        // N] ORDER BY post_id ASC LIMIT N`. Products live in wc_products in the
+        // harness, hence alegra_stub_post_type().
+        if (strpos($query, '_alegra_item_id') !== false && stripos($query, 'post_type') !== false) {
+            $ids = [];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (!isset($meta['_alegra_item_id']) || (string) $meta['_alegra_item_id'] === '') {
+                    continue;
+                }
+                $type = alegra_stub_post_type((int) $pid);
+                if ($type === 'product' || $type === 'product_variation') {
+                    $ids[] = (int) $pid;
+                }
+            }
+            if (preg_match('/post_id\s*>\s*(\d+)/', $query, $m)) {
+                $ids = array_values(array_filter($ids, static fn ($id) => $id > (int) $m[1]));
+            }
+            sort($ids);
+            if (preg_match('/LIMIT\s+(\d+)/i', $query, $m)) {
+                $ids = array_slice($ids, 0, (int) $m[1]);
+            }
+            return array_map(static fn ($id) => (object) ['post_id' => $id], $ids);
+        }
 
         if (strpos($query, 'alegra_category_id') !== false && strpos($query, 'termmeta') !== false) {
             $GLOBALS['alegra_category_lookups'] = ($GLOBALS['alegra_category_lookups'] ?? 0) + 1;
