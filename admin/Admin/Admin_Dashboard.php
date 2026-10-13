@@ -4308,6 +4308,11 @@ class Admin_Dashboard
             }
             Sync\Products::clear_deadline();               // C8/T3.2
 
+            // task-8: durable cancel check — do NOT persist the cursor if the run
+            // was cancelled/failed mid-flight (re-reads Runs::status, not the stop
+            // transient). Inside the try; the finally still releases the lock.
+            $this->abort_if_run_cancelled($run_id, $type, $lock);
+
             // Reanudación: pausado ⇒ persistir offset sin avanzar start; completo ⇒
             // avanzar start, resetear offset y persistir el cursor compartido.
             if ($paused) {
@@ -4414,6 +4419,10 @@ class Admin_Dashboard
             \Alegra\Connector\Runs::update_progress($run_id, $processed, $total_items);
         }
 
+        // task-8: second durable cancel check — immediately before persisting the
+        // batch_state (all types). No persist, no state recreate on a cancel.
+        $this->abort_if_run_cancelled($run_id, $type, $lock);
+
         if ($done) {
             \Alegra\Connector\Run_Context::finish($run_id, 'completed');
             // B-A (Oracle): `alegra_connector_products_import_cursor` es un
@@ -4468,14 +4477,14 @@ class Admin_Dashboard
             ),
         ]);
         } catch (\Throwable $e) {
-            // Solo excepciones reales. En el harness también atrapa el throw de
-            // wp_send_json_*; Run_Context::finish (T1.5) no re-finaliza si ya cerró.
-            \Alegra\Connector\Run_Context::finish($run_id, 'failed', $e->getMessage());
-            // task-6: una excepción REAL es un terminal path del run que ESTE AJAX
-            // arrancó ⇒ no deja resume state. El throw de wp_send_json_* del harness
-            // (que también salta en el envío exitoso) NO es un fallo: se excluye.
+            // En el harness wp_send_json_* THROWS, así que este catch también
+            // corre en el envío EXITOSO; en producción el envío hace die() y NO
+            // llega acá. Ese throw NO es un fallo: se ignora por completo.
             $harness_send = class_exists('Alegra_Test_JSON_Response') && ($e instanceof \Alegra_Test_JSON_Response);
             if (!$harness_send) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'failed', $e->getMessage());
+                // task-6: una excepción REAL es un terminal path del run que ESTE
+                // AJAX arrancó ⇒ no deja resume state.
                 delete_transient('alegra_batch_state');
                 if ($type === 'products') {
                     delete_option('alegra_connector_products_import_cursor');
@@ -4488,6 +4497,43 @@ class Admin_Dashboard
             // Solo para excepciones: los sends ya liberaron antes.
             \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
         }
+    }
+
+    /**
+     * task-8: durable cancel guard.
+     *
+     * Re-reads `Runs::status($run_id)` (NOT the `alegra_run_stop_*` transient —
+     * `Run_Context::finish()` teardown deletes it) and aborts the page when the
+     * run is no longer `running`, so a cancel during an in-flight page cannot
+     * resurrect the resume state (no cursor, no batch_state).
+     *
+     * Must be called INSIDE the try{} so the `finally` releases the lock. The
+     * lock is also released explicitly BEFORE the response because
+     * `wp_send_json_*` ends the request with `die()`, which SKIPS `finally` in
+     * production (the harness throws instead, so both release paths are safe).
+     */
+    private function abort_if_run_cancelled(int $run_id, string $type, string $lock): void
+    {
+        if ($run_id <= 0 || \Alegra\Connector\Runs::status($run_id) === 'running') {
+            return;
+        }
+
+        // The run was cancelled/failed mid-flight: never persist resume state.
+        delete_transient('alegra_batch_state');
+        delete_transient('alegra_sync_progress');
+        if ($type === 'products' && (int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
+            delete_option('alegra_connector_products_import_cursor');
+            delete_option('alegra_connector_products_import_total');
+            delete_option('alegra_connector_products_chunk_owner');
+        }
+
+        \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
+
+        wp_send_json_success([
+            'done'      => true,
+            'cancelled' => true,
+            'message'   => __('Sincronización cancelada.', 'alegra-connector'),
+        ]);
     }
 
     /**

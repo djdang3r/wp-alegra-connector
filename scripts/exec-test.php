@@ -16481,4 +16481,94 @@ TestRunner::test('T82.7 un cursor cron (marker invalidado por el cron) sobrevive
     TestRunner::assertSame(45, (int) get_option('alegra_connector_products_import_cursor', 0), 'el cursor del cron sobrevive');
 });
 
+echo "\nT83 — Durable cancel guard\n";
+
+TestRunner::test('T83.1 un cancel a mitad de página no resucita el resume state', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Runs::finish($rid, 'cancelled', 'Cancelado por el usuario');   // run ya cancelado
+    update_option('alegra_connector_products_import_cursor', 0, false);
+    update_option('alegra_connector_products_chunk_owner', $rid, false);
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+
+    TestRunner::assertTrue($resp->success, 'responde success (cancelado)');
+    TestRunner::assertTrue((bool) ($resp->payload['cancelled'] ?? false), 'marca cancelled');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'sin cursor');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'sin batch_state');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'lock libre');
+});
+
+TestRunner::test('T83.2 cancel sin run_id limpia el estado sin error', function (): void {
+    alegra_test_reset();
+    set_transient('alegra_batch_state', ['type' => 'products'], 600);   // sin run_id
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_cancel_sync());
+
+    TestRunner::assertTrue($resp->success, 'cancel responde success');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'state borrado');
+});
+
+TestRunner::test('T83.3 tras el abort un nuevo start funciona (sin lock colgado)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    \Alegra\Connector\Runs::finish($rid, 'cancelled', 'x');
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 1, 'total_items' => 0, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_sync_page());    // aborta el run cancelado
+
+    $_POST['sync_type'] = 'products';
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type']);
+
+    TestRunner::assertTrue($resp->success, 'un nuevo start procede tras el abort (lock libre)');
+});
+
+TestRunner::test('T83.4 una excepción real limpia cursor + total + marker', function (): void {
+    alegra_test_reset();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_import_total', 60, false);
+    update_option('alegra_connector_products_chunk_owner', $rid, false);
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 30, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+
+    $logger   = make_logger();
+    $throwing = new class($logger) extends Client {
+        public function get(string $endpoint, array $params = []): array|\WP_Error
+        {
+            throw new \RuntimeException('boom-page');
+        }
+    };
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard($throwing, $logger);
+
+    $threw = false;
+    try {
+        $admin->ajax_sync_page();
+    } catch (\RuntimeException $e) {
+        $threw = true;
+    }
+
+    TestRunner::assertTrue($threw, 'la excepción se propaga');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'cursor ausente');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_total', false), 'total ausente');
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'marker ausente');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'batch_state ausente');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($rid), 'el run queda failed');
+});
+
 exit(TestRunner::summary());
