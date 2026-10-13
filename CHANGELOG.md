@@ -2,6 +2,49 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.12] - 2026-10-12
+
+> **Productos: la dedup de imágenes valida que el attachment esté vivo + desglose por imagen en el probe.**
+> La deduplicación de imágenes ya no reutiliza un attachment **muerto**: cuando el
+> id encontrado (por `Entity_Map` o por meta `_alegra_image_url`) apunta a un
+> attachment borrado / de una instalación previa, se limpia el mapeo fantasma y se
+> **fuerza la re-descarga**, así las imágenes vuelven a importarse. El probe del
+> Monitor suma el **desglose por imagen** (host, permitido, URL normalizada, ids de
+> dedup por hash/URL + viva/muerta) y reporta la destacada y la galería del producto.
+
+### Fixed
+
+- **Productos: la dedup de imágenes reutilizaba un attachment muerto (regresión).**
+  `download_and_attach_image()` devolvía el id mapeado **sin validar que estuviera
+  vivo**, por lo que un mapeo stale (`Entity_Map` + `_alegra_image_url_hash`/
+  `_alegra_image_url` de un producto borrado o instalación previa) cortaba la
+  descarga en silencio y la imagen no se adjuntaba. Ahora se valida que el
+  attachment sea un `attachment` real con estado `inherit` (y archivo existente
+  cuando la ruta se puede resolver); si está muerto se limpia el mapeo fantasma
+  (`Entity_Map::remove()` + borrado de las metas `_alegra_image_url_hash`/
+  `_alegra_image_url`) y se fuerza la re-descarga. Un attachment válido sigue
+  deduplicando sin re-descargar.
+- **Productos: la búsqueda por meta (`get_attachment_by_url`) también descarta
+  attachments muertos.** El mismo filtro de "vivo" se aplica al fallback por
+  `_alegra_image_url`, evitando que un ghost id legacy deduplique.
+
+### Added
+
+- **Monitor: desglose por imagen en el probe (read-only).** `ajax_probe_images`
+  suma `images_breakdown` (una entrada por imagen: host, `allowed`, URL
+  normalizada, id+estado de dedup por hash y por URL), `product_thumbnail_id`
+  (`_thumbnail_id`) y `product_image_gallery` (`_product_image_gallery`). El nuevo
+  `Products::image_dedup_probe()` es **read-only** (no escribe, no rellena el mapa,
+  no reparenta) y la UI renderiza los valores con `.text()`/nodos DOM.
+- **Strings i18n del desglose.** `diagProbeBreakdown`, `diagProbeThumbnail`,
+  `diagProbeGallery`, `diagProbeAllowed`, `diagProbeDedupHash`, `diagProbeDedupUrl`,
+  `diagProbeLive`, `diagProbeStale`, `diagProbeNone`.
+
+### Tests
+
+- **Exec-test:** bloque task-10 (T74: la dedup no reutiliza attachments muertos y
+  limpia el mapeo; T75: desglose por imagen + `_thumbnail_id`/galería y render UI).
+
 ## [2.8.11] - 2026-10-12
 
 > **Monitor: diagnóstico read-only de importación de imágenes.**
