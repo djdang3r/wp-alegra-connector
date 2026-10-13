@@ -3286,7 +3286,19 @@ class Products
     }
 
     /**
-     * task-10/task-15: the default liveness verdict (before the filter).
+     * task-10/task-15 + todo 10: the default liveness verdict (before the filter).
+     *
+     * GOTCHA (root cause of the image duplication): in real WordPress,
+     * `get_post_status()` for an ATTACHMENT whose `post_parent` is set returns
+     * the PARENT's status (the product → `publish`), NOT `inherit`. Requiring
+     * `inherit` therefore classified EVERY plugin attachment (parent = the
+     * product) as DEAD, so `get_attachment_by_hash()` always forgot it and the
+     * dedup never reused → every import downloaded a NEW attachment.
+     *
+     * Liveness now rejects only: a MISSING post, a non-`attachment` type, a
+     * `trash`/`auto-draft` status, or (below, unchanged) a genuinely missing
+     * LOCAL absolute file. A parented attachment legitimately reporting its
+     * parent's status is LIVE. Offloaded media (empty / non-local path) stays LIVE.
      */
     private static function attachment_is_live_unfiltered(int $attachment_id): bool
     {
@@ -3295,12 +3307,18 @@ class Products
         }
         $post = get_post($attachment_id);
         if (!$post) {
-            return false;
+            return false; // missing post
         }
+        if (get_post_type($attachment_id) !== 'attachment') {
+            return false; // not an attachment
+        }
+
         $status = function_exists('get_post_status')
             ? (string) get_post_status($attachment_id)
             : (string) ($post->post_status ?? '');
-        if ($status !== 'inherit' || get_post_type($attachment_id) !== 'attachment') {
+        // `trash`/`auto-draft` are dead. A parented attachment reports its
+        // PARENT's status here, so 'inherit' is NOT required.
+        if (in_array($status, ['trash', 'auto-draft'], true)) {
             return false;
         }
 

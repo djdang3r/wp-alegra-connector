@@ -16637,4 +16637,53 @@ TestRunner::test('T84.2 favorite: reemplaza la PLUGIN featured, conserva galerí
     TestRunner::assertSame($galPlugin . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
 });
 
+echo "\nT85 — Attachment liveness (parent-status gotcha)\n";
+
+TestRunner::test('T85.1 importar el MISMO ítem 3 veces crea UN solo attachment (idempotente)', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;   // descarga real ⇒ media_handle_sideload setea post_parent
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-idem');
+
+    $item = ['id' => 'it-idem', 'name' => 'ID', 'reference' => 'SID', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/idem.png', 'favorite' => true],
+    ]];
+    $p = make_products();
+    $p->import_single_item_public($item, 0, false, false);
+    $thumb1 = (int) get_post_meta(10, '_thumbnail_id', true);
+    $p->import_single_item_public($item, 0, false, false);
+    $p->import_single_item_public($item, 0, false, false);
+
+    // El attachment tiene post_parent = 10 ⇒ get_post_status() devuelve el status
+    // del PADRE ('publish'), NO 'inherit'. Antes eso lo marcaba DEAD y cada import
+    // bajaba uno nuevo (el bug de duplicación). Ahora es LIVE ⇒ dedup.
+    TestRunner::assertSame(1, alegra_count_attachments(), '3 imports ⇒ 1 solo attachment');
+    TestRunner::assertSame($thumb1, (int) get_post_meta(10, '_thumbnail_id', true), 'misma _thumbnail_id');
+    TestRunner::assertTrue($thumb1 > 0, 'la featured existe');
+});
+
+TestRunner::test('T85.2 un attachment trashed o con archivo local faltante SIGUE muerto', function (): void {
+    alegra_test_reset();
+    $is_live = static fn (int $id): bool => (bool) alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'attachment_is_live', $id);
+
+    // (a) trashed ⇒ DEAD.
+    $trashed = alegra_make_live_attachment(9500);
+    $GLOBALS['wp_posts'][9500]->post_status = 'trash';
+    TestRunner::assertFalse($is_live(9500), 'trashed ⇒ dead');
+
+    // (b) archivo LOCAL faltante ⇒ DEAD.
+    $missing = alegra_make_live_attachment(9501);
+    update_post_meta(9501, '_wp_attached_file', '/nonexistent/alegra/missing.jpg');
+    TestRunner::assertFalse($is_live(9501), 'archivo local faltante ⇒ dead');
+
+    // (c) attachment con parent (status del padre = publish) ⇒ LIVE.
+    $parented = alegra_make_live_attachment(9502);
+    $GLOBALS['wp_posts'][9502]->post_parent = 10;
+    TestRunner::assertTrue($is_live(9502), 'con parent ⇒ LIVE (no exige inherit)');
+
+    // (d) post inexistente ⇒ DEAD.
+    TestRunner::assertFalse($is_live(999999), 'post inexistente ⇒ dead');
+});
+
 exit(TestRunner::summary());

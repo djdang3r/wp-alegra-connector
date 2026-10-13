@@ -868,6 +868,30 @@ function wc_clear_notices() { $GLOBALS['wc_notices'] = []; }
 function get_post($post_id) { return $GLOBALS['wp_posts'][(int) $post_id] ?? null; }
 function wp_is_post_revision($post_id) { return false; }
 function get_post_type($post_id) { return $GLOBALS['wp_posts'][(int) $post_id]->post_type ?? ''; }
+/**
+ * get_post_status() — mirrors real WordPress.
+ *
+ * GOTCHA (todo 10): for an ATTACHMENT whose `post_parent` is set, WP returns the
+ * PARENT's status (the product → `publish`), NOT `inherit`. The harness now
+ * reproduces that: a parented attachment reports the parent's status when the
+ * parent is a `wp_posts` row, else `publish` (products built by
+ * alegra_make_product live in `wc_products`, not `wp_posts`, but are published).
+ */
+function get_post_status($post_id)
+{
+    $post = $GLOBALS['wp_posts'][(int) $post_id] ?? null;
+    if ($post === null) {
+        return false;
+    }
+    $parent = (int) ($post->post_parent ?? 0);
+    if ($parent > 0) {
+        $parent_post = $GLOBALS['wp_posts'][$parent] ?? null;
+        return $parent_post !== null
+            ? (string) ($parent_post->post_status ?? 'inherit')
+            : 'publish';
+    }
+    return (string) ($post->post_status ?? 'inherit');
+}
 function wp_insert_post($data)
 {
     $id = (int) ($GLOBALS['alegra_next_post_id'] ?? 1000);
