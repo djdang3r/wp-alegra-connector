@@ -1845,7 +1845,13 @@ class Products
     /**
      * Sync a single item by Alegra ID (used by webhooks)
      */
-    private function import_single_item_from_alegra(array $item, int $run_id = 0): bool|string
+    /**
+     * @param bool $reconcile    Caller-gated: when true, image refs are
+     *                           reconciled to the exact desired set (replace,
+     *                           not merge). Default false (legacy append).
+     * @param bool $allow_delete Caller-gated deletion of replaced plugin images.
+     */
+    private function import_single_item_from_alegra(array $item, int $run_id = 0, bool $reconcile = false, bool $allow_delete = false): bool|string
     {
         // Lane C (Phase 1): internal plugin helper items must never be
         // imported as WC products. The guard runs BEFORE the tombstone /
@@ -1954,7 +1960,7 @@ class Products
                     // AC-07: make sure the indexed map is populated even for a
                     // product found through the (legacy) postmeta fallback.
                     \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $existing_id);
-                    $this->update_product_from_alegra($product, $item);
+                    $this->update_product_from_alegra($product, $item, false, $reconcile, $allow_delete);
                     $this->assign_product_category((int) $existing_id, $item);
 
                     // D4: refrescar variaciones TAMBIÉN en update.
@@ -1977,7 +1983,7 @@ class Products
                     \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', (int) $existing_by_sku);
                     $product = wc_get_product($existing_by_sku);
                     if ($product) {
-                        $this->update_product_from_alegra($product, $item);
+                        $this->update_product_from_alegra($product, $item, false, $reconcile, $allow_delete);
                         $this->assign_product_category((int) $existing_by_sku, $item);
                         return 'updated';
                     }
@@ -2017,7 +2023,7 @@ class Products
             }
             // New product: nothing to preserve, so the field exclusion is
             // ignored ($is_new=true).
-            $this->update_product_from_alegra($product, $item, true);
+            $this->update_product_from_alegra($product, $item, true, $reconcile, $allow_delete);
         }
 
         // Import variant children. Alegra returns `itemVariants` for a
@@ -2393,7 +2399,7 @@ class Products
         return is_array($saved) ? array_values($saved) : [];
     }
 
-    private function update_product_from_alegra(\WC_Product $product, array $item, bool $is_new = false): void
+    private function update_product_from_alegra(\WC_Product $product, array $item, bool $is_new = false, bool $reconcile = false, bool $allow_delete = false): void
     {
         $product_id = (int) $product->get_id();
         $guard_key = 'alegra_updating_product_' . $product_id;
@@ -2464,7 +2470,7 @@ class Products
             // Import product images from Alegra
             if (get_option('alegra_connector_sync_images', true) && !in_array('images', $preserve, true)) {
                 $mode = get_option('alegra_connector_sync_images_mode', 'favorite');
-                $this->import_product_images($product_id, $item['images'] ?? [], $mode);
+                $this->import_product_images($product_id, $item['images'] ?? [], $mode, $reconcile, $allow_delete);
             }
         } finally {
             // Release the guard - keep it a bit longer to catch any delayed hooks
@@ -2516,18 +2522,35 @@ class Products
     }
 
     /**
-     * Import images from Alegra to WooCommerce product.
+     * Import images from Alegra to a WooCommerce product.
      *
-     * Mode 'favorite': Only the image with favorite:true is downloaded as featured image.
-     * Mode 'all': All images are downloaded. The favorite (or first) becomes featured,
-     *             the rest are added to the product gallery.
-     * Mode 'except_favorite': All images except the favorite. All go to gallery,
-     *                         no featured image is set. Falls back to 'all' if no favorite.
+     * Selection semantics (UNCHANGED):
+     *  - 'favorite': only the favorite image (or the first URL when none is
+     *    flagged favorite) becomes the featured image. The gallery is NEVER touched.
+     *  - 'all': the first image becomes featured, the rest go to the gallery.
+     *  - 'except_favorite': the first non-favorite becomes featured, the rest of the
+     *    non-favorites go to the gallery; falls back to 'all' when every image is
+     *    the favorite.
+     *
+     * Behavior is CALLER-GATED by `$reconcile`/`$allow_delete` (both default false
+     * ⇒ today's append behavior, which webhooks/cron/single-item/repair keep). When
+     * `$reconcile` is true (ONLY the chunked products-import AJAX):
+     *  - the mode-resolved desired set REPLACES the product's refs (no merge);
+     *  - ALL-OR-NOTHING: every desired image must resolve before ANY write
+     *    (including the featured); a failure/deferral rewrites and deletes nothing;
+     *  - pre-existing NON-plugin gallery ids (merchant/unknown) are preserved;
+     *  - `favorite` leaves the gallery untouched and never deletes;
+     *  - replaced plugin images are deleted only when `$allow_delete` is true.
      *
      * Alegra API image object: {id, name, url, favorite}
      */
-    private function import_product_images(int $product_id, array $images, string $mode): void
+    private function import_product_images(int $product_id, array $images, string $mode, bool $reconcile = false, bool $allow_delete = false): void
     {
+        if ($reconcile) {
+            $this->reconcile_product_images($product_id, $images, $mode, $allow_delete);
+            return;
+        }
+
         if (empty($images)) return;
 
         // Find the favorite image URL
@@ -2637,6 +2660,163 @@ class Products
                 update_post_meta($product_id, '_product_image_gallery', implode(',', $all_ids));
             }
         }
+    }
+
+    /**
+     * Todo 1: reconcile the product's image refs to the mode-resolved desired set.
+     *
+     * ALL-OR-NOTHING: every desired image is resolved (via the dedup-aware
+     * `download_and_attach_image()`) BEFORE any write. If any desired image
+     * fails or defers, NOTHING is written (the prior set is kept). Pre-existing
+     * NON-plugin gallery ids are preserved; `favorite` leaves the gallery
+     * untouched. Deletion of replaced plugin images is Todo 3's guarded job
+     * (only when `$allow_delete`).
+     */
+    private function reconcile_product_images(int $product_id, array $images, string $mode, bool $allow_delete): void
+    {
+        // --- Resolve the DESIRED set (same selection rules as legacy) ---
+        $favorite_url = null;
+        foreach ($images as $img) {
+            if (!empty($img['favorite']) && !empty($img['url'])) { $favorite_url = (string) $img['url']; break; }
+        }
+
+        $desired_featured_url = null;
+        $desired_gallery_urls = [];
+        $touch_gallery        = ($mode !== 'favorite');
+
+        if ($mode === 'favorite') {
+            $desired_featured_url = $favorite_url;
+            if ($desired_featured_url === null) {
+                foreach ($images as $img) {
+                    if (!empty($img['url'])) { $desired_featured_url = (string) $img['url']; break; }
+                }
+            }
+        } else {
+            $seen  = [];
+            $urls  = [];
+            foreach ($images as $img) {
+                if (empty($img['url'])) continue;
+                $url = (string) $img['url'];
+                if ($mode === 'except_favorite' && $url === $favorite_url) continue;
+                if (isset($seen[$url])) continue;
+                $seen[$url] = true;
+                $urls[] = $url;
+            }
+            // except_favorite fallback: every image was the favorite → use all.
+            if ($mode === 'except_favorite' && empty($urls)) {
+                foreach ($images as $img) {
+                    if (empty($img['url'])) continue;
+                    $url = (string) $img['url'];
+                    if (isset($seen[$url])) continue;
+                    $seen[$url] = true;
+                    $urls[] = $url;
+                }
+            }
+            $desired_featured_url = $urls[0] ?? null;
+            $desired_gallery_urls = array_slice($urls, 1);
+        }
+
+        // --- Resolve EVERY desired image BEFORE any write (all-or-nothing) ---
+        $resolved_featured = 0;
+        if ($desired_featured_url !== null && $desired_featured_url !== '') {
+            if (self::deadline_exhausted()) {
+                self::$image_stats['deferred']++;
+                return; // abort: keep the prior set
+            }
+            $resolved_featured = $this->download_and_attach_image($product_id, $desired_featured_url);
+            if ($resolved_featured <= 0) {
+                return; // abort: keep the prior set
+            }
+        }
+
+        $resolved_gallery = [];
+        foreach ($desired_gallery_urls as $url) {
+            if (self::deadline_exhausted()) {
+                self::$image_stats['deferred']++;
+                return; // abort: keep the prior set
+            }
+            $id = $this->download_and_attach_image($product_id, $url);
+            if ($id <= 0) {
+                return; // abort: keep the prior set
+            }
+            $resolved_gallery[] = $id;
+        }
+
+        // --- Capture the OLD refs (for the new set + Todo 3's orphan set) ---
+        $old_featured = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        $old_gallery  = self::parse_gallery_ids(get_post_meta($product_id, '_product_image_gallery', true));
+
+        // --- Compute the NEW refs ---
+        if ($resolved_featured > 0) {
+            $new_featured = $resolved_featured;
+        } else {
+            // No desired featured: drop only a PLUGIN-created featured; keep a
+            // merchant/unknown one untouched.
+            $new_featured = ($old_featured > 0 && !self::is_plugin_created_image($old_featured)) ? $old_featured : 0;
+        }
+
+        if ($touch_gallery) {
+            $preserved = [];
+            foreach ($old_gallery as $id) {
+                if (!self::is_plugin_created_image((int) $id)) {
+                    $preserved[] = (int) $id;
+                }
+            }
+            $new_gallery = array_values(array_unique(array_merge($resolved_gallery, $preserved)));
+        } else {
+            $new_gallery = $old_gallery; // favorite: gallery untouched
+        }
+
+        // --- Write (only reached when every desired image resolved) ---
+        if ($new_featured > 0) {
+            set_post_thumbnail($product_id, $new_featured);
+        } elseif ($old_featured > 0) {
+            delete_post_meta($product_id, '_thumbnail_id');
+        }
+
+        if ($touch_gallery) {
+            if (empty($new_gallery)) {
+                delete_post_meta($product_id, '_product_image_gallery');
+            } else {
+                update_post_meta($product_id, '_product_image_gallery', implode(',', $new_gallery));
+            }
+        }
+
+        // Todo 3 appends the guarded deletion of the replaced plugin images here.
+    }
+
+    /**
+     * Todo 1: parse a `_product_image_gallery` value (legacy string or array)
+     * into a list of positive int ids, de-duplicated.
+     *
+     * @return int[]
+     */
+    private static function parse_gallery_ids(mixed $raw): array
+    {
+        if (is_array($raw)) {
+            $raw = implode(',', array_map('strval', $raw));
+        }
+        $raw = (string) $raw;
+        if ($raw === '') {
+            return [];
+        }
+        $ids = [];
+        foreach (explode(',', $raw) as $part) {
+            $id = (int) trim($part);
+            if ($id > 0) { $ids[] = $id; }
+        }
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * Todo 1/Todo 3: true when an attachment was created by this plugin (it
+     * carries the `_alegra_image_url` marker). Merchant-uploaded / unknown
+     * attachments have no marker and are never deleted.
+     */
+    private static function is_plugin_created_image(int $attachment_id): bool
+    {
+        return $attachment_id > 0
+            && (string) get_post_meta($attachment_id, '_alegra_image_url', true) !== '';
     }
 
     /**
@@ -3145,9 +3325,9 @@ class Products
         return $attachment_id;
     }
 
-    public function import_single_item_public(array $item, int $run_id = 0): bool|string
+    public function import_single_item_public(array $item, int $run_id = 0, bool $reconcile = false, bool $allow_delete = false): bool|string
     {
-        return $this->import_single_item_from_alegra($item, $run_id);
+        return $this->import_single_item_from_alegra($item, $run_id, $reconcile, $allow_delete);
     }
 
     /**

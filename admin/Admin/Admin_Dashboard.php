@@ -4283,7 +4283,7 @@ class Admin_Dashboard
                     continue;
                 }
 
-                $r = $products_sync->import_single_item_public($item, $run_id);   // T3.2: run_id + 'stopped'
+                $r = $products_sync->import_single_item_public($item, $run_id, true, true);   // T3.2: run_id + 'stopped'; Todo 1: reconcile + allow_delete (chunked products import ONLY)
                 if ($r === 'stopped') { $paused = true; break; }
                 if ($r === true) { $state['imported']++; }
                 elseif ($r === 'updated') { $state['updated']++; }

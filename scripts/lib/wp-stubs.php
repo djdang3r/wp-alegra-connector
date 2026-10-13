@@ -887,7 +887,20 @@ function wp_update_post($data)
     return $id;
 }
 function get_attached_file($attachment_id) { return ''; }
-function set_post_thumbnail($post_id, $thumb_id) { return true; }
+function set_post_thumbnail($post_id, $thumb_id)
+{
+    // Real WP semantics: writes/removes `_thumbnail_id`. Only ever called once
+    // an image actually resolved, so legacy (download-disabled) tests are
+    // unaffected; the reconcile suite depends on it being observable.
+    $post_id  = (int) $post_id;
+    $thumb_id = (int) $thumb_id;
+    if ($thumb_id > 0) {
+        update_post_meta($post_id, '_thumbnail_id', $thumb_id);
+    } else {
+        delete_post_meta($post_id, '_thumbnail_id');
+    }
+    return true;
+}
 function download_url($url, $timeout = 300) { return new WP_Error('http_request_failed', 'download disabled in harness'); }
 function media_handle_sideload($file_array, $post_id, $desc = null) { return new WP_Error('unsupported', 'sideload disabled in harness'); }
 

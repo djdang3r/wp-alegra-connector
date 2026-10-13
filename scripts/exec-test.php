@@ -9993,7 +9993,7 @@ TestRunner::test('T29.42 a loose type=variant item is applied to its child or lo
 TestRunner::test('T29.43 the chunked handler routes variants instead of skipping them (D4)', function (): void {
     $src = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'admin/Admin/Admin_Dashboard.php');
     TestRunner::assertStringNotContains("if (\$item_type === 'variant') { continue; }", $src, 'the silent variant skip must be gone');
-    TestRunner::assertStringContains('import_single_item_public($item, $run_id)', $src, 'variants must be routed through the handler');
+    TestRunner::assertStringContains('import_single_item_public($item, $run_id', $src, 'variants must be routed through the handler');
 });
 
 TestRunner::test('T29.44 the warehouse notice is rendered in settings when a warehouse is configured', function (): void {
@@ -15841,6 +15841,132 @@ TestRunner::test('T76.17 el acumulador de progreso cubre la corrida (TTL alto)',
     $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_repair_images');
     TestRunner::assertStringContains('alegra_repair_images_progress', $src, 'usa el acumulador entre chunks');
     TestRunner::assertStringContains('HOUR_IN_SECONDS', $src, 'el acumulador usa un TTL horario (no 600)');
+});
+
+// ===========================================================================
+// === task: products-image-sync-reconcile (plan todos 1-5) ==================
+// ===========================================================================
+echo "\nT77 — Image reconcile (caller-gated replace-not-merge)\n";
+
+/** Crea un attachment VIVO y lo marca como plugin-created (dedup-aware). */
+function alegra_seed_plugin_image(int $id, string $url): int
+{
+    alegra_make_live_attachment($id);
+    update_post_meta($id, '_alegra_image_url', $url);
+    update_post_meta($id, '_alegra_image_url_hash', md5($url));
+    \Alegra\Connector\Entity_Map::map('image', md5($url), 'attachment', $id);
+    return $id;
+}
+
+function alegra_count_attachments(): int
+{
+    $n = 0;
+    foreach (($GLOBALS['wp_posts'] ?? []) as $p) {
+        if (($p->post_type ?? '') === 'attachment') { $n++; }
+    }
+    return $n;
+}
+
+/** Producto importable (item map + meta) listo para import_single_item_public. */
+function alegra_seed_linked_product(int $pid, string $alegra_id): void
+{
+    alegra_make_product($pid, ['name' => 'P' . $pid]);
+    update_post_meta($pid, '_alegra_item_id', $alegra_id);
+    \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', $pid);
+}
+
+TestRunner::test('T77.1 reconcile reemplaza (no mergea) y preserva ids merchant', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-rc');
+
+    $a        = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+    $b        = alegra_seed_plugin_image(8002, 'https://cdn3.alegra.com/b.png');
+    $stale    = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    $merchant = alegra_make_live_attachment(9000);   // sin _alegra_image_url
+
+    update_post_meta(10, '_product_image_gallery', $stale . ',' . $merchant);
+
+    $item = ['id' => 'it-rc', 'name' => 'RC', 'reference' => 'SRC', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+        ['id' => 'ib', 'url' => 'https://cdn3.alegra.com/b.png'],
+    ]];
+    $r = make_products()->import_single_item_public($item, 0, true, false);   // reconcile, sin delete
+
+    TestRunner::assertSame('updated', $r, 'se reconcilia el producto existente');
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'featured = primera imagen');
+    TestRunner::assertSame($b . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería reemplazada: plugin stale fuera, merchant preservado');
+    TestRunner::assertTrue(get_post($stale) !== null, 'sin allow_delete NO se borra el stale');
+});
+
+TestRunner::test('T77.2 reconcile repetido = no-op (0 attachments nuevos, refs iguales)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-r2');
+    alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+
+    $item = ['id' => 'it-r2', 'name' => 'R2', 'reference' => 'SR2', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+    ]];
+    $p = make_products();
+    $p->import_single_item_public($item, 0, true, true);
+    $thumb1   = (int) get_post_meta(10, '_thumbnail_id', true);
+    $count1   = alegra_count_attachments();
+
+    $p->import_single_item_public($item, 0, true, true);
+    $thumb2 = (int) get_post_meta(10, '_thumbnail_id', true);
+    $count2 = alegra_count_attachments();
+
+    TestRunner::assertSame(8001, $thumb1, 'la featured viene de la dedup viva');
+    TestRunner::assertSame($thumb1, $thumb2, 'la featured no cambia en el repeat');
+    TestRunner::assertSame($count1, $count2, 'el repeat NO crea attachments');
+});
+
+TestRunner::test('T77.3 reconcile aborta ante un fallo (all-or-nothing, sin rewrite ni delete)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-r3');
+    alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');   // resuelve
+    $stale    = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    $merchant = alegra_make_live_attachment(9000);
+
+    update_post_meta(10, '_thumbnail_id', $stale);
+    update_post_meta(10, '_product_image_gallery', (string) $merchant);
+
+    // urlX NO tiene dedup viva ⇒ download falla en el harness ⇒ abort.
+    $item = ['id' => 'it-r3', 'name' => 'R3', 'reference' => 'SR3', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+        ['id' => 'ix', 'url' => 'https://cdn3.alegra.com/missing.png'],
+    ]];
+    $r = make_products()->import_single_item_public($item, 0, true, true);
+
+    TestRunner::assertSame('updated', $r, 'el ítem se procesa');
+    TestRunner::assertSame($stale, (int) get_post_meta(10, '_thumbnail_id', true), 'featured intacto (no rewrite)');
+    TestRunner::assertSame((string) $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
+    TestRunner::assertTrue(get_post($stale) !== null, 'no se borra nada al abortar');
+});
+
+TestRunner::test('T77.4 reconcile en favorite: sólo featured, galería intacta', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-r4');
+    $a        = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+    $stale    = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    $merchant = alegra_make_live_attachment(9000);
+
+    update_post_meta(10, '_product_image_gallery', $stale . ',' . $merchant);
+
+    $item = ['id' => 'it-r4', 'name' => 'R4', 'reference' => 'SR4', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+    ]];
+    make_products()->import_single_item_public($item, 0, true, false);
+
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'featured = favorita');
+    TestRunner::assertSame($stale . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'favorite NO toca la galería');
 });
 
 exit(TestRunner::summary());
