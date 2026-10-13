@@ -4134,8 +4134,14 @@ class Admin_Dashboard
             ];
             set_transient('alegra_batch_state', $state, 600);
 
-            if ($type === 'products' && $total > 0) {
-                update_option('alegra_connector_products_import_total', $total, false);
+            if ($type === 'products') {
+                // task: chunked-owner marker. Its presence guarantees an
+                // UNFINISHED chunked run owns the shared cursor (every
+                // non-chunked writer clears it; done/cancel/release clear it).
+                update_option('alegra_connector_products_chunk_owner', (int) $run_id, false);
+                if ($total > 0) {
+                    update_option('alegra_connector_products_import_total', $total, false);
+                }
             }
 
             // D-D: liberar el lock per-type ANTES de responder (die() no corre finally).
@@ -4237,6 +4243,10 @@ class Admin_Dashboard
             if (is_wp_error($items)) {
                 \Alegra\Connector\Run_Context::finish($run_id, 'failed', $items->get_error_message());
                 delete_transient('alegra_batch_state');
+                // task(6): an owned chunked terminal path ⇒ no stale resume state.
+                delete_option('alegra_connector_products_import_cursor');
+                delete_option('alegra_connector_products_import_total');
+                delete_option('alegra_connector_products_chunk_owner');
                 \Alegra\Connector\Sync\Controller::release_sync_lock_public($type, $lock);
                 wp_send_json_error(['message' => $items->get_error_message()]);
             }
@@ -4407,6 +4417,9 @@ class Admin_Dashboard
             // terminó es `products`.
             if ($type === 'products') {
                 delete_option('alegra_connector_products_import_cursor');
+                // task-6: a completed chunked run leaves NO stale `_total`/owner.
+                delete_option('alegra_connector_products_import_total');
+                delete_option('alegra_connector_products_chunk_owner');
                 // task-7: persist a read-only summary of the last products
                 // import for the Monitor card. Purely additive observability;
                 // it never touches the import/upsert flow.
@@ -4454,6 +4467,18 @@ class Admin_Dashboard
             // Solo excepciones reales. En el harness también atrapa el throw de
             // wp_send_json_*; Run_Context::finish (T1.5) no re-finaliza si ya cerró.
             \Alegra\Connector\Run_Context::finish($run_id, 'failed', $e->getMessage());
+            // task-6: una excepción REAL es un terminal path del run que ESTE AJAX
+            // arrancó ⇒ no deja resume state. El throw de wp_send_json_* del harness
+            // (que también salta en el envío exitoso) NO es un fallo: se excluye.
+            $harness_send = class_exists('Alegra_Test_JSON_Response') && ($e instanceof \Alegra_Test_JSON_Response);
+            if (!$harness_send) {
+                delete_transient('alegra_batch_state');
+                if ($type === 'products') {
+                    delete_option('alegra_connector_products_import_cursor');
+                    delete_option('alegra_connector_products_import_total');
+                    delete_option('alegra_connector_products_chunk_owner');
+                }
+            }
             throw $e;
         } finally {
             // Solo para excepciones: los sends ya liberaron antes.
@@ -5671,6 +5696,7 @@ class Admin_Dashboard
         // "Pausado en el ítem X de Y" banner on the Products page.
         delete_option('alegra_connector_products_import_cursor');
         delete_option('alegra_connector_products_import_total');
+        delete_option('alegra_connector_products_chunk_owner');
         wp_send_json_success(['message' => __('Sincronización cancelada', 'alegra-connector')]);
     }
 
@@ -5702,6 +5728,7 @@ class Admin_Dashboard
         // banner on the Products page after the user pressed "Liberar".
         delete_option('alegra_connector_products_import_cursor');
         delete_option('alegra_connector_products_import_total');
+        delete_option('alegra_connector_products_chunk_owner');
 
         // Close heartbeat-expired chunked runs, then force any remainder that
         // is still `running` (younger than the grace window) to `stale`: the

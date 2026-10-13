@@ -1726,14 +1726,19 @@ class Products
 
             // Persist the resume cursor after every completed page.
             update_option($cursor_key, $start, false);
+            // task-6: a non-chunked owner seizes the shared cursor ⇒ invalidate
+            // the chunked-owner marker (invariant: marker ⟹ chunked owns cursor).
+            delete_option('alegra_connector_products_chunk_owner');
         }
 
         // Clear the cursor only when the catalog was fully walked; otherwise the
         // next run resumes where this one stopped (AC-19).
         if ($completed) {
             delete_option($cursor_key);
+            delete_option('alegra_connector_products_chunk_owner');
         } elseif ($start > 0) {
             update_option($cursor_key, $start, false);
+            delete_option('alegra_connector_products_chunk_owner');
         }
 
         // Final progress (T3.2.a: a pause is reported as paused, not done)

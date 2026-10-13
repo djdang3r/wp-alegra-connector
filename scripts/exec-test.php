@@ -16300,4 +16300,91 @@ TestRunner::test('T80.5 webhook/cron/single-item (defaults) NO reconcilian ni bo
     TestRunner::assertTrue(str_contains((string) get_post_meta(10, '_product_image_gallery', true), (string) $stale), 'legacy append: conserva la ref previa (NO reconcilia)');
 });
 
+echo "\nT81 — Cursor ownership marker + terminal clears\n";
+
+TestRunner::test('T81.1 el chunked start escribe el marker de dueño (= run id)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_connection_tested', true);
+    $_POST['sync_type'] = 'products';
+    $_POST['from_zero'] = '1';
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_start());
+    unset($_POST['sync_type'], $_POST['from_zero']);
+
+    $run_id = (int) ($resp->payload['run_id'] ?? 0);
+    TestRunner::assertTrue($run_id > 0, 'arranca el run chunked');
+    TestRunner::assertSame($run_id, (int) get_option('alegra_connector_products_chunk_owner', 0), 'marker = run_id');
+});
+
+TestRunner::test('T81.2 un error de API en la página limpia cursor + total + marker', function (): void {
+    alegra_test_reset();
+    alegra_mock_fail('GET', '/items', 500, ['error' => 'boom']);
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_import_total', 60, false);
+    update_option('alegra_connector_products_chunk_owner', $rid, false);
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 30, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+
+    TestRunner::assertFalse($resp->success, 'el WP_Error responde error');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'cursor ausente');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_total', false), 'total ausente');
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'marker ausente');
+    TestRunner::assertFalse(get_transient('alegra_batch_state'), 'batch_state ausente');
+    TestRunner::assertFalse(\Alegra\Connector\Admin\Admin_Dashboard::import_residue_status()['active'], 'sin residuo');
+});
+
+TestRunner::test('T81.3 un chunked reanudable conserva el cursor y el marker', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', false);
+    for ($i = 0; $i < 30; $i++) {
+        alegra_mock_seed_item('it-c' . $i, ['name' => 'C' . $i, 'reference' => 'SC' . $i, 'status' => 'active']);
+    }
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    update_option('alegra_connector_products_import_cursor', 0, false);
+    update_option('alegra_connector_products_chunk_owner', $rid, false);
+    set_transient('alegra_batch_state', [
+        'type' => 'products', 'run_id' => $rid, 'start' => 0, 'offset' => 0, 'per_page' => 30,
+        'total_pages' => 2, 'total_items' => 60, 'imported' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => 0,
+        'policy' => 'respect', 'images' => ['ok' => 0, 'blocked' => 0, 'download' => 0, 'sideload' => 0, 'deferred' => 0], 'filters' => [],
+    ], 600);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_sync_page());
+
+    TestRunner::assertTrue($resp->success, 'la página responde ok');
+    TestRunner::assertFalse((bool) ($resp->payload['done'] ?? true), 'no terminó: es reanudable');
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'cursor avanzó');
+    TestRunner::assertSame($rid, (int) get_option('alegra_connector_products_chunk_owner', 0), 'marker se mantiene');
+});
+
+TestRunner::test('T81.4 import_from_alegra (cron/manual) invalida el marker', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_chunk_owner', 999, false);   // marker huérfano
+    alegra_mock_seed_item('it-cron1', ['name' => 'X', 'reference' => 'SX', 'status' => 'active']);
+
+    make_controller()->import_from_alegra('products', 0);
+
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'el cron invalida el marker al tomar el cursor');
+});
+
+TestRunner::test('T81.5 cancel y release limpian el marker', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    update_option('alegra_connector_products_chunk_owner', 5, false);
+    alegra_capture_json(fn () => $admin->ajax_cancel_sync());
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'cancel limpia el marker');
+
+    update_option('alegra_connector_products_chunk_owner', 6, false);
+    alegra_capture_json(fn () => $admin->ajax_release_import());
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'release limpia el marker');
+});
+
 exit(TestRunner::summary());

@@ -123,6 +123,7 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_uuid_columns_migrated');
     delete_option('alegra_connector_products_import_cursor');
     delete_option('alegra_connector_products_import_total');
+    delete_option('alegra_connector_products_chunk_owner');
     delete_option('alegra_connector_last_import_summary');
     delete_option('alegra_connector_allowed_image_hosts_extra');
     delete_option('alegra_connector_restrict_image_hosts');
