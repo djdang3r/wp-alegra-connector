@@ -64,6 +64,7 @@
             this.initInvoiceNoticeDismiss();
             this.initShippingConfig();
             this.initImportResidueBanner();
+            this.initBulkWipe();
         },
 
         /**
@@ -400,6 +401,166 @@
                     });
                 };
                 } // end doSync
+            });
+        },
+
+        // -------------------------------------------------------------------
+        // Bulk wipe ("Borrador masivo / Reset total"). Preview is READ-ONLY;
+        // start requires typing BORRAR (also enforced server-side); the loop is
+        // chunked and STOPS the instant the server reports aborted.
+        // -------------------------------------------------------------------
+        initBulkWipe: function() {
+            var $btn = $('.alegra-bulk-wipe');
+            if (!$btn.length) { return; }
+
+            var $modal    = $('#alegra-wipe-modal');
+            var $counts   = $modal.find('.ac-wipe-counts');
+            var $input    = $modal.find('.ac-wipe-confirm-input');
+            var $confirm  = $modal.find('.ac-wipe-confirm');
+            var $cancel   = $modal.find('.ac-wipe-cancel');
+            var $err      = $modal.find('.ac-wipe-error');
+            var $progress = $modal.find('.ac-wipe-progress');
+            var $bar      = $modal.find('.ac-wipe-bar-fill');
+            var $log      = $modal.find('.ac-wipe-log');
+            var $download = $modal.find('.ac-wipe-download');
+            var running   = false;
+
+            function close() {
+                $modal.hide();
+                $('body').removeClass('ac-modal-open');
+            }
+
+            function blockedMsg(blockers) {
+                if (!blockers || !blockers.length) { return ''; }
+                var map = {
+                    kill_switch: S.wipeBlockedKillSwitch,
+                    live_run:    S.wipeBlockedRunning,
+                    batch_state: S.wipeBlockedRunning,
+                    chunk_owner: S.wipeBlockedRunning
+                };
+                return blockers.map(function(b) { return map[b] || b; }).join(' ');
+            }
+
+            $btn.on('click', function() {
+                if ($btn.prop('disabled')) { return; }
+                $err.text('');
+                $progress.hide();
+                $log.text('');
+                $input.val('');
+                $confirm.prop('disabled', true);
+                $counts.text(S.wipeLoading || 'Calculando…');
+                $modal.show();
+                $('body').addClass('ac-modal-open');
+
+                $.post(alegraConnector.ajaxUrl, {
+                    action: 'alegra_wipe_preview',
+                    _ajax_nonce: alegraConnector.nonce
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        $counts.text('');
+                        $err.text((r && r.data && r.data.message) || S.error);
+                        return;
+                    }
+                    var d = r.data || {};
+                    var p = d.preview || {};
+                    $counts.text(
+                        fmt(S.wipePreview, p.total_products || 0, p.images || 0) + ' ' +
+                        fmt(S.wipePreviewSkipped, p.images_skipped || 0, p.orders || 0)
+                    );
+                    var b = blockedMsg(d.blockers);
+                    if (b) {
+                        $err.text(b);
+                        $confirm.prop('disabled', true);
+                    }
+                }).fail(function() {
+                    $counts.text('');
+                    $err.text(S.connectionError);
+                });
+            });
+
+            $input.on('input', function() {
+                var ok = String($(this).val()).trim().toUpperCase() === 'BORRAR';
+                $confirm.prop('disabled', !ok);
+            });
+
+            $cancel.on('click', function() { if (!running) { close(); } });
+
+            $confirm.on('click', function() {
+                if (running) { return; }
+                running = true;
+                $confirm.prop('disabled', true);
+                $cancel.text(S.wipeRunning || 'Borrando…');
+                $err.text('');
+                $progress.show();
+                $bar.css('width', '2%').data('pct', 2);
+
+                var totals = { products: 0, images: 0, skipped: 0 };
+
+                $.post(alegraConnector.ajaxUrl, {
+                    action: 'alegra_wipe_start',
+                    _ajax_nonce: alegraConnector.nonce,
+                    confirm: 'BORRAR'
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        running = false;
+                        $err.text((r && r.data && r.data.message) || S.error);
+                        $confirm.prop('disabled', false);
+                        $cancel.text(S.cancel || 'Cancelar');
+                        return;
+                    }
+                    var d = r.data || {};
+                    if (d.backup) {
+                        $download.attr(
+                            'href',
+                            alegraConnector.ajaxUrl + '?action=alegra_wipe_download_backup&_ajax_nonce=' +
+                            encodeURIComponent(alegraConnector.nonce)
+                        ).show();
+                    }
+                    processPage();
+                }).fail(function() {
+                    running = false;
+                    $err.text(S.connectionError);
+                    $confirm.prop('disabled', false);
+                });
+
+                function processPage() {
+                    $.post(alegraConnector.ajaxUrl, {
+                        action: 'alegra_wipe_page',
+                        _ajax_nonce: alegraConnector.nonce
+                    }).done(function(r) {
+                        if (!r || !r.success) {
+                            running = false;
+                            $err.text((r && r.data && r.data.message) || S.error);
+                            return;
+                        }
+                        var d = r.data || {};
+                        totals.products += (d.products_deleted || 0);
+                        totals.images   += (d.images_deleted || 0);
+                        totals.skipped  += (d.images_skipped || 0);
+                        $log.text(fmt(S.wipeProgress, totals.products, totals.images, totals.skipped));
+                        var pct = Math.min(99, ($bar.data('pct') || 2) + 5);
+                        $bar.css('width', pct + '%').data('pct', pct);
+
+                        if (d.aborted) {
+                            running = false;
+                            $bar.css('width', '100%');
+                            $err.text((S.wipeAborted || 'Borrador detenido.') + ' ' + (d.reason || ''));
+                            $cancel.text(S.cancel || 'Cancelar');
+                            return; // STOP — never re-call after abort.
+                        }
+                        if (d.done) {
+                            running = false;
+                            $bar.css('width', '100%');
+                            $log.text(fmt(S.wipeDone, totals.products, totals.images, totals.skipped));
+                            setTimeout(function() { location.reload(); }, 2500);
+                            return;
+                        }
+                        processPage();
+                    }).fail(function() {
+                        running = false;
+                        $err.text(S.connectionError);
+                    });
+                }
             });
         },
 

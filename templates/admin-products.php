@@ -147,6 +147,11 @@ endif; ?>
             <span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;"></span>
             <?php esc_html_e('Reimportar todo desde cero', 'alegra-connector'); ?>
         </button>
+        <button type="button" class="ac-btn ac-btn-danger ac-btn-sm alegra-bulk-wipe"
+                title="<?php esc_attr_e('Elimina los productos importados, sus variaciones y sus imágenes. Operación irreversible.', 'alegra-connector'); ?>">
+            <span class="dashicons dashicons-trash" style="font-size:14px;width:14px;height:14px;"></span>
+            <?php esc_html_e('Borrador masivo (Reset total)', 'alegra-connector'); ?>
+        </button>
         <?php if ((string) get_option('alegra_connector_inventory_source', 'alegra') !== 'woocommerce') : ?>
         <button type="button" class="ac-btn ac-btn-sm alegra-sync-inventory" title="<?php esc_attr_e('Trae las existencias desde Alegra y actualiza el stock de WooCommerce.', 'alegra-connector'); ?>">
             <span class="dashicons dashicons-update" style="font-size:14px;width:14px;height:14px;"></span>
@@ -400,6 +405,46 @@ if ($total_pages > 1) {
             <a href="#" id="ac-filter-all" style="margin-right:auto;font-size:12px;"><?php esc_html_e('Traer todo sin filtros', 'alegra-connector'); ?></a>
             <button type="button" class="ac-btn" id="ac-filter-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
             <button type="button" class="ac-btn ac-btn-primary" id="ac-filter-apply"><?php esc_html_e('Aplicar y traer', 'alegra-connector'); ?></button>
+        </div>
+    </div>
+</div>
+
+<!-- Bulk wipe modal ("Borrador masivo / Reset total") -->
+<div id="alegra-wipe-modal" class="ac-modal-overlay" style="display:none;">
+    <div class="ac-modal">
+        <h2><?php esc_html_e('Borrador masivo (Reset total)', 'alegra-connector'); ?></h2>
+
+        <div class="ac-notice error" role="alert" style="margin-bottom:12px;line-height:1.5;">
+            <strong><?php esc_html_e('OPERACIÓN IRREVERSIBLE.', 'alegra-connector'); ?></strong>
+            <?php esc_html_e('Se borrarán los productos importados, sus variaciones y TODAS sus imágenes (archivos incluidos). El backup guarda datos pero NO puede restaurar las imágenes.', 'alegra-connector'); ?>
+            <br>
+            <?php esc_html_e('Las órdenes, clientes, facturas, pagos, ajustes, cupones, categorías y los productos NO importados NO se tocan.', 'alegra-connector'); ?>
+        </div>
+
+        <p class="ac-wipe-counts" style="font-size:13px;color:var(--ac-text-secondary);min-height:18px;"></p>
+
+        <label style="display:block;margin-top:10px;font-size:13px;">
+            <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Para confirmar, escribí BORRAR:', 'alegra-connector'); ?></span>
+            <input type="text" class="ac-wipe-confirm-input" autocomplete="off" spellcheck="false"
+                   placeholder="BORRAR" style="width:100%;" />
+        </label>
+
+        <div class="ac-wipe-progress" style="display:none;margin-top:12px;">
+            <div style="height:8px;background:var(--ac-surface-alt);border-radius:4px;overflow:hidden;">
+                <div class="ac-wipe-bar-fill" style="height:100%;width:2%;background:var(--ac-danger);transition:width .3s;"></div>
+            </div>
+            <p class="ac-wipe-log" style="font-size:12px;color:var(--ac-text-muted);margin-top:6px;"></p>
+        </div>
+
+        <p class="ac-wipe-error" style="color:var(--ac-warning);font-size:12px;min-height:16px;margin-top:8px;"></p>
+
+        <div class="ac-modal-actions" style="margin-top:12px;display:flex;gap:10px;align-items:center;justify-content:flex-end;">
+            <a href="#" class="ac-btn ac-btn-sm ac-wipe-download" style="display:none;margin-right:auto;">
+                <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
+                <?php esc_html_e('Descargar backup', 'alegra-connector'); ?>
+            </a>
+            <button type="button" class="ac-btn ac-wipe-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
+            <button type="button" class="ac-btn ac-btn-danger ac-wipe-confirm" disabled><?php esc_html_e('Borrar todo', 'alegra-connector'); ?></button>
         </div>
     </div>
 </div>

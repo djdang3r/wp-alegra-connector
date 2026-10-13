@@ -17046,4 +17046,31 @@ TestRunner::test('T86.11 el kill switch a mitad de run aborta el chunk (aborted=
     TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($run_id), 'el run quedó cerrado');
 });
 
+TestRunner::test('T86.12 la UI del borrador masivo está cableada (botón + modal BORRAR + loop abortable)', function (): void {
+    $tpl = cfg2_source('templates/admin-products.php');
+    TestRunner::assertStringContains('alegra-bulk-wipe', $tpl, 'botón danger');
+    TestRunner::assertStringContains('alegra-wipe-modal', $tpl, 'modal del borrador');
+    TestRunner::assertStringContains('ac-wipe-confirm-input', $tpl, 'input de confirmación');
+    TestRunner::assertStringContains('BORRAR', $tpl, 'exige escribir BORRAR');
+    TestRunner::assertStringContains('NO puede restaurar', $tpl, 'avisa que no restaura archivos');
+    TestRunner::assertStringContains('ac-wipe-download', $tpl, 'link al backup admin-only');
+
+    $js = cfg2_source('admin/assets/js/admin.js');
+    TestRunner::assertStringContains('initBulkWipe', $js, 'init del borrador');
+    TestRunner::assertStringContains("'alegra_wipe_preview'", $js, 'llama al preview');
+    TestRunner::assertStringContains("'alegra_wipe_start'", $js, 'llama al start');
+    TestRunner::assertStringContains("'alegra_wipe_page'", $js, 'llama al page');
+    TestRunner::assertStringContains('d.aborted', $js, 'corta el loop si aborted');
+
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    foreach (['alegra_wipe_preview', 'alegra_wipe_start', 'alegra_wipe_page', 'alegra_wipe_download_backup'] as $act) {
+        TestRunner::assertStringContains('wp_ajax_' . $act, $ctor, 'acción registrada: ' . $act);
+    }
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    foreach (['wipeLoading', 'wipePreview', 'wipeRunning', 'wipeProgress', 'wipeDone', 'wipeAborted', 'wipeBlockedKillSwitch', 'wipeBlockedRunning'] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
+    }
+});
+
 exit(TestRunner::summary());

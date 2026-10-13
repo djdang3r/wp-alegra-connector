@@ -1076,12 +1076,22 @@ class Admin_Dashboard
             'repairImagesRunning'   => __('Reparando imágenes...', 'alegra-connector'),
             'repairImagesDone'      => __('Reparación de imágenes completada.', 'alegra-connector'),
             'repairImagesBusy'      => __('Ya hay una reparación de imágenes en curso. Esperá a que termine.', 'alegra-connector'),
-            'repairImagesTitle'     => __('Reparación de imágenes', 'alegra-connector'),
-            'repairImagesNoData'    => __('Sin reparaciones todavía.', 'alegra-connector'),
+            'repairImagesTitle'     => __('Reparación de imágenes', 'alegra-connector'),            'repairImagesNoData'    => __('Sin reparaciones todavía.', 'alegra-connector'),
             'repairProcessed'       => __('Procesados', 'alegra-connector'),
             'repairRefsCleaned'     => __('Refs limpiadas', 'alegra-connector'),
             'repairImagesDownloaded'=> __('Imágenes bajadas', 'alegra-connector'),
             'repairStillMissing'    => __('Aún sin imagen', 'alegra-connector'),
+
+            // products-bulk-wipe: "Borrador masivo (Reset total)" modal + loop.
+            'wipeLoading'           => __('Calculando qué se borrará…', 'alegra-connector'),
+            'wipePreview'           => __('Se borrarán %1$s productos y %2$s imágenes.', 'alegra-connector'),
+            'wipePreviewSkipped'    => __('%1$s imágenes protegidas/compartidas se conservarán; %2$s pedidos quedarán sin esos productos.', 'alegra-connector'),
+            'wipeRunning'           => __('Borrando…', 'alegra-connector'),
+            'wipeProgress'          => __('Productos: %1$s · Imágenes: %2$s · Conservadas: %3$s', 'alegra-connector'),
+            'wipeDone'              => __('Completado: %1$s productos y %2$s imágenes borrados (%3$s imágenes conservadas).', 'alegra-connector'),
+            'wipeAborted'           => __('Borrador detenido:', 'alegra-connector'),
+            'wipeBlockedKillSwitch' => __('El plugin está detenido (kill switch). Reactivalo para borrar.', 'alegra-connector'),
+            'wipeBlockedRunning'    => __('Hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector'),
 
             // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
             'cfVerifying'           => __('Verificando...', 'alegra-connector'),
