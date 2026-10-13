@@ -886,7 +886,13 @@ function wp_update_post($data)
     }
     return $id;
 }
-function get_attached_file($attachment_id) { return ''; }
+function get_attached_file($attachment_id)
+{
+    // products-image-sync-reconcile: real-download attachments record their own
+    // `_wp_attached_file`; legacy fixtures have none (⇒ '').
+    $file = get_post_meta((int) $attachment_id, '_wp_attached_file', true);
+    return is_string($file) ? $file : '';
+}
 function set_post_thumbnail($post_id, $thumb_id)
 {
     // Real WP semantics: writes/removes `_thumbnail_id`. Only ever called once
@@ -901,8 +907,56 @@ function set_post_thumbnail($post_id, $thumb_id)
     }
     return true;
 }
-function download_url($url, $timeout = 300) { return new WP_Error('http_request_failed', 'download disabled in harness'); }
-function media_handle_sideload($file_array, $post_id, $desc = null) { return new WP_Error('unsupported', 'sideload disabled in harness'); }
+function download_url($url, $timeout = 300)
+{
+    // products-image-sync-reconcile: opt-in real downloads. When
+    // $GLOBALS['alegra_mock_image_downloads'] is truthy a real temp file is
+    // produced so the reconcile/dedup/delete paths become observable; the
+    // default keeps the historical "download disabled" behavior.
+    if (empty($GLOBALS['alegra_mock_image_downloads'])) {
+        return new WP_Error('http_request_failed', 'download disabled in harness');
+    }
+    $tmp = tempnam(sys_get_temp_dir(), 'alegra-dl-');
+    if ($tmp === false) {
+        return new WP_Error('http_request_failed', 'tempnam failed');
+    }
+    file_put_contents($tmp, 'alegra-image-bytes');
+    return $tmp;
+}
+function media_handle_sideload($file_array, $post_id, $desc = null)
+{
+    if (empty($GLOBALS['alegra_mock_image_downloads'])) {
+        return new WP_Error('unsupported', 'sideload disabled in harness');
+    }
+    $name = (string) ($file_array['name'] ?? 'image.jpg');
+    $tmp  = (string) ($file_array['tmp_name'] ?? '');
+
+    $uploads = wp_upload_dir();
+    $basedir = (string) ($uploads['basedir'] ?? sys_get_temp_dir());
+    wp_mkdir_p($basedir);
+    $dest = rtrim($basedir, '/') . '/' . $name;
+    if ($tmp !== '' && is_file($tmp)) {
+        @copy($tmp, $dest);
+        @unlink($tmp);
+    } else {
+        @file_put_contents($dest, 'alegra-image-bytes');
+    }
+
+    $id = wp_insert_post([
+        'post_title'  => $name,
+        'post_type'   => 'attachment',
+        'post_status' => 'inherit',
+        'post_parent' => (int) $post_id,
+    ]);
+    update_post_meta($id, '_wp_attached_file', $dest);
+    return $id;
+}
+function wp_check_filetype_and_ext($file, $filename, $mimes = null)
+{
+    $ext = strtolower((string) pathinfo((string) $filename, PATHINFO_EXTENSION));
+    return ['ext' => $ext !== '' ? $ext : 'jpg', 'type' => 'image/jpeg', 'proper_filename' => false];
+}
+function wp_get_image_mime($file) { return 'image/jpeg'; }
 function wp_get_attachment_url($attachment_id)
 {
     // Derived from the attachment's own `_wp_attached_file`, mirroring WP.

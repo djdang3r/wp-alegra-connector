@@ -16191,4 +16191,113 @@ TestRunner::test('T79.3 el caller (download_and_attach_image) forwardea el produ
     TestRunner::assertSame('8000', (string) get_post_meta(10, '_product_image_gallery', true), 'galería sin el muerto');
 });
 
+echo "\nT80 — Image engine behavioral coverage (real download + delete)\n";
+
+TestRunner::test('T80.1 el import real baja las imágenes una vez y el repeat no duplica', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-n1');
+
+    $item = ['id' => 'it-n1', 'name' => 'N1', 'reference' => 'SN1', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/1.png', 'favorite' => true],
+        ['id' => 'i2', 'url' => 'https://cdn3.alegra.com/2.png'],
+    ]];
+    $p      = make_products();
+    $count0 = alegra_count_attachments();
+    $p->import_single_item_public($item, 0, true, true);
+    $count1 = alegra_count_attachments();
+    $thumb  = (int) get_post_meta(10, '_thumbnail_id', true);
+    $gal    = (string) get_post_meta(10, '_product_image_gallery', true);
+
+    TestRunner::assertSame($count0 + 2, $count1, 'baja 2 imágenes reales (una vez)');
+    TestRunner::assertTrue($thumb > 0, 'featured asignada');
+    TestRunner::assertTrue($gal !== '', 'la 2ª imagen va a la galería');
+
+    $p->import_single_item_public($item, 0, true, true);
+    TestRunner::assertSame($count1, alegra_count_attachments(), 'el repeat NO crea attachments');
+    TestRunner::assertSame($thumb, (int) get_post_meta(10, '_thumbnail_id', true), 'misma featured');
+    TestRunner::assertSame($gal, (string) get_post_meta(10, '_product_image_gallery', true), 'misma galería');
+});
+
+TestRunner::test('T80.2 un update reemplaza: borra las viejas y deja el set nuevo', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-u1');
+
+    $p = make_products();
+    $p->import_single_item_public(['id' => 'it-u1', 'name' => 'U', 'reference' => 'SU', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/1.png', 'favorite' => true],
+    ]], 0, true, true);
+    $oldThumb = (int) get_post_meta(10, '_thumbnail_id', true);
+    TestRunner::assertTrue($oldThumb > 0 && get_post($oldThumb) !== null, 'la vieja existe');
+
+    $p->import_single_item_public(['id' => 'it-u1', 'name' => 'U', 'reference' => 'SU', 'images' => [
+        ['id' => 'i2', 'url' => 'https://cdn3.alegra.com/2.png', 'favorite' => true],
+    ]], 0, true, true);
+    $newThumb = (int) get_post_meta(10, '_thumbnail_id', true);
+
+    TestRunner::assertTrue($newThumb > 0 && $newThumb !== $oldThumb, 'nueva featured');
+    TestRunner::assertSame(null, get_post($oldThumb), 'la vieja se borró de Media');
+});
+
+TestRunner::test('T80.3 un producto sin imágenes en Alegra limpia sus refs plugin', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-e1');
+
+    $p = make_products();
+    $p->import_single_item_public(['id' => 'it-e1', 'name' => 'E', 'reference' => 'SE', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/1.png', 'favorite' => true],
+    ]], 0, true, true);
+    $old = (int) get_post_meta(10, '_thumbnail_id', true);
+    TestRunner::assertTrue($old > 0, 'arranca con featured');
+
+    $p->import_single_item_public(['id' => 'it-e1', 'name' => 'E', 'reference' => 'SE', 'images' => []], 0, true, true);
+
+    TestRunner::assertSame(0, (int) get_post_meta(10, '_thumbnail_id', true), 'featured plugin limpiada');
+    TestRunner::assertSame(null, get_post($old), 'y el plugin image se borra');
+});
+
+TestRunner::test('T80.4 repair_product_images NO reconcilia ni borra (no destructivo)', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_make_product(10, ['name' => 'R']);
+    $stale = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    update_post_meta(10, '_thumbnail_id', 9999);            // muerto
+    update_post_meta(10, '_product_image_gallery', (string) $stale);
+
+    make_products()->repair_product_images(10, [['id' => 'ib', 'url' => 'https://cdn3.alegra.com/b.png', 'favorite' => true]]);
+
+    TestRunner::assertTrue(get_post($stale) !== null, 'repair NO borra la ref previa');
+    TestRunner::assertTrue(str_contains((string) get_post_meta(10, '_product_image_gallery', true), (string) $stale), 'repair NO reconcilia (conserva la galería)');
+});
+
+TestRunner::test('T80.5 webhook/cron/single-item (defaults) NO reconcilian ni borran', function (): void {
+    alegra_test_reset();
+    $GLOBALS['alegra_mock_image_downloads'] = true;
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-w1');
+    $stale = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    update_post_meta(10, '_thumbnail_id', $stale);
+    update_post_meta(10, '_product_image_gallery', (string) $stale);
+
+    // Sin flags (false,false): path legacy del webhook/cron/single-item.
+    make_products()->import_single_item_public(['id' => 'it-w1', 'name' => 'W', 'reference' => 'SW', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/1.png'],
+        ['id' => 'i2', 'url' => 'https://cdn3.alegra.com/2.png'],
+    ]], 0);
+
+    TestRunner::assertTrue(get_post($stale) !== null, 'el path legacy NO borra');
+    TestRunner::assertTrue(str_contains((string) get_post_meta(10, '_product_image_gallery', true), (string) $stale), 'legacy append: conserva la ref previa (NO reconcilia)');
+});
+
 exit(TestRunner::summary());
