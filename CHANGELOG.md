@@ -2,6 +2,38 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.11] - 2026-10-12
+
+> **Monitor: diagnóstico read-only de importación de imágenes.**
+> El Monitor suma un bloque read-only de **configuración de imágenes** y un botón
+> **"Probar imágenes (1 producto)"** que compara el **DETALLE** (`GET /items/{id}`)
+> contra el **LISTADO** (`GET /items`) de un producto vinculado, para revelar si el
+> listado de Alegra dejó de traer `images`. Sirve para explicar por qué las imágenes
+> de producto no se importaron. **No descarga ni importa imágenes, no escribe nada.**
+
+### Added
+
+- **Monitor: bloque de configuración de imágenes (read-only).** El payload de
+  diagnóstico (`import_diagnostics()`) suma la clave `images` con
+  `sync_images`, `sync_images_mode`, `restrict_image_hosts` e `images_preserved`,
+  con labels ya resueltos. Refleja exactamente las compuertas que lee
+  `Products::update_product_from_alegra()` (`alegra_connector_sync_images` +
+  `!preserve 'images'`), el modo y el allowlist de hosts. Solo lectura.
+- **Monitor: botón "Probar imágenes (1 producto)"** respaldado por la acción AJAX
+  `wp_ajax_alegra_probe_images`. Toma UN producto vinculado (`_alegra_item_id`) y
+  consulta la API dos veces — `get_item()` (DETALLE, `GET /items/{id}`) y
+  `get_items(['id' => …, 'mode' => 'advanced'])` (LISTADO, `GET /items`) — reportando
+  por cada uno: si la llamada tuvo éxito, el conteo de `images`, una muestra JSON y
+  las claves de la primera imagen. Verificación de nonce (`check_ajax_referer`) y
+  capability (`manage_woocommerce`). Diagnóstico **read-only**: no descarga ni importa
+  imágenes ni muta productos.
+
+### Tests
+
+- **Exec-test:** bloque task-9 (config de imágenes en el diagnóstico, cableado UI +
+  handler del probe, y prueba end-to-end que confirma que DETALLE trae imágenes
+  mientras el LISTADO no, sin escrituras ni mutación de producto).
+
 ## [2.8.10] - 2026-10-12
 
 > **Monitor: resumen del último import de productos + aviso de configuración.**
