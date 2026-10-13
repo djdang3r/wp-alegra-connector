@@ -3042,7 +3042,7 @@ class Products
      *
      * @return int[]
      */
-    private function wipe_collect_image_ids(\WC_Product $product): array
+    public function wipe_collect_image_ids(\WC_Product $product): array
     {
         $ids = self::product_image_refs($product);
 
@@ -3463,6 +3463,89 @@ class Products
             }
         }
         return array_keys($out);
+    }
+
+    /**
+     * Todo 4 (M3): READ-ONLY preview of what a wipe would do.
+     *
+     * Counts imported products by post type, the DEDUPLICATED image set
+     * (including variation images), how many attachments would be SKIPPED
+     * (term/logo/placeholder/outside-set), and, best-effort, how many orders
+     * reference the wiped products. Never writes anything.
+     *
+     * @return array{products:int,variations:int,total_products:int,images:int,images_skipped:int,orders:int}
+     */
+    public function wipe_preview(): array
+    {
+        $wipe_ids = $this->wipe_build_id_set();
+        $wipe_set = [];
+        foreach ($wipe_ids as $id) {
+            $wipe_set[(int) $id] = true;
+        }
+
+        $products   = 0;
+        $variations = 0;
+        $images     = [];
+        $skipped    = [];
+        $ids        = [];
+
+        foreach ($wipe_ids as $product_id) {
+            $product = wc_get_product((int) $product_id);
+            if (!$product instanceof \WC_Product) {
+                continue;
+            }
+            $ids[] = (int) $product_id;
+
+            if ($product->get_type() === 'variation') {
+                $variations++;
+            } else {
+                $products++;
+            }
+
+            foreach ($this->wipe_collect_image_ids($product) as $image_id) {
+                if (isset($images[$image_id])) {
+                    continue;
+                }
+                $images[$image_id] = true;
+                if ($this->wipe_attachment_verdict($image_id, $wipe_set) !== 'delete') {
+                    $skipped[$image_id] = true;
+                }
+            }
+        }
+
+        return [
+            'products'        => $products,
+            'variations'      => $variations,
+            'total_products'  => $products + $variations,
+            'images'          => count($images),
+            'images_skipped'  => count($skipped),
+            'orders'          => $this->wipe_count_orders_referencing($ids),
+        ];
+    }
+
+    /**
+     * Best-effort count of orders whose line items reference the wiped products.
+     * Read-only; returns 0 when the order-itemmeta table is unavailable (HPOS).
+     *
+     * @param int[] $product_ids
+     */
+    private function wipe_count_orders_referencing(array $product_ids): int
+    {
+        global $wpdb;
+
+        $ids = self::normalize_id_list($product_ids);
+        if ($ids === []) {
+            return 0;
+        }
+
+        $in_list = implode(',', $ids);
+        $count = $wpdb->get_var(
+            "SELECT COUNT(DISTINCT order_id) FROM {$wpdb->prefix}woocommerce_order_itemmeta
+             WHERE meta_key IN ('_product_id', '_variation_id')
+               AND meta_value IN ({$in_list})"
+        );
+
+        return is_numeric($count) ? (int) $count : 0;
     }
 
     /**

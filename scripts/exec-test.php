@@ -16905,4 +16905,87 @@ TestRunner::test('T86.7 H3/L1: el cierre reconcilia huérfanos (producto+adjunto
     TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'las options del wipe se limpiaron');
 });
 
+echo "\nT86 — Bulk wipe (reset total) — handlers\n";
+
+TestRunner::test('T86.8 ajax_wipe_preview es READ-ONLY y cuenta por tipo + imágenes deduplicadas (M3)', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-p1');
+    update_post_meta(10, '_thumbnail_id', 8001);
+    alegra_seed_linked_product(12, 'it-p2');
+    $term_img = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/t.png');
+    update_term_meta(500, 'thumbnail_id', $term_img);
+    update_post_meta(12, '_thumbnail_id', $term_img);
+    alegra_make_variable_product(20, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        21 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+    ]);
+    update_post_meta(20, '_alegra_item_id', 'it-v');
+    update_post_meta(21, '_alegra_item_id', 'it-v1');
+    update_post_meta(21, '_thumbnail_id', 8010);
+    alegra_make_product(30, ['name' => 'Foreign']);   // no item id
+    update_post_meta(30, '_thumbnail_id', 8001);      // also referenced by a foreign post
+
+    $before = serialize($GLOBALS['wp_postmeta']);
+    $admin  = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp   = alegra_capture_json(fn () => $admin->ajax_wipe_preview());
+
+    TestRunner::assertTrue($resp->success, 'preview responde success');
+    $p = $resp->payload['preview'];
+    TestRunner::assertSame(3, (int) $p['products'], '3 productos (2 simples + 1 variable)');
+    TestRunner::assertSame(1, (int) $p['variations'], '1 variación con item id');
+    TestRunner::assertSame(4, (int) $p['total_products'], 'total 4');
+    TestRunner::assertSame(3, (int) $p['images'], '3 imágenes únicas (deduplicadas)');
+    TestRunner::assertSame(2, (int) $p['images_skipped'], '8001 (post ajeno) y 8003 (term) se saltean; 8010 es interno');
+    TestRunner::assertSame($before, serialize($GLOBALS['wp_postmeta']), 'M3: preview no muta postmeta');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'M3: preview no escribe el set');
+});
+
+TestRunner::test('T86.9 ajax_wipe_start exige BORRAR server-side y crea run+lock+export (M1/H1)', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-s');
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    // (a) sin BORRAR ⇒ rechazo.
+    $_POST['confirm'] = 'BORRARX';
+    $r1 = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    TestRunner::assertFalse($r1->success, 'sin BORRAR se rechaza');
+    TestRunner::assertStringContains('BORRAR', (string) ($r1->payload['message'] ?? ''), 'el mensaje menciona BORRAR');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'no se creó el set');
+
+    // (b) kill switch activo ⇒ rechazo.
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $_POST['confirm'] = 'BORRAR';
+    $r2 = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    TestRunner::assertFalse($r2->success, 'con kill switch se rechaza');
+    \Alegra\Connector\Kill_Switch::deactivate();
+    \Alegra\Connector\Kill_Switch::reset_cache();
+
+    // (c) import corriendo ⇒ rechazo.
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => 1], 600);
+    $_POST['confirm'] = 'BORRAR';
+    $r3 = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    delete_transient('alegra_batch_state');
+    unset($_POST['confirm']);
+    TestRunner::assertFalse($r3->success, 'con import corriendo se rechaza');
+
+    // (d) camino feliz.
+    $_POST['confirm'] = 'BORRAR';
+    $ok = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    TestRunner::assertTrue($ok->success, 'con BORRAR y sin bloqueos arranca');
+    TestRunner::assertSame([10], get_option('alegra_connector_wipe_ids', []), 'el set se persistió');
+    TestRunner::assertTrue((string) get_option('alegra_connector_wipe_lock_token', '') !== '', 'el token del lock se persistió');
+    TestRunner::assertTrue(is_array(get_option('alegra_lock_alegra_sync_running_products', false)), 'el lock del import está tomado (H1)');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status((int) $ok->payload['run_id']), 'run wipe_products creado');
+    $bkp = (string) get_option('alegra_connector_wipe_backup_file', '');
+    TestRunner::assertTrue($bkp !== '' && is_file($bkp), 'M1: el export existe');
+    TestRunner::assertTrue(is_file(dirname($bkp) . '/.htaccess'), 'M1: .htaccess de denegación');
+    TestRunner::assertTrue(is_file(dirname($bkp) . '/index.php'), 'M1: index.php de denegación');
+
+    // sanity cleanup
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
 exit(TestRunner::summary());

@@ -20,6 +20,18 @@ if (!defined('ABSPATH')) {
 
 class Admin_Dashboard
 {
+    /** Products per page in the chunked bulk wipe. */
+    private const WIPE_CHUNK = 20;
+
+    /**
+     * The per-type sync lock key shared with the products import (H1). Using
+     * the SAME key gives real mutual exclusion between a wipe and an import.
+     */
+    private const WIPE_LOCK_KEY = 'alegra_sync_running_products';
+
+    /** Backup subdirectory (inside uploads) for the wipe safety export. */
+    private const WIPE_BACKUP_DIR = 'alegra-wipe';
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -98,6 +110,11 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_probe_images', [$this, 'ajax_probe_images']);
         // task-15: non-destructive "Reparar imágenes" (Monitor panel), chunked.
         add_action('wp_ajax_alegra_repair_images', [$this, 'ajax_repair_images']);
+        // Bulk wipe ("Borrador masivo / reset total"): preview + gated start +
+        // chunked page + admin-only backup download.
+        add_action('wp_ajax_alegra_wipe_preview', [$this, 'ajax_wipe_preview']);
+        add_action('wp_ajax_alegra_wipe_start', [$this, 'ajax_wipe_start']);
+        add_action('wp_ajax_alegra_wipe_download_backup', [$this, 'ajax_wipe_download_backup']);
     }
 
     /**
@@ -5805,6 +5822,249 @@ class Admin_Dashboard
         $this->log('warning', 'Import locks released by user');
 
         wp_send_json_success(['message' => __('Importación liberada. Ya podés reimportar.', 'alegra-connector')]);
+    }
+
+    // =======================================================================
+    // Bulk wipe ("Borrador masivo / Reset total").
+    //
+    // Destructive + irreversible: preview is read-only; start requires a
+    // server-side `BORRAR`, holds the SAME lock as the products import (H1),
+    // writes a protected safety export (M1) and opens a `wipe_products` run;
+    // page does the chunked work (abortable + heartbeated) and closes with the
+    // integrity cleanup.
+    // =======================================================================
+
+    /**
+     * AJAX: READ-ONLY preview of the wipe (counts + blockers). Writes nothing.
+     */
+    public function ajax_wipe_preview(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        $products = new Sync\Products($this->api, $this->logger);
+        $preview  = $products->wipe_preview();
+
+        $blockers = [];
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $blockers[] = 'kill_switch';
+        }
+        if (self::has_genuinely_live_run('products')) {
+            $blockers[] = 'live_run';
+        }
+        if (is_array(get_transient('alegra_batch_state'))) {
+            $blockers[] = 'batch_state';
+        }
+        if ((int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
+            $blockers[] = 'chunk_owner';
+        }
+
+        wp_send_json_success([
+            'preview'  => $preview,
+            'blockers' => $blockers,
+        ]);
+    }
+
+    /**
+     * AJAX: start the wipe. Requires an exact server-side `BORRAR`.
+     */
+    public function ajax_wipe_start(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        // Server-side confirmation gate: never trust the UI checkbox alone.
+        $confirm = isset($_POST['confirm']) ? strtoupper(trim((string) wp_unslash($_POST['confirm']))) : '';
+        if ($confirm !== 'BORRAR') {
+            wp_send_json_error(['message' => __('Debés escribir BORRAR para confirmar el borrado.', 'alegra-connector')]);
+        }
+
+        // H1 gates.
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            wp_send_json_error(['message' => __('El plugin está detenido (kill switch activo). Reactivalo antes de borrar.', 'alegra-connector')]);
+        }
+        if (self::has_genuinely_live_run('products') || is_array(get_transient('alegra_batch_state')) || (int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
+            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+        }
+
+        // H1: the SAME lock as the products import ⇒ real mutual exclusion.
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
+        if ($lock === false) {
+            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+        }
+
+        // Build the payload INSIDE the try; send OUTSIDE it. In the execution
+        // harness wp_send_json_* throws, so a send inside try{} would be caught
+        // by catch(\Throwable) and misreported as a failure.
+        $payload = null;
+        $error   = '';
+        try {
+            $products = new Sync\Products($this->api, $this->logger);
+            $wipe_ids = $products->wipe_build_id_set();
+
+            if ($wipe_ids === []) {
+                \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $lock);
+                \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+                $error = __('No hay productos importados para borrar.', 'alegra-connector');
+            } else {
+                // Persist the authoritative set + reset the run-scoped rollups.
+                update_option('alegra_connector_wipe_ids', $wipe_ids, false);
+                update_option('alegra_connector_wipe_cursor', 0, false);
+                update_option('alegra_connector_wipe_alegra_ids', [], false);
+                update_option('alegra_connector_wipe_deleted_ids', [], false);
+                update_option('alegra_connector_wipe_lock_token', (string) $lock, false);
+
+                // M1: the safety export is written AFTER the gate, in a
+                // protected uploads subdir.
+                $backup = $this->write_wipe_backup($wipe_ids);
+                if ($backup !== '') {
+                    update_option('alegra_connector_wipe_backup_file', $backup, false);
+                }
+
+                $run_id = \Alegra\Connector\Run_Context::begin('wipe_products', null, ['wipe' => true]);
+                update_option('alegra_connector_wipe_run_id', (int) $run_id, false);
+
+                $this->log('warning', 'Bulk wipe started', [
+                    'run_id'      => $run_id,
+                    'total'       => count($wipe_ids),
+                    'backup_file' => $backup !== '' ? basename($backup) : '',
+                ]);
+
+                // The lock is NOT released: every chunk keeps it (H1).
+                $payload = [
+                    'run_id'  => (int) $run_id,
+                    'total'   => count($wipe_ids),
+                    'chunk'   => self::WIPE_CHUNK,
+                    'preview' => $products->wipe_preview(),
+                    'backup'  => $backup !== '' ? basename($backup) : '',
+                    'message' => sprintf(__('Borrador masivo iniciado: %d productos.', 'alegra-connector'), count($wipe_ids)),
+                ];
+            }
+        } catch (\Throwable $e) {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $lock);
+            \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+            delete_option('alegra_connector_wipe_lock_token');
+            $this->log('error', 'Bulk wipe start failed', ['error' => $e->getMessage()]);
+            $error = __('No se pudo iniciar el borrador.', 'alegra-connector');
+        }
+
+        if ($error !== '') {
+            wp_send_json_error(['message' => $error]);
+        }
+        wp_send_json_success($payload);
+    }
+
+    /**
+     * Write the safety export JSON into the protected uploads subdir (M1).
+     *
+     * @param int[] $wipe_ids
+     * @return string Absolute path, or '' on failure.
+     */
+    private function write_wipe_backup(array $wipe_ids): string
+    {
+        $uploads = wp_upload_dir();
+        $basedir = rtrim((string) ($uploads['basedir'] ?? ''), '/\\');
+        if ($basedir === '') {
+            return '';
+        }
+        $dir = $basedir . '/' . self::WIPE_BACKUP_DIR;
+        if (!wp_mkdir_p($dir)) {
+            return '';
+        }
+
+        // Deny direct web access (Apache). index.php keeps directory listings
+        // off on nginx/Apache; the real serving path is an admin-only endpoint.
+        if (!file_exists($dir . '/.htaccess')) {
+            @file_put_contents($dir . '/.htaccess', "Deny from all\n");
+        }
+        if (!file_exists($dir . '/index.php')) {
+            @file_put_contents($dir . '/index.php', "<?php\n// Silence is golden.\n");
+        }
+
+        $rows = [];
+        $products = new Sync\Products($this->api, $this->logger);
+        foreach ($wipe_ids as $product_id) {
+            $product_id = (int) $product_id;
+            $product    = wc_get_product($product_id);
+            if (!$product instanceof \WC_Product) {
+                continue;
+            }
+
+            $image_ids = $products->wipe_collect_image_ids($product);
+            $image_urls = [];
+            foreach ($image_ids as $image_id) {
+                $url = function_exists('wp_get_attachment_url') ? wp_get_attachment_url($image_id) : false;
+                if (is_string($url) && $url !== '') {
+                    $image_urls[] = $url;
+                }
+            }
+
+            $rows[] = [
+                'product_id'     => $product_id,
+                'name'           => (string) $product->get_name(),
+                'sku'            => (string) $product->get_sku(),
+                'alegra_item_id' => (string) get_post_meta($product_id, '_alegra_item_id', true),
+                'allegra_type'   => (string) $product->get_type(),
+                'image_ids'      => array_values($image_ids),
+                'image_urls'     => $image_urls,
+                'prices'         => [
+                    'regular' => (string) $product->get_regular_price(),
+                    'sale'    => (string) $product->get_sale_price(),
+                    'price'   => (string) $product->get_price(),
+                ],
+                'categories'     => array_map('intval', (array) $product->get_category_ids()),
+            ];
+        }
+
+        $payload = [
+            'generated_at' => current_time('mysql'),
+            'user_id'      => get_current_user_id(),
+            'user_login'   => function_exists('wp_get_current_user') ? (string) wp_get_current_user()->user_login : '',
+            'note'         => 'Backup de datos de productos importados. NO puede restaurar los archivos de imagen (se destruyen).',
+            'products'     => $rows,
+        ];
+
+        $file = $dir . '/alegra-wipe-backup-' . date('Ymd-His') . '.json';
+        $written = @file_put_contents($file, (string) wp_json_encode($payload));
+
+        return $written !== false ? $file : '';
+    }
+
+    /**
+     * AJAX: admin-only download of the safety export (M1). Never a public URL.
+     */
+    public function ajax_wipe_download_backup(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            wp_die(__('No tenés permisos.', 'alegra-connector'), 403);
+        }
+
+        $file = (string) get_option('alegra_connector_wipe_backup_file', '');
+        if ($file === '' || !is_file($file)) {
+            wp_die(__('Backup no encontrado.', 'alegra-connector'), 404);
+        }
+
+        // The file must live inside the protected wipe subdir.
+        $uploads = wp_upload_dir();
+        $dir = rtrim((string) ($uploads['basedir'] ?? ''), '/\\') . '/' . self::WIPE_BACKUP_DIR . '/';
+        if (strpos($file, $dir) !== 0) {
+            wp_die(__('Ruta de backup inválida.', 'alegra-connector'), 403);
+        }
+
+        if (function_exists('nocache_headers')) {
+            nocache_headers();
+        }
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . basename($file) . '"');
+        }
+        readfile($file);
+        exit;
     }
 
     /**
