@@ -15058,4 +15058,178 @@ TestRunner::test('T73.9 el reporte del probe arma detalle+listado y no escribe',
     TestRunner::assertStringNotContains('update_option', $ajax, 'no escribe opciones');
 });
 
+// ===========================================================================
+// === task-10: image dedup validity + probe breakdown ======================
+// ===========================================================================
+echo "\nT74 — Image dedup validity (a stale/dead attachment must never dedup)\n";
+
+TestRunner::test('T74.1 una asignación stale (attachment borrado) NO deduplica y limpia el mapa', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    $p = make_products();
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+
+    $url  = 'https://cdn3.alegra.com/stale.png';
+    $hash = md5($url);
+    // Dead target: id 9999 has NO wp_posts entry (deleted attachment). This is
+    // the merchant's regression: the indexed map still points at a ghost.
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', 9999);
+    update_post_meta(9999, '_alegra_image_url_hash', $hash);
+    update_post_meta(9999, '_alegra_image_url', $url);
+
+    $id = alegra_call_private($p, 'download_and_attach_image', 1000, $url);
+
+    TestRunner::assertSame(0, $id, 'no deduplica hacia un attachment muerto');
+    TestRunner::assertSame(1, \Alegra\Connector\Sync\Products::image_stats()['download'], 'intenta la descarga (no dedup)');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa stale se elimina');
+    TestRunner::assertSame('', (string) get_post_meta(9999, '_alegra_image_url_hash', true), 'meta hash stale eliminada');
+    TestRunner::assertSame('', (string) get_post_meta(9999, '_alegra_image_url', true), 'meta url stale eliminada');
+});
+
+TestRunner::test('T74.2 un attachment VÁLIDO sigue deduplicando sin re-descargar', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    $p = make_products();
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+
+    $url  = 'https://cdn3.alegra.com/live.png';
+    $hash = md5($url);
+    $att  = 7001;
+    $GLOBALS['wp_posts'][$att] = (object) ['ID' => $att, 'post_type' => 'attachment', 'post_status' => 'inherit'];
+    update_post_meta($att, '_alegra_image_url_hash', $hash);
+    update_post_meta($att, '_alegra_image_url', $url);
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $att);
+
+    $id = alegra_call_private($p, 'download_and_attach_image', 1000, $url);
+
+    TestRunner::assertSame($att, $id, 'deduplica hacia el attachment vivo');
+    TestRunner::assertSame(0, \Alegra\Connector\Sync\Products::image_stats()['download'], 'NO re-descarga');
+    TestRunner::assertSame($att, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa válido se mantiene');
+});
+
+TestRunner::test('T74.3 stale encontrado por meta (sin mapa) también se limpia y re-descarga', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    $p = make_products();
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+
+    $url  = 'https://cdn3.alegra.com/ghost.png';
+    $hash = md5($url);
+    // No entity map: a legacy postmeta row points at a non-existent attachment.
+    update_post_meta(8888, '_alegra_image_url_hash', $hash);
+    update_post_meta(8888, '_alegra_image_url', $url);
+
+    $id = alegra_call_private($p, 'download_and_attach_image', 1000, $url);
+
+    TestRunner::assertSame(0, $id, 'no deduplica hacia el ghost');
+    TestRunner::assertSame(1, \Alegra\Connector\Sync\Products::image_stats()['download'], 'intenta la descarga');
+    TestRunner::assertSame('', (string) get_post_meta(8888, '_alegra_image_url_hash', true), 'meta hash limpiada');
+    TestRunner::assertSame('', (string) get_post_meta(8888, '_alegra_image_url', true), 'meta url limpiada');
+});
+
+TestRunner::test('T74.4 image_dedup_probe es read-only y reporta viva/muerta', function (): void {
+    alegra_test_reset();
+
+    $live_url  = 'https://cdn.alegra.test/live.png';
+    $live_hash = md5($live_url);
+    $live      = 7100;
+    $GLOBALS['wp_posts'][$live] = (object) ['ID' => $live, 'post_type' => 'attachment', 'post_status' => 'inherit'];
+    update_post_meta($live, '_alegra_image_url_hash', $live_hash);
+    update_post_meta($live, '_alegra_image_url', $live_url);
+    \Alegra\Connector\Entity_Map::map('image', $live_hash, 'attachment', $live);
+
+    $dead_url  = 'https://cdn.alegra.test/dead.png';
+    $dead_hash = md5($dead_url);
+    \Alegra\Connector\Entity_Map::map('image', $dead_hash, 'attachment', 9999);
+    update_post_meta(9999, '_alegra_image_url_hash', $dead_hash);
+    update_post_meta(9999, '_alegra_image_url', $dead_url);
+
+    $probe = \Alegra\Connector\Sync\Products::image_dedup_probe($live_url, 10);
+    TestRunner::assertSame($live, $probe['dedup_by_hash_id'], 'hash id vivo');
+    TestRunner::assertTrue($probe['dedup_by_hash_live'], 'hash viva');
+    TestRunner::assertSame($live, $probe['dedup_by_url_id'], 'url id vivo');
+    TestRunner::assertTrue($probe['dedup_by_url_live'], 'url viva');
+
+    $probe2 = \Alegra\Connector\Sync\Products::image_dedup_probe($dead_url, 10);
+    TestRunner::assertSame(9999, $probe2['dedup_by_hash_id'], 'hash id stale reportado');
+    TestRunner::assertFalse($probe2['dedup_by_hash_live'], 'hash stale => no viva');
+    TestRunner::assertSame(9999, $probe2['dedup_by_url_id'], 'url id stale reportado');
+    TestRunner::assertFalse($probe2['dedup_by_url_live'], 'url stale => no viva');
+
+    // READ-ONLY: the probe must not clean up anything.
+    TestRunner::assertSame(9999, \Alegra\Connector\Entity_Map::find_attachment_id($dead_hash), 'el probe NO limpia el mapa');
+    TestRunner::assertSame($dead_hash, (string) get_post_meta(9999, '_alegra_image_url_hash', true), 'el probe NO borra meta');
+});
+
+echo "\nT75 — Image probe breakdown (dedup liveness + featured/gallery)\n";
+
+TestRunner::test('T75.1 el probe reporta el desglose por imagen y la destacada/galería', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Probe']);
+    update_post_meta(10, '_alegra_item_id', 'it-bd');
+
+    $live_url  = 'https://cdn.alegra.test/live.png';
+    $live_hash = md5($live_url);
+    $att_live  = 7200;
+    $GLOBALS['wp_posts'][$att_live] = (object) ['ID' => $att_live, 'post_type' => 'attachment', 'post_status' => 'inherit'];
+    update_post_meta($att_live, '_alegra_image_url_hash', $live_hash);
+    update_post_meta($att_live, '_alegra_image_url', $live_url);
+    \Alegra\Connector\Entity_Map::map('image', $live_hash, 'attachment', $att_live);
+
+    $dead_url  = 'https://cdn.alegra.test/dead.png';
+    $dead_hash = md5($dead_url);
+    \Alegra\Connector\Entity_Map::map('image', $dead_hash, 'attachment', 9999);
+    update_post_meta(9999, '_alegra_image_url_hash', $dead_hash);
+
+    update_post_meta(10, '_thumbnail_id', $att_live);
+    update_post_meta(10, '_product_image_gallery', $att_live . ',7201');
+
+    $detail = ['id' => 'it-bd', 'name' => 'P', 'images' => [
+        ['id' => 'i1', 'url' => $live_url],
+        ['id' => 'i2', 'url' => $dead_url],
+    ]];
+    $list = [['id' => 'it-bd']];
+    $fake = new Alegra_Probe_API($detail, $list, make_logger());
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard($fake, make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_probe_images());
+    $p = $resp->payload;
+
+    TestRunner::assertArrayHasKey('images_breakdown', $p, 'desglose presente');
+    TestRunner::assertCount(2, $p['images_breakdown'], 'una entrada por imagen');
+
+    $b0 = $p['images_breakdown'][0];
+    TestRunner::assertSame(0, $b0['index'], 'index 0');
+    TestRunner::assertSame('cdn.alegra.test', $b0['url_host'], 'host de la imagen');
+    TestRunner::assertTrue($b0['allowed'], 'host permitido');
+    TestRunner::assertSame($live_url, $b0['normalized_url'], 'url normalizada');
+    TestRunner::assertSame($att_live, $b0['dedup_by_hash_id'], 'hash id vivo');
+    TestRunner::assertTrue($b0['dedup_by_hash_live'], 'hash viva');
+    TestRunner::assertSame($att_live, $b0['dedup_by_url_id'], 'url id vivo');
+    TestRunner::assertTrue($b0['dedup_by_url_live'], 'url viva');
+
+    $b1 = $p['images_breakdown'][1];
+    TestRunner::assertSame(1, $b1['index'], 'index 1');
+    TestRunner::assertSame(9999, $b1['dedup_by_hash_id'], 'hash id stale');
+    TestRunner::assertFalse($b1['dedup_by_hash_live'], 'hash muerta');
+    TestRunner::assertFalse($b1['dedup_by_url_live'], 'url muerta');
+
+    TestRunner::assertSame($att_live, $p['product_thumbnail_id'], '_thumbnail_id reportado');
+    TestRunner::assertSame($att_live . ',7201', $p['product_image_gallery'], '_product_image_gallery reportado');
+});
+
+TestRunner::test('T75.2 la UI renderiza el desglose con .text() y strings nuevos', function (): void {
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('images_breakdown', $tpl, 'renderiza el desglose');
+    TestRunner::assertStringContains('.text(', $tpl, 'usa .text()');
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    foreach ([
+        'diagProbeBreakdown', 'diagProbeThumbnail', 'diagProbeGallery',
+        'diagProbeAllowed', 'diagProbeDedupHash', 'diagProbeDedupUrl',
+        'diagProbeLive', 'diagProbeStale', 'diagProbeNone',
+    ] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
+    }
+});
+
 exit(TestRunner::summary());

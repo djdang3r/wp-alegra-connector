@@ -350,6 +350,40 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         return $s;
     }
 
+    // task-10: read-only dedup breakdown. Server values are rendered with
+    // .text()/DOM nodes only — never concatenated into HTML.
+    function liveLabel(live) {
+        return live ? (S.diagProbeLive || 'viva') : (S.diagProbeStale || 'muerta');
+    }
+
+    function dedupLabel(label, id, live) {
+        if (!id) { return (label || '') + ': ' + (S.diagProbeNone || 'ninguna'); }
+        return (label || '') + ': ' + id + ' (' + liveLabel(live) + ')';
+    }
+
+    function renderImageBreakdown(payload) {
+        var $s = $('<div>').css({ marginTop: '6px' });
+        $s.append($('<div>').css({ fontWeight: '600', fontSize: '12px' }).text(S.diagProbeBreakdown || ''));
+        var bd = payload.images_breakdown || [];
+        if (!bd.length) {
+            $s.append($('<div>').text(S.diagProbeNone || '-'));
+        }
+        for (var i = 0; i < bd.length; i++) {
+            var b = bd[i] || {};
+            var line = '#' + (b.index || 0) + ' ' + (b.url_host || '') +
+                ' — ' + (S.diagProbeAllowed || '') + ': ' + (b.allowed ? 'OK' : 'NO') +
+                ' — ' + dedupLabel(S.diagProbeDedupHash, b.dedup_by_hash_id, b.dedup_by_hash_live) +
+                ' — ' + dedupLabel(S.diagProbeDedupUrl, b.dedup_by_url_id, b.dedup_by_url_live);
+            $s.append($('<div>').css({ fontFamily: 'monospace', wordBreak: 'break-all' }).text(line));
+            if (b.normalized_url) {
+                $s.append($('<div>').css({ wordBreak: 'break-all', color: 'var(--ac-text-muted)' }).text(b.normalized_url));
+            }
+        }
+        $s.append(diagRow(S.diagProbeThumbnail, $('<span>').text(payload.product_thumbnail_id || 0)));
+        $s.append(diagRow(S.diagProbeGallery, $('<span>').text(payload.product_image_gallery || (S.diagProbeNone || '-'))));
+        return $s;
+    }
+
     function renderImageProbe(payload) {
         var $wrap = $('<div>');
         if (!payload) { return $wrap; }
@@ -361,6 +395,7 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         }
         $wrap.append(probeSection(S.diagProbeDetail, payload.detail));
         $wrap.append(probeSection(S.diagProbeList, payload.list));
+        $wrap.append(renderImageBreakdown(payload));
         return $wrap;
     }
 

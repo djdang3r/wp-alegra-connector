@@ -1040,6 +1040,16 @@ class Admin_Dashboard
             'diagProbeSample'       => __('Muestra', 'alegra-connector'),
             'diagProbeFound'        => __('Producto encontrado en el listado', 'alegra-connector'),
             'diagProbeNotFound'     => __('Producto no encontrado en el listado (filtro id no soportado)', 'alegra-connector'),
+            // task-10: per-image dedup breakdown in the probe.
+            'diagProbeBreakdown'    => __('Desglose por imagen (dedup)', 'alegra-connector'),
+            'diagProbeThumbnail'    => __('Imagen destacada actual', 'alegra-connector'),
+            'diagProbeGallery'      => __('Galería actual', 'alegra-connector'),
+            'diagProbeAllowed'      => __('Host permitido', 'alegra-connector'),
+            'diagProbeDedupHash'    => __('Dedup por hash', 'alegra-connector'),
+            'diagProbeDedupUrl'     => __('Dedup por URL', 'alegra-connector'),
+            'diagProbeLive'         => __('viva', 'alegra-connector'),
+            'diagProbeStale'        => __('muerta', 'alegra-connector'),
+            'diagProbeNone'         => __('ninguna', 'alegra-connector'),
 
             // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
             'cfVerifying'           => __('Verificando...', 'alegra-connector'),
@@ -6029,16 +6039,20 @@ class Admin_Dashboard
         $linked = self::find_linked_product();
         if ($linked === null) {
             return [
-                'no_linked_product' => true,
-                'linked_product'    => null,
-                'message'           => __('No hay productos vinculados a Alegra para probar.', 'alegra-connector'),
-                'detail'            => null,
-                'list'              => null,
+                'no_linked_product'     => true,
+                'linked_product'        => null,
+                'message'               => __('No hay productos vinculados a Alegra para probar.', 'alegra-connector'),
+                'detail'                => null,
+                'list'                  => null,
+                'images_breakdown'      => [],
+                'product_thumbnail_id'  => 0,
+                'product_image_gallery' => '',
             ];
         }
 
-        $alegra_id = $linked['alegra_id'];
-        $no_api    = new \WP_Error('no_api', __('Cliente de Alegra no disponible.', 'alegra-connector'));
+        $alegra_id  = $linked['alegra_id'];
+        $product_id = (int) ($linked['id'] ?? 0);
+        $no_api     = new \WP_Error('no_api', __('Cliente de Alegra no disponible.', 'alegra-connector'));
 
         $detail_raw = $api !== null ? $api->get_item($alegra_id) : $no_api;
         $list_raw   = $api !== null
@@ -6046,11 +6060,66 @@ class Admin_Dashboard
             : $no_api;
 
         return [
-            'no_linked_product' => false,
-            'linked_product'    => $linked,
-            'detail'            => self::summarize_image_detail($detail_raw),
-            'list'              => self::summarize_image_list($list_raw, $alegra_id),
+            'no_linked_product'     => false,
+            'linked_product'        => $linked,
+            'detail'                => self::summarize_image_detail($detail_raw),
+            'list'                  => self::summarize_image_list($list_raw, $alegra_id),
+            'images_breakdown'      => self::build_image_breakdown($detail_raw, $product_id),
+            'product_thumbnail_id'  => (int) get_post_meta($product_id, '_thumbnail_id', true),
+            'product_image_gallery' => self::image_gallery_value($product_id),
         ];
+    }
+
+    /**
+     * task-10: READ-ONLY per-image dedup breakdown for the probe. Mirrors what
+     * `Products::download_and_attach_image` would resolve for each URL WITHOUT
+     * downloading or writing anything.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private static function build_image_breakdown(mixed $detail_raw, int $product_id): array
+    {
+        if (!is_array($detail_raw) || !isset($detail_raw['images']) || !is_array($detail_raw['images'])) {
+            return [];
+        }
+
+        $out   = [];
+        $index = 0;
+        foreach ($detail_raw['images'] as $image) {
+            $url = '';
+            if (is_array($image)) {
+                $url = (string) ($image['url'] ?? '');
+            } elseif (is_string($image)) {
+                $url = $image;
+            }
+
+            $probe = \Alegra\Connector\Sync\Products::image_dedup_probe($url, $product_id);
+            $out[] = [
+                'index'              => $index++,
+                'url_host'           => $probe['url_host'],
+                'allowed'            => \Alegra\Connector\Sync\Products::is_allowed_image_url($url),
+                'normalized_url'     => $probe['normalized_url'],
+                'dedup_by_hash_id'   => $probe['dedup_by_hash_id'],
+                'dedup_by_hash_live' => $probe['dedup_by_hash_live'],
+                'dedup_by_url_id'    => $probe['dedup_by_url_id'],
+                'dedup_by_url_live'  => $probe['dedup_by_url_live'],
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Normalize `_product_image_gallery` (legacy string meta, sometimes array)
+     * to a comma-separated string for the read-only report.
+     */
+    private static function image_gallery_value(int $product_id): string
+    {
+        $raw = get_post_meta($product_id, '_product_image_gallery', true);
+        if (is_array($raw)) {
+            return implode(',', array_map('strval', $raw));
+        }
+        return (string) $raw;
     }
 
     /**

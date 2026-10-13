@@ -2806,7 +2806,7 @@ class Products
         }
 
         // Normalize URL to strip query params that may differ between syncs
-        $normalized_url = $this->normalize_image_url($image_url);
+        $normalized_url = self::normalize_image_url($image_url);
         if (empty($normalized_url)) return 0;
 
         // Compute hash for fast indexed lookup (avoid full-string scan in MySQL)
@@ -2907,7 +2907,14 @@ class Products
         // on the unindexed meta_value was a full table scan per image.
         $mapped = \Alegra\Connector\Entity_Map::find_attachment_id($url_hash);
         if ($mapped) {
-            return $mapped;
+            if (self::attachment_is_live((int) $mapped)) {
+                return (int) $mapped;
+            }
+            // task-10: the indexed map points at a stale/dead attachment
+            // (previous install, deleted product). Deduping to it would
+            // silently skip the download and leave the image unattached.
+            self::forget_stale_attachment((int) $mapped, $url_hash);
+            return 0;
         }
 
         global $wpdb;
@@ -2922,6 +2929,10 @@ class Products
         ));
 
         if ($id) {
+            if (!self::attachment_is_live((int) $id)) {
+                self::forget_stale_attachment((int) $id, $url_hash);
+                return 0;
+            }
             // Backfill the indexed map so subsequent lookups are O(1).
             \Alegra\Connector\Entity_Map::map('image', $url_hash, 'attachment', (int) $id);
             return (int) $id;
@@ -2931,11 +2942,102 @@ class Products
     }
 
     /**
+     * task-10: an attachment id is only a valid dedup target when it is a LIVE
+     * WordPress attachment. A stale id (deleted product / previous install)
+     * must never short-circuit the download.
+     */
+    private static function attachment_is_live(int $attachment_id): bool
+    {
+        if ($attachment_id <= 0) {
+            return false;
+        }
+        $post = get_post($attachment_id);
+        if (!$post) {
+            return false;
+        }
+        $status = function_exists('get_post_status')
+            ? (string) get_post_status($attachment_id)
+            : (string) ($post->post_status ?? '');
+        if ($status !== 'inherit' || get_post_type($attachment_id) !== 'attachment') {
+            return false;
+        }
+        // When the underlying file can be resolved it must still exist; when the
+        // path is unknown (empty) a valid attachment post is enough.
+        $file = get_attached_file($attachment_id);
+        if (is_string($file) && $file !== '' && !file_exists($file)) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * task-10: drop the stale dedup bookkeeping for a dead attachment so the
+     * next run re-downloads instead of resolving to a ghost id.
+     */
+    private static function forget_stale_attachment(int $attachment_id, string $url_hash): void
+    {
+        if ($url_hash !== '') {
+            \Alegra\Connector\Entity_Map::remove('image', $url_hash, 'attachment');
+        }
+        if ($attachment_id > 0) {
+            if (get_post_meta($attachment_id, '_alegra_image_url_hash', true)) {
+                delete_post_meta($attachment_id, '_alegra_image_url_hash');
+            }
+            if (get_post_meta($attachment_id, '_alegra_image_url', true)) {
+                delete_post_meta($attachment_id, '_alegra_image_url');
+            }
+        }
+    }
+
+    /**
+     * task-10: READ-ONLY diagnostic of what the dedup lookup would resolve for
+     * an image URL. Performs NO writes, NO map backfill and NO reparenting.
+     *
+     * @return array{url_host:string,normalized_url:string,dedup_by_hash_id:int,dedup_by_hash_live:bool,dedup_by_url_id:int,dedup_by_url_live:bool}
+     */
+    public static function image_dedup_probe(string $image_url, int $product_id = 0): array
+    {
+        $host       = strtolower((string) (wp_parse_url($image_url)['host'] ?? ''));
+        $normalized = self::normalize_image_url($image_url);
+        $hash       = $normalized !== '' ? md5($normalized) : '';
+
+        $hash_id = 0;
+        if ($hash !== '') {
+            $mapped  = \Alegra\Connector\Entity_Map::find_attachment_id($hash);
+            $hash_id = $mapped !== null ? (int) $mapped : 0;
+        }
+
+        $url_id = 0;
+        if ($normalized !== '') {
+            global $wpdb;
+            $found = $wpdb->get_var($wpdb->prepare(
+                "SELECT pm.post_id FROM {$wpdb->postmeta} pm
+                 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_type = 'attachment'
+                 WHERE pm.meta_key = '_alegra_image_url' AND pm.meta_value = %s
+                 ORDER BY p.post_parent = %d DESC
+                 LIMIT 1",
+                $normalized,
+                $product_id
+            ));
+            $url_id = $found ? (int) $found : 0;
+        }
+
+        return [
+            'url_host'           => $host,
+            'normalized_url'     => $normalized,
+            'dedup_by_hash_id'   => $hash_id,
+            'dedup_by_hash_live' => self::attachment_is_live($hash_id),
+            'dedup_by_url_id'    => $url_id,
+            'dedup_by_url_live'  => self::attachment_is_live($url_id),
+        ];
+    }
+
+    /**
      * Normalize an image URL by removing query parameters and fragments.
      * This ensures that the same image with different query strings (tokens,
      * cache busters, etc.) is correctly identified as duplicate.
      */
-    private function normalize_image_url(string $url): string
+    private static function normalize_image_url(string $url): string
     {
         $url = trim($url);
         if ($url === '') {
@@ -2963,7 +3065,7 @@ class Products
     private function get_attachment_by_url(int $product_id, string $image_url): int
     {
         // Normalize the URL to match stored values that were also normalized
-        $image_url = $this->normalize_image_url($image_url);
+        $image_url = self::normalize_image_url($image_url);
         if ($image_url === '') {
             return 0;
         }
@@ -2982,6 +3084,12 @@ class Products
 
         $attachment_id = $id ? (int) $id : 0;
         if ($attachment_id > 0) {
+            if (!self::attachment_is_live($attachment_id)) {
+                // task-10: a dead attachment (deleted product / previous
+                // install) must not dedup — forget it so the caller re-downloads.
+                self::forget_stale_attachment($attachment_id, md5($image_url));
+                return 0;
+            }
             // AC-23: only reparent when the parent actually differs. The old
             // code called wp_update_post() on EVERY hit (extra write + hook
             // storm) even when nothing changed.
