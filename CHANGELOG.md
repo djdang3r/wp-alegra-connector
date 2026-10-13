@@ -2,6 +2,61 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.14] - 2026-10-13
+
+> **"Traer productos" deja de DUPLICAR imágenes: reconcile idempotente + borrado seguro.**
+> Cada import reconcilia las imágenes del producto al set EXACTO que trae Alegra
+> (reemplaza, no mergea). Al actualizar, las imágenes **creadas por el plugin** que
+> quedan reemplazadas se borran de la Media **solo** si no las referencia ningún otro
+> producto (`_thumbnail_id`/galería) ni ningún término; las imágenes del merchant y las
+> compartidas **se conservan**. El modo `favorite` ahora deduplica (no baja una imagen
+> nueva por import), **no toca la galería** y no borra nada. Reconcile y borrado se
+> habilitan **solo** desde el import chunked de productos. Además, el banner fantasma
+> **"Pausado en el ítem X de Y"** ya no aparece cuando no hay una pausa real.
+
+### Fixed
+
+- **Imágenes duplicadas al reimportar/actualizar productos.** La galería sólo
+  *agregaba* ids en cada import. Ahora el import chunked reconcilia las referencias al
+  set exacto que resuelve el modo configurado (`favorite`/`except_favorite`/`all`):
+  **all-or-nothing** (si alguna imagen no se puede resolver/descargar, no se reescribe
+  ni se borra nada), preserva los ids de galería que **no** creó el plugin, y las
+  imágenes plugin reemplazadas se borran con guardas (origen plugin + no referenciada
+  por otro post/término; galería con `FIND_IN_SET`, nunca `LIKE '%id%'`).
+- **`favorite` bajaba un attachment nuevo en cada import.** El branch `favorite` ahora
+  resuelve por dedup (`download_and_attach_image`) y hace `set_post_thumbnail`, en vez
+  de descargar a ciegas; los featured legacy sin marcador se backfillean una vez desde
+  su propia URL para volverse dedup-aware (y borrables al reemplazarse).
+- **Banner "Pausado en el ítem X de Y" fantasma.** El cursor de reanudación ahora se
+  limpia en CADA terminal path del import chunked (done, error de API, excepción,
+  cancel, release) y un self-heal dedicado limpia un cursor chunked huérfano al
+  renderizar Productos (dueño = marcador dedicado, no `_total > 0`). Un cursor de
+  cron/manual (sin marcador) nunca se toca.
+- **Carrera cancel/reanudar.** Una página cancelada en vuelo ya no puede resucitar su
+  estado de reanudación: antes de persistir, el handler re-lee el estado del run
+  (`Runs::status`) y aborta (sin dejar cursor/estado) si ya no está `running`.
+
+### Added
+
+- **Marker de dueño del cursor chunked** (`alegra_connector_products_chunk_owner` = id
+  del run chunked), escrito al arrancar y limpiado por `import_from_alegra` cuando un
+  owner no-chunked toma el cursor, de modo que la invariante "marker presente ⇒ un run
+  chunked sin terminar es dueño del cursor" se mantiene.
+
+### Known limitation
+
+- Las imágenes de galería **legacy** (pre-2.5) sin `_alegra_image_url` se tratan como
+  **del merchant** y se preservan (no se borran). La herramienta "Limpiar imágenes
+  duplicadas" (que se mantiene) sirve para la limpieza histórica.
+
+### Tests
+
+- **Exec-test:** bloques T77–T83 — reconcile reemplaza-no-mergea + preserves merchant,
+  favorite dedup + backfill legacy, borrado seguro (compartido post/término, boundary
+  `12` vs `123`, merchant, favorite sin borrar galería), de-reference de `forget_stale`,
+  cobertura REAL de descarga+borrado, marker de cursor en cada terminal path, self-heal
+  del cursor huérfano + predicado puro + diag read-only, y el guard durable de cancel.
+
 ## [2.8.13] - 2026-10-13
 
 > **Runs a prueba de fatales + "Reparar imágenes" (no destructivo) en el Monitor.**
