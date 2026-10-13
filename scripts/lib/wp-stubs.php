@@ -1029,6 +1029,13 @@ function wp_delete_attachment($attachment_id, $force_delete = false)
     }
     return (object) ['ID' => $attachment_id];
 }
+function wp_attachment_is_image($attachment_id = 0)
+{
+    // products-bulk-wipe: the harness treats fixtures as images by default; a
+    // test opts a fixture out via $GLOBALS['alegra_non_image_attachments'][id].
+    $id = (int) $attachment_id;
+    return !isset($GLOBALS['alegra_non_image_attachments'][$id]);
+}
 
 // Terms -----------------------------------------------------------------
 function get_term($term_id, $taxonomy = '')

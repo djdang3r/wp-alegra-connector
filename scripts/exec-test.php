@@ -17097,4 +17097,26 @@ TestRunner::test('T86.13 si se pierde el lock, el chunk aborta (aborted=true, re
     \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
 });
 
+TestRunner::test('T86.14 un adjunto NO-imagen en el slot de imagen se saltea (sobrevive) y se cuenta', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-nonimg');
+
+    // Real image in the featured slot — must be deleted.
+    $real = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/real.png');
+    update_post_meta(10, '_thumbnail_id', $real);
+
+    // A NON-image attachment (e.g. a PDF) reachable via the WC REST API in the
+    // gallery slot — must survive the wipe (invariant: no borra no-imágenes).
+    $doc = alegra_make_live_attachment(8002);
+    $GLOBALS['alegra_non_image_attachments'][$doc] = true;
+    update_post_meta(10, '_product_image_gallery', (string) $doc);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+
+    TestRunner::assertSame(null, get_post($real), 'la imagen real se borra');
+    TestRunner::assertTrue(get_post($doc) !== null, 'el adjunto NO-imagen sobrevive (no se borra)');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'sólo la imagen real se borró');
+    TestRunner::assertSame(1, (int) $res['images_skipped'], 'el adjunto no-imagen se contó como skipeado');
+});
+
 exit(TestRunner::summary());

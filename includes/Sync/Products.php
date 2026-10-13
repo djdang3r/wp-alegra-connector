@@ -3298,6 +3298,14 @@ class Products
             return 'skip';
         }
 
+        // Never touch a non-image attachment. A product image slot should always
+        // hold an image, but the WC REST API can point `_thumbnail_id`/gallery at
+        // any attachment; wiping a document/audio file would violate the
+        // "no borra archivos no-imagen" invariant.
+        if (!function_exists('wp_attachment_is_image') || !wp_attachment_is_image($attachment_id)) {
+            return 'skip';
+        }
+
         if (self::attachment_referenced_by_term($attachment_id)) {
             return 'skip';
         }

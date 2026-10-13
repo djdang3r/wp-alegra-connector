@@ -181,6 +181,9 @@ function alegra_test_reset(): void
     $GLOBALS['alegra_test_gmt_offset'] = 0;
     // products-image-sync-reconcile: opt-in real downloads (off by default).
     $GLOBALS['alegra_mock_image_downloads'] = false;
+    // products-bulk-wipe: attachments in image slots are images by default; a
+    // test marks a fixture non-image here so the wipe must skip it.
+    $GLOBALS['alegra_non_image_attachments'] = [];
 
     // Re-entrant sync-lock registry is request-scoped in production; clear it so
     // a test that leaves a lock held cannot contaminate the next test.
