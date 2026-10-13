@@ -16840,4 +16840,69 @@ TestRunner::test('T86.5 H6: el chunk aborta con kill switch o stop, sin borrar n
     TestRunner::assertTrue(wc_get_product(10) !== null, 'sigue vivo tras el stop');
 });
 
+echo "\nT86 — Bulk wipe (reset total) — integrity\n";
+
+TestRunner::test('T86.6 B2: sin tombstones para los ids borrados; un reimport normal recrea el producto', function (): void {
+    alegra_test_reset();
+    // Register the tombstone hook like production does, so the wipe's
+    // remove_action() is observable (otherwise the test would be vacuous).
+    add_action('before_delete_post', [\Alegra\Connector\Tombstone_Manager::class, 'on_post_delete']);
+
+    alegra_seed_linked_product(10, 'it-b2');
+    $img = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/b2.png');
+    update_post_meta(10, '_thumbnail_id', $img);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+    TestRunner::assertSame(1, (int) $res['products_deleted'], 'producto borrado');
+    TestRunner::assertSame(null, \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'it-b2'), 'el wipe NO deja tombstone (B2)');
+
+    // A pre-existing tombstone for a wiped id must be deleted by close (by VALUE).
+    \Alegra\Connector\Tombstone_Manager::create([
+        'alegra_id' => 'it-b2', 'alegra_type' => 'item', 'wc_post_id' => 10, 'reason' => 'bulk_wc',
+    ]);
+    TestRunner::assertSame('bulk_wc', \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'it-b2'), 'tombstone pre-existente sembrado');
+
+    $report = make_products()->wipe_finalize_integrity();
+    TestRunner::assertTrue((int) $report['tombstones_deleted'] >= 1, 'el cierre borró el tombstone del id');
+    TestRunner::assertSame(null, \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'it-b2'), 'sin tombstone tras el cierre (B2)');
+
+    // NORMAL re-import (not "desde cero"): the product is recreated.
+    \Alegra\Connector\Run_Context::set_tombstone_policy('respect');
+    alegra_mock_seed_item('it-b2', ['name' => 'B2', 'reference' => 'SB2']);
+    $created = make_products()->import_single_item_public(['id' => 'it-b2', 'name' => 'B2', 'reference' => 'SB2'], 0, false, false);
+    TestRunner::assertTrue($created === true || $created === 'updated', 'el reimport recrea/actualiza el producto');
+    TestRunner::assertTrue(\Alegra\Connector\Entity_Map::find_wc_id('item', 'it-b2', 'product') !== null, 'el producto existe de nuevo tras el reimport');
+
+    // Control: the hook DOES create a tombstone outside the wipe.
+    alegra_seed_linked_product(40, 'it-ctl');
+    wc_get_product(40)->delete(true);
+    TestRunner::assertSame('manual_wc', (string) \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'it-ctl'), 'un delete normal sí crea tombstone (control)');
+});
+
+TestRunner::test('T86.7 H3/L1: el cierre reconcilia huérfanos (producto+adjunto) y limpia las lookup tables', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-h3');
+    $img = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/h3.png');
+    update_post_meta(10, '_thumbnail_id', $img);
+
+    // Pre-existing orphan map rows (product + attachment).
+    \Alegra\Connector\Entity_Map::map('item', 'ghost-item', 'product', 999999);
+    \Alegra\Connector\Entity_Map::map('image', 'ghost-hash', 'attachment', 888888);
+
+    // WC lookup tables carrying rows for the wiped product (L1).
+    $GLOBALS['alegra_lookup_tables']['wc_product_meta_lookup'][] = 10;
+    $GLOBALS['alegra_lookup_tables']['wp_wc_product_attributes_lookup'][] = 10;
+
+    make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+    $report = make_products()->wipe_finalize_integrity();
+
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_wc_id('item', 'ghost-item', 'product'), 'H3: huérfano de producto reconciliado');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_wc_id('image', 'ghost-hash', 'attachment'), 'H3: huérfano de adjunto reconciliado');
+    TestRunner::assertTrue((int) $report['attachment_orphans'] >= 1, 'el reporte cuenta el adjunto huérfano');
+    TestRunner::assertTrue((int) $report['lookup_rows_deleted'] >= 2, 'L1: se borraron filas de lookup');
+    TestRunner::assertFalse(in_array(10, $GLOBALS['alegra_lookup_tables']['wc_product_meta_lookup'], true), 'L1: meta_lookup sin el id');
+    TestRunner::assertFalse(in_array(10, $GLOBALS['alegra_lookup_tables']['wp_wc_product_attributes_lookup'], true), 'L1: attributes_lookup sin el id');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'las options del wipe se limpiaron');
+});
+
 exit(TestRunner::summary());

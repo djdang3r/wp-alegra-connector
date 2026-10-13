@@ -3353,6 +3353,119 @@ class Products
     }
 
     /**
+     * Todo 3: close the wipe — leave the DB integral.
+     *
+     *  - B2: delete the tombstones for the collected `_alegra_item_id` values
+     *    (by VALUE, never by post id) so a NORMAL re-import can recreate them.
+     *  - H3: loop `Entity_Map::reconcile_orphans()` to exhaustion + an explicit
+     *    attachment pass (map rows whose attachment post is gone).
+     *  - L1: force-clean the WC lookup tables for the deleted product ids.
+     *  - Clear the wipe run options; clear the import cursor only when no owner.
+     *
+     * @return array{tombstones_deleted:int,reconciled:array<string,int>,attachment_orphans:int,lookup_rows_deleted:int}
+     */
+    public function wipe_finalize_integrity(): array
+    {
+        global $wpdb;
+
+        $report = [
+            'tombstones_deleted'  => 0,
+            'reconciled'          => ['products' => 0, 'customers' => 0, 'orders' => 0],
+            'attachment_orphans'  => 0,
+            'lookup_rows_deleted' => 0,
+        ];
+
+        // B2: tombstones are keyed by the Alegra id, not the post id.
+        $alegra_ids = self::normalize_string_list(get_option('alegra_connector_wipe_alegra_ids', []));
+        if ($alegra_ids !== []) {
+            $placeholders = implode(',', array_fill(0, count($alegra_ids), '%s'));
+            $deleted = $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->prefix}alegra_tombstones
+                 WHERE alegra_type = 'item' AND alegra_id IN ({$placeholders})",
+                ...$alegra_ids
+            ));
+            $report['tombstones_deleted'] = is_numeric($deleted) ? (int) $deleted : 0;
+        }
+
+        // H3: product/customer orphans to exhaustion (keyset-free, batched).
+        $guard = 0;
+        do {
+            $round = \Alegra\Connector\Entity_Map::reconcile_orphans(1000);
+            foreach ($round as $key => $count) {
+                $report['reconciled'][$key] = (int) ($report['reconciled'][$key] ?? 0) + (int) $count;
+            }
+            $guard++;
+        } while (array_sum($round) > 0 && $guard < 1000);
+
+        // H3: the explicit attachment pass.
+        $report['attachment_orphans'] = \Alegra\Connector\Entity_Map::reconcile_attachment_orphans(1000);
+
+        // L1: WC lookup tables must carry no rows for the wiped ids.
+        $deleted_ids = self::normalize_id_list(get_option('alegra_connector_wipe_deleted_ids', []));
+        if ($deleted_ids !== []) {
+            $report['lookup_rows_deleted'] = $this->wipe_cleanup_lookup_tables($deleted_ids);
+        }
+
+        // Clear the wipe run options.
+        delete_option('alegra_connector_wipe_cursor');
+        delete_option('alegra_connector_wipe_ids');
+        delete_option('alegra_connector_wipe_alegra_ids');
+        delete_option('alegra_connector_wipe_deleted_ids');
+
+        // H1: only clear the shared import cursor when no chunked owner exists.
+        if ((int) get_option('alegra_connector_products_chunk_owner', 0) <= 0) {
+            delete_option('alegra_connector_products_import_cursor');
+            delete_option('alegra_connector_products_import_total');
+            delete_option('alegra_connector_products_chunk_owner');
+        }
+
+        return $report;
+    }
+
+    /**
+     * L1: delete every WC lookup-table row for the given product ids.
+     *
+     * @param int[] $product_ids
+     */
+    private function wipe_cleanup_lookup_tables(array $product_ids): int
+    {
+        global $wpdb;
+
+        $ids = self::normalize_id_list($product_ids);
+        if ($ids === []) {
+            return 0;
+        }
+        $in_list = implode(',', $ids);
+
+        $removed = 0;
+        foreach (["{$wpdb->prefix}wc_product_meta_lookup", "{$wpdb->prefix}wc_product_attributes_lookup"] as $table) {
+            $result = $wpdb->query("DELETE FROM {$table} WHERE product_id IN ({$in_list})");
+            if (is_numeric($result)) {
+                $removed += (int) $result;
+            }
+        }
+        return $removed;
+    }
+
+    /**
+     * Cast a raw column to a list of non-empty strings (de-duplicated).
+     *
+     * @param mixed $values
+     * @return string[]
+     */
+    private static function normalize_string_list(mixed $values): array
+    {
+        $out = [];
+        foreach ((array) $values as $value) {
+            $value = (string) $value;
+            if ($value !== '') {
+                $out[$value] = true;
+            }
+        }
+        return array_keys($out);
+    }
+
+    /**
      * Hosts allowed as a source for product images when the restriction mode is
      * ON (AC-68).
      *

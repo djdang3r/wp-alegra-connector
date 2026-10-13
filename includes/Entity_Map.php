@@ -171,6 +171,38 @@ class Entity_Map
     }
 
     /**
+     * Delete `attachment` mappings whose WC attachment post no longer exists
+     * (bulk-wipe H3). `reconcile_orphans()` only covers product/customer, so the
+     * wipe does an explicit attachment pass to leave no ghost rows behind.
+     */
+    public static function reconcile_attachment_orphans(int $batch = 1000): int
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_entity_map';
+
+        $ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT m.wc_entity_id FROM {$table} m
+             LEFT JOIN {$wpdb->posts} s ON s.ID = m.wc_entity_id AND s.post_type = 'attachment'
+             WHERE m.wc_entity_type = %s AND s.ID IS NULL
+             LIMIT %d",
+            'attachment',
+            $batch
+        ));
+
+        $removed = 0;
+        foreach ((array) $ids as $id) {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$table} WHERE wc_entity_type = %s AND wc_entity_id = %d",
+                'attachment',
+                (int) $id
+            ));
+            $removed++;
+        }
+
+        return $removed;
+    }
+
+    /**
      * Backfill the entity_map table from existing postmeta data.
      *
      * AC-21: this used to load every matching postmeta/usermeta row into memory

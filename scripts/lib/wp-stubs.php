@@ -1507,6 +1507,15 @@ class WC_Product
         }
 
         unset($GLOBALS['wc_products'][$id]);
+        // Real WC products are wp_posts; synthesize the row so hooks that call
+        // get_post() (e.g. the tombstone handler) behave faithfully.
+        if (!isset($GLOBALS['wp_posts'][$id])) {
+            $GLOBALS['wp_posts'][$id] = (object) [
+                'ID'          => $id,
+                'post_type'   => $this->type === 'variation' ? 'product_variation' : 'product',
+                'post_status' => 'publish',
+            ];
+        }
         do_action('before_delete_post', $id);
         unset($GLOBALS['wp_posts'][$id]);
         if (isset($GLOBALS['wp_postmeta'][$id])) {
@@ -2218,6 +2227,39 @@ class Alegra_Mock_Wpdb
             return $rows;
         }
 
+        // Entity_Map orphan reconciliation (H3): `LEFT JOIN <source> … WHERE
+        // wc_entity_type='…' AND s.ID IS NULL`. Emulates the JOIN by checking
+        // existence; products may live in wc_products in the harness.
+        if (strpos($query, 'alegra_entity_map') !== false
+            && stripos($query, 'left join') !== false
+            && stripos($query, 'is null') !== false) {
+            preg_match("/wc_entity_type\s*=\s*'([^']*)'/", $query, $mt);
+            $type = $mt[1] ?? '';
+            $out = [];
+            foreach (($GLOBALS['alegra_entity_map'] ?? []) as $row) {
+                if (($row['wc_entity_type'] ?? '') !== $type) {
+                    continue;
+                }
+                $id = (int) ($row['wc_entity_id'] ?? 0);
+                $exists = true;
+                if ($type === 'product') {
+                    $exists = alegra_stub_post_type($id) === 'product';
+                } elseif ($type === 'customer') {
+                    $exists = isset($GLOBALS['wp_users'][$id]);
+                } elseif ($type === 'attachment') {
+                    $exists = isset($GLOBALS['wp_posts'][$id])
+                        && (string) ($GLOBALS['wp_posts'][$id]->post_type ?? '') === 'attachment';
+                }
+                if (!$exists) {
+                    $out[] = (object) ['wc_entity_id' => $id];
+                }
+            }
+            if (preg_match('/LIMIT\s+(\d+)/i', $query, $m)) {
+                $out = array_slice($out, 0, (int) $m[1]);
+            }
+            return $out;
+        }
+
         // wp_alegra_runs: supports status / run_type / started_at< filters and LIMIT
         // (currently_running, recent, mark_abandoned).
         if (strpos($query, 'alegra_runs') !== false) {
@@ -2243,6 +2285,51 @@ class Alegra_Mock_Wpdb
     public function query($query)
     {
         $query = (string) $query;
+
+        // Bulk-wipe B2: `DELETE FROM …alegra_tombstones WHERE alegra_type='item'
+        // AND alegra_id IN ('a','b',…)`.
+        if (stripos($query, 'alegra_tombstones') !== false && stripos($query, 'DELETE') !== false) {
+            $table = $this->prefix . 'alegra_tombstones';
+            preg_match("/alegra_id\s+IN\s*\(([^)]*)\)/i", $query, $mi);
+            $wanted = [];
+            if (!empty($mi[1])) {
+                foreach (explode(',', $mi[1]) as $part) {
+                    $wanted[trim($part, " '\t\n\r")] = true;
+                }
+            }
+            preg_match("/alegra_type\s*=\s*'([^']*)'/", $query, $mt);
+            $type = $mt[1] ?? 'item';
+            $n = 0;
+            $rows = $GLOBALS['alegra_db'][$table] ?? [];
+            foreach ($rows as $i => $row) {
+                if (($row['alegra_type'] ?? '') !== $type) { continue; }
+                if (!isset($wanted[(string) ($row['alegra_id'] ?? '')])) { continue; }
+                unset($GLOBALS['alegra_db'][$table][$i]);
+                $n++;
+            }
+            if (isset($GLOBALS['alegra_db'][$table])) {
+                $GLOBALS['alegra_db'][$table] = array_values($GLOBALS['alegra_db'][$table]);
+            }
+            return $n;
+        }
+
+        // Bulk-wipe L1: `DELETE FROM …wc_product_meta_lookup / …attributes_lookup
+        // WHERE product_id IN (…)`.
+        if (stripos($query, 'wc_product_meta_lookup') !== false
+            || stripos($query, 'wp_wc_product_attributes_lookup') !== false) {
+            $table = stripos($query, 'wc_product_meta_lookup') !== false
+                ? 'wc_product_meta_lookup'
+                : 'wp_wc_product_attributes_lookup';
+            $before = count($GLOBALS['alegra_lookup_tables'][$table] ?? []);
+            if (stripos($query, 'DELETE') !== false && preg_match('/product_id\s+IN\s*\(([^)]*)\)/i', $query, $m)) {
+                $ids = array_map('intval', array_filter(array_map('trim', explode(',', $m[1])), 'strlen'));
+                $GLOBALS['alegra_lookup_tables'][$table] = array_values(array_diff(
+                    $GLOBALS['alegra_lookup_tables'][$table] ?? [],
+                    $ids
+                ));
+            }
+            return $before - count($GLOBALS['alegra_lookup_tables'][$table] ?? []);
+        }
 
         // wp_alegra_runs: `UPDATE … SET status='stale' … WHERE status='running'
         // AND started_at < cutoff LIMIT N` (Runs::mark_stale). Must honour the
