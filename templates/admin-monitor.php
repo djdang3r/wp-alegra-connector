@@ -49,6 +49,18 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
             <p style="color:var(--ac-text-muted);"><?php esc_html_e('Cargando diagnóstico...', 'alegra-connector'); ?></p>
         </div>
     </div>
+
+    <!-- task-9: read-only image probe. Lives OUTSIDE #ac-monitor-diag so the
+         5s poll refresh never wipes the probe result. -->
+    <div id="ac-monitor-image-diag" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--ac-border-light);">
+        <button type="button" class="ac-btn ac-btn-xs ac-btn-primary" id="alegra-probe-images">
+            <span class="dashicons dashicons-images-alt2" style="font-size:12px;width:12px;height:12px;"></span>
+            <?php esc_html_e('Probar imágenes (1 producto)', 'alegra-connector'); ?>
+        </button>
+        <div id="ac-monitor-image-probe" style="margin-top:8px;font-size:12px;color:var(--ac-text-secondary);">
+            <p style="color:var(--ac-text-muted);"><?php esc_html_e('Prueba de solo lectura: no descarga ni importa imágenes.', 'alegra-connector'); ?></p>
+        </div>
+    </div>
 </div>
 
 <!-- task-7: last completed products import (read-only) -->
@@ -302,6 +314,53 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
         var ksTxt = (ks.label || '') + (ks.active && ks.reason ? ' (' + ks.reason + ')' : '');
         $wrap.append(diagRow(S.diagKillSwitch, $('<span>').text(ksTxt)));
 
+        // task-9: read-only image-import config (why images may not import).
+        var img = d.images || {};
+        $wrap.append($('<div>').css({ marginTop: '8px', fontWeight: '600', fontSize: '12px' }).text(S.diagImagesTitle));
+        $wrap.append(diagRow(S.diagImageSync, $('<span>').text(img.sync_images_label || '')));
+        $wrap.append(diagRow(S.diagImageMode, $('<span>').text(img.sync_images_mode || '')));
+        $wrap.append(diagRow(S.diagImageRestrict, $('<span>').text(img.restrict_image_hosts_label || '')));
+        $wrap.append(diagRow(S.diagImagePreserved, $('<span>').text(img.images_preserved_label || '')));
+
+        return $wrap;
+    }
+
+    // task-9: read-only image-probe result. Every server value is injected with
+    // .text()/DOM nodes — never concatenated into HTML.
+    function probeSection(title, r) {
+        var $s = $('<div>').css({ marginTop: '6px' });
+        $s.append($('<div>').css({ fontWeight: '600', fontSize: '12px' }).text(title));
+        if (!r) {
+            return $s.append($('<div>').text('-'));
+        }
+        var okTxt = r.http_ok ? S.diagProbeHttpOk : (S.diagProbeError + ': ' + (r.error || ''));
+        $s.append($('<div>').text(okTxt));
+        if (r.http_ok && r.found === false) {
+            $s.append($('<div>').text(S.diagProbeNotFound));
+        } else if (r.found === true) {
+            $s.append($('<div>').text(S.diagProbeFound));
+        }
+        $s.append($('<div>').text((S.diagProbeImagesCount || '') + ': ' + (r.images_count || 0)));
+        if (r.first_image_keys && r.first_image_keys.length) {
+            $s.append($('<div>').text((S.diagProbeKeys || '') + ': ' + r.first_image_keys.join(', ')));
+        }
+        if (r.sample) {
+            $s.append($('<div>').css({ fontFamily: 'monospace', wordBreak: 'break-all' }).text((S.diagProbeSample || '') + ': ' + r.sample));
+        }
+        return $s;
+    }
+
+    function renderImageProbe(payload) {
+        var $wrap = $('<div>');
+        if (!payload) { return $wrap; }
+        if (payload.no_linked_product) {
+            return $wrap.append($('<div>').css({ color: 'var(--ac-warning)' }).text(payload.message || S.diagProbeNoLinked));
+        }
+        if (payload.linked_product) {
+            $wrap.append($('<div>').css({ fontWeight: '600' }).text('#' + payload.linked_product.id + ' → ' + payload.linked_product.alegra_id));
+        }
+        $wrap.append(probeSection(S.diagProbeDetail, payload.detail));
+        $wrap.append(probeSection(S.diagProbeList, payload.list));
         return $wrap;
     }
 
@@ -410,6 +469,32 @@ $monitor_nonce = wp_create_nonce('alegra_connector_nonce');
                 error: function() {
                     showNotice(S.connectionError, 'error');
                     $btn.prop('disabled', false);
+                }
+            });
+        });
+
+        // task-9: read-only image probe. Never mutates anything; the result is
+        // rendered with .text()/DOM nodes only.
+        $(document).on('click', '#alegra-probe-images', function() {
+            var $btn = $(this).prop('disabled', true);
+            var $out = $('#ac-monitor-image-probe').empty().append(
+                $('<p>').css('color', 'var(--ac-text-muted)').text(S.diagProbeRunning)
+            );
+            $.ajax({
+                url: alegraConnector.ajaxUrl,
+                type: 'POST',
+                data: { action: 'alegra_probe_images', _ajax_nonce: monitorNonce },
+                success: function(r) {
+                    $btn.prop('disabled', false);
+                    if (r && r.success) {
+                        $out.empty().append(renderImageProbe(r.data));
+                    } else {
+                        $out.empty().append($('<div>').css('color', 'var(--ac-danger)').text((r && r.data && r.data.message) || S.error));
+                    }
+                },
+                error: function() {
+                    $btn.prop('disabled', false);
+                    $out.empty().append($('<div>').css('color', 'var(--ac-danger)').text(S.connectionError));
                 }
             });
         });

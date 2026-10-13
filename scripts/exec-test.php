@@ -80,6 +80,40 @@ function make_controller(?Logger $logger = null): Controller
 }
 
 /**
+ * task-9: fake API client that returns canned DETAIL / LIST responses without
+ * touching HTTP. Lets the image-probe test reproduce the merchant's symptom
+ * (detail carries `images`, the list does not) deterministically.
+ */
+class Alegra_Probe_API extends Client
+{
+    /** @var string[] */
+    public array $item_ids = [];
+    /** @var array<int,array> */
+    public array $list_params = [];
+    private mixed $detail_response;
+    private mixed $list_response;
+
+    public function __construct(mixed $detail_response, mixed $list_response, ?Logger $logger = null)
+    {
+        parent::__construct($logger);
+        $this->detail_response = $detail_response;
+        $this->list_response   = $list_response;
+    }
+
+    public function get_item(string $id): array|\WP_Error
+    {
+        $this->item_ids[] = $id;
+        return $this->detail_response;
+    }
+
+    public function get_items(array $params = []): array|\WP_Error
+    {
+        $this->list_params[] = $params;
+        return $this->list_response;
+    }
+}
+
+/**
  * Wire the production refund owner hook (State_Sync::register_hooks()'s
  * woocommerce_order_refunded listener) without the method's static "registered"
  * guard, so each test gets a clean hook registry.
@@ -14857,6 +14891,171 @@ TestRunner::test('T72.8 el resumen NO infla images: iguala el payload aunque la 
     TestRunner::assertSame((int) $resp->payload['images']['ok'], (int) $s['images']['ok'], 'images.ok NO se infla (summary == payload)');
     TestRunner::assertSame((int) $resp->payload['images']['deferred'], (int) $s['images']['deferred'], 'images.deferred NO se infla (summary == payload)');
     TestRunner::assertSame((int) $resp->payload['images']['failed'], (int) $s['images']['failed'], 'images.failed NO se infla: el resumen iguala el payload de completado');
+});
+
+// ===========================================================================
+// === task-9: read-only image-import diagnostic ============================
+// ===========================================================================
+echo "\nT73 — Image-import diagnostic (read-only)\n";
+
+TestRunner::test('T73.1 import_diagnostics expone el bloque images y conserva las claves previas', function (): void {
+    alegra_test_reset();
+    // Harness defaults: sync_images=false; no mode/restrict/preserve option set.
+    $d = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertArrayHasKey('images', $d, 'bloque images');
+    TestRunner::assertSame(false, $d['images']['sync_images'], 'sync_images default');
+    TestRunner::assertSame('favorite', $d['images']['sync_images_mode'], 'mode default favorite');
+    TestRunner::assertSame(false, $d['images']['restrict_image_hosts'], 'restrict default false');
+    TestRunner::assertSame(false, $d['images']['images_preserved'], 'images no preservadas por default');
+
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    update_option('alegra_connector_restrict_image_hosts', true);
+    update_option('alegra_connector_import_preserve_fields', ['images', 'name']);
+    $d2 = \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+    TestRunner::assertSame(true, $d2['images']['sync_images'], 'sync_images true');
+    TestRunner::assertSame('all', $d2['images']['sync_images_mode'], 'mode all');
+    TestRunner::assertSame(true, $d2['images']['restrict_image_hosts'], 'restrict true');
+    TestRunner::assertSame(true, $d2['images']['images_preserved'], 'images preservadas');
+
+    // Every pre-existing key survives (no regression of the task-5/task-7 panel).
+    foreach (['sync_method', 'sync_method_label', 'residue', 'cursor', 'import_total', 'locks', 'kill_switch', 'inventory_source', 'realtime_inventory_warning'] as $k) {
+        TestRunner::assertArrayHasKey($k, $d2, 'clave previa ' . $k);
+    }
+});
+
+TestRunner::test('T73.2 ajax_monitor_status mantiene las claves previas y suma diagnostics.images', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_monitor_status());
+    TestRunner::assertTrue($resp->success, 'respuesta ok');
+    foreach (['running', 'cron', 'recent', 'recent_webhooks', 'sync_method', 'kill_switch_active', 'kill_switch_reason', 'diagnostics', 'last_import_summary'] as $k) {
+        TestRunner::assertArrayHasKey($k, $resp->payload, 'payload previo ' . $k);
+    }
+    TestRunner::assertArrayHasKey('images', $resp->payload['diagnostics'], 'diagnostics.images');
+    TestRunner::assertSame(true, $resp->payload['diagnostics']['images']['sync_images'], 'sync_images via monitor');
+});
+
+TestRunner::test('T73.3 probe: detalle CON imágenes vs listado SIN imágenes reporta ambos conteos', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Probe']);
+    update_post_meta(10, '_alegra_item_id', 'it-probe');
+    $detail = [
+        'id' => 'it-probe', 'name' => 'Probe',
+        'images' => [['id' => 'img-1', 'name' => 'A', 'url' => 'https://cdn.example.test/a.png', 'favorite' => true]],
+    ];
+    $list = [['id' => 'it-probe', 'name' => 'Probe']]; // el LIST ya no trae images
+    $fake = new Alegra_Probe_API($detail, $list, make_logger());
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard($fake, make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_probe_images());
+
+    TestRunner::assertTrue($resp->success, 'probe responde success');
+    TestRunner::assertSame(false, $resp->payload['no_linked_product'], 'hay producto vinculado');
+    TestRunner::assertSame('it-probe', $resp->payload['linked_product']['alegra_id'], 'id tomado del meta');
+    TestRunner::assertSame(true, $resp->payload['detail']['http_ok'], 'detail http ok');
+    TestRunner::assertSame(1, $resp->payload['detail']['images_count'], 'detail.images_count > 0');
+    TestRunner::assertSame(true, $resp->payload['list']['http_ok'], 'list http ok');
+    TestRunner::assertSame(0, $resp->payload['list']['images_count'], 'list.images_count == 0');
+    TestRunner::assertSame(true, $resp->payload['list']['found'], 'el item existe en el listado');
+    TestRunner::assertSame(['id', 'name', 'url', 'favorite'], $resp->payload['detail']['first_image_keys'], 'claves de la imagen');
+    TestRunner::assertStringContains('a.png', $resp->payload['detail']['sample'], 'muestra con la url');
+
+    TestRunner::assertSame('it-probe', $fake->item_ids[0] ?? null, 'get_item(alegra_id)');
+    TestRunner::assertSame('advanced', $fake->list_params[0]['mode'] ?? null, 'list mode advanced');
+    TestRunner::assertSame('it-probe', $fake->list_params[0]['id'] ?? null, 'list filtro id');
+    TestRunner::assertSame(30, $fake->list_params[0]['limit'] ?? null, 'list limit 30');
+});
+
+TestRunner::test('T73.4 probe con el mock real consulta detalle y listado', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Con img']);
+    update_post_meta(10, '_alegra_item_id', 'itm-9');
+    alegra_mock_seed_item('itm-9', [
+        'name' => 'Con img', 'reference' => 'S9', 'status' => 'active',
+        'images' => [['id' => 'i9', 'name' => 'A', 'url' => 'https://cdn.alegra.test/a.png', 'favorite' => true]],
+    ]);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_probe_images());
+    TestRunner::assertTrue($resp->success, 'success');
+    TestRunner::assertSame(1, $resp->payload['detail']['images_count'], 'detail con imagen');
+    TestRunner::assertSame(1, $resp->payload['list']['images_count'], 'list con imagen');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items/itm-9'), 'se consultó GET /items/{id}');
+    TestRunner::assertSame(1, alegra_mock_count('GET', '/items'), 'se consultó GET /items');
+});
+
+TestRunner::test('T73.5 probe sin producto vinculado reporta gracefully (sin error)', function (): void {
+    alegra_test_reset();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_probe_images());
+    TestRunner::assertTrue($resp->success, 'no es un error de AJAX');
+    TestRunner::assertSame(true, $resp->payload['no_linked_product'], 'flag no_linked_product');
+    TestRunner::assertSame(0, alegra_mock_count('GET', '/items'), 'no consulta la API sin producto');
+});
+
+TestRunner::test('T73.6 probe reporta WP_Error de detalle y listado sin fatal', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'X']);
+    update_post_meta(10, '_alegra_item_id', 'it-err');
+    $fake = new Alegra_Probe_API(new \WP_Error('http', 'detail boom'), new \WP_Error('http', 'list boom'), make_logger());
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard($fake, make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_probe_images());
+    TestRunner::assertTrue($resp->success, 'success aunque la API falle');
+    TestRunner::assertSame(false, $resp->payload['detail']['http_ok'], 'detail no ok');
+    TestRunner::assertStringContains('detail boom', (string) $resp->payload['detail']['error'], 'mensaje de error detail');
+    TestRunner::assertSame(false, $resp->payload['list']['http_ok'], 'list no ok');
+    TestRunner::assertSame(0, $resp->payload['list']['images_count'], 'sin imágenes en error');
+});
+
+TestRunner::test('T73.7 probe es read-only: no hay escrituras a Alegra ni mutación de producto', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'RO']);
+    update_post_meta(10, '_alegra_item_id', 'itm-ro');
+    $thumb_before = get_post_meta(10, '_thumbnail_id', true);
+    alegra_mock_seed_item('itm-ro', [
+        'name' => 'RO', 'reference' => 'SRO', 'status' => 'active',
+        'images' => [['id' => 'iro', 'name' => 'A', 'url' => 'https://cdn.alegra.test/ro.png', 'favorite' => true]],
+    ]);
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    alegra_capture_json(fn () => $admin->ajax_probe_images());
+
+    $writes = array_values(array_filter(alegra_mock_requests(), static fn ($r) => ($r['method'] ?? '') !== 'GET'));
+    TestRunner::assertCount(0, $writes, 'ninguna escritura a Alegra');
+    TestRunner::assertSame('itm-ro', (string) get_post_meta(10, '_alegra_item_id', true), 'el meta no cambia');
+    TestRunner::assertSame($thumb_before, get_post_meta(10, '_thumbnail_id', true), 'no se fija imagen destacada');
+});
+
+TestRunner::test('T73.8 la UI y el handler del probe están cableados', function (): void {
+    $tpl = cfg2_source('templates/admin-monitor.php');
+    TestRunner::assertStringContains('alegra-probe-images', $tpl, 'botón Probar imágenes');
+    TestRunner::assertStringContains('alegra_probe_images', $tpl, 'acción AJAX del probe');
+    TestRunner::assertStringContains('ac-monitor-image-probe', $tpl, 'contenedor del resultado');
+    TestRunner::assertStringContains('renderImageProbe', $tpl, 'render del resultado');
+
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    TestRunner::assertStringContains('wp_ajax_alegra_probe_images', $ctor, 'acción registrada');
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    foreach ([
+        'diagImagesTitle', 'diagImageSync', 'diagImageMode', 'diagImageRestrict', 'diagImagePreserved',
+        'diagProbeButton', 'diagProbeRunning', 'diagProbeNoLinked', 'diagProbeDetail', 'diagProbeList',
+        'diagProbeHttpOk', 'diagProbeError', 'diagProbeImagesCount', 'diagProbeKeys', 'diagProbeSample',
+        'diagProbeFound', 'diagProbeNotFound',
+    ] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
+    }
+});
+
+TestRunner::test('T73.9 el reporte del probe arma detalle+listado y no escribe', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'build_image_probe_report');
+    TestRunner::assertStringContains('get_item', $src, 'usa get_item (detalle)');
+    TestRunner::assertStringContains('get_items', $src, 'usa get_items (listado)');
+    TestRunner::assertStringContains("'mode' => 'advanced'", $src, 'modo advanced en el listado');
+
+    $ajax = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_probe_images');
+    TestRunner::assertStringContains('check_ajax_referer', $ajax, 'verifica nonce');
+    TestRunner::assertStringContains('manage_woocommerce', $ajax, 'verifica capability');
+    TestRunner::assertStringNotContains('update_option', $ajax, 'no escribe opciones');
 });
 
 exit(TestRunner::summary());

@@ -94,6 +94,8 @@ class Admin_Dashboard
         // Write_Gate::run_explicit(), never the automatic path.
         add_action('wp_ajax_alegra_update_shipping_item_name', [$this, 'ajax_update_shipping_item_name']);
         add_action('wp_ajax_alegra_remove_shipping_mapping', [$this, 'ajax_remove_shipping_mapping']);
+        // task-9: read-only image-import diagnostic probe (Monitor panel).
+        add_action('wp_ajax_alegra_probe_images', [$this, 'ajax_probe_images']);
     }
 
     /**
@@ -1018,6 +1020,26 @@ class Admin_Dashboard
             'confirmRecreateManual' => __('¿Recrear también los productos que borraste a mano?', 'alegra-connector'),
             // T5.2b (dueño único): desglose de fallos de imagen en el resumen.
             'imagesFailed'          => __('%1$s imágenes no se pudieron importar (%2$s host no permitido, %3$s fallo de descarga, %4$s fallo al adjuntar, %5$s diferidas).', 'alegra-connector'),
+
+            // task-9: read-only image-import diagnostics in the Monitor panel.
+            'diagImagesTitle'       => __('Imágenes', 'alegra-connector'),
+            'diagImageSync'         => __('Sincronizar imágenes', 'alegra-connector'),
+            'diagImageMode'         => __('Modo de imágenes', 'alegra-connector'),
+            'diagImageRestrict'     => __('Restringir hosts de imagen', 'alegra-connector'),
+            'diagImagePreserved'    => __('Imágenes preservadas', 'alegra-connector'),
+            'diagProbeButton'       => __('Probar imágenes (1 producto)', 'alegra-connector'),
+            'diagProbeRunning'      => __('Consultando Alegra...', 'alegra-connector'),
+            'diagProbeTitle'        => __('Prueba de imágenes', 'alegra-connector'),
+            'diagProbeNoLinked'     => __('No hay productos vinculados a Alegra para probar.', 'alegra-connector'),
+            'diagProbeDetail'       => __('Detalle (GET /items/{id})', 'alegra-connector'),
+            'diagProbeList'         => __('Listado (GET /items)', 'alegra-connector'),
+            'diagProbeHttpOk'       => __('HTTP OK', 'alegra-connector'),
+            'diagProbeError'        => __('Error', 'alegra-connector'),
+            'diagProbeImagesCount'  => __('Imágenes', 'alegra-connector'),
+            'diagProbeKeys'         => __('Claves de la 1ª imagen', 'alegra-connector'),
+            'diagProbeSample'       => __('Muestra', 'alegra-connector'),
+            'diagProbeFound'        => __('Producto encontrado en el listado', 'alegra-connector'),
+            'diagProbeNotFound'     => __('Producto no encontrado en el listado (filtro id no soportado)', 'alegra-connector'),
 
             // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
             'cfVerifying'           => __('Verificando...', 'alegra-connector'),
@@ -5875,6 +5897,45 @@ class Admin_Dashboard
             // surprises merchants. Read-only flag; no behaviour changes.
             'inventory_source'           => $inventory_source,
             'realtime_inventory_warning' => ($method === 'real-time' && $inventory_source === 'alegra'),
+            // task-9: read-only image-import config, so a merchant with no
+            // SSH/DB access can see why images may not be imported.
+            'images'                     => self::image_sync_diagnostics(),
+        ];
+    }
+
+    /**
+     * task-9: READ-ONLY snapshot of the image-import settings.
+     *
+     * Mirrors exactly the gates `Products::update_product_from_alegra()` reads
+     * (`alegra_connector_sync_images` + `!preserve 'images'`) plus the mode and
+     * the host allowlist flag. It never writes anything.
+     *
+     * @return array{
+     *   sync_images:bool,sync_images_label:string,sync_images_mode:string,
+     *   restrict_image_hosts:bool,restrict_image_hosts_label:string,
+     *   images_preserved:bool,images_preserved_label:string
+     * }
+     */
+    public static function image_sync_diagnostics(): array
+    {
+        $sync_images = (bool) get_option('alegra_connector_sync_images', true);
+        $mode        = (string) get_option('alegra_connector_sync_images_mode', 'favorite');
+        $restrict    = (bool) get_option('alegra_connector_restrict_image_hosts', false);
+
+        $preserve = get_option('alegra_connector_import_preserve_fields', []);
+        $preserve = is_array($preserve) ? $preserve : [];
+        $preserved = in_array('images', $preserve, true);
+
+        return [
+            'sync_images'                => $sync_images,
+            'sync_images_label'          => $sync_images ? __('Activado', 'alegra-connector') : __('Desactivado', 'alegra-connector'),
+            'sync_images_mode'           => $mode,
+            'restrict_image_hosts'       => $restrict,
+            'restrict_image_hosts_label' => $restrict ? __('Activado', 'alegra-connector') : __('Desactivado', 'alegra-connector'),
+            'images_preserved'           => $preserved,
+            'images_preserved_label'     => $preserved
+                ? __('Sí (no se importan imágenes)', 'alegra-connector')
+                : __('No', 'alegra-connector'),
         ];
     }
 
@@ -5929,6 +5990,228 @@ class Admin_Dashboard
     {
         $summary = get_option('alegra_connector_last_import_summary', null);
         return is_array($summary) ? $summary : null;
+    }
+
+    /**
+     * task-9: READ-ONLY image-import diagnostic.
+     *
+     * A merchant with no SSH/DB/panel access clicks "Probar imágenes (1
+     * producto)" and this fetches ONE linked product twice from Alegra —
+     * through the DETAIL endpoint (get_item, always mode=advanced) and through
+     * the LIST endpoint (get_items, mode=advanced) — and reports, for each,
+     * whether the call succeeded, how many `images` the payload carried, a
+     * short JSON sample and the raw keys of the first image.
+     *
+     * The hypothesis it proves/disproves: the LIST response stopped carrying
+     * `images` while the DETAIL still does. It performs NO writes, downloads
+     * NO image and mutates NO product.
+     */
+    public function ajax_probe_images(): void
+    {
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => __('No tienes permisos.', 'alegra-connector')]);
+        }
+
+        wp_send_json_success(self::build_image_probe_report($this->api));
+    }
+
+    /**
+     * Build the read-only image-probe report against the given API client.
+     *
+     * Exposed as a static so the execution harness can drive it with a canned
+     * client; the AJAX handler just forwards `$this->api`.
+     *
+     * @return array<string,mixed>
+     */
+    public static function build_image_probe_report(?API\Client $api): array
+    {
+        $linked = self::find_linked_product();
+        if ($linked === null) {
+            return [
+                'no_linked_product' => true,
+                'linked_product'    => null,
+                'message'           => __('No hay productos vinculados a Alegra para probar.', 'alegra-connector'),
+                'detail'            => null,
+                'list'              => null,
+            ];
+        }
+
+        $alegra_id = $linked['alegra_id'];
+        $no_api    = new \WP_Error('no_api', __('Cliente de Alegra no disponible.', 'alegra-connector'));
+
+        $detail_raw = $api !== null ? $api->get_item($alegra_id) : $no_api;
+        $list_raw   = $api !== null
+            ? $api->get_items(['id' => $alegra_id, 'mode' => 'advanced', 'limit' => 30])
+            : $no_api;
+
+        return [
+            'no_linked_product' => false,
+            'linked_product'    => $linked,
+            'detail'            => self::summarize_image_detail($detail_raw),
+            'list'              => self::summarize_image_list($list_raw, $alegra_id),
+        ];
+    }
+
+    /**
+     * Find ONE product linked to Alegra (`_alegra_item_id` non-empty).
+     *
+     * @return array{id:int,alegra_id:string}|null
+     */
+    private static function find_linked_product(): ?array
+    {
+        global $wpdb;
+
+        // Fast path in production: an indexed lookup. The execution harness
+        // cannot emulate this arbitrary SELECT, so it returns null there and
+        // the bounded scan below finds the seeded product instead.
+        if (isset($wpdb->postmeta)) {
+            $pid = $wpdb->get_var(
+                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key='_alegra_item_id' AND meta_value <> '' ORDER BY post_id ASC LIMIT 1"
+            );
+            if ($pid) {
+                $alegra_id = (string) get_post_meta((int) $pid, '_alegra_item_id', true);
+                if ($alegra_id !== '') {
+                    return ['id' => (int) $pid, 'alegra_id' => $alegra_id];
+                }
+            }
+        }
+
+        if (!function_exists('wc_get_products')) {
+            return null;
+        }
+
+        $per_page = 100;
+        for ($page = 1; $page <= 20; $page++) {
+            $products = wc_get_products(['limit' => $per_page, 'page' => $page, 'status' => 'publish']);
+            if (empty($products)) {
+                break;
+            }
+            foreach ((array) $products as $product) {
+                if (!is_object($product) || !method_exists($product, 'get_id')) {
+                    continue;
+                }
+                $alegra_id = (string) get_post_meta((int) $product->get_id(), '_alegra_item_id', true);
+                if ($alegra_id !== '') {
+                    return ['id' => (int) $product->get_id(), 'alegra_id' => $alegra_id];
+                }
+            }
+            if (count($products) < $per_page) {
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Summarize a single-item (DETAIL) response.
+     *
+     * @return array<string,mixed>
+     */
+    private static function summarize_image_detail(mixed $result): array
+    {
+        if (is_wp_error($result)) {
+            return self::image_probe_error($result);
+        }
+        if (!is_array($result)) {
+            return self::image_probe_invalid();
+        }
+        return ['http_ok' => true, 'error' => null] + self::image_probe_stats($result);
+    }
+
+    /**
+     * Summarize a list (LIST) response, locating the item by id.
+     *
+     * The `id` filter is documented on GET /items, but if the deployment/API
+     * does not honour it we still report the list we received (with
+     * `found:false`) instead of erroring.
+     *
+     * @return array<string,mixed>
+     */
+    private static function summarize_image_list(mixed $result, string $alegra_id): array
+    {
+        if (is_wp_error($result)) {
+            return self::image_probe_error($result) + ['items_count' => 0, 'found' => false];
+        }
+        if (!is_array($result)) {
+            return self::image_probe_invalid() + ['items_count' => 0, 'found' => false];
+        }
+
+        // Tolerate the `{metadata, data}` wrapper the endpoint may return.
+        $items       = (isset($result['data']) && is_array($result['data'])) ? $result['data'] : $result;
+        $items_count = count($items);
+
+        $found = null;
+        foreach ($items as $candidate) {
+            if (is_array($candidate) && (string) ($candidate['id'] ?? '') === $alegra_id) {
+                $found = $candidate;
+                break;
+            }
+        }
+        if ($found === null && $items_count === 1) {
+            // Some deployments honour `id` and return a single-item array.
+            $first = reset($items);
+            if (is_array($first)) {
+                $found = $first;
+            }
+        }
+
+        $base = ['http_ok' => true, 'error' => null, 'items_count' => $items_count, 'found' => $found !== null];
+        if ($found === null) {
+            return $base + ['images_count' => 0, 'sample' => '', 'first_image_keys' => []];
+        }
+        return $base + self::image_probe_stats($found);
+    }
+
+    /**
+     * @return array{images_count:int,sample:string,first_image_keys:array<int,string>}
+     */
+    private static function image_probe_stats(array $item): array
+    {
+        $images = (isset($item['images']) && is_array($item['images'])) ? $item['images'] : [];
+        $count  = count($images);
+
+        $first = $images[0] ?? null;
+        $keys  = is_array($first) ? array_values(array_keys($first)) : [];
+
+        $sample = '';
+        if ($count > 0) {
+            $encoded = wp_json_encode(array_slice($images, 0, 1));
+            if (is_string($encoded)) {
+                $sample = strlen($encoded) > 400 ? substr($encoded, 0, 400) . '…' : $encoded;
+            }
+        }
+
+        return ['images_count' => $count, 'sample' => $sample, 'first_image_keys' => $keys];
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private static function image_probe_error(\WP_Error $error): array
+    {
+        return [
+            'http_ok'          => false,
+            'error'            => $error->get_error_message(),
+            'images_count'     => 0,
+            'sample'           => '',
+            'first_image_keys' => [],
+        ];
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private static function image_probe_invalid(): array
+    {
+        return [
+            'http_ok'          => false,
+            'error'            => __('Respuesta inesperada de Alegra.', 'alegra-connector'),
+            'images_count'     => 0,
+            'sample'           => '',
+            'first_image_keys' => [],
+        ];
     }
 
     public function ajax_register_webhooks(): void
