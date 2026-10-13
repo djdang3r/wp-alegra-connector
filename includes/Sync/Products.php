@@ -3229,7 +3229,7 @@ class Products
             // task-10: the indexed map points at a stale/dead attachment
             // (previous install, deleted product). Deduping to it would
             // silently skip the download and leave the image unattached.
-            self::forget_stale_attachment((int) $mapped, $url_hash);
+            self::forget_stale_attachment((int) $mapped, $url_hash, $product_id);
             return 0;
         }
 
@@ -3246,7 +3246,7 @@ class Products
 
         if ($id) {
             if (!self::attachment_is_live((int) $id)) {
-                self::forget_stale_attachment((int) $id, $url_hash);
+                self::forget_stale_attachment((int) $id, $url_hash, $product_id);
                 return 0;
             }
             // Backfill the indexed map so subsequent lookups are O(1).
@@ -3330,7 +3330,7 @@ class Products
      * task-10: drop the stale dedup bookkeeping for a dead attachment so the
      * next run re-downloads instead of resolving to a ghost id.
      */
-    private static function forget_stale_attachment(int $attachment_id, string $url_hash): void
+    private static function forget_stale_attachment(int $attachment_id, string $url_hash, int $product_id): void
     {
         if ($url_hash !== '') {
             \Alegra\Connector\Entity_Map::remove('image', $url_hash, 'attachment');
@@ -3341,6 +3341,22 @@ class Products
             }
             if (get_post_meta($attachment_id, '_alegra_image_url', true)) {
                 delete_post_meta($attachment_id, '_alegra_image_url');
+            }
+        }
+
+        // Todo 4: de-reference the dead id from THIS product only (never another).
+        if ($product_id > 0 && $attachment_id > 0) {
+            if ((int) get_post_meta($product_id, '_thumbnail_id', true) === $attachment_id) {
+                delete_post_meta($product_id, '_thumbnail_id');
+            }
+            $gallery = self::parse_gallery_ids(get_post_meta($product_id, '_product_image_gallery', true));
+            if (in_array($attachment_id, $gallery, true)) {
+                $kept = array_values(array_diff($gallery, [$attachment_id]));
+                if (empty($kept)) {
+                    delete_post_meta($product_id, '_product_image_gallery');
+                } else {
+                    update_post_meta($product_id, '_product_image_gallery', implode(',', $kept));
+                }
             }
         }
     }
@@ -3443,7 +3459,7 @@ class Products
             if (!self::attachment_is_live($attachment_id)) {
                 // task-10: a dead attachment (deleted product / previous
                 // install) must not dedup — forget it so the caller re-downloads.
-                self::forget_stale_attachment($attachment_id, md5($image_url));
+                self::forget_stale_attachment($attachment_id, md5($image_url), $product_id);
                 return 0;
             }
             // AC-23: only reparent when the parent actually differs. The old

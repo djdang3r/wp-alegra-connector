@@ -16140,4 +16140,55 @@ TestRunner::test('T78.6 favorite borra sólo el featured reemplazado, jamás la 
     TestRunner::assertSame($galPlugin . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
 });
 
+echo "\nT79 — forget_stale_attachment de-references its product\n";
+
+TestRunner::test('T79.1 forget_stale_attachment quita el id muerto del producto que lo referencia', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'P10']);
+    $dead = 9999;
+    update_post_meta(10, '_thumbnail_id', $dead);
+    update_post_meta(10, '_product_image_gallery', '8000,' . $dead . ',8001');
+    update_post_meta($dead, '_alegra_image_url_hash', 'h');
+    update_post_meta($dead, '_alegra_image_url', 'u');
+    \Alegra\Connector\Entity_Map::map('image', 'h', 'attachment', $dead);
+
+    alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'forget_stale_attachment', $dead, 'h', 10);
+
+    TestRunner::assertSame('', (string) get_post_meta(10, '_thumbnail_id', true), 'featured de-referenciado');
+    TestRunner::assertSame('8000,8001', (string) get_post_meta(10, '_product_image_gallery', true), 'galería sin el id muerto');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_attachment_id('h'), 'mapa eliminado');
+});
+
+TestRunner::test('T79.2 forget_stale_attachment NO toca el producto ajeno', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'P10']);
+    alegra_make_product(20, ['name' => 'P20']);
+    $dead = 9999;
+    update_post_meta(10, '_product_image_gallery', (string) $dead);
+    update_post_meta(20, '_product_image_gallery', '8000,' . $dead);
+    update_post_meta(20, '_thumbnail_id', $dead);
+
+    alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'forget_stale_attachment', $dead, 'h', 10);
+
+    TestRunner::assertSame('', (string) get_post_meta(10, '_product_image_gallery', true), 'el producto 10 se limpia');
+    TestRunner::assertSame('8000,' . $dead, (string) get_post_meta(20, '_product_image_gallery', true), 'el producto 20 NO se toca');
+    TestRunner::assertSame($dead, (int) get_post_meta(20, '_thumbnail_id', true), 'featured de 20 intacto');
+});
+
+TestRunner::test('T79.3 el caller (download_and_attach_image) forwardea el product_id', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'P10']);
+    $url  = 'https://cdn3.alegra.com/dead.png';
+    $hash = md5($url);
+    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', 9999);
+    update_post_meta(9999, '_alegra_image_url_hash', $hash);
+    update_post_meta(10, '_thumbnail_id', 9999);
+    update_post_meta(10, '_product_image_gallery', '8000,9999');
+
+    alegra_call_private(make_products(), 'download_and_attach_image', 10, $url);
+
+    TestRunner::assertSame('', (string) get_post_meta(10, '_thumbnail_id', true), 'featured de-referenciado por el caller');
+    TestRunner::assertSame('8000', (string) get_post_meta(10, '_product_image_gallery', true), 'galería sin el muerto');
+});
+
 exit(TestRunner::summary());
