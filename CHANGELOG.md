@@ -10,7 +10,9 @@ All notable changes to Alegra Connector.
 > quedan reemplazadas se borran de la Media **solo** si no las referencia ningún otro
 > producto (`_thumbnail_id`/galería) ni ningún término; las imágenes del merchant y las
 > compartidas **se conservan**. El modo `favorite` ahora deduplica (no baja una imagen
-> nueva por import), **no toca la galería** y no borra nada. Reconcile y borrado se
+> nueva por import) y **no toca la galería**; al actualizar, la featured **creada por el
+> plugin** reemplazada se borra (si no la referencia otro post/término), mientras que
+> una imagen del **merchant** o compartida **nunca** se borra. Reconcile y borrado se
 > habilitan **solo** desde el import chunked de productos. Además, el banner fantasma
 > **"Pausado en el ítem X de Y"** ya no aparece cuando no hay una pausa real.
 
@@ -25,8 +27,11 @@ All notable changes to Alegra Connector.
   por otro post/término; galería con `FIND_IN_SET`, nunca `LIKE '%id%'`).
 - **`favorite` bajaba un attachment nuevo en cada import.** El branch `favorite` ahora
   resuelve por dedup (`download_and_attach_image`) y hace `set_post_thumbnail`, en vez
-  de descargar a ciegas; los featured legacy sin marcador se backfillean una vez desde
-  su propia URL para volverse dedup-aware (y borrables al reemplazarse).
+  de descargar a ciegas. Al actualizar, la featured **creada por el plugin** que queda
+  reemplazada se borra (solo si es plugin + no la referencia otro post/término); los
+  featured **del merchant o editados a mano NUNCA se borran** — no llevan el marcador de
+  origen `_alegra_image_url`, que únicamente escribe la descarga del plugin — y la
+  galería no se toca.
 - **Banner "Pausado en el ítem X de Y" fantasma.** El cursor de reanudación ahora se
   limpia en CADA terminal path del import chunked (done, error de API, excepción,
   cancel, release) y un self-heal dedicado limpia un cursor chunked huérfano al
