@@ -872,6 +872,41 @@ function wp_is_post_revision($post_id) { return false; }
 function get_post_type($post_id) { return $GLOBALS['wp_posts'][(int) $post_id]->post_type ?? ''; }
 
 /**
+ * Bulk-wipe backup: the export reads the product name via `get_the_title()`
+ * (no WC_Product hydration). Products built by `alegra_make_product()` live in
+ * `wc_products`, so fall back to the object's name when there is no wp_posts row.
+ */
+function get_the_title($post = 0)
+{
+    $id = is_object($post) ? (int) ($post->ID ?? 0) : (int) $post;
+    if (isset($GLOBALS['wp_posts'][$id])) {
+        return (string) ($GLOBALS['wp_posts'][$id]->post_title ?? '');
+    }
+    if (isset($GLOBALS['wc_products'][$id]) && $GLOBALS['wc_products'][$id] instanceof WC_Product) {
+        return $GLOBALS['wc_products'][$id]->get_name();
+    }
+    return '';
+}
+
+/**
+ * Bulk-wipe backup: variation children for the by-id image collector, read from
+ * wp_posts (WP-faithful), restricted to the requested post_type.
+ */
+function get_children($args = [], $output = null)
+{
+    $args   = (array) $args;
+    $parent = (int) ($args['post_parent'] ?? 0);
+    $type   = (string) ($args['post_type'] ?? '');
+    $out    = [];
+    foreach (($GLOBALS['wp_posts'] ?? []) as $id => $post) {
+        if ((int) ($post->post_parent ?? 0) !== $parent) { continue; }
+        if ($type !== '' && (string) ($post->post_type ?? '') !== $type) { continue; }
+        $out[] = (int) $id;
+    }
+    return $out;
+}
+
+/**
  * Resolve a post's type for the bulk-wipe SQL emulation. Products built with
  * `alegra_make_product()` live in `wc_products`, not `wp_posts`, so a raw SQL
  * JOIN on wp_posts would miss them. Production products ARE wp_posts; this

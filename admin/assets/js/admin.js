@@ -544,6 +544,13 @@
                 $bar.css('width', '2%').data('pct', 2);
 
                 var totals = { products: 0, images: 0, skipped: 0 };
+                // A chunk can die mid-flight on a slow host (a non-JSON PHP
+                // fatal). The wipe is resumable via the server-side keyset
+                // cursor, so re-issuing the SAME chunk is safe: already-deleted
+                // products simply drop out of the set. Bounded so a truly dead
+                // backend still surfaces the error promptly.
+                var pageAttempts = 0;
+                var WIPE_PAGE_MAX_RETRIES = 3;
 
                 $.ajax({
                     url: alegraConnector.ajaxUrl,
@@ -585,6 +592,7 @@
                             $err.text(bodyMessage(r, S.error));
                             return;
                         }
+                        pageAttempts = 0; // a healthy chunk clears the retry budget
                         var d = r.data || {};
                         totals.products += (d.products_deleted || 0);
                         totals.images   += (d.images_deleted || 0);
@@ -608,6 +616,18 @@
                         }
                         processPage();
                     }).fail(function(xhr) {
+                        // .fail() covers both a transport error and a body
+                        // jQuery could not parse as JSON (a non-JSON PHP fatal).
+                        // Retry the SAME chunk with a short backoff; the server
+                        // cursor makes that idempotent. Only once the retries
+                        // are spent do we surface the real error — modal stays
+                        // open and Cancelar works. BORRAR is never re-armed.
+                        if (pageAttempts < WIPE_PAGE_MAX_RETRIES) {
+                            pageAttempts++;
+                            $log.text(fmt(S.wipeRetrying, pageAttempts, WIPE_PAGE_MAX_RETRIES));
+                            setTimeout(processPage, 1000 * pageAttempts);
+                            return;
+                        }
                         resetBusy();
                         $err.text(xhrMessage(xhr, S.connectionError));
                     });

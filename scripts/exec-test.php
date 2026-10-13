@@ -17001,17 +17001,25 @@ TestRunner::test('T86.10 ajax_wipe_page es reanudable por id, commitea heartbeat
     TestRunner::assertTrue($start->success, 'start ok');
     $run_id = (int) $start->payload['run_id'];
 
-    $p1 = alegra_capture_json(fn () => $admin->ajax_wipe_page());
-    TestRunner::assertFalse((bool) $p1->payload['done'], 'página 1 no termina');
-    TestRunner::assertSame(20, (int) $p1->payload['products_deleted'], 'borró 20 (chunk)');
-    TestRunner::assertTrue(\Alegra\Connector\Heartbeat::get($run_id) !== null, 'M2: heartbeat por chunk');
-    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($run_id), 'el run sigue running');
-    $cursor = (int) get_option('alegra_connector_wipe_cursor', 0);
-    TestRunner::assertSame(119, $cursor, 'cursor keyset = último product_id');
+    $deleted = 0;
+    $pages   = 0;
+    $last    = null;
+    do {
+        $last = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+        $deleted += (int) $last->payload['products_deleted'];
+        $pages++;
+        if ($pages === 1) {
+            TestRunner::assertFalse((bool) $last->payload['done'], 'página 1 no termina');
+            TestRunner::assertSame(5, (int) $last->payload['products_deleted'], 'borró 5 (WIPE_CHUNK)');
+            TestRunner::assertTrue(\Alegra\Connector\Heartbeat::get($run_id) !== null, 'M2: heartbeat por chunk');
+            TestRunner::assertSame('running', \Alegra\Connector\Runs::status($run_id), 'el run sigue running');
+            TestRunner::assertSame(104, (int) get_option('alegra_connector_wipe_cursor', 0), 'cursor keyset = último product_id');
+        }
+    } while (empty($last->payload['done']) && $pages < 50);
 
-    $p2 = alegra_capture_json(fn () => $admin->ajax_wipe_page());
-    TestRunner::assertTrue((bool) $p2->payload['done'], 'página 2 termina');
-    TestRunner::assertSame(5, (int) $p2->payload['products_deleted'], 'borró los 5 restantes');
+    TestRunner::assertSame(6, $pages, '25 productos / chunk 5 = 5 páginas llenas + la vacía final');
+    TestRunner::assertSame(25, $deleted, 'todos los productos se borraron');
+    TestRunner::assertTrue((bool) $last->payload['done'], 'la última página termina');
     TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'run completado');
     TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'H1: lock liberado al terminar');
     TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'state del wipe limpio');
@@ -17068,7 +17076,9 @@ TestRunner::test('T86.12 la UI del borrador masivo está cableada (botón + moda
     }
 
     $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
-    foreach (['wipeLoading', 'wipePreview', 'wipeRunning', 'wipeProgress', 'wipeDone', 'wipeAborted', 'wipeBlockedKillSwitch', 'wipeBlockedRunning'] as $k) {
+    TestRunner::assertStringContains('wipeRetrying', $js, 'avisa del reintento de chunk');
+
+    foreach (['wipeLoading', 'wipePreview', 'wipeRunning', 'wipeRetrying', 'wipeProgress', 'wipeDone', 'wipeAborted', 'wipeBlockedKillSwitch', 'wipeBlockedRunning'] as $k) {
         TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
     }
 });
@@ -17176,8 +17186,8 @@ TestRunner::test('T86.16 ajax_wipe_start NO llama a wipe_preview (arranque livia
     \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
 });
 
-TestRunner::test('T86.17 ambos handlers de wipe elevan time limit / memoria / ignoran aborto', function (): void {
-    foreach (['ajax_wipe_preview', 'ajax_wipe_start'] as $m) {
+TestRunner::test('T86.17 los tres handlers de wipe elevan time limit / memoria / ignoran aborto', function (): void {
+    foreach (['ajax_wipe_preview', 'ajax_wipe_start', 'ajax_wipe_page'] as $m) {
         $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, $m);
         TestRunner::assertStringContains('set_time_limit', $src, $m . ' sube el límite de tiempo');
         TestRunner::assertStringContains('wp_raise_memory_limit', $src, $m . ' sube la memoria');
@@ -17199,6 +17209,52 @@ TestRunner::test('T86.18 write_wipe_backup exporta TODOS los productos y es JSON
     TestRunner::assertSame(5, count($data['products'] ?? []), 'todos los productos están en el export');
     TestRunner::assertSame(100, (int) ($data['products'][0]['product_id'] ?? 0), 'primer producto incluido');
     TestRunner::assertSame(104, (int) ($data['products'][4]['product_id'] ?? 0), 'último producto incluido');
+});
+
+TestRunner::test('T86.19 el chunk se autolimita por presupuesto de tiempo: done=false (NO aborted) y el cursor avanza', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-budget' . $i);
+    }
+
+    // Presupuesto mínimo: ya agotado tras el primer producto ⇒ el chunk corta
+    // limpio con progreso parcial. Debe ser done=false, NO aborted.
+    $res = make_products()->wipe_imported_products_chunk(0, 50, [
+        'wipe_ids'    => [100, 101, 102, 103, 104],
+        'time_budget' => 0.0,
+    ]);
+
+    TestRunner::assertFalse((bool) $res['aborted'], 'presupuesto agotado NO es un abort');
+    TestRunner::assertSame('', (string) $res['reason'], 'sin reason de abort');
+    TestRunner::assertFalse((bool) $res['done'], 'no done: quedan productos por borrar');
+    TestRunner::assertSame(1, (int) $res['processed'], 'procesa exactamente 1 (progreso garantizado, sin loop infinito)');
+    TestRunner::assertSame(100, (int) $res['next_after_id'], 'el cursor keyset avanzó al último procesado');
+    TestRunner::assertSame(false, wc_get_product(100), 'el 100 sí se borró');
+    TestRunner::assertTrue(wc_get_product(104) !== null, 'el 104 sigue pendiente para el próximo chunk');
+
+    // La continuación re-lee el MISMO cursor keyset y termina el lote.
+    $res2 = make_products()->wipe_imported_products_chunk((int) $res['next_after_id'], 50, [
+        'wipe_ids'    => [100, 101, 102, 103, 104],
+        'time_budget' => 30.0,
+    ]);
+    TestRunner::assertTrue((bool) $res2['done'], 'con presupuesto holgado termina');
+    TestRunner::assertSame(4, (int) $res2['products_deleted'], 'borró los 4 restantes');
+});
+
+TestRunner::test('T86.20 la UI reintenta un chunk fallido (mismo cursor) y sólo tras agotar los reintentos muestra el error', function (): void {
+    $js = cfg2_source('admin/assets/js/admin.js');
+
+    TestRunner::assertStringContains('WIPE_PAGE_MAX_RETRIES', $js, 'hay un tope de reintentos para el chunk');
+    TestRunner::assertStringContains('pageAttempts', $js, 'se cuentan los intentos del chunk');
+    TestRunner::assertStringContains('pageAttempts < WIPE_PAGE_MAX_RETRIES', $js, 'sólo reintenta mientras queden intentos');
+    TestRunner::assertStringContains('setTimeout(processPage', $js, 'reintenta el MISMO chunk con backoff');
+    TestRunner::assertStringContains('S.wipeRetrying', $js, 'avisa del reintento en el log del modal');
+
+    // El reintento del page ocurre ANTES de surfacear el error real (la última
+    // aparición de xhrMessage es la del handler del chunk).
+    $retry = strpos($js, 'setTimeout(processPage');
+    $reset = strrpos($js, '$err.text(xhrMessage(xhr, S.connectionError));');
+    TestRunner::assertTrue($retry !== false && $reset !== false && $retry < $reset, 'primero reintenta, después muestra el error real');
 });
 
 exit(TestRunner::summary());

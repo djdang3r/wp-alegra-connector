@@ -3059,6 +3059,54 @@ class Products
     }
 
     /**
+     * Todo 1 (H2) + backup: every image id a product owns, resolved from
+     * postmeta WITHOUT instantiating a WC_Product. Same result as
+     * wipe_collect_image_ids(), but it never hydrates the product CRUD object —
+     * which is what made the safety export slow enough to time out.
+     *
+     * @return int[]
+     */
+    public function wipe_collect_image_ids_by_id(int $product_id): array
+    {
+        $ids = self::product_image_refs_by_id($product_id);
+
+        foreach ((array) get_children([
+            'post_parent' => $product_id,
+            'post_type'   => 'product_variation',
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+        ]) as $child_id) {
+            $ids = array_merge($ids, self::product_image_refs_by_id((int) $child_id));
+        }
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * Featured (`_thumbnail_id`) + gallery refs of ONE post id, read straight
+     * from postmeta (no WC_Product needed).
+     *
+     * @return int[]
+     */
+    private static function product_image_refs_by_id(int $product_id): array
+    {
+        $ids = [];
+
+        $thumb = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($thumb > 0) {
+            $ids[] = $thumb;
+        }
+
+        $raw = get_post_meta($product_id, '_product_image_gallery', true);
+        foreach (self::parse_gallery_ids($raw) as $gallery_id) {
+            $ids[] = $gallery_id;
+        }
+
+        return self::normalize_id_list($ids);
+    }
+
+    /**
      * The product's own image references: featured (`_thumbnail_id`) + gallery.
      * Reads postmeta directly (mirrors `WC_Product::get_image_id()` and is
      * observable in every environment, including the execution harness).
@@ -3123,6 +3171,15 @@ class Products
         $limit = max(1, $limit);
         $run_id = (int) ($opts['run_id'] ?? 0);
 
+        // Self-imposed time budget: stop CLEANLY between products once the
+        // deadline trips, so a chunk (which also unlinks image files) can never
+        // run past the host's max_execution_time — a fatal there is what the
+        // browser reports as "Error de conexión". At least one product is always
+        // processed so the keyset cursor advances (never an infinite loop); the
+        // caller then just requests the next chunk. This is NOT an abort.
+        $time_budget = isset($opts['time_budget']) ? (float) $opts['time_budget'] : 20.0;
+        $deadline    = microtime(true) + max(0.0, $time_budget);
+
         $raw_set = $opts['wipe_ids'] ?? get_option('alegra_connector_wipe_ids', []);
         $wipe_set = [];
         foreach ((array) $raw_set as $wid) {
@@ -3171,10 +3228,18 @@ class Products
         $deleted_images  = [];
         $alegra_ids      = [];
         $deleted_products = [];
+        $deadline_hit    = false;
 
         try {
             foreach ($ids as $product_id) {
                 $product_id = (int) $product_id;
+
+                // Budget check BETWEEN products: only after at least one has
+                // been processed, so progress (and the cursor) always advances.
+                if ($result['processed'] > 0 && microtime(true) >= $deadline) {
+                    $deadline_hit = true;
+                    break;
+                }
 
                 $abort = self::wipe_abort_reason($run_id);
                 if ($abort !== '') {
@@ -3262,8 +3327,10 @@ class Products
             );
         }
 
-        // A short page means the catalog was fully walked (keyset cursor).
-        $result['done'] = !$result['aborted'] && count($ids) < $limit;
+        // A short page means the catalog was fully walked (keyset cursor). A
+        // budget trip is a partial page too: the caller re-invokes the same
+        // keyset cursor (done=false, NOT aborted).
+        $result['done'] = !$result['aborted'] && !$deadline_hit && count($ids) < $limit;
 
         return $result;
     }

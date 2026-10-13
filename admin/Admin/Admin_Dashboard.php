@@ -20,8 +20,12 @@ if (!defined('ABSPATH')) {
 
 class Admin_Dashboard
 {
-    /** Products per page in the chunked bulk wipe. */
-    private const WIPE_CHUNK = 20;
+    /**
+     * Products per page in the chunked bulk wipe. Kept small on purpose: each
+     * chunk also unlinks image files, and a smaller page stays comfortably under
+     * a shared host's max_execution_time even on the slowest request.
+     */
+    private const WIPE_CHUNK = 5;
 
     /**
      * The per-type sync lock key shared with the products import (H1). Using
@@ -1088,6 +1092,7 @@ class Admin_Dashboard
             'wipePreview'           => __('Se borrarán %1$s productos y %2$s imágenes.', 'alegra-connector'),
             'wipePreviewSkipped'    => __('%1$s imágenes protegidas/compartidas se conservarán; %2$s pedidos quedarán sin esos productos.', 'alegra-connector'),
             'wipeRunning'           => __('Borrando…', 'alegra-connector'),
+            'wipeRetrying'          => __('Reintentando el borrado (%1$s/%2$s)…', 'alegra-connector'),
             'wipeProgress'          => __('Productos: %1$s · Imágenes: %2$s · Conservadas: %3$s', 'alegra-connector'),
             'wipeDone'              => __('Completado: %1$s productos y %2$s imágenes borrados (%3$s imágenes conservadas).', 'alegra-connector'),
             'wipeAborted'           => __('Borrador detenido:', 'alegra-connector'),
@@ -5906,8 +5911,10 @@ class Admin_Dashboard
 
         // Start must be FAST: build the id set, take the lock, write the export,
         // create the run, return. Raise the limits so neither the export write
-        // nor the light counts can emit a non-JSON PHP fatal.
-        @set_time_limit(120);
+        // nor the light counts can emit a non-JSON PHP fatal. The backup export
+        // walks the whole catalog (postmeta reads only, never wc_get_product),
+        // so give it real headroom on a slow/shared host.
+        @set_time_limit(300);
         wp_raise_memory_limit();
         ignore_user_abort(true);
 
@@ -6045,12 +6052,14 @@ class Admin_Dashboard
 
         foreach ($wipe_ids as $product_id) {
             $product_id = (int) $product_id;
-            $product    = wc_get_product($product_id);
-            if (!$product instanceof \WC_Product) {
+            if ($product_id <= 0) {
                 continue;
             }
 
-            $image_ids = $products->wipe_collect_image_ids($product);
+            // Read straight from postmeta / the post title: instantiating a
+            // WC_Product per product (the old code) is what made the export slow
+            // enough to time out on a slow host. The JSON shape is unchanged.
+            $image_ids = $products->wipe_collect_image_ids_by_id($product_id);
             $image_urls = [];
             foreach ($image_ids as $image_id) {
                 $url = function_exists('wp_get_attachment_url') ? wp_get_attachment_url($image_id) : false;
@@ -6061,18 +6070,18 @@ class Admin_Dashboard
 
             $row = [
                 'product_id'     => $product_id,
-                'name'           => (string) $product->get_name(),
-                'sku'            => (string) $product->get_sku(),
+                'name'           => (string) get_the_title($product_id),
+                'sku'            => (string) get_post_meta($product_id, '_sku', true),
                 'alegra_item_id' => (string) get_post_meta($product_id, '_alegra_item_id', true),
-                'allegra_type'   => (string) $product->get_type(),
+                'allegra_type'   => self::wipe_product_type($product_id),
                 'image_ids'      => array_values($image_ids),
                 'image_urls'     => $image_urls,
                 'prices'         => [
-                    'regular' => (string) $product->get_regular_price(),
-                    'sale'    => (string) $product->get_sale_price(),
-                    'price'   => (string) $product->get_price(),
+                    'regular' => (string) get_post_meta($product_id, '_regular_price', true),
+                    'sale'    => (string) get_post_meta($product_id, '_sale_price', true),
+                    'price'   => (string) get_post_meta($product_id, '_price', true),
                 ],
-                'categories'     => array_map('intval', (array) $product->get_category_ids()),
+                'categories'     => array_map('intval', (array) wp_get_object_terms($product_id, 'product_cat', ['fields' => 'ids'])),
             ];
 
             $encoded = (string) wp_json_encode($row);
@@ -6087,6 +6096,22 @@ class Admin_Dashboard
         fclose($handle);
 
         return $ok ? $file : '';
+    }
+
+    /**
+     * The `product_type` taxonomy slug of a product (simple/variable/…), read
+     * without instantiating the WC_Product. Falls back to 'simple'.
+     */
+    private static function wipe_product_type(int $product_id): string
+    {
+        $terms = get_the_terms($product_id, 'product_type');
+        if (is_array($terms) && $terms !== []) {
+            $term = reset($terms);
+            if (is_object($term) && isset($term->slug)) {
+                return (string) $term->slug;
+            }
+        }
+        return 'simple';
     }
 
     /**
@@ -6131,6 +6156,15 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
             wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
+
+        // The delete path unlinks image files — the heaviest work in the plugin.
+        // Mirror the preview/start so a chunk can NEVER emit a non-JSON PHP
+        // fatal mid-request ("Error de conexión"). The chunk itself also
+        // self-limits its work via a time budget (see
+        // Products::wipe_imported_products_chunk), so this is just the ceiling.
+        @set_time_limit(300);
+        wp_raise_memory_limit();
+        ignore_user_abort(true);
 
         $token = (string) get_option('alegra_connector_wipe_lock_token', '');
         if ($token === '') {
