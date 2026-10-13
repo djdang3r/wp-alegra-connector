@@ -5864,6 +5864,13 @@ class Admin_Dashboard
             wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
 
+        // The preview is now bounded (constant # of queries), but a large
+        // catalog plus the batched scans can still take a moment: raise the
+        // limits so the request can never emit a non-JSON PHP fatal.
+        @set_time_limit(120);
+        wp_raise_memory_limit();
+        ignore_user_abort(true);
+
         $products = new Sync\Products($this->api, $this->logger);
         $preview  = $products->wipe_preview();
 
@@ -5896,6 +5903,13 @@ class Admin_Dashboard
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
             wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
+
+        // Start must be FAST: build the id set, take the lock, write the export,
+        // create the run, return. Raise the limits so neither the export write
+        // nor the light counts can emit a non-JSON PHP fatal.
+        @set_time_limit(120);
+        wp_raise_memory_limit();
+        ignore_user_abort(true);
 
         // Server-side confirmation gate: never trust the UI checkbox alone.
         $confirm = isset($_POST['confirm']) ? strtoupper(trim((string) wp_unslash($_POST['confirm']))) : '';
@@ -5955,11 +5969,14 @@ class Admin_Dashboard
                 ]);
 
                 // The lock is NOT released: every chunk keeps it (H1).
+                // Light counts only — NEVER the full preview here: calling
+                // `wipe_preview()` after the run was created is exactly what
+                // fataled and left the run stuck.
                 $payload = [
                     'run_id'  => (int) $run_id,
                     'total'   => count($wipe_ids),
                     'chunk'   => self::WIPE_CHUNK,
-                    'preview' => $products->wipe_preview(),
+                    'counts'  => $products->wipe_summary_counts($wipe_ids),
                     'backup'  => $backup !== '' ? basename($backup) : '',
                     'message' => sprintf(__('Borrador masivo iniciado: %d productos.', 'alegra-connector'), count($wipe_ids)),
                 ];
@@ -6005,8 +6022,27 @@ class Admin_Dashboard
             @file_put_contents($dir . '/index.php', "<?php\n// Silence is golden.\n");
         }
 
-        $rows = [];
+        // Stream the export so a large catalog is never buffered in memory in
+        // one giant array/JSON string (the old version could OOM/timeout). Every
+        // product is still written; the JSON shape is unchanged.
+        $file = $dir . '/alegra-wipe-backup-' . date('Ymd-His') . '.json';
+        $handle = @fopen($file, 'w');
+        if ($handle === false) {
+            return '';
+        }
+
+        $header = [
+            'generated_at' => current_time('mysql'),
+            'user_id'      => get_current_user_id(),
+            'user_login'   => function_exists('wp_get_current_user') ? (string) wp_get_current_user()->user_login : '',
+            'note'         => 'Backup de datos de productos importados. NO puede restaurar los archivos de imagen (se destruyen).',
+        ];
+        $prefix = rtrim((string) wp_json_encode($header), '}');
+
         $products = new Sync\Products($this->api, $this->logger);
+        $ok = fwrite($handle, $prefix . ',"products":[') !== false;
+        $first = true;
+
         foreach ($wipe_ids as $product_id) {
             $product_id = (int) $product_id;
             $product    = wc_get_product($product_id);
@@ -6023,7 +6059,7 @@ class Admin_Dashboard
                 }
             }
 
-            $rows[] = [
+            $row = [
                 'product_id'     => $product_id,
                 'name'           => (string) $product->get_name(),
                 'sku'            => (string) $product->get_sku(),
@@ -6038,20 +6074,19 @@ class Admin_Dashboard
                 ],
                 'categories'     => array_map('intval', (array) $product->get_category_ids()),
             ];
+
+            $encoded = (string) wp_json_encode($row);
+            if (!$first) {
+                $ok = fwrite($handle, ',') !== false && $ok;
+            }
+            $ok = fwrite($handle, $encoded) !== false && $ok;
+            $first = false;
         }
 
-        $payload = [
-            'generated_at' => current_time('mysql'),
-            'user_id'      => get_current_user_id(),
-            'user_login'   => function_exists('wp_get_current_user') ? (string) wp_get_current_user()->user_login : '',
-            'note'         => 'Backup de datos de productos importados. NO puede restaurar los archivos de imagen (se destruyen).',
-            'products'     => $rows,
-        ];
+        $ok = fwrite($handle, ']}') !== false && $ok;
+        fclose($handle);
 
-        $file = $dir . '/alegra-wipe-backup-' . date('Ymd-His') . '.json';
-        $written = @file_put_contents($file, (string) wp_json_encode($payload));
-
-        return $written !== false ? $file : '';
+        return $ok ? $file : '';
     }
 
     /**

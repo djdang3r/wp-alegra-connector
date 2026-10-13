@@ -2017,6 +2017,7 @@ class Alegra_Mock_Wpdb
     public function get_var($query, $x = null, $y = null)
     {
         $query = (string) $query;
+        $GLOBALS['alegra_dbread_count'] = ($GLOBALS['alegra_dbread_count'] ?? 0) + 1;
 
         if (strpos($query, 'option_name') !== false && preg_match("/option_name\s*=\s*'([^']+)'/", $query, $m)) {
             return array_key_exists($m[1], $GLOBALS['wp_options'])
@@ -2163,6 +2164,83 @@ class Alegra_Mock_Wpdb
     public function get_results($query, $output = null)
     {
         $query = (string) $query;
+
+        // Observability for tests: count every $wpdb->{get_results,get_col}
+        // read so a test can assert the wipe preview is BOUNDED (constant # of
+        // queries regardless of catalog size). get_col() delegates here.
+        $GLOBALS['alegra_dbread_count'] = ($GLOBALS['alegra_dbread_count'] ?? 0) + 1;
+
+        // Bulk-wipe preview counts: `SELECT p.post_type, COUNT(*) … GROUP BY
+        // p.post_type` — grouped counts, not the id list. Must precede the
+        // generic `_alegra_item_id` discovery branch below.
+        if (strpos($query, '_alegra_item_id') !== false
+            && stripos($query, 'group by') !== false
+            && stripos($query, 'count(') !== false) {
+            $counts = ['product' => 0, 'product_variation' => 0];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (!isset($meta['_alegra_item_id']) || (string) $meta['_alegra_item_id'] === '') {
+                    continue;
+                }
+                $type = alegra_stub_post_type((int) $pid);
+                if ($type === 'product' || $type === 'product_variation') {
+                    $counts[$type]++;
+                }
+            }
+            $out = [];
+            foreach ($counts as $type => $cnt) {
+                if ($cnt > 0) {
+                    $out[] = (object) ['post_type' => $type, 'cnt' => $cnt];
+                }
+            }
+            return $out;
+        }
+
+        // Bulk-wipe preview: ONE termmeta scan for term `thumbnail_id` refs.
+        if (strpos($query, 'termmeta') !== false
+            && strpos($query, 'thumbnail_id') !== false
+            && stripos($query, 'meta_value') !== false) {
+            $out = [];
+            foreach (($GLOBALS['wp_term_meta'] ?? []) as $term_id => $meta) {
+                if (isset($meta['thumbnail_id']) && (string) $meta['thumbnail_id'] !== '') {
+                    $out[] = (object) ['term_id' => (int) $term_id, 'meta_value' => (string) $meta['thumbnail_id']];
+                }
+            }
+            return $out;
+        }
+
+        // Bulk-wipe preview: ONE scan of EVERY `_thumbnail_id` row
+        // (`meta_value <> ''`, no equality / no `post_id <>` exclusion).
+        if (strpos($query, '_thumbnail_id') !== false
+            && stripos($query, 'meta_value') !== false
+            && strpos($query, 'post_id <>') === false
+            && !preg_match("/meta_value\s*=\s*'/", $query)) {
+            $out = [];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (isset($meta['_thumbnail_id']) && (string) $meta['_thumbnail_id'] !== '') {
+                    $out[] = (object) ['post_id' => (int) $pid, 'meta_value' => (string) $meta['_thumbnail_id']];
+                }
+            }
+            return $out;
+        }
+
+        // Bulk-wipe preview: ONE scan of EVERY `_product_image_gallery` row
+        // (no `FIND_IN_SET` single-id lookup).
+        if (strpos($query, '_product_image_gallery') !== false
+            && stripos($query, 'meta_value') !== false
+            && stripos($query, 'FIND_IN_SET') === false) {
+            $out = [];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (!isset($meta['_product_image_gallery'])) {
+                    continue;
+                }
+                $val = $meta['_product_image_gallery'];
+                $val = is_array($val) ? implode(',', $val) : (string) $val;
+                if ($val !== '') {
+                    $out[] = (object) ['post_id' => (int) $pid, 'meta_value' => $val];
+                }
+            }
+            return $out;
+        }
 
         // Bulk-wipe discovery: `SELECT DISTINCT pm.post_id … INNER JOIN posts
         // … WHERE meta_key='_alegra_item_id' AND post_type IN (…) [AND post_id >

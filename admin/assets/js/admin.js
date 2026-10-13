@@ -441,6 +441,46 @@
                 return blockers.map(function(b) { return map[b] || b; }).join(' ');
             }
 
+            // Pull the REAL server message. jQuery may fail to parse a JSON body
+            // (e.g. an HTML/PHP error page), so inspect responseText directly;
+            // only fall back to the generic string when nothing useful is there.
+            function xhrMessage(xhr, fallback) {
+                var msg = fallback || S.connectionError;
+                try {
+                    var t = xhr && xhr.responseText;
+                    if (t) {
+                        var j = JSON.parse(t);
+                        if (j && j.data && j.data.message) { return j.data.message; }
+                        if (j && j.message) { return j.message; }
+                    }
+                } catch (e) {}
+                return msg;
+            }
+
+            function bodyMessage(r, fallback) {
+                if (r && typeof r === 'object') {
+                    if (r.data && r.data.message) { return r.data.message; }
+                    if (r.message) { return r.message; }
+                }
+                return fallback || S.error;
+            }
+
+            // Recompute the destructive-confirm gate. It is ONLY ever enabled by
+            // an explicit user action (typing BORRAR) — never silently after a
+            // failed request.
+            function syncConfirm() {
+                var typed = String($input.val()).trim().toUpperCase() === 'BORRAR';
+                $confirm.prop('disabled', !typed);
+            }
+
+            // A request finished (ok or error): the UI is no longer mid-flight,
+            // so restore the cancel affordance. Deliberately does NOT re-enable
+            // the destructive confirm.
+            function resetBusy() {
+                running = false;
+                $cancel.text(S.cancel || 'Cancelar');
+            }
+
             $btn.on('click', function() {
                 if ($btn.prop('disabled')) { return; }
                 $err.text('');
@@ -452,13 +492,19 @@
                 $modal.show();
                 $('body').addClass('ac-modal-open');
 
-                $.post(alegraConnector.ajaxUrl, {
-                    action: 'alegra_wipe_preview',
-                    _ajax_nonce: alegraConnector.nonce
+                // Disable the trigger while the preview is in flight so a slow
+                // (but bounded) request cannot be double-fired.
+                $btn.prop('disabled', true);
+
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_wipe_preview', _ajax_nonce: alegraConnector.nonce }
                 }).done(function(r) {
                     if (!r || !r.success) {
                         $counts.text('');
-                        $err.text((r && r.data && r.data.message) || S.error);
+                        $err.text(bodyMessage(r, S.error));
                         return;
                     }
                     var d = r.data || {};
@@ -472,18 +518,21 @@
                         $err.text(b);
                         $confirm.prop('disabled', true);
                     }
-                }).fail(function() {
+                }).fail(function(xhr) {
                     $counts.text('');
-                    $err.text(S.connectionError);
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                }).always(function() {
+                    $btn.prop('disabled', false);
                 });
             });
 
-            $input.on('input', function() {
-                var ok = String($(this).val()).trim().toUpperCase() === 'BORRAR';
-                $confirm.prop('disabled', !ok);
-            });
+            $input.on('input', syncConfirm);
 
-            $cancel.on('click', function() { if (!running) { close(); } });
+            $cancel.on('click', function() {
+                // Allow closing whenever no chunk request is mid-flight. An
+                // errored run must NOT leave the modal permanently locked.
+                if (!running) { close(); }
+            });
 
             $confirm.on('click', function() {
                 if (running) { return; }
@@ -496,16 +545,18 @@
 
                 var totals = { products: 0, images: 0, skipped: 0 };
 
-                $.post(alegraConnector.ajaxUrl, {
-                    action: 'alegra_wipe_start',
-                    _ajax_nonce: alegraConnector.nonce,
-                    confirm: 'BORRAR'
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_wipe_start', _ajax_nonce: alegraConnector.nonce, confirm: 'BORRAR' }
                 }).done(function(r) {
                     if (!r || !r.success) {
-                        running = false;
-                        $err.text((r && r.data && r.data.message) || S.error);
-                        $confirm.prop('disabled', false);
-                        $cancel.text(S.cancel || 'Cancelar');
+                        // Keep the modal OPEN with the real error and let the
+                        // user cancel; do NOT silently re-arm the destructive
+                        // confirm. `running` is cleared so Cancelar works.
+                        resetBusy();
+                        $err.text(bodyMessage(r, S.error));
                         return;
                     }
                     var d = r.data || {};
@@ -517,20 +568,21 @@
                         ).show();
                     }
                     processPage();
-                }).fail(function() {
-                    running = false;
-                    $err.text(S.connectionError);
-                    $confirm.prop('disabled', false);
+                }).fail(function(xhr) {
+                    resetBusy();
+                    $err.text(xhrMessage(xhr, S.connectionError));
                 });
 
                 function processPage() {
-                    $.post(alegraConnector.ajaxUrl, {
-                        action: 'alegra_wipe_page',
-                        _ajax_nonce: alegraConnector.nonce
+                    $.ajax({
+                        url: alegraConnector.ajaxUrl,
+                        type: 'POST',
+                        dataType: 'json',
+                        data: { action: 'alegra_wipe_page', _ajax_nonce: alegraConnector.nonce }
                     }).done(function(r) {
                         if (!r || !r.success) {
-                            running = false;
-                            $err.text((r && r.data && r.data.message) || S.error);
+                            resetBusy();
+                            $err.text(bodyMessage(r, S.error));
                             return;
                         }
                         var d = r.data || {};
@@ -542,23 +594,22 @@
                         $bar.css('width', pct + '%').data('pct', pct);
 
                         if (d.aborted) {
-                            running = false;
+                            resetBusy();
                             $bar.css('width', '100%');
                             $err.text((S.wipeAborted || 'Borrador detenido.') + ' ' + (d.reason || ''));
-                            $cancel.text(S.cancel || 'Cancelar');
                             return; // STOP — never re-call after abort.
                         }
                         if (d.done) {
-                            running = false;
+                            resetBusy();
                             $bar.css('width', '100%');
                             $log.text(fmt(S.wipeDone, totals.products, totals.images, totals.skipped));
                             setTimeout(function() { location.reload(); }, 2500);
                             return;
                         }
                         processPage();
-                    }).fail(function() {
-                        running = false;
-                        $err.text(S.connectionError);
+                    }).fail(function(xhr) {
+                        resetBusy();
+                        $err.text(xhrMessage(xhr, S.connectionError));
                     });
                 }
             });

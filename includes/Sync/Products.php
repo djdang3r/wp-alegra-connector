@@ -3474,12 +3474,24 @@ class Products
     }
 
     /**
-     * Todo 4 (M3): READ-ONLY preview of what a wipe would do.
+     * Todo 4 (M3) + performance: READ-ONLY preview of what a wipe would do.
      *
-     * Counts imported products by post type, the DEDUPLICATED image set
-     * (including variation images), how many attachments would be SKIPPED
-     * (term/logo/placeholder/outside-set), and, best-effort, how many orders
-     * reference the wiped products. Never writes anything.
+     * BOUNDED work: a constant handful of SQL statements REGARDLESS of catalog
+     * size. The previous version looped the whole catalog with
+     * `wc_get_product()` AND called `wipe_attachment_verdict()` per image (~3
+     * SQL per image) — thousands of queries that fatally timed out. This
+     * version:
+     *   - counts imported products vs variations in ONE grouped query;
+     *   - collects the DEDUPLICATED image set (featured + gallery, including
+     *     variation images) with TWO batched postmeta scans, parsed in PHP;
+     *   - derives the SKIPPED set (referenced outside the wipe set, term
+     *     thumbnail, custom logo, WC placeholder, non-image) from those same
+     *     scans plus one termmeta scan — never per image;
+     *   - counts referencing orders with ONE query.
+     *
+     * The skip reasons here are BEST-EFFORT/cheap; the authoritative per-image
+     * decision is still made at deletion time by `wipe_attachment_verdict()`.
+     * Never writes anything.
      *
      * @return array{products:int,variations:int,total_products:int,images:int,images_skipped:int,orders:int}
      */
@@ -3491,44 +3503,199 @@ class Products
             $wipe_set[(int) $id] = true;
         }
 
-        $products   = 0;
-        $variations = 0;
-        $images     = [];
-        $skipped    = [];
-        $ids        = [];
-
-        foreach ($wipe_ids as $product_id) {
-            $product = wc_get_product((int) $product_id);
-            if (!$product instanceof \WC_Product) {
-                continue;
-            }
-            $ids[] = (int) $product_id;
-
-            if ($product->get_type() === 'variation') {
-                $variations++;
-            } else {
-                $products++;
-            }
-
-            foreach ($this->wipe_collect_image_ids($product) as $image_id) {
-                if (isset($images[$image_id])) {
-                    continue;
-                }
-                $images[$image_id] = true;
-                if ($this->wipe_attachment_verdict($image_id, $wipe_set) !== 'delete') {
-                    $skipped[$image_id] = true;
-                }
-            }
-        }
+        [$products, $variations] = $this->wipe_count_by_type();
+        [$referenced_inside, $referenced_outside] = $this->wipe_image_reference_map($wipe_set);
 
         return [
             'products'        => $products,
             'variations'      => $variations,
             'total_products'  => $products + $variations,
-            'images'          => count($images),
-            'images_skipped'  => count($skipped),
-            'orders'          => $this->wipe_count_orders_referencing($ids),
+            'images'          => count($referenced_inside),
+            'images_skipped'  => $this->wipe_count_skipped_images(array_keys($referenced_inside), $referenced_outside),
+            'orders'          => $this->wipe_count_orders_referencing($wipe_ids),
         ];
+    }
+
+    /**
+     * Lightweight counts for the wipe START payload: products vs variations
+     * (one grouped query) and the best-effort orders count. It deliberately
+     * does NOT scan the image catalog, so `ajax_wipe_start` stays fast. The old
+     * code called the FULL `wipe_preview()` AFTER creating the run, which
+     * fatally timed out and left the run permanently stuck.
+     *
+     * @param int[] $wipe_ids The already-built wipe id set.
+     * @return array{products:int,variations:int,total_products:int,orders:int}
+     */
+    public function wipe_summary_counts(array $wipe_ids): array
+    {
+        [$products, $variations] = $this->wipe_count_by_type();
+
+        return [
+            'products'       => $products,
+            'variations'     => $variations,
+            'total_products' => $products + $variations,
+            'orders'         => $this->wipe_count_orders_referencing($wipe_ids),
+        ];
+    }
+
+    /**
+     * One grouped query: how many imported products vs variations.
+     *
+     * @return array{0:int,1:int} [products, variations]
+     */
+    private function wipe_count_by_type(): array
+    {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            "SELECT p.post_type AS post_type, COUNT(*) AS cnt
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_alegra_item_id'
+               AND pm.meta_value <> ''
+               AND p.post_type IN ('product', 'product_variation')
+             GROUP BY p.post_type"
+        );
+
+        $products   = 0;
+        $variations = 0;
+        foreach ((array) $rows as $row) {
+            $type = is_object($row) ? (string) ($row->post_type ?? '') : (string) ($row['post_type'] ?? '');
+            $cnt  = is_object($row) ? (int) ($row->cnt ?? 0) : (int) ($row['cnt'] ?? 0);
+            if ($type === 'product_variation') {
+                $variations += $cnt;
+            } else {
+                $products += $cnt;
+            }
+        }
+
+        return [$products, $variations];
+    }
+
+    /**
+     * Batched image reference map, built from TWO postmeta scans (featured
+     * `_thumbnail_id` + `_product_image_gallery`) parsed in PHP — never per
+     * image. A reference from a post INSIDE the wipe set makes the image part
+     * of the wipe; a reference from OUTSIDE the set makes it a protected skip
+     * (H4/H5).
+     *
+     * @param array<int,true> $wipe_set
+     * @return array{0:array<int,true>,1:array<int,true>} [inside-set refs, outside-set refs]
+     */
+    private function wipe_image_reference_map(array $wipe_set): array
+    {
+        global $wpdb;
+
+        $inside  = [];
+        $outside = [];
+
+        $thumbs = $wpdb->get_results(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_thumbnail_id' AND meta_value <> ''"
+        );
+        foreach ((array) $thumbs as $row) {
+            $pid = is_object($row) ? (int) ($row->post_id ?? 0) : (int) ($row['post_id'] ?? 0);
+            $att = is_object($row) ? (int) ($row->meta_value ?? 0) : (int) ($row['meta_value'] ?? 0);
+            if ($pid <= 0 || $att <= 0) {
+                continue;
+            }
+            if (isset($wipe_set[$pid])) {
+                $inside[$att] = true;
+            } else {
+                $outside[$att] = true;
+            }
+        }
+
+        $galleries = $wpdb->get_results(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_product_image_gallery' AND meta_value <> ''"
+        );
+        foreach ((array) $galleries as $row) {
+            $pid = is_object($row) ? (int) ($row->post_id ?? 0) : (int) ($row['post_id'] ?? 0);
+            $raw = is_object($row) ? ($row->meta_value ?? '') : ($row['meta_value'] ?? '');
+            if ($pid <= 0) {
+                continue;
+            }
+            foreach (self::parse_gallery_ids($raw) as $att) {
+                if (isset($wipe_set[$pid])) {
+                    $inside[$att] = true;
+                } else {
+                    $outside[$att] = true;
+                }
+            }
+        }
+
+        return [$inside, $outside];
+    }
+
+    /**
+     * Best-effort count of the candidate images a wipe would SKIP: referenced
+     * outside the set, used as a term thumbnail, the theme custom logo, the WC
+     * placeholder, or a non-image attachment.
+     *
+     * @param int[]           $candidates
+     * @param array<int,true> $outside
+     */
+    private function wipe_count_skipped_images(array $candidates, array $outside): int
+    {
+        if ($candidates === []) {
+            return 0;
+        }
+
+        $term_thumbs = $this->wipe_term_thumbnail_ids();
+        $logo        = (int) get_theme_mod('custom_logo');
+        $placeholder = (int) get_option(self::WC_PLACEHOLDER_OPTION);
+
+        // Prime the post cache so the per-candidate `wp_attachment_is_image()`
+        // check does not issue one get_post query per image. Gated on the core
+        // function so the execution harness (which lacks it) still runs.
+        if (function_exists('_prime_post_caches')) {
+            _prime_post_caches(array_map('intval', $candidates), false, false);
+        }
+
+        $skipped = 0;
+        foreach ($candidates as $att) {
+            $att = (int) $att;
+            if (isset($outside[$att])
+                || isset($term_thumbs[$att])
+                || ($logo > 0 && $att === $logo)
+                || ($placeholder > 0 && $att === $placeholder)
+                || !function_exists('wp_attachment_is_image')
+                || !wp_attachment_is_image($att)
+            ) {
+                $skipped++;
+            }
+        }
+
+        return $skipped;
+    }
+
+    /**
+     * One termmeta scan: the attachment ids used as a term `thumbnail_id`.
+     *
+     * @return array<int,true>
+     */
+    private function wipe_term_thumbnail_ids(): array
+    {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            "SELECT meta_value FROM {$wpdb->termmeta}
+             WHERE meta_key = 'thumbnail_id' AND meta_value <> ''"
+        );
+
+        $out = [];
+        foreach ((array) $rows as $row) {
+            $raw = is_object($row) ? ($row->meta_value ?? '') : ($row['meta_value'] ?? '');
+            foreach ((array) $raw as $value) {
+                $value = (int) $value;
+                if ($value > 0) {
+                    $out[$value] = true;
+                }
+            }
+        }
+
+        return $out;
     }
 
     /**

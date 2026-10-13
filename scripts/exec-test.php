@@ -17119,4 +17119,86 @@ TestRunner::test('T86.14 un adjunto NO-imagen en el slot de imagen se saltea (so
     TestRunner::assertSame(1, (int) $res['images_skipped'], 'el adjunto no-imagen se contó como skipeado');
 });
 
+TestRunner::test('T86.15 wipe_preview es ACOTADO: nº de queries constante y sin loop por-imagen (rendimiento)', function (): void {
+    // Catálogo CHICO: 1 producto + 1 imagen.
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-small');
+    update_post_meta(10, '_thumbnail_id', 8001);
+    $GLOBALS['alegra_dbread_count'] = 0;
+    make_products()->wipe_preview();
+    $small_q = (int) $GLOBALS['alegra_dbread_count'];
+
+    // Catálogo GRANDE: 60 productos, cada uno con featured + galería (120 imgs).
+    alegra_test_reset();
+    for ($i = 0; $i < 60; $i++) {
+        $pid = 100 + $i;
+        alegra_seed_linked_product($pid, 'it-big' . $i);
+        $att = alegra_seed_plugin_image(2000 + $i, 'https://cdn3.alegra.com/big' . $i . '.png');
+        update_post_meta($pid, '_thumbnail_id', $att);
+        update_post_meta($pid, '_product_image_gallery', (string) ($att + 500));
+    }
+    $GLOBALS['alegra_dbread_count'] = 0;
+    $preview = make_products()->wipe_preview();
+    $big_q = (int) $GLOBALS['alegra_dbread_count'];
+
+    TestRunner::assertSame(60, (int) $preview['products'], 'cuenta los 60 productos');
+    TestRunner::assertSame(120, (int) $preview['images'], '120 imágenes únicas');
+    TestRunner::assertSame(0, (int) $preview['images_skipped'], 'ninguna compartida ⇒ 0 salteadas');
+    TestRunner::assertTrue($big_q > 0, 'el preview hizo queries');
+    TestRunner::assertSame($small_q, $big_q, 'el nº de queries NO crece con el catálogo (acotado)');
+
+    // Guarda de fuente: sin veredicto por-imagen ni wc_get_product por producto.
+    $src = alegra_method_source(\Alegra\Connector\Sync\Products::class, 'wipe_preview');
+    TestRunner::assertStringNotContains('wipe_attachment_verdict', $src, 'preview no llama al veredicto por-imagen');
+    TestRunner::assertStringNotContains('wc_get_product', $src, 'preview no instancia productos uno por uno');
+});
+
+TestRunner::test('T86.16 ajax_wipe_start NO llama a wipe_preview (arranque liviano; el run no queda colgado)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_wipe_start');
+    TestRunner::assertStringNotContains('->wipe_preview(', $src, 'start no invoca el preview pesado');
+    TestRunner::assertStringContains('->wipe_summary_counts(', $src, 'start usa el conteo liviano');
+
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-start');
+    update_post_meta(10, '_thumbnail_id', 8001);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $ok = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+
+    TestRunner::assertTrue($ok->success, 'start ok');
+    TestRunner::assertArrayHasKey('counts', $ok->payload, 'devuelve counts livianos (no un preview pesado)');
+    TestRunner::assertSame(1, (int) $ok->payload['counts']['products'], 'el conteo liviano ve 1 producto');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status((int) $ok->payload['run_id']), 'el run queda running (no se cerró por fatal)');
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T86.17 ambos handlers de wipe elevan time limit / memoria / ignoran aborto', function (): void {
+    foreach (['ajax_wipe_preview', 'ajax_wipe_start'] as $m) {
+        $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, $m);
+        TestRunner::assertStringContains('set_time_limit', $src, $m . ' sube el límite de tiempo');
+        TestRunner::assertStringContains('wp_raise_memory_limit', $src, $m . ' sube la memoria');
+        TestRunner::assertStringContains('ignore_user_abort', $src, $m . ' ignora el aborto del cliente');
+    }
+});
+
+TestRunner::test('T86.18 write_wipe_backup exporta TODOS los productos y es JSON válido (streaming)', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-bk' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $file  = alegra_call_private($admin, 'write_wipe_backup', [100, 101, 102, 103, 104]);
+
+    TestRunner::assertTrue(is_string($file) && $file !== '' && is_file($file), 'el export se escribió');
+    $data = json_decode((string) file_get_contents($file), true);
+    TestRunner::assertTrue(is_array($data), 'el export es JSON válido');
+    TestRunner::assertSame(5, count($data['products'] ?? []), 'todos los productos están en el export');
+    TestRunner::assertSame(100, (int) ($data['products'][0]['product_id'] ?? 0), 'primer producto incluido');
+    TestRunner::assertSame(104, (int) ($data['products'][4]['product_id'] ?? 0), 'último producto incluido');
+});
+
 exit(TestRunner::summary());
