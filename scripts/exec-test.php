@@ -16387,4 +16387,98 @@ TestRunner::test('T81.5 cancel y release limpian el marker', function (): void {
     TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'release limpia el marker');
 });
 
+echo "\nT82 — Orphan-cursor self-heal + pure predicate\n";
+
+TestRunner::test('T82.1 un cursor chunked huérfano se auto-sanea y no muestra banner', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_import_total', 60, false);
+    update_option('alegra_connector_products_chunk_owner', 12, false);
+
+    \Alegra\Connector\Admin\Admin_Dashboard::self_heal_orphan_cursor();
+
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'cursor limpiado');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_total', false), 'total limpiado');
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'marker limpiado');
+    TestRunner::assertFalse(\Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false), 'sin banner Pausado');
+});
+
+TestRunner::test('T82.2 un cursor sin marker (cron/manual) NUNCA se auto-sanea', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_import_total', 60, false);   // stale _total, sin marker
+
+    \Alegra\Connector\Admin\Admin_Dashboard::self_heal_orphan_cursor();
+
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'el cursor sobrevive');
+    TestRunner::assertSame(60, (int) get_option('alegra_connector_products_import_total', 0), 'el total sobrevive');
+});
+
+TestRunner::test('T82.3 con residuo activo el cursor se conserva', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_chunk_owner', 12, false);
+    set_transient('alegra_batch_state', ['type' => 'products', 'run_id' => 12], 600);   // residuo
+
+    \Alegra\Connector\Admin\Admin_Dashboard::self_heal_orphan_cursor();
+
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'el cursor se conserva');
+    TestRunner::assertTrue(\Alegra\Connector\Admin\Admin_Dashboard::import_residue_status()['active'], 'el residuo sigue activo');
+});
+
+TestRunner::test('T82.4 con un run chunked corriendo el cursor NO se auto-sanea', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    $rid = \Alegra\Connector\Runs::start('chunked_import');
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_chunk_owner', $rid, false);
+
+    \Alegra\Connector\Admin\Admin_Dashboard::self_heal_orphan_cursor();
+
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'run corriendo ⇒ no se toca');
+});
+
+TestRunner::test('T82.5 should_show_products_pause_banner es puro (sin side effects)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_import_total', 60, false);
+    update_option('alegra_connector_products_chunk_owner', 12, false);
+
+    \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false);
+    \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(true);
+
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'sin side effect (cursor)');
+    TestRunner::assertSame(12, (int) get_option('alegra_connector_products_chunk_owner', 0), 'sin side effect (marker)');
+});
+
+TestRunner::test('T82.6 import_diagnostics es read-only (no muta cursor/marker)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    update_option('alegra_connector_products_chunk_owner', 12, false);
+
+    \Alegra\Connector\Admin\Admin_Dashboard::import_diagnostics();
+
+    TestRunner::assertSame(30, (int) get_option('alegra_connector_products_import_cursor', 0), 'cursor intacto');
+    TestRunner::assertSame(12, (int) get_option('alegra_connector_products_chunk_owner', 0), 'marker intacto');
+});
+
+TestRunner::test('T82.7 un cursor cron (marker invalidado por el cron) sobrevive al self-heal', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    update_option('alegra_connector_products_chunk_owner', 777, false);   // marker huérfano
+    alegra_mock_seed_item('it-own', ['name' => 'O', 'reference' => 'SO', 'status' => 'active']);
+
+    make_controller()->import_from_alegra('products', 0);                 // el cron toma el cursor
+
+    TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'el cron invalidó el marker');
+
+    // Un cursor propio del cron/manual (sin marker) debe sobrevivir al self-heal.
+    update_option('alegra_connector_products_import_cursor', 45, false);
+    \Alegra\Connector\Admin\Admin_Dashboard::self_heal_orphan_cursor();
+
+    TestRunner::assertSame(45, (int) get_option('alegra_connector_products_import_cursor', 0), 'el cursor del cron sobrevive');
+});
+
 exit(TestRunner::summary());

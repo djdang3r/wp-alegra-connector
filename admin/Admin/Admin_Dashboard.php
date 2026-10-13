@@ -1840,6 +1840,10 @@ class Admin_Dashboard
             wp_die(esc_html__('No tienes permisos.', 'alegra-connector'));
         }
 
+        // task-7: self-heal an orphaned chunked cursor before rendering the page
+        // so a phantom "Pausado en el ítem X de Y" banner never appears.
+        self::self_heal_orphan_cursor();
+
         $page = isset($_GET['paged']) ? max(1, (int) $_GET['paged']) : 1;
         $per_page = 20;
 
@@ -5874,6 +5878,40 @@ class Admin_Dashboard
     {
         $cursor = (int) get_option('alegra_connector_products_import_cursor', 0);
         return $cursor > 0 && !$residue_active;
+    }
+
+    /**
+     * task-7: clear a CHUNKED-OWNED cursor that is orphaned.
+     *
+     * Acts ONLY when the dedicated chunk-owner marker is PRESENT — which
+     * guarantees an UNFINISHED chunked run owns the cursor, because every
+     * non-chunked writer clears the marker — AND there is no active residue AND
+     * no running chunked run. A cron/manual `import_from_alegra` cursor (no
+     * marker) is NEVER touched; a stale `_total` from a prior chunked run can no
+     * longer cause a false positive (ownership is the marker, not `_total`).
+     *
+     * Side-effecting by design; it is called from the Products-page render path.
+     * `should_show_products_pause_banner()` stays a PURE predicate.
+     */
+    public static function self_heal_orphan_cursor(): void
+    {
+        if ((int) get_option('alegra_connector_products_chunk_owner', 0) <= 0) {
+            return; // not chunked-owned (cron/manual cursor, or no marker)
+        }
+
+        if (self::import_residue_status()['active']) {
+            return; // a genuine pause/residue owns it
+        }
+
+        foreach (\Alegra\Connector\Runs::currently_running() as $run) {
+            if ((string) ($run->run_type ?? '') === 'chunked_import') {
+                return; // a chunked run is actually running
+            }
+        }
+
+        delete_option('alegra_connector_products_import_cursor');
+        delete_option('alegra_connector_products_import_total');
+        delete_option('alegra_connector_products_chunk_owner');
     }
 
     /**
