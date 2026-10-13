@@ -2851,10 +2851,15 @@ class Products
     }
 
     /**
-     * Todo 2: if the product's current `_thumbnail_id` is a plugin/legacy
-     * attachment lacking the `_alegra_image_url` marker, stamp it from the
-     * attachment's own URL so it becomes dedup-aware (and, once replaced,
-     * deletable under Todo 3's guard). One-time and idempotent.
+     * Todo 2 (FIX 1): make the product's current legacy `_thumbnail_id`
+     * dedup-aware WITHOUT marking it plugin-created.
+     *
+     * Stores the attachment's own URL hash + an Entity_Map entry (both used only
+     * by the dedup lookup). It deliberately does NOT write `_alegra_image_url`:
+     * that meta is the DELETION license and is set EXCLUSIVELY by
+     * `download_and_attach_image()`. A merchant/unknown attachment therefore can
+     * never be classified as plugin-created (see `is_plugin_created_image()`)
+     * and can never be deleted by `delete_replaced_image()`. One-time/idempotent.
      */
     private function backfill_legacy_thumbnail_marker(int $product_id): void
     {
@@ -2863,7 +2868,7 @@ class Products
             return;
         }
         if ((string) get_post_meta($thumb, '_alegra_image_url', true) !== '') {
-            return; // already marked
+            return; // already plugin-marked (only download_and_attach_image sets it)
         }
 
         $url = function_exists('wp_get_attachment_url') ? wp_get_attachment_url($thumb) : false;
@@ -2875,7 +2880,6 @@ class Products
             return;
         }
         $hash = md5($normalized);
-        update_post_meta($thumb, '_alegra_image_url', $normalized);
         update_post_meta($thumb, '_alegra_image_url_hash', $hash);
         \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $thumb);
     }

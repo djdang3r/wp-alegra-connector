@@ -15968,7 +15968,7 @@ TestRunner::test('T77.4 reconcile en favorite: sólo featured, galería intacta'
     TestRunner::assertSame($stale . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'favorite NO toca la galería');
 });
 
-TestRunner::test('T77.5 favorite marca un featured legacy (backfill de su propia URL)', function (): void {
+TestRunner::test('T77.5 favorite registra un featured legacy en el Entity_Map sin volverlo borrable', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_sync_images', true);
     update_option('alegra_connector_sync_images_mode', 'favorite');
@@ -15984,12 +15984,16 @@ TestRunner::test('T77.5 favorite marca un featured legacy (backfill de su propia
     $item = ['id' => 'it-bf', 'name' => 'BF', 'reference' => 'SBF', 'images' => [
         ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/other.png', 'favorite' => true],
     ]];
-    make_products()->import_single_item_public($item, 0, false, false);   // legacy favorite ⇒ backfill
+    make_products()->import_single_item_public($item, 0, false, false);   // legacy favorite ⇒ backfill (hash only)
 
-    $url = (string) get_post_meta($legacy, '_alegra_image_url', true);
-    TestRunner::assertTrue($url !== '', 'el featured legacy queda marcado (backfill)');
-    TestRunner::assertSame(md5($url), (string) get_post_meta($legacy, '_alegra_image_url_hash', true), 'hash coherente');
-    TestRunner::assertSame($legacy, \Alegra\Connector\Entity_Map::find_attachment_id(md5($url)), 'mapa poblado para dedup/delete');
+    // FIX 1: el backfill NO escribe `_alegra_image_url` (la license de borrado,
+    // que SÓLO setea download_and_attach_image) ⇒ un attachment merchant/legacy
+    // nunca se clasifica como plugin-created.
+    TestRunner::assertSame('', (string) get_post_meta($legacy, '_alegra_image_url', true), 'NO queda plugin-created');
+    $hash = (string) get_post_meta($legacy, '_alegra_image_url_hash', true);
+    TestRunner::assertTrue($hash !== '', 'se guarda el hash (dedup)');
+    TestRunner::assertSame($legacy, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'Entity_Map poblado para dedup');
+    TestRunner::assertFalse((bool) alegra_call_private_static(\Alegra\Connector\Sync\Products::class, 'is_plugin_created_image', $legacy), 'no es plugin-created');
 });
 
 TestRunner::test('T77.6 favorite repetido: un solo attachment, misma featured, galería intacta', function (): void {
@@ -16569,6 +16573,68 @@ TestRunner::test('T83.4 una excepción real limpia cursor + total + marker', fun
     TestRunner::assertFalse(get_option('alegra_connector_products_chunk_owner', false), 'marker ausente');
     TestRunner::assertFalse(get_transient('alegra_batch_state'), 'batch_state ausente');
     TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($rid), 'el run queda failed');
+});
+
+echo "\nT84 — Merchant safety (FIX 1 regression) + favorite replace rule\n";
+
+/**
+ * Attachment "del merchant": vivo, con su propio archivo/URL real (derivable por
+ * wp_get_attachment_url) pero SIN marcador plugin `_alegra_image_url`. Es el
+ * fixture que hace observable el bug del backfill (antes del FIX 1 quedaba
+ * marcado como plugin-created y se borraba).
+ */
+function alegra_make_merchant_attachment(int $id, string $file = '2024/06/merchant.jpg'): int
+{
+    alegra_make_live_attachment($id);
+    $GLOBALS['wp_posts'][$id]->guid = 'https://example.test/wp-content/uploads/' . ltrim($file, '/');
+    update_post_meta($id, '_wp_attached_file', $file);
+    return $id;
+}
+
+TestRunner::test('T84.1 un featured MERCHANT con archivo real sobrevive a un update (nunca se borra)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-mg');
+
+    $merchant = alegra_make_merchant_attachment(9000, '2024/06/merchant-photo.jpg');
+    $a        = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+    update_post_meta(10, '_thumbnail_id', $merchant);
+
+    // UPDATE: Alegra trae una imagen ⇒ reemplaza la featured merchant.
+    make_products()->import_single_item_public(['id' => 'it-mg', 'name' => 'MG', 'reference' => 'SMG', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+    ]], 0, true, true);
+
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'la featured se reemplaza por la de Alegra');
+    TestRunner::assertTrue(get_post($merchant) !== null, 'la imagen MERCHANT NO se borra');
+    TestRunner::assertSame('', (string) get_post_meta($merchant, '_alegra_image_url', true), 'el merchant nunca se marca como plugin-created');
+});
+
+TestRunner::test('T84.2 favorite: reemplaza la PLUGIN featured, conserva galería y merchant', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-fr');
+
+    $a         = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');    // nueva featured
+    $oldFeat   = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');  // plugin reemplazada
+    $galPlugin = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/gal.png');  // plugin en galería (sin cambios)
+    $merchant  = alegra_make_merchant_attachment(9000, '2024/06/m.jpg');             // merchant en galería
+    update_post_meta(10, '_thumbnail_id', $oldFeat);
+    update_post_meta(10, '_product_image_gallery', $galPlugin . ',' . $merchant);
+
+    make_products()->import_single_item_public(['id' => 'it-fr', 'name' => 'FR', 'reference' => 'SFR', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true],
+    ]], 0, true, true);
+
+    // Regla resuelta: favorite reemplaza la featured PLUGIN creada; NUNCA toca
+    // la galería ni borra una imagen del merchant.
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'nueva featured');
+    TestRunner::assertSame(null, get_post($oldFeat), 'la PLUGIN featured reemplazada SÍ se borra');
+    TestRunner::assertTrue(get_post($galPlugin) !== null, 'la plugin en galería (sin cambios) se conserva');
+    TestRunner::assertTrue(get_post($merchant) !== null, 'el merchant se conserva');
+    TestRunner::assertSame($galPlugin . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
 });
 
 exit(TestRunner::summary());
