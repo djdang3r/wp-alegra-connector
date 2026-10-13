@@ -17073,4 +17073,28 @@ TestRunner::test('T86.12 la UI del borrador masivo está cableada (botón + moda
     }
 });
 
+TestRunner::test('T86.13 si se pierde el lock, el chunk aborta (aborted=true, reason lock_lost)', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-l' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $start = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    TestRunner::assertTrue($start->success, 'start ok');
+
+    // Simulate a stolen/lost lock: the option disappears under us.
+    delete_option('alegra_lock_alegra_sync_running_products');
+
+    $p = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    TestRunner::assertTrue((bool) $p->payload['aborted'], 'aborta al perder el lock');
+    TestRunner::assertSame('lock_lost', (string) $p->payload['reason'], 'reason lock_lost');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'estado del wipe limpio');
+    TestRunner::assertSame(0, (int) $p->payload['products_deleted'], 'no borró nada en esa página');
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
 exit(TestRunner::summary());
