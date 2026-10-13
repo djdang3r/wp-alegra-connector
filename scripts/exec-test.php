@@ -16988,4 +16988,62 @@ TestRunner::test('T86.9 ajax_wipe_start exige BORRAR server-side y crea run+lock
     \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
 });
 
+TestRunner::test('T86.10 ajax_wipe_page es reanudable por id, commitea heartbeat y al terminar libera el lock', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 25; $i++) {
+        $pid = 100 + $i;
+        alegra_seed_linked_product($pid, 'it-c' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $start = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    TestRunner::assertTrue($start->success, 'start ok');
+    $run_id = (int) $start->payload['run_id'];
+
+    $p1 = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    TestRunner::assertFalse((bool) $p1->payload['done'], 'página 1 no termina');
+    TestRunner::assertSame(20, (int) $p1->payload['products_deleted'], 'borró 20 (chunk)');
+    TestRunner::assertTrue(\Alegra\Connector\Heartbeat::get($run_id) !== null, 'M2: heartbeat por chunk');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($run_id), 'el run sigue running');
+    $cursor = (int) get_option('alegra_connector_wipe_cursor', 0);
+    TestRunner::assertSame(119, $cursor, 'cursor keyset = último product_id');
+
+    $p2 = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    TestRunner::assertTrue((bool) $p2->payload['done'], 'página 2 termina');
+    TestRunner::assertSame(5, (int) $p2->payload['products_deleted'], 'borró los 5 restantes');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'run completado');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'H1: lock liberado al terminar');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'state del wipe limpio');
+
+    $again = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
+    TestRunner::assertTrue(is_string($again) && $again !== '', 'tras el wipe se puede reimportar (lock libre)');
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T86.11 el kill switch a mitad de run aborta el chunk (aborted=true) y limpia el estado', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 25; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-k' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $start = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    $run_id = (int) $start->payload['run_id'];
+
+    \Alegra\Connector\Kill_Switch::activate('test-mid');
+    $p = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    \Alegra\Connector\Kill_Switch::deactivate();
+    \Alegra\Connector\Kill_Switch::reset_cache();
+
+    TestRunner::assertTrue((bool) $p->payload['aborted'], 'el chunk reporta aborted');
+    TestRunner::assertSame('kill_switch', (string) $p->payload['reason'], 'reason kill_switch');
+    TestRunner::assertFalse((bool) $p->payload['done'], 'no queda done');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_ids', false), 'el estado del wipe se limpió');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'el lock se liberó');
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($run_id), 'el run quedó cerrado');
+});
+
 exit(TestRunner::summary());
