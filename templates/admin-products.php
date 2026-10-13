@@ -116,7 +116,11 @@ if (!empty($ac_import_residue['active'])):
 <?php
 $ac_cursor = (int) get_option('alegra_connector_products_import_cursor', 0);
 $ac_import_total = (int) get_option('alegra_connector_products_import_total', 0);
-if ($ac_cursor > 0): ?>
+if ($ac_cursor > 0):
+    // task-13: suppress the duplicate "Pausado en..." banner while the residue
+    // banner above already shows the same pause (Reanudar/Cancelar/Liberar).
+    if (\Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(!empty($ac_import_residue['active']))):
+    ?>
     <div class="ac-notice warning" style="margin-bottom:14px;">
         <span class="ac-badge warning"><?php echo esc_html(sprintf(
             /* translators: %1$s: ítem del cursor, %2$s: total o "?" */
@@ -125,7 +129,9 @@ if ($ac_cursor > 0): ?>
             $ac_import_total > 0 ? number_format_i18n($ac_import_total) : '?'
         )); ?></span>
     </div>
-<?php endif; ?>
+    <?php
+    endif;
+endif; ?>
 
 <!-- Actions + Filters -->
 <div class="ac-card" style="margin-bottom:14px;padding:12px 20px;">

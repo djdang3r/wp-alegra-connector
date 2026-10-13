@@ -7191,7 +7191,10 @@ TestRunner::test('T28.19 clear() no borra el stop; forget() borra sólo el displ
 
 TestRunner::test('T28.110 ajax_kill_run pide el stop y NO limpia el heartbeat', function (): void {
     alegra_test_reset();
-    $run_id = 55;
+    alegra_clear_heartbeat_cache();
+    // Oracle MEDIUM fix: ajax_kill_run now rejects an unknown run_id, so the
+    // live run must actually exist (a real row) to exercise the live branch.
+    $run_id = \Alegra\Connector\Runs::start('chunked_import');
     \Alegra\Connector\Heartbeat::set($run_id, ['step' => 'products', 'message' => 'corriendo']);
 
     $_POST['run_id'] = $run_id;
@@ -7202,6 +7205,7 @@ TestRunner::test('T28.110 ajax_kill_run pide el stop y NO limpia el heartbeat', 
     TestRunner::assertTrue($resp->success, 'kill_run debe responder success');
     TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop($run_id), 'el stop debe quedar pedido');
     TestRunner::assertTrue(\Alegra\Connector\Heartbeat::get($run_id) !== null, 'el heartbeat NO debe limpiarse');
+    alegra_clear_heartbeat_cache();
 });
 
 TestRunner::test('T28.111 Run_Context::finish no re-finaliza un run ya cerrado', function (): void {
@@ -7213,6 +7217,219 @@ TestRunner::test('T28.111 Run_Context::finish no re-finaliza un run ya cerrado',
     \Alegra\Connector\Run_Context::finish($run_id, 'cancelled', 'Detenido por el usuario');
 
     TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'no debe pisar completed con cancelled');
+});
+
+// ===========================================================================
+// === task-11: "Detener este proceso" sobre runs MUERTOS + reapeo de zombies ===
+// ===========================================================================
+
+TestRunner::test('T28.112 mark_killed cierra una fila running y es idempotente', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $id = (int) $wpdb->insert_id;
+
+    \Alegra\Connector\Runs::mark_killed($id, 'Detenido por el usuario');
+
+    TestRunner::assertSame('killed', \Alegra\Connector\Runs::status($id), 'mark_killed debe cerrar la fila como killed');
+    $row = $GLOBALS['alegra_db']['wp_alegra_runs'][0];
+    TestRunner::assertSame('Detenido por el usuario', (string) ($row['error_summary'] ?? ''), 'debe guardar el motivo');
+    TestRunner::assertTrue(!empty($row['finished_at']), 'debe setear finished_at');
+
+    // Idempotente: una fila ya cerrada no se re-finaliza ni pisa el motivo.
+    \Alegra\Connector\Runs::mark_killed($id, 'otro motivo');
+    TestRunner::assertSame('killed', \Alegra\Connector\Runs::status($id), 'sigue killed');
+    TestRunner::assertSame('Detenido por el usuario', (string) ($GLOBALS['alegra_db']['wp_alegra_runs'][0]['error_summary'] ?? ''), 'no pisa el motivo de una fila ya cerrada');
+});
+
+TestRunner::test('T28.113 reap_dead_runs reapea zombies de todo tipo pero no con heartbeat ni jóvenes', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $old = gmdate('Y-m-d H:i:s', current_time('timestamp') - 900);
+
+    // cron muerto y chunked muerto (viejos, sin heartbeat)
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => $old]);
+    $cron = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($cron);
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => $old]);
+    $chunked = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($chunked);
+
+    // cron viejo PERO con heartbeat vivo
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => $old]);
+    $alive = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::set($alive, ['step' => 'sync', 'message' => 'vivo']);
+
+    // cron joven (dentro del grace) sin heartbeat
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $young = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($young);
+
+    $reaped = \Alegra\Connector\Runs::reap_dead_runs(600);
+
+    TestRunner::assertSame(2, $reaped, 'debe reapear exactamente los 2 zombies sin heartbeat');
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($cron), 'cron zombie → stale');
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($chunked), 'chunked zombie → stale');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($alive), 'con heartbeat vivo NO se reapea');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($young), 'un run joven NO se reapea');
+});
+
+TestRunner::test('T28.114 currently_running no lista el zombie reapeado', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $old = gmdate('Y-m-d H:i:s', current_time('timestamp') - 900);
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => $old]);
+    $zombie = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($zombie);
+
+    $running = \Alegra\Connector\Runs::currently_running();
+
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($zombie), 'el zombie cron queda stale');
+    foreach ($running as $r) {
+        TestRunner::assertNotSame($zombie, (int) $r->id, 'el zombie no debe listarse como running');
+    }
+});
+
+TestRunner::test('T28.115 ajax_kill_run cierra un run MUERTO y sólo pide stop a uno vivo', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    // MUERTO: running sin heartbeat → force-close
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $dead = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($dead);
+
+    $_POST['run_id'] = $dead;
+    $resp = alegra_capture_json(fn () => $admin->ajax_kill_run());
+    unset($_POST['run_id']);
+
+    TestRunner::assertTrue($resp->success, 'el run muerto debe responder success');
+    TestRunner::assertSame('killed', \Alegra\Connector\Runs::status($dead), 'el run muerto debe quedar killed');
+    TestRunner::assertStringContains('cerrado', (string) ($resp->payload['message'] ?? ''), 'mensaje de cierre');
+
+    // VIVO: running con heartbeat → sólo pide stop
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'chunked_import', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $live = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::set($live, ['step' => 'products', 'message' => 'corriendo']);
+
+    $_POST['run_id'] = $live;
+    $resp2 = alegra_capture_json(fn () => $admin->ajax_kill_run());
+    unset($_POST['run_id']);
+
+    TestRunner::assertTrue($resp2->success, 'el run vivo debe responder success');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($live), 'el run vivo NO se cierra');
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop($live), 'al run vivo se le pide stop');
+});
+
+TestRunner::test('T28.120 kill de un run con heartbeat vencido pide stop ADEMÁS de cerrarlo', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    $wpdb = $GLOBALS['wpdb'];
+
+    // Oracle MEDIUM: Heartbeat TTL=120s y hay pasos vivos que no lo refrescan
+    // (inventory pull / credit-note watcher; products cada 5ª página), así que un
+    // run VIVO dentro de un paso silencioso >120s se ve DEAD. El stop debe
+    // enviarse igual, aunque mark_killed cierre la fila.
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync_all', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $run = (int) $wpdb->insert_id;
+    \Alegra\Connector\Heartbeat::forget($run);   // TTL vencido → clasificado DEAD
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['run_id'] = $run;
+    $resp = alegra_capture_json(fn () => $admin->ajax_kill_run());
+    unset($_POST['run_id']);
+
+    TestRunner::assertTrue($resp->success, 'responde success');
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop($run), 'debe pedir el stop aunque parezca muerto');
+    TestRunner::assertSame('killed', \Alegra\Connector\Runs::status($run), 'además cierra la fila');
+    alegra_clear_heartbeat_cache();
+});
+
+TestRunner::test('T28.121 kill de un run inexistente responde error (no falso éxito)', function (): void {
+    alegra_test_reset();
+    alegra_clear_heartbeat_cache();
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $_POST['run_id'] = 999999;   // no existe
+    $resp = alegra_capture_json(fn () => $admin->ajax_kill_run());
+    unset($_POST['run_id']);
+
+    TestRunner::assertFalse($resp->success, 'un run inexistente NO debe responder success');
+    TestRunner::assertStringContains('no encontrado', (string) ($resp->payload['message'] ?? ''), 'mensaje de no encontrado');
+    TestRunner::assertFalse(\Alegra\Connector\Runs::should_stop(999999), 'no debe pedir stop de un run inexistente');
+});
+
+// ===========================================================================
+// === task-12: cierre del run ante un FATAL (register_shutdown_function) ===
+// ===========================================================================
+
+TestRunner::test('T28.116 el finalizador de shutdown cierra el run ante un fatal no capturable', function (): void {
+    alegra_test_reset();
+    $run_id = 0;
+    try {
+        \Alegra\Connector\Run_Context::wrap('cron_sync_all', function ($rid) use (&$run_id) {
+            $run_id = $rid;
+            // Simula PHP disparando el shutdown handler en medio de un FATAL
+            // (max execution time / OOM), que NO es un Throwable capturable.
+            \Alegra\Connector\Run_Context::finalize_inflight_runs();
+            throw new \RuntimeException('fatal simulado');
+        }, 'cron');
+    } catch (\RuntimeException $e) {
+        // wrap re-lanza, como hoy.
+    }
+
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($run_id), 'el run no debe quedar running');
+    TestRunner::assertSame(
+        'Interrumpido (fatal/timeout)',
+        (string) ($GLOBALS['alegra_db']['wp_alegra_runs'][0]['error_summary'] ?? ''),
+        'debe cerrarlo el finalizador de shutdown (no el catch)'
+    );
+});
+
+TestRunner::test('T28.117 wrap normal no re-finaliza en el shutdown (idempotente)', function (): void {
+    alegra_test_reset();
+    $run_id = 0;
+    \Alegra\Connector\Run_Context::wrap('manual_import', function ($rid) use (&$run_id) {
+        $run_id = $rid;
+        return 7;
+    }, 'tester');
+
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'wrap normal cierra completed');
+
+    // Un shutdown posterior no debe tocar un run ya cerrado.
+    \Alegra\Connector\Run_Context::finalize_inflight_runs();
+
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'sigue completed');
+    TestRunner::assertSame(null, $GLOBALS['alegra_db']['wp_alegra_runs'][0]['error_summary'] ?? null, 'no le agrega error');
+});
+
+TestRunner::test('T28.118 el finalizador sólo toca los runs de ESTE request', function (): void {
+    alegra_test_reset();
+    $wpdb = $GLOBALS['wpdb'];
+
+    // Run de OTRO request: fila running preexistente, fuera del registry.
+    $wpdb->insert($wpdb->prefix . 'alegra_runs', ['run_type' => 'cron_sync_all', 'status' => 'running', 'started_at' => current_time('mysql')]);
+    $foreign = (int) $wpdb->insert_id;
+
+    $mine = 0;
+    try {
+        \Alegra\Connector\Run_Context::wrap('manual_import', function ($rid) use (&$mine) {
+            $mine = $rid;
+            \Alegra\Connector\Run_Context::finalize_inflight_runs();
+            throw new \RuntimeException('fatal');
+        }, 'tester');
+    } catch (\RuntimeException $e) {
+    }
+
+    TestRunner::assertSame('failed', \Alegra\Connector\Runs::status($mine), 'mi run se finaliza');
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($foreign), 'el run de otro request NO se toca');
+});
+
+TestRunner::test('T28.119 run_cron_sync eleva el time limit al presupuesto de la corrida', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Sync\Controller::class, 'run_cron_sync');
+    TestRunner::assertStringContains('set_time_limit', $src, 'el cron debe elevar el límite de ejecución');
+    TestRunner::assertStringContains('$run_budget', $src, 'ligado al presupuesto real de la corrida');
 });
 
 // ===========================================================================
@@ -7744,6 +7961,69 @@ TestRunner::test('T70.8 kill_all libera los locks de importación y conserva el 
         TestRunner::assertFalse((bool) get_option('alegra_lock_alegra_sync_running_' . $t, false), 'lock ' . $t . ' liberado');
     }
     TestRunner::assertTrue(\Alegra\Connector\Kill_Switch::is_active(), 'kill_all sigue activando el kill switch');
+});
+
+// ---------------------------------------------------------------------------
+// task-13: "Liberar"/"Cancelar" deben borrar el cursor/total del banner "Pausado"
+// ---------------------------------------------------------------------------
+
+TestRunner::test('T70.9 ajax_release_import borra el cursor/total del banner Pausado', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    update_option('alegra_connector_products_import_total', 3000, false);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_release_import());
+
+    TestRunner::assertTrue($resp->success, 'release responde success');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'el cursor debe borrarse');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_total', false), 'el total debe borrarse');
+    TestRunner::assertFalse(\Alegra\Connector\Admin\Admin_Dashboard::import_residue_status()['active'], 'sin residuo tras liberar');
+    TestRunner::assertFalse(
+        \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false),
+        'el banner Pausado ya no debe mostrarse'
+    );
+});
+
+TestRunner::test('T70.10 ajax_cancel_sync borra el cursor/total del banner Pausado', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_products_import_cursor', 1500, false);
+    update_option('alegra_connector_products_import_total', 3000, false);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp = alegra_capture_json(fn () => $admin->ajax_cancel_sync());
+
+    TestRunner::assertTrue($resp->success, 'cancel responde success');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_cursor', false), 'el cursor debe borrarse');
+    TestRunner::assertFalse(get_option('alegra_connector_products_import_total', false), 'el total debe borrarse');
+    TestRunner::assertFalse(
+        \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false),
+        'el banner Pausado ya no debe mostrarse'
+    );
+});
+
+TestRunner::test('T70.11 el banner Pausado se oculta con cursor 0 o residuo activo', function (): void {
+    alegra_test_reset();
+    // cursor 0 → nunca
+    TestRunner::assertFalse(
+        \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false),
+        'sin cursor no hay banner Pausado'
+    );
+
+    update_option('alegra_connector_products_import_cursor', 30, false);
+    TestRunner::assertTrue(
+        \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(false),
+        'cursor > 0 sin residuo muestra el banner'
+    );
+    TestRunner::assertFalse(
+        \Alegra\Connector\Admin\Admin_Dashboard::should_show_products_pause_banner(true),
+        'con el banner de residuo activo se suprime el duplicado'
+    );
+
+    // El template debe usar el guard para no duplicar el banner mientras el
+    // residuo (Reanudar/Cancelar/Liberar) ya muestra la pausa.
+    $tpl = (string) file_get_contents($GLOBALS['alegra_plugin_root'] . 'templates/admin-products.php');
+    TestRunner::assertStringContains('should_show_products_pause_banner', $tpl, 'el template aplica el guard de residuo');
 });
 
 TestRunner::test('T72.1 un lock FRESCO sin run vivo NO se libera (in-flight starter)', function (): void {

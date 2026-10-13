@@ -204,6 +204,13 @@ class Controller
         $run_budget = max(60, min(590, (int) get_option('alegra_connector_cron_run_budget', 540)));
         $deadline = microtime(true) + $run_budget;
 
+        // Budget > default max_execution_time (30-60 s on many hosts): without
+        // raising it the cron is killed mid-run on EVERY tick, leaving one zombie
+        // per tick. The shutdown finalizer in Run_Context::wrap is the backstop if
+        // the host still kills us; the +30 s margin sits above the wall-clock
+        // deadline so the cooperative `$deadline` check wins the race.
+        @set_time_limit($run_budget + 30);
+
         $this->logger->info('Starting cron synchronization (Alegra → WC only)');
 
         try {
@@ -229,6 +236,16 @@ class Controller
         ];
         $step = 0;
         $total_steps = 4;
+
+        // Refresh the heartbeat up front so a long pre-step (inventory pull,
+        // credit-note watcher) never lets Runs::reap_dead_runs(600) reap a LIVE
+        // cron; each step below refreshes it again.
+        Heartbeat::set($run_id, [
+            'step' => 'sync',
+            'message' => __('Sincronizando...', 'alegra-connector'),
+            'step_num' => $step,
+            'total_steps' => $total_steps,
+        ]);
 
         // PULL only: Alegra → WC
         if (get_option('alegra_connector_sync_products', false)) {

@@ -5652,6 +5652,11 @@ class Admin_Dashboard
         delete_transient('alegra_sync_progress');
         delete_transient('alegra_batch_state');
         delete_transient('alegra_sync_cancelled');
+        // task-13: a cancel abandons the import, so there is no resume point.
+        // Clearing the products cursor/total also removes the separate
+        // "Pausado en el ítem X de Y" banner on the Products page.
+        delete_option('alegra_connector_products_import_cursor');
+        delete_option('alegra_connector_products_import_total');
         wp_send_json_success(['message' => __('Sincronización cancelada', 'alegra-connector')]);
     }
 
@@ -5677,6 +5682,12 @@ class Admin_Dashboard
         delete_transient('alegra_batch_state');
         delete_transient('alegra_sync_progress');
         delete_transient('alegra_sync_cancelled');
+
+        // task-13: full reset. The products cursor/total mark a resume point;
+        // leaving them behind kept the separate "Pausado en el ítem X de Y"
+        // banner on the Products page after the user pressed "Liberar".
+        delete_option('alegra_connector_products_import_cursor');
+        delete_option('alegra_connector_products_import_total');
 
         // Close heartbeat-expired chunked runs, then force any remainder that
         // is still `running` (younger than the grace window) to `stale`: the
@@ -5808,6 +5819,20 @@ class Admin_Dashboard
             'live'   => $live,
             'lock'   => $lock_held,
         ];
+    }
+
+    /**
+     * Whether the Products "Pausado en el ítem X de Y" banner should render.
+     *
+     * The cursor marks a paused chunked products import; completing, cancelling
+     * or releasing the import deletes it (task-13). While the residue banner
+     * (Reanudar/Cancelar/Liberar) is already active it conveys the same pause,
+     * so the duplicate is suppressed.
+     */
+    public static function should_show_products_pause_banner(bool $residue_active = false): bool
+    {
+        $cursor = (int) get_option('alegra_connector_products_import_cursor', 0);
+        return $cursor > 0 && !$residue_active;
     }
 
     /**
@@ -7072,7 +7097,27 @@ class Admin_Dashboard
         $run_id = (int) ($_POST['run_id'] ?? 0);
         if ($run_id <= 0) wp_send_json_error(['message' => __('ID invalido.', 'alegra-connector')]);
 
+        // Oracle LOW: an unknown run_id is not a success — do not lie to the user.
+        if (\Alegra\Connector\Runs::status($run_id) === null) {
+            wp_send_json_error(['message' => __('Proceso no encontrado.', 'alegra-connector')]);
+        }
+
+        // Oracle MEDIUM: send the cooperative stop signal for EVERY run — even one
+        // we classify as DEAD. Heartbeat::TTL is 120s and several LIVE cron steps do
+        // not refresh it (inventory pull, credit-note watcher; products refresh only
+        // every 5th page), so a live run inside a >120s silent step looks DEAD.
+        // Without the stop it would run to completion as a phantom. request_stop on
+        // a truly-dead run is a harmless transient (TTL 300s).
         \Alegra\Connector\Runs::request_stop($run_id);
+
+        // A DEAD run (no heartbeat within its TTL) will never observe the stop:
+        // force-close the row so the Monitor stops showing the zombie. A LIVE run
+        // keeps the cooperative signal and finishes on its next check.
+        if (\Alegra\Connector\Heartbeat::get($run_id) === null) {
+            \Alegra\Connector\Runs::mark_killed($run_id);
+            $this->log('info', 'Dead run force-closed by user', ['run_id' => $run_id]);
+            wp_send_json_success(['message' => __('Proceso cerrado.', 'alegra-connector')]);
+        }
 
         // Do NOT clear the heartbeat: the run is still alive until the running flow
         // observes Runs::should_stop() and calls Run_Context::finish(). Clearing the

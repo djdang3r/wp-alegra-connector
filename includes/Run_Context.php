@@ -27,6 +27,22 @@ final class Run_Context
     private static string $type = '';
     private static string $tombstone_policy = 'respect'; // respect | ignore_bulk | ignore_all
 
+    /**
+     * Run ids opened by THIS request through wrap() and not yet finalized.
+     *
+     * A PHP FATAL (`Maximum execution time exceeded`, memory exhaustion) is NOT
+     * a catchable Throwable, so wrap()'s try/catch never runs finish() and the
+     * row stays `running` forever = a zombie. This registry lets the shutdown
+     * finalizer close exactly the runs this request started — never another
+     * request's.
+     *
+     * @var array<int, bool>
+     */
+    private static array $inflight = [];
+
+    /** @var bool */
+    private static bool $shutdown_registered = false;
+
     public static function begin(string $type, ?string $started_by = null, array $context = []): int
     {
         $run_id = Runs::start($type, $started_by, $context);
@@ -60,6 +76,7 @@ final class Run_Context
 
     private static function teardown(int $run_id): void
     {
+        unset(self::$inflight[$run_id]);                    // ya no hay nada que finalizar en shutdown
         delete_transient('alegra_run_stop_' . $run_id);     // el stop ya fue observado
         Heartbeat::forget($run_id);                         // sólo el display
         Logger::clear_run_context();
@@ -81,6 +98,13 @@ final class Run_Context
     public static function wrap(string $type, callable $fn, ?string $started_by = null, array $context = []): mixed
     {
         $run_id = self::begin($type, $started_by, $context);
+
+        // Any PHP fatal during $fn is uncatchable: without a shutdown finalizer
+        // the row would stay `running` forever (accumulating zombies). Track only
+        // runs this request opened and let the finalizer settle them.
+        self::$inflight[$run_id] = true;
+        self::register_shutdown_finalizer();
+
         try {
             $result = $fn($run_id);
             self::finish($run_id, 'completed');
@@ -88,6 +112,37 @@ final class Run_Context
         } catch (\Throwable $e) {
             self::finish($run_id, 'failed', $e->getMessage());
             throw $e;
+        }
+    }
+
+    /**
+     * Register the shutdown finalizer once per request.
+     *
+     * In production this is the global `register_shutdown_function()`; the
+     * harness can invoke finalize_inflight_runs() directly to simulate it.
+     */
+    private static function register_shutdown_finalizer(): void
+    {
+        if (self::$shutdown_registered) {
+            return;
+        }
+        self::$shutdown_registered = true;
+        register_shutdown_function(static function (): void {
+            self::finalize_inflight_runs();
+        });
+    }
+
+    /**
+     * Close every run this request opened (via wrap) that is still `running`
+     * when PHP shuts down. Runs on normal shutdown too, but by then wrap() has
+     * already drained its id through teardown(), so it is a harmless no-op.
+     * idempotent: finish() on an already-closed run returns without re-writing.
+     */
+    public static function finalize_inflight_runs(): void
+    {
+        foreach (array_keys(self::$inflight) as $id) {
+            unset(self::$inflight[$id]);
+            self::finish((int) $id, 'failed', 'Interrumpido (fatal/timeout)');
         }
     }
 

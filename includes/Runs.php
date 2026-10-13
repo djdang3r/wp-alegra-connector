@@ -136,10 +136,38 @@ class Runs
 
     /**
      * Request a running process to stop.
+     *
+     * Cooperative signal for a LIVE worker: the running flow observes it via
+     * should_stop() on its next check. A DEAD worker will never observe it —
+     * use mark_killed() to settle that row.
      */
     public static function request_stop(int $run_id): void
     {
         set_transient('alegra_run_stop_' . $run_id, 1, 300);
+    }
+
+    /**
+     * Force-close a run that is DEAD (no live heartbeat) immediately.
+     *
+     * Unlike request_stop() (which only signals a live worker), this settles the
+     * row so the Monitor stops showing a zombie as active. Idempotent: the WHERE
+     * clause only matches a row still `running`, so a finished row is untouched.
+     */
+    public static function mark_killed(int $run_id, string $reason = 'Detenido por el usuario'): void
+    {
+        global $wpdb;
+
+        $wpdb->update(
+            $wpdb->prefix . 'alegra_runs',
+            [
+                'status' => 'killed',
+                'finished_at' => current_time('mysql'),
+                'error_summary' => substr($reason, 0, 500),
+            ],
+            ['id' => $run_id, 'status' => 'running'],
+            ['%s', '%s', '%s'],
+            ['%d', '%s']
+        );
     }
 
     /**
@@ -195,6 +223,7 @@ class Runs
 
         self::mark_stale();
         self::mark_abandoned();
+        self::reap_dead_runs();
 
         return $wpdb->get_results($wpdb->prepare(
             "SELECT * FROM $table WHERE status = 'running' ORDER BY started_at DESC LIMIT %d",
@@ -255,6 +284,51 @@ class Runs
                 ], ['id' => (int) $row->id]);
             }
         }
+    }
+
+    /**
+     * Reap zombie `running` runs of ANY type (cron, chunked, manual, webhook…).
+     *
+     * mark_abandoned() only covers chunked_import, so a cron worker that dies
+     * without closing (fatal / timeout) stayed `running` until mark_stale()'s 1h
+     * TTL and the Monitor showed it as active the whole time. Here a row older
+     * than the grace window with NO live heartbeat is settled as `stale`.
+     *
+     * The grace MUST be larger than any run budget: a live long-running process
+     * that legitimately has not finished yet has a fresh heartbeat (Heartbeat TTL
+     * 120s, refreshed on every progress tick), so it is never reaped.
+     *
+     * @return int Number of rows reaped.
+     */
+    public static function reap_dead_runs(int $grace_seconds = 600): int
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'alegra_runs';
+        // Mismo reloj con que Runs::start() guardó started_at (current_time('mysql')).
+        $cutoff = gmdate('Y-m-d H:i:s', current_time('timestamp') - $grace_seconds);
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM $table
+             WHERE status = 'running' AND started_at < %s
+             LIMIT 200",
+            $cutoff
+        ));
+
+        $reaped = 0;
+        foreach ($rows as $row) {
+            $id = (int) $row->id;
+            if (Heartbeat::get($id) !== null) {   // heartbeat live → still running
+                continue;
+            }
+            $wpdb->update($table, [
+                'status' => 'stale',
+                'finished_at' => current_time('mysql'),
+                'error_summary' => __('Proceso abandonado (sin finalizar)', 'alegra-connector'),
+            ], ['id' => $id, 'status' => 'running']);
+            $reaped++;
+        }
+
+        return $reaped;
     }
 
     /**
