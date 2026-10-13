@@ -37,6 +37,13 @@ class Products
      */
     private const MAX_ITEM_VARIANTS = 100;
 
+    /**
+     * The WC core option holding the placeholder image id. Referenced by the
+     * bulk wipe's image guard (H4). Kept as a constant so it is not mistaken
+     * for a plugin option by the uninstall audit.
+     */
+    private const WC_PLACEHOLDER_OPTION = 'woocommerce_placeholder_image_id';
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -3091,6 +3098,258 @@ class Products
             }
         }
         return array_map('intval', array_keys($out));
+    }
+
+    /**
+     * Todo 2: delete one keyset page of imported products, their variations and
+     * their images — safely.
+     *
+     * NON-NEGOTIABLE guards (all applied for the whole chunk):
+     *  - B1: `Public_::set_syncing(true)` suppresses the WC delete → Alegra
+     *        push (`woocommerce_delete_product`) while we delete. Restored in
+     *        `finally`.
+     *  - B2: `before_delete_post` tombstone hook is removed so the wipe does
+     *        NOT create tombstones that would block the re-import. Restored in
+     *        `finally`.
+     *  - H4/H5: an attachment is deleted ONLY if it is not referenced from
+     *        outside the wipe set (any member of the set is "internal").
+     *  - H6: the chunk aborts on the kill switch or a requested stop.
+     *
+     * @param array{run_id?:int,wipe_ids?:int[]} $opts
+     * @return array{processed:int,products_deleted:int,images_deleted:int,images_skipped:int,next_after_id:int,done:bool,aborted:bool,reason:string}
+     */
+    public function wipe_imported_products_chunk(int $after_id, int $limit, array $opts = []): array
+    {
+        $limit = max(1, $limit);
+        $run_id = (int) ($opts['run_id'] ?? 0);
+
+        $raw_set = $opts['wipe_ids'] ?? get_option('alegra_connector_wipe_ids', []);
+        $wipe_set = [];
+        foreach ((array) $raw_set as $wid) {
+            $wid = (int) $wid;
+            if ($wid > 0) {
+                $wipe_set[$wid] = true;
+            }
+        }
+
+        $result = [
+            'processed'        => 0,
+            'products_deleted' => 0,
+            'images_deleted'   => 0,
+            'images_skipped'   => 0,
+            'next_after_id'    => $after_id,
+            'done'             => false,
+            'aborted'          => false,
+            'reason'           => '',
+        ];
+
+        // Abort BEFORE touching anything when a stop is already requested.
+        $early = self::wipe_abort_reason($run_id);
+        if ($early !== '') {
+            $result['aborted'] = true;
+            $result['reason']  = $early;
+            return $result;
+        }
+
+        $ids = $this->wipe_ids_page($after_id, $limit);
+        if (empty($ids)) {
+            $result['done'] = true;
+            return $result;
+        }
+
+        $was_syncing = \Alegra\Connector\Public\Public_::is_syncing();
+
+        // B2: suppress tombstone creation for the whole chunk.
+        $tombstone_hook = [\Alegra\Connector\Tombstone_Manager::class, 'on_post_delete'];
+        $had_tombstone_hook = remove_action('before_delete_post', $tombstone_hook);
+
+        // B1: suppress the WC delete → Alegra push for the whole chunk.
+        if (!$was_syncing) {
+            \Alegra\Connector\Public\Public_::set_syncing(true);
+        }
+
+        $deleted_images  = [];
+        $alegra_ids      = [];
+        $deleted_products = [];
+
+        try {
+            foreach ($ids as $product_id) {
+                $product_id = (int) $product_id;
+
+                $abort = self::wipe_abort_reason($run_id);
+                if ($abort !== '') {
+                    $result['aborted'] = true;
+                    $result['reason']  = $abort;
+                    break;
+                }
+
+                $product = wc_get_product($product_id);
+                if (!$product instanceof \WC_Product) {
+                    // Already gone (e.g. a child deleted with its parent): advance
+                    // the cursor without counting it.
+                    $result['next_after_id'] = $product_id;
+                    continue;
+                }
+
+                $result['processed']++;
+
+                // Collect BEFORE deleting: postmeta is gone afterwards.
+                $image_ids = $this->wipe_collect_image_ids($product);
+                $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
+                if ($alegra_id !== '') {
+                    $alegra_ids[] = $alegra_id;
+                }
+
+                // Drop the plugin's mapping rows for the product + its children.
+                \Alegra\Connector\Entity_Map::remove_by_wc('product', $product_id);
+                foreach ((array) $product->get_children() as $child_id) {
+                    \Alegra\Connector\Entity_Map::remove_by_wc('product', (int) $child_id);
+                }
+
+                // Delete the product (WC also removes its variations).
+                $product->delete(true);
+                $result['products_deleted']++;
+                $deleted_products[] = $product_id;
+
+                // Delete the collected attachments, at most once each (H5).
+                foreach ($image_ids as $att_id) {
+                    $att_id = (int) $att_id;
+                    if ($att_id <= 0 || isset($deleted_images[$att_id])) {
+                        continue;
+                    }
+                    $deleted_images[$att_id] = true;
+
+                    if ($this->wipe_attachment_verdict($att_id, $wipe_set) !== 'delete') {
+                        $result['images_skipped']++;
+                        continue;
+                    }
+
+                    $hash = (string) get_post_meta($att_id, '_alegra_image_url_hash', true);
+                    wp_delete_attachment($att_id, true);
+                    \Alegra\Connector\Entity_Map::remove_by_wc('attachment', $att_id);
+                    if ($hash !== '') {
+                        \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
+                    }
+                    $result['images_deleted']++;
+                }
+
+                $result['next_after_id'] = $product_id;
+            }
+        } finally {
+            if (!$was_syncing) {
+                \Alegra\Connector\Public\Public_::set_syncing(false);
+            }
+            if ($had_tombstone_hook) {
+                add_action('before_delete_post', $tombstone_hook);
+            }
+        }
+
+        // Persist the run-scoped rollups for the close/finalize step (B2 + L1).
+        if ($alegra_ids !== []) {
+            $existing = (array) get_option('alegra_connector_wipe_alegra_ids', []);
+            update_option(
+                'alegra_connector_wipe_alegra_ids',
+                array_values(array_unique(array_merge($existing, $alegra_ids))),
+                false
+            );
+        }
+        if ($deleted_products !== []) {
+            $existing = (array) get_option('alegra_connector_wipe_deleted_ids', []);
+            update_option(
+                'alegra_connector_wipe_deleted_ids',
+                array_values(array_unique(array_merge($existing, $deleted_products))),
+                false
+            );
+        }
+
+        // A short page means the catalog was fully walked (keyset cursor).
+        $result['done'] = !$result['aborted'] && count($ids) < $limit;
+
+        return $result;
+    }
+
+    /**
+     * H6: the abort reason for the current moment ('' = keep going).
+     */
+    private static function wipe_abort_reason(int $run_id): string
+    {
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            return 'kill_switch';
+        }
+        if ($run_id > 0 && \Alegra\Connector\Runs::should_stop($run_id)) {
+            return 'stopped';
+        }
+        return '';
+    }
+
+    /**
+     * H4/H5: may this attachment be deleted as part of the wipe?
+     *
+     * `delete` when NOT referenced by: a term thumbnail, the theme custom logo,
+     * the WC placeholder image, or a post OUTSIDE the wipe set. References from
+     * any member of the set are internal (the whole set is being wiped).
+     *
+     * @param array<int,true> $wipe_set
+     * @return 'delete'|'skip'
+     */
+    private function wipe_attachment_verdict(int $attachment_id, array $wipe_set): string
+    {
+        if ($attachment_id <= 0) {
+            return 'skip';
+        }
+
+        if (self::attachment_referenced_by_term($attachment_id)) {
+            return 'skip';
+        }
+        if ((int) get_theme_mod('custom_logo') === $attachment_id) {
+            return 'skip';
+        }
+        if ((int) get_option(self::WC_PLACEHOLDER_OPTION) === $attachment_id) {
+            return 'skip';
+        }
+        if ($this->wipe_referenced_outside_set($attachment_id, $wipe_set)) {
+            return 'skip';
+        }
+
+        return 'delete';
+    }
+
+    /**
+     * H4/H5 (set-aware): true when a post OUTSIDE the wipe set references this
+     * attachment as featured or inside its gallery. Unlike
+     * `attachment_referenced_by_another_post()` (single-product), every member
+     * of the wipe set is treated as internal.
+     *
+     * @param array<int,true> $wipe_set
+     */
+    private function wipe_referenced_outside_set(int $attachment_id, array $wipe_set): bool
+    {
+        global $wpdb;
+
+        $thumbs = $wpdb->get_col($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+             WHERE meta_key = '_thumbnail_id' AND meta_value = %s",
+            (string) $attachment_id
+        ));
+        foreach ((array) $thumbs as $pid) {
+            if (!isset($wipe_set[(int) $pid])) {
+                return true;
+            }
+        }
+
+        $galleries = $wpdb->get_col($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+             WHERE meta_key = '_product_image_gallery'
+               AND FIND_IN_SET(%d, REPLACE(meta_value, ' ', '')) > 0",
+            $attachment_id
+        ));
+        foreach ((array) $galleries as $pid) {
+            if (!isset($wipe_set[(int) $pid])) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

@@ -1482,6 +1482,41 @@ class WC_Product
     public function update_meta_data($key, $value) { update_post_meta($this->id, (string) $key, $value); return $this; }
     public function get_meta($key, $single = true) { return get_post_meta($this->id, (string) $key, $single); }
     public function delete_meta_data($key) { delete_post_meta($this->id, (string) $key); return $this; }
+
+    /**
+     * Harness replica of `WC_Product::delete( $force )`.
+     *
+     * Real WC removes the post (via wp_delete_post, which fires
+     * `before_delete_post` while meta still exists) and then fires
+     * `woocommerce_delete_product`. Reproducing both is what makes the wipe's
+     * suppressions observable: B1 (set_syncing suppresses the delete→Alegra
+     * push) and B2 (remove_action suppresses the tombstone). Variable products
+     * delete their children first, like the WC data store.
+     */
+    public function delete($force_delete = false)
+    {
+        $id = (int) $this->id;
+
+        if ($this->type === 'variable') {
+            foreach ((array) ($this->data['children'] ?? []) as $child_id) {
+                $child = $GLOBALS['wc_products'][(int) $child_id] ?? null;
+                if ($child instanceof WC_Product) {
+                    $child->delete(true);
+                }
+            }
+        }
+
+        unset($GLOBALS['wc_products'][$id]);
+        do_action('before_delete_post', $id);
+        unset($GLOBALS['wp_posts'][$id]);
+        if (isset($GLOBALS['wp_postmeta'][$id])) {
+            unset($GLOBALS['wp_postmeta'][$id]);
+        }
+        do_action('woocommerce_delete_product', $id);
+
+        return true;
+    }
+
     public function save()
     {
         // Replica WC_Product::validate_props() (WC >= 3.0): el estado se deriva
@@ -2136,6 +2171,40 @@ class Alegra_Mock_Wpdb
                 $ids = array_slice($ids, 0, (int) $m[1]);
             }
             return array_map(static fn ($id) => (object) ['post_id' => $id], $ids);
+        }
+
+        // Bulk-wipe H4/H5: "referenced outside the set" scans — the featured
+        // (`_thumbnail_id = X`) and the gallery (`FIND_IN_SET(X, …)`) without a
+        // `post_id <> N` exclusion, returning EVERY referencing post.
+        if (strpos($query, '_thumbnail_id') !== false
+            && preg_match("/meta_value\s*=\s*'([^']+)'/", $query, $mv)
+            && strpos($query, 'post_id <>') === false) {
+            $out = [];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (isset($meta['_thumbnail_id']) && (string) $meta['_thumbnail_id'] === $mv[1]) {
+                    $out[] = (object) ['post_id' => (int) $pid];
+                }
+            }
+            return $out;
+        }
+        if (strpos($query, '_product_image_gallery') !== false
+            && preg_match('/FIND_IN_SET\(\s*(\d+)/', $query, $mi)
+            && strpos($query, 'post_id <>') === false) {
+            $target = (int) $mi[1];
+            $out = [];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $pid => $meta) {
+                if (!isset($meta['_product_image_gallery'])) { continue; }
+                $gallery = is_array($meta['_product_image_gallery'])
+                    ? implode(',', $meta['_product_image_gallery'])
+                    : (string) $meta['_product_image_gallery'];
+                foreach (explode(',', $gallery) as $part) {
+                    if ((int) trim($part) === $target) {
+                        $out[] = (object) ['post_id' => (int) $pid];
+                        break;
+                    }
+                }
+            }
+            return $out;
         }
 
         if (strpos($query, 'alegra_category_id') !== false && strpos($query, 'termmeta') !== false) {

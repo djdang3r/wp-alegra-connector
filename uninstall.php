@@ -127,6 +127,14 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_last_import_summary');
     delete_option('alegra_connector_allowed_image_hosts_extra');
     delete_option('alegra_connector_restrict_image_hosts');
+    // Bulk wipe ("Borrador masivo"): run-scoped ids + cursor + lock/run/export.
+    delete_option('alegra_connector_wipe_ids');
+    delete_option('alegra_connector_wipe_alegra_ids');
+    delete_option('alegra_connector_wipe_deleted_ids');
+    delete_option('alegra_connector_wipe_cursor');
+    delete_option('alegra_connector_wipe_lock_token');
+    delete_option('alegra_connector_wipe_run_id');
+    delete_option('alegra_connector_wipe_backup_file');
     delete_option('alegra_connector_import_time_budget');
     delete_option('alegra_connector_import_max_pages');
     delete_option('alegra_connector_chunked_page_budget');

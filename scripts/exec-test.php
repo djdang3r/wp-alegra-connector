@@ -16727,4 +16727,117 @@ TestRunner::test('T86.1 el set del wipe incluye productos+variaciones con _alegr
     TestRunner::assertTrue(get_post_meta(10, '_alegra_item_id', true) === 'it-p', 'discovery no toca metas');
 });
 
+echo "\nT86 — Bulk wipe (reset total) — guarded chunk\n";
+
+TestRunner::test('T86.2 B1: con push activo el wipe NO llama a delete_item de Alegra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_push_products_enabled', true);
+    $public = make_public();                       // registers woocommerce_delete_product
+    alegra_seed_linked_product(10, 'it-b1');
+    $img = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/b1.png');
+    update_post_meta(10, '_thumbnail_id', $img);
+    alegra_mock_seed_item('it-b1', ['name' => 'B1', 'reference' => 'SB1']);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+
+    TestRunner::assertSame(0, count(alegra_mock_requests('DELETE')), 'B1: NINGÚN DELETE a Alegra durante el wipe');
+    TestRunner::assertSame(0, alegra_mock_count('DELETE', '/items/it-b1'), 'B1: delete_item del ítem nunca se envió');
+    TestRunner::assertSame(1, (int) $res['products_deleted'], 'el producto igual se borró localmente');
+    TestRunner::assertSame(false, wc_get_product(10), 'el producto ya no existe');
+});
+
+TestRunner::test('T86.3 H4/H5: no borra adjuntos de terms/logo/placeholder/ajenos; compartido del wipe se borra una vez', function (): void {
+    alegra_test_reset();
+
+    // Shared by TWO wiped products ⇒ internal ⇒ delete ONCE.
+    alegra_seed_linked_product(10, 'it-a');
+    alegra_seed_linked_product(11, 'it-b');
+    $shared = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/shared.png');
+    update_post_meta(10, '_thumbnail_id', $shared);
+    update_post_meta(11, '_thumbnail_id', $shared);
+
+    // Referenced by a post OUTSIDE the set (survivor) — featured + gallery.
+    alegra_make_product(30, ['name' => 'Survivor']);
+    $foreign = alegra_seed_plugin_image(8002, 'https://cdn3.alegra.com/foreign.png');
+    update_post_meta(30, '_thumbnail_id', $foreign);
+    alegra_seed_linked_product(12, 'it-c');
+    update_post_meta(12, '_thumbnail_id', $foreign);
+
+    alegra_make_product(31, ['name' => 'Survivor2']);
+    $gallery_foreign = alegra_seed_plugin_image(8006, 'https://cdn3.alegra.com/gallery-foreign.png');
+    update_post_meta(31, '_product_image_gallery', (string) $gallery_foreign);
+    alegra_seed_linked_product(16, 'it-g');
+    update_post_meta(16, '_product_image_gallery', (string) $gallery_foreign);
+
+    // Term thumbnail.
+    $term_img = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/term.png');
+    update_term_meta(500, 'thumbnail_id', $term_img);
+    alegra_seed_linked_product(13, 'it-d');
+    update_post_meta(13, '_thumbnail_id', $term_img);
+
+    // Theme custom logo + WC placeholder.
+    $logo = alegra_seed_plugin_image(8004, 'https://cdn3.alegra.com/logo.png');
+    set_theme_mod('custom_logo', $logo);
+    alegra_seed_linked_product(14, 'it-e');
+    update_post_meta(14, '_thumbnail_id', $logo);
+    $ph = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/placeholder.png');
+    update_option('woocommerce_placeholder_image_id', $ph);
+    alegra_seed_linked_product(15, 'it-f');
+    update_post_meta(15, '_thumbnail_id', $ph);
+
+    $wipe = [10, 11, 12, 13, 14, 15, 16];
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => $wipe]);
+
+    TestRunner::assertSame(null, get_post($shared), 'H5: compartido por dos del wipe se borra UNA vez');
+    TestRunner::assertTrue(get_post($foreign) !== null, 'H4: referenciado por un post ajeno (featured) NO se borra');
+    TestRunner::assertTrue(get_post($gallery_foreign) !== null, 'H4: referenciado por un post ajeno (galería) NO se borra');
+    TestRunner::assertTrue(get_post($term_img) !== null, 'H4: referenciado por un term NO se borra');
+    TestRunner::assertTrue(get_post($logo) !== null, 'H4: logo del sitio NO se borra');
+    TestRunner::assertTrue(get_post($ph) !== null, 'H4: placeholder de WC NO se borra');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'sólo el compartido interno se borró');
+    TestRunner::assertSame(5, (int) $res['images_skipped'], '5 adjuntos protegidos se saltearon');
+    TestRunner::assertTrue(wc_get_product(30) !== null && get_post_meta(30, '_alegra_item_id', true) === '', 'producto ajeno intacto');
+});
+
+TestRunner::test('T86.4 H2: las imágenes de las variaciones también se borran', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(20, ['color' => ['name' => 'Color', 'options' => ['Rojo', 'Azul']]], [
+        21 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+        22 => ['variation_attributes' => ['attribute_color' => 'Azul']],
+    ]);
+    update_post_meta(20, '_alegra_item_id', 'it-var');
+    update_post_meta(21, '_alegra_item_id', 'it-var-1');
+    $img1 = alegra_seed_plugin_image(8010, 'https://cdn3.alegra.com/var1.png');
+    $img2 = alegra_seed_plugin_image(8011, 'https://cdn3.alegra.com/var2.png');
+    update_post_meta(21, '_thumbnail_id', $img1);
+    update_post_meta(22, '_thumbnail_id', $img2);   // variation WITHOUT item id
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [20, 21]]);
+
+    TestRunner::assertSame(null, get_post($img1), 'imagen de la variación con item id borrada');
+    TestRunner::assertSame(null, get_post($img2), 'imagen de la variación SIN item id también borrada (H2)');
+    TestRunner::assertSame(2, (int) $res['images_deleted'], 'dos imágenes de variación borradas');
+    TestRunner::assertSame(false, wc_get_product(22), 'la variación sin item id se fue con el padre');
+});
+
+TestRunner::test('T86.5 H6: el chunk aborta con kill switch o stop, sin borrar nada', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-kill');
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+    TestRunner::assertTrue((bool) $res['aborted'], 'aborta con kill switch');
+    TestRunner::assertSame('kill_switch', $res['reason'], 'reason kill_switch');
+    TestRunner::assertSame(0, (int) $res['products_deleted'], 'no borró nada');
+    TestRunner::assertTrue(wc_get_product(10) !== null, 'el producto sigue vivo');
+    \Alegra\Connector\Kill_Switch::deactivate();
+    \Alegra\Connector\Kill_Switch::reset_cache();
+
+    $run_id = \Alegra\Connector\Runs::start('wipe_products');
+    \Alegra\Connector\Runs::request_stop($run_id);
+    $res2 = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10], 'run_id' => $run_id]);
+    TestRunner::assertTrue((bool) $res2['aborted'], 'aborta con stop');
+    TestRunner::assertSame('stopped', $res2['reason'], 'reason stopped');
+    TestRunner::assertTrue(wc_get_product(10) !== null, 'sigue vivo tras el stop');
+});
+
 exit(TestRunner::summary());
