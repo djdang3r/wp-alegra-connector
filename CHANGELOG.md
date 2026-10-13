@@ -2,6 +2,27 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.16] - 2026-10-13
+
+> **Fix del "Borrador masivo": timeout del preview y errores de UI.** El preview
+> calculaba las imágenes con ~3 consultas SQL **por imagen** (miles de queries en un
+> catálogo grande) y `ajax_wipe_start` volvía a llamarlo, así que un catálogo real
+> producía un **timeout de PHP** → "Error de conexión", el modal se bloqueaba y el run
+> `wipe_products` quedaba colgado tomando el lock de importación de productos.
+
+### Fixed
+
+- **Preview acotado.** Cuenta productos/imágenes con un número **constante** de
+  consultas (sin el veredicto por-imagen; la decisión **real y segura** se sigue
+  tomando al borrar). El conteo de "imágenes a conservar" del preview es best-effort.
+- **Start liviano.** `ajax_wipe_start` ya **no** re-ejecuta el preview; arranca rápido
+  y no puede quedar colgado creando el run.
+- **Límites.** Preview y start suben `set_time_limit(120)` + `wp_raise_memory_limit()` +
+  `ignore_user_abort(true)`.
+- **UX.** El botón se deshabilita mientras calcula; ante error muestra el **mensaje
+  real** (parsea la respuesta), mantiene el modal abierto y **Cancelar funciona**; ya
+  no re-habilita el confirm destructivo por su cuenta.
+
 ## [2.8.15] - 2026-10-13
 
 > **Nuevo "Borrador masivo (Reset total)" en Productos.** Elimina de una sola vez los
