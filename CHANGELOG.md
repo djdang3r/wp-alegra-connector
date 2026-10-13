@@ -2,6 +2,57 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.13] - 2026-10-13
+
+> **Runs a prueba de fatales + "Reparar imágenes" (no destructivo) en el Monitor.**
+> Los runs ya no quedan colgados: los zombies se reapean solos, **"Detener"** fuerza
+> el cierre de un run muerto y un **FATAL de PHP** cierra el run (shutdown finalizer);
+> el cron eleva el límite de ejecución y late desde el arranque. **"Liberar"/
+> "Cancelar"** ahora borran el cursor/total del import (desaparece el banner
+> "Pausado en el ítem X de Y"). Nueva herramienta del Monitor **"Reparar imágenes"**:
+> repara referencias de imágenes rotas en productos importados (limpia un
+> `_thumbnail_id` muerto y los ids muertos de la galería y reimporta las imágenes
+> desde Alegra) **sin borrar productos ni adjuntos**, respetando la configuración.
+
+### Fixed
+
+- **Runs colgados (zombies).** `Runs::reap_dead_runs()` reapea cualquier run
+  `running` sin heartbeat (de **todo** tipo, no sólo `chunked_import`) y
+  `Runs::mark_killed()` cierra un run muerto cuando el usuario pulsa "Detener"
+  (`ajax_kill_run`); `currently_running()` deja de listarlos como activos.
+- **Runs que quedaban `running` tras un FATAL de PHP.** `Run_Context::wrap()`
+  registra un shutdown finalizer que cierra el run (`failed`, "Interrumpido
+  (fatal/timeout)") cuando PHP muere por timeout/memoria. No toca `begin()`/
+  `resume()`, así el import chunked multi-request queda intacto.
+- **Cron matado en cada tick.** `run_cron_sync()` eleva `set_time_limit()` al
+  presupuesto de la corrida y refresca el `Heartbeat` desde el arranque, para no
+  dejar un zombie por tick en hosts con `max_execution_time` corto.
+- **"Detener" no hacía nada en un run vivo con heartbeat vencido.** `ajax_kill_run`
+  ahora envía **siempre** la señal cooperativa de stop (un paso largo y silencioso
+  podía verse como muerto) y responde error si el `run_id` no existe.
+- **El banner "Pausado en el ítem X de Y" quedaba tras "Liberar"/"Cancelar".**
+  Ambos borran el cursor/total del import de productos, dejando un reset completo.
+
+### Added
+
+- **Monitor: "Reparar imágenes" (no destructivo).** Acción
+  `wp_ajax_alegra_repair_images`, con cursor por **chunks**, lock con **refresco
+  por chunk** y **resumen acumulado**. Recorre los productos con `_alegra_item_id`
+  (incluye drafts), limpia referencias muertas (`_thumbnail_id` y
+  `_product_image_gallery`) y reimporta las imágenes desde Alegra por el camino de
+  dedup existente. Obedece `alegra_connector_sync_images` + `..._sync_images_mode`,
+  **nunca muta la imagen destacada de un producto sano** y es seguro con medios
+  offloaded (S3/CDN, filtro `alegra_connector_attachment_is_live`). Nunca borra
+  productos ni adjuntos.
+
+### Tests
+
+- **Exec-test:** bloques task-11..task-15 — reapeo de zombies + "Detener"
+  (T28.112–115), finalizer en fatal + time limit del cron (T28.116–119), cursor del
+  import en Liberar/Cancelar (T70.9–70.11), fix de `ajax_kill_run` (T28.120–121) y
+  "Reparar imágenes" (T76.1–76.17: limpieza de refs, dedup viva/muerta, featured
+  preservada, offload, lock por chunk y resumen acumulado).
+
 ## [2.8.12] - 2026-10-12
 
 > **Productos: la dedup de imágenes valida que el attachment esté vivo + desglose por imagen en el probe.**
