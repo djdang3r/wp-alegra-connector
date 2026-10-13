@@ -910,6 +910,23 @@ function wp_get_attachment_url($attachment_id)
     if (!is_string($file) || $file === '') { return false; }
     return 'https://example.test/wp-content/uploads/' . ltrim($file, '/');
 }
+function wp_delete_attachment($attachment_id, $force_delete = false)
+{
+    // products-image-sync-reconcile: the guarded delete path removes the
+    // attachment post + its meta (and the file when resolvable) so the suite can
+    // observe a real deletion.
+    $attachment_id = (int) $attachment_id;
+    if (!isset($GLOBALS['wp_posts'][$attachment_id])) { return false; }
+    $file = get_post_meta($attachment_id, '_wp_attached_file', true);
+    unset($GLOBALS['wp_posts'][$attachment_id]);
+    if (isset($GLOBALS['wp_postmeta'][$attachment_id])) {
+        unset($GLOBALS['wp_postmeta'][$attachment_id]);
+    }
+    if (is_string($file) && $file !== '' && is_file($file)) {
+        @unlink($file);
+    }
+    return (object) ['ID' => $attachment_id];
+}
 
 // Terms -----------------------------------------------------------------
 function get_term($term_id, $taxonomy = '')
@@ -1862,6 +1879,53 @@ class Alegra_Mock_Wpdb
                     if ($row['alegra_type'] === $type && $row['alegra_id'] === $alegra_id && $row['wc_entity_type'] === $wc_type) {
                         return (string) $row['wc_entity_id'];
                     }
+                }
+            }
+            return null;
+        }
+
+        // products-image-sync-reconcile: the guarded delete checks whether an
+        // attachment is referenced by ANOTHER post as a featured image (exact
+        // `_thumbnail_id`) or inside a comma gallery (`FIND_IN_SET`, boundary
+        // safe). Must run BEFORE the generic postmeta scan (which ignores the
+        // `post_id <> $product_id` exclusion and would false-positive on self).
+        if (strpos($query, '_thumbnail_id') !== false
+            && preg_match("/meta_value\s*=\s*'([^']+)'/", $query, $mv)
+            && preg_match('/post_id\s*<>\s*(\d+)/', $query, $mp)) {
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $post_id => $meta) {
+                if ((int) $post_id === (int) $mp[1]) { continue; }
+                if (isset($meta['_thumbnail_id']) && (string) $meta['_thumbnail_id'] === $mv[1]) {
+                    return (string) $post_id;
+                }
+            }
+            return null;
+        }
+
+        if (strpos($query, '_product_image_gallery') !== false
+            && preg_match('/FIND_IN_SET\(\s*(\d+)/', $query, $mi)
+            && preg_match('/post_id\s*<>\s*(\d+)/', $query, $mp)) {
+            $target = (int) $mi[1];
+            foreach (($GLOBALS['wp_postmeta'] ?? []) as $post_id => $meta) {
+                if ((int) $post_id === (int) $mp[1]) { continue; }
+                if (!isset($meta['_product_image_gallery'])) { continue; }
+                $gallery = is_array($meta['_product_image_gallery'])
+                    ? implode(',', $meta['_product_image_gallery'])
+                    : (string) $meta['_product_image_gallery'];
+                foreach (explode(',', $gallery) as $part) {
+                    if ((int) trim($part) === $target) { return (string) $post_id; }
+                }
+            }
+            return null;
+        }
+
+        // Term-reference guard: `termmeta` `thumbnail_id` LIKE '%<id>%' (conservative).
+        if (strpos($query, 'termmeta') !== false
+            && strpos($query, 'thumbnail_id') !== false
+            && preg_match("/meta_value\s+LIKE\s+'%(\d+)%'/", $query, $mi)) {
+            $target = (int) $mi[1];
+            foreach (($GLOBALS['wp_term_meta'] ?? []) as $term_id => $meta) {
+                if (isset($meta['thumbnail_id']) && (int) $meta['thumbnail_id'] === $target) {
+                    return (string) $term_id;
                 }
             }
             return null;

@@ -2795,7 +2795,20 @@ class Products
             }
         }
 
-        // Todo 3 appends the guarded deletion of the replaced plugin images here.
+        // --- Todo 3: delete the replaced plugin images (guarded) ---
+        // Orphan set = the ids the rewrite ACTUALLY removed (old refs − new refs).
+        // For `favorite`, $new_gallery === $old_gallery, so the only possible
+        // orphan is the replaced featured — the gallery is never deleted.
+        if ($allow_delete) {
+            $old_refs = array_merge($old_featured > 0 ? [$old_featured] : [], $old_gallery);
+            $new_refs = array_map('intval', array_merge($new_featured > 0 ? [$new_featured] : [], $new_gallery));
+            foreach (array_unique($old_refs) as $orphan) {
+                $orphan = (int) $orphan;
+                if ($orphan > 0 && !in_array($orphan, $new_refs, true)) {
+                    $this->delete_replaced_image($orphan, $product_id);
+                }
+            }
+        }
     }
 
     /**
@@ -2860,6 +2873,86 @@ class Products
         update_post_meta($thumb, '_alegra_image_url', $normalized);
         update_post_meta($thumb, '_alegra_image_url_hash', $hash);
         \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $thumb);
+    }
+
+    /**
+     * Todo 3: delete a replaced plugin image, but ONLY when it is safe.
+     *
+     * Guards (ALL must pass):
+     *  (a) plugin-created: it carries `_alegra_image_url`;
+     *  (b) NOT referenced by another post as `_thumbnail_id`, nor inside another
+     *      post's comma gallery (boundary-safe `FIND_IN_SET`, never LIKE '%id%');
+     *  (c) NOT referenced by any term `thumbnail_id` (conservative LIKE).
+     * On delete it also drops the `image`→attachment Entity_Map entry.
+     */
+    private function delete_replaced_image(int $attachment_id, int $product_id): void
+    {
+        if ($attachment_id <= 0) {
+            return;
+        }
+        if (!self::is_plugin_created_image($attachment_id)) {
+            return; // (a) never delete merchant/unknown media
+        }
+        if (self::attachment_referenced_by_another_post($attachment_id, $product_id)) {
+            return; // (b) shared with another product/post
+        }
+        if (self::attachment_referenced_by_term($attachment_id)) {
+            return; // (c) used as a term thumbnail
+        }
+
+        $hash = (string) get_post_meta($attachment_id, '_alegra_image_url_hash', true);
+        wp_delete_attachment($attachment_id, true);
+        if ($hash !== '') {
+            \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
+        }
+    }
+
+    /**
+     * Todo 3 (b): another post references this id as featured (exact) or inside
+     * its comma-separated gallery (`FIND_IN_SET`, boundary safe).
+     */
+    private static function attachment_referenced_by_another_post(int $attachment_id, int $product_id): bool
+    {
+        global $wpdb;
+
+        $thumb = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+             WHERE meta_key = '_thumbnail_id' AND meta_value = %s AND post_id <> %d
+             LIMIT 1",
+            (string) $attachment_id,
+            $product_id
+        ));
+        if ($thumb) {
+            return true;
+        }
+
+        $gallery = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+             WHERE meta_key = '_product_image_gallery'
+               AND FIND_IN_SET(%d, REPLACE(meta_value, ' ', '')) > 0
+               AND post_id <> %d
+             LIMIT 1",
+            $attachment_id,
+            $product_id
+        ));
+
+        return (bool) $gallery;
+    }
+
+    /**
+     * Todo 3 (c): any term references this id as its `thumbnail_id`
+     * (conservative LIKE ⇒ a false positive keeps the image).
+     */
+    private static function attachment_referenced_by_term(int $attachment_id): bool
+    {
+        global $wpdb;
+        $term = $wpdb->get_var($wpdb->prepare(
+            "SELECT term_id FROM {$wpdb->termmeta}
+             WHERE meta_key = 'thumbnail_id' AND meta_value LIKE %s
+             LIMIT 1",
+            '%' . $attachment_id . '%'
+        ));
+        return (bool) $term;
     }
 
     /**

@@ -16039,4 +16039,105 @@ TestRunner::test('T77.7 favorite sin flag usa la primera URL y un host bloqueado
     TestRunner::assertSame(0, (int) get_post_meta(10, '_thumbnail_id', true), 'sin attachment');
 });
 
+echo "\nT78 — Safe deletion of replaced plugin images\n";
+
+TestRunner::test('T78.1 un plugin image reemplazado y único se borra (Media + mapa)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-d1');
+    $a   = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+    $old = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/old.png');
+    update_post_meta(10, '_thumbnail_id', $old);
+
+    $item = ['id' => 'it-d1', 'name' => 'D1', 'images' => [['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true]]];
+    make_products()->import_single_item_public($item, 0, true, true);
+
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'featured = nueva');
+    TestRunner::assertSame(null, get_post($old), 'el plugin image reemplazado se borra');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_attachment_id(md5('https://cdn3.alegra.com/old.png')), 'se quita del mapa');
+});
+
+TestRunner::test('T78.2 un plugin image compartido por otro post NO se borra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-d2');
+    alegra_seed_linked_product(20, 'it-d2q');
+    $shared = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/shared.png');
+    update_post_meta(10, '_thumbnail_id', $shared);
+    update_post_meta(20, '_thumbnail_id', $shared);   // Q también lo usa
+
+    make_products()->import_single_item_public(['id' => 'it-d2', 'name' => 'D2', 'images' => []], 0, true, true);
+
+    TestRunner::assertTrue(get_post($shared) !== null, 'compartido por otro post ⇒ se mantiene');
+});
+
+TestRunner::test('T78.3 boundary-safe: 12 no se confunde con 123 en la galería', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-b1');
+    alegra_seed_linked_product(20, 'it-b2');
+    $shared = alegra_seed_plugin_image(123, 'https://cdn3.alegra.com/n123.png');
+    $cand   = alegra_seed_plugin_image(12, 'https://cdn3.alegra.com/n12.png');
+    update_post_meta(20, '_product_image_gallery', (string) $shared);
+    update_post_meta(10, '_thumbnail_id', $cand);
+    update_post_meta(10, '_product_image_gallery', (string) $shared);
+
+    make_products()->import_single_item_public(['id' => 'it-b1', 'name' => 'B1', 'images' => []], 0, true, true);
+
+    TestRunner::assertTrue(get_post($shared) !== null, '123 (referenciado por Q) se mantiene');
+    TestRunner::assertSame(null, get_post($cand), '12 se borra: no matchea 123 (boundary-safe)');
+});
+
+TestRunner::test('T78.4 un plugin image usado por un term NO se borra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-d4');
+    $termimg = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/term.png');
+    update_post_meta(10, '_thumbnail_id', $termimg);
+    update_term_meta(5, 'thumbnail_id', $termimg);
+
+    make_products()->import_single_item_public(['id' => 'it-d4', 'name' => 'D4', 'images' => []], 0, true, true);
+
+    TestRunner::assertTrue(get_post($termimg) !== null, 'usado por un term ⇒ se mantiene');
+});
+
+TestRunner::test('T78.5 un attachment merchant (sin marca) NUNCA se borra', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'all');
+    alegra_seed_linked_product(10, 'it-d5');
+    $merchant = alegra_make_live_attachment(9000);   // sin _alegra_image_url
+    update_post_meta(10, '_thumbnail_id', $merchant);
+
+    make_products()->import_single_item_public(['id' => 'it-d5', 'name' => 'D5', 'images' => []], 0, true, true);
+
+    TestRunner::assertTrue(get_post($merchant) !== null, 'merchant ⇒ se mantiene');
+    TestRunner::assertSame($merchant, (int) get_post_meta(10, '_thumbnail_id', true), 'su featured merchant se preserva');
+});
+
+TestRunner::test('T78.6 favorite borra sólo el featured reemplazado, jamás la galería', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-d6');
+    $a         = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/a.png');
+    $oldFeat   = alegra_seed_plugin_image(8003, 'https://cdn3.alegra.com/oldfeat.png');
+    $galPlugin = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/gal.png');
+    $merchant  = alegra_make_live_attachment(9000);
+    update_post_meta(10, '_thumbnail_id', $oldFeat);
+    update_post_meta(10, '_product_image_gallery', $galPlugin . ',' . $merchant);
+
+    $item = ['id' => 'it-d6', 'name' => 'D6', 'images' => [['id' => 'ia', 'url' => 'https://cdn3.alegra.com/a.png', 'favorite' => true]]];
+    make_products()->import_single_item_public($item, 0, true, true);
+
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'featured = nueva');
+    TestRunner::assertSame(null, get_post($oldFeat), 'el featured reemplazado se borra');
+    TestRunner::assertTrue(get_post($galPlugin) !== null, 'la galería plugin NO se toca');
+    TestRunner::assertSame($galPlugin . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
+});
+
 exit(TestRunner::summary());
