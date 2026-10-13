@@ -903,6 +903,13 @@ function set_post_thumbnail($post_id, $thumb_id)
 }
 function download_url($url, $timeout = 300) { return new WP_Error('http_request_failed', 'download disabled in harness'); }
 function media_handle_sideload($file_array, $post_id, $desc = null) { return new WP_Error('unsupported', 'sideload disabled in harness'); }
+function wp_get_attachment_url($attachment_id)
+{
+    // Derived from the attachment's own `_wp_attached_file`, mirroring WP.
+    $file = get_post_meta((int) $attachment_id, '_wp_attached_file', true);
+    if (!is_string($file) || $file === '') { return false; }
+    return 'https://example.test/wp-content/uploads/' . ltrim($file, '/');
+}
 
 // Terms -----------------------------------------------------------------
 function get_term($term_id, $taxonomy = '')

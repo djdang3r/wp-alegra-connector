@@ -2564,6 +2564,12 @@ class Products
 
         // --- Mode: only the favorite image ---
         if ($mode === 'favorite') {
+            // Todo 2: stamp an existing legacy/meta-less featured so it is
+            // dedup-aware and (once replaced) deletable, then resolve via the
+            // dedup path (reuse a live attachment, re-download a dead one).
+            // The gallery is NEVER touched and NO deletion happens here.
+            $this->backfill_legacy_thumbnail_marker($product_id);
+
             $url = $favorite_url;
             if (!$url) {
                 // No favorite flag → fallback to first image with URL
@@ -2577,7 +2583,10 @@ class Products
                     self::$image_stats['deferred']++;
                     return;
                 }
-                $this->import_product_image($product_id, $url);
+                $attachment_id = $this->download_and_attach_image($product_id, $url);
+                if ($attachment_id) {
+                    set_post_thumbnail($product_id, $attachment_id);
+                }
             }
             return;
         }
@@ -2674,6 +2683,10 @@ class Products
      */
     private function reconcile_product_images(int $product_id, array $images, string $mode, bool $allow_delete): void
     {
+        // Todo 2: stamp a legacy/meta-less featured so the orphan detection in
+        // Todo 3 can tell it apart from a merchant image.
+        $this->backfill_legacy_thumbnail_marker($product_id);
+
         // --- Resolve the DESIRED set (same selection rules as legacy) ---
         $favorite_url = null;
         foreach ($images as $img) {
@@ -2817,6 +2830,36 @@ class Products
     {
         return $attachment_id > 0
             && (string) get_post_meta($attachment_id, '_alegra_image_url', true) !== '';
+    }
+
+    /**
+     * Todo 2: if the product's current `_thumbnail_id` is a plugin/legacy
+     * attachment lacking the `_alegra_image_url` marker, stamp it from the
+     * attachment's own URL so it becomes dedup-aware (and, once replaced,
+     * deletable under Todo 3's guard). One-time and idempotent.
+     */
+    private function backfill_legacy_thumbnail_marker(int $product_id): void
+    {
+        $thumb = (int) get_post_meta($product_id, '_thumbnail_id', true);
+        if ($thumb <= 0) {
+            return;
+        }
+        if ((string) get_post_meta($thumb, '_alegra_image_url', true) !== '') {
+            return; // already marked
+        }
+
+        $url = function_exists('wp_get_attachment_url') ? wp_get_attachment_url($thumb) : false;
+        if (!is_string($url) || $url === '') {
+            return;
+        }
+        $normalized = self::normalize_image_url($url);
+        if ($normalized === '') {
+            return;
+        }
+        $hash = md5($normalized);
+        update_post_meta($thumb, '_alegra_image_url', $normalized);
+        update_post_meta($thumb, '_alegra_image_url_hash', $hash);
+        \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $thumb);
     }
 
     /**
@@ -3489,47 +3532,6 @@ class Products
         }
 
         return false;
-    }
-
-    private function import_product_image(int $product_id, string $image_url): void
-    {
-        if (empty($image_url)) return;
-
-        if (!self::is_allowed_image_url($image_url)) {
-            self::$image_stats['blocked']++;
-            $this->logger->warning('Blocked image download from a non-allowlisted host', [
-                'product_id' => $product_id,
-                'host' => (string) (wp_parse_url($image_url)['host'] ?? ''),
-            ]);
-            return;
-        }
-
-        require_once ABSPATH . 'wp-admin/includes/media.php';
-        require_once ABSPATH . 'wp-admin/includes/file.php';
-        require_once ABSPATH . 'wp-admin/includes/image.php';
-
-        $tmp = download_url($image_url, 15);
-        if (is_wp_error($tmp)) {
-            self::$image_stats['download']++;
-            $this->logger->warning('Image download failed for product ' . $product_id, ['error' => $tmp->get_error_message()]);
-            return;
-        }
-
-        $fallback = 'alegra-' . $product_id;
-        $check = wp_check_filetype_and_ext($tmp, $fallback . '.jpg');
-        $ext = !empty($check['ext'])
-            ? (string) $check['ext']
-            : self::extension_from_mime((string) (wp_get_image_mime($tmp) ?: mime_content_type($tmp)));
-        $file_array = ['name' => $fallback . '.' . $ext, 'tmp_name' => $tmp];
-
-        $attachment_id = media_handle_sideload($file_array, $product_id);
-        if (!is_wp_error($attachment_id)) {
-            self::$image_stats['ok']++;
-            set_post_thumbnail($product_id, $attachment_id);
-        } else {
-            self::$image_stats['sideload']++;
-            $this->logger->warning('Image sideload failed for product ' . $product_id, ['error' => $attachment_id->get_error_message()]);
-        }
     }
 
     public function sync_single_item_by_alegra_id(string $alegra_id): bool|string

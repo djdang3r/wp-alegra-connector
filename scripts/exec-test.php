@@ -15145,7 +15145,7 @@ TestRunner::test('T72.8 el resumen NO infla images: iguala el payload aunque la 
     // The harness only imports images on the UPDATE path (wc_get_product() does
     // not know a post created by wp_insert_post), so pre-link an existing WC
     // product. A blocked (private) host increments `blocked` WITHOUT any
-    // network call: is_allowed_image_url() fails and import_product_image()
+    // network call: is_allowed_image_url() fails and download_and_attach_image()
     // returns early (SSRF guard, default mode).
     alegra_make_product(10, ['name' => 'Con imagen']);
     update_post_meta(10, '_alegra_item_id', 'itm-img');
@@ -15668,7 +15668,7 @@ TestRunner::test('T76.8 un producto sano NO se toca ni cambia su destacada (conf
     TestRunner::assertFalse((bool) $r['still_missing'], 'tiene imagen viva');
 });
 
-TestRunner::test('T76.9 el modo configurado se obedece (favorite no deduplica)', function (): void {
+TestRunner::test('T76.9 el modo favorite deduplica (reusa el attachment vivo, no re-descarga)', function (): void {
     alegra_test_reset();
     alegra_make_product(10, ['name' => 'Cfg']);
     update_option('alegra_connector_sync_images', true);
@@ -15676,18 +15676,17 @@ TestRunner::test('T76.9 el modo configurado se obedece (favorite no deduplica)',
 
     $url  = 'https://cdn3.alegra.com/cfg.png';
     $hash = md5($url);
-    $att  = alegra_make_live_attachment(7500);
-    update_post_meta($att, '_alegra_image_url_hash', $hash);
-    update_post_meta($att, '_alegra_image_url', $url);
-    \Alegra\Connector\Entity_Map::map('image', $hash, 'attachment', $att);
+    $att  = alegra_seed_plugin_image(7500, $url);
     update_post_meta(10, '_thumbnail_id', 9998);   // muerto → needs_import
 
     $r = make_products()->repair_product_images(10, [['id' => 'i1', 'url' => $url, 'favorite' => true]]);
 
-    // favorite usa import_product_image() (sin dedup) → intenta descargar y falla,
-    // en vez de resolver la dedup viva como haría el modo `all`.
-    TestRunner::assertTrue((int) $r['images_failed'] >= 1, 'favorite NO usa dedup');
+    // Todo 2: el path favorite ahora resuelve por dedup (download_and_attach_image)
+    // en vez de descargar a ciegas: reusa el attachment vivo.
+    TestRunner::assertSame(0, (int) $r['images_failed'], 'favorite deduplica (no intenta descargar)');
+    TestRunner::assertSame(0, (int) $r['images_downloaded'], 'no crea un attachment nuevo');
     TestRunner::assertSame($att, \Alegra\Connector\Entity_Map::find_attachment_id($hash), 'el mapa vivo queda intacto');
+    TestRunner::assertSame($att, (int) get_post_meta(10, '_thumbnail_id', true), 'la featured = attachment deduplicado');
 });
 
 TestRunner::test('T76.10 attachment_is_live: offload (no-local / filtro) cuenta como viva', function (): void {
@@ -15967,6 +15966,77 @@ TestRunner::test('T77.4 reconcile en favorite: sólo featured, galería intacta'
 
     TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'featured = favorita');
     TestRunner::assertSame($stale . ',' . $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'favorite NO toca la galería');
+});
+
+TestRunner::test('T77.5 favorite marca un featured legacy (backfill de su propia URL)', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-bf');
+
+    // Featured legacy: attachment vivo SIN `_alegra_image_url` pero con su
+    // propio `_wp_attached_file` (del que se deriva la URL).
+    $legacy = alegra_make_live_attachment(7600);
+    update_post_meta($legacy, '_wp_attached_file', '2024/01/legacy.jpg');
+    update_post_meta(10, '_thumbnail_id', $legacy);
+    TestRunner::assertSame('', (string) get_post_meta($legacy, '_alegra_image_url', true), 'sin marca al inicio');
+
+    $item = ['id' => 'it-bf', 'name' => 'BF', 'reference' => 'SBF', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/other.png', 'favorite' => true],
+    ]];
+    make_products()->import_single_item_public($item, 0, false, false);   // legacy favorite ⇒ backfill
+
+    $url = (string) get_post_meta($legacy, '_alegra_image_url', true);
+    TestRunner::assertTrue($url !== '', 'el featured legacy queda marcado (backfill)');
+    TestRunner::assertSame(md5($url), (string) get_post_meta($legacy, '_alegra_image_url_hash', true), 'hash coherente');
+    TestRunner::assertSame($legacy, \Alegra\Connector\Entity_Map::find_attachment_id(md5($url)), 'mapa poblado para dedup/delete');
+});
+
+TestRunner::test('T77.6 favorite repetido: un solo attachment, misma featured, galería intacta', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-f2');
+    $att      = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/f.png');
+    $merchant = alegra_make_live_attachment(9000);
+    update_post_meta(10, '_product_image_gallery', (string) $merchant);
+
+    $item = ['id' => 'it-f2', 'name' => 'F2', 'reference' => 'SF2', 'images' => [
+        ['id' => 'ia', 'url' => 'https://cdn3.alegra.com/f.png', 'favorite' => true],
+    ]];
+    $p      = make_products();
+    $count0 = alegra_count_attachments();
+    $p->import_single_item_public($item, 0, false, false);   // favorite legacy (dedup)
+    $p->import_single_item_public($item, 0, false, false);
+
+    TestRunner::assertSame($count0, alegra_count_attachments(), 'el repeat no crea attachments');
+    TestRunner::assertSame($att, (int) get_post_meta(10, '_thumbnail_id', true), 'misma featured');
+    TestRunner::assertSame((string) $merchant, (string) get_post_meta(10, '_product_image_gallery', true), 'galería intacta');
+});
+
+TestRunner::test('T77.7 favorite sin flag usa la primera URL y un host bloqueado no adjunta', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_sync_images', true);
+    update_option('alegra_connector_sync_images_mode', 'favorite');
+    alegra_seed_linked_product(10, 'it-fe');
+    $a = alegra_seed_plugin_image(8001, 'https://cdn3.alegra.com/first.png');
+
+    // Sin flag favorite ⇒ usa la primera URL (dedup viva).
+    $item = ['id' => 'it-fe', 'name' => 'FE', 'reference' => 'SFE', 'images' => [
+        ['id' => 'i1', 'url' => 'https://cdn3.alegra.com/first.png'],
+    ]];
+    make_products()->import_single_item_public($item, 0, false, false);
+    TestRunner::assertSame($a, (int) get_post_meta(10, '_thumbnail_id', true), 'sin flag usa la primera URL');
+
+    // Host privado bloqueado ⇒ blocked, sin attachment.
+    \Alegra\Connector\Sync\Products::reset_image_stats();
+    update_post_meta(10, '_thumbnail_id', 0);
+    $item2 = ['id' => 'it-fe', 'name' => 'FE', 'reference' => 'SFE', 'images' => [
+        ['id' => 'ib', 'url' => 'http://10.0.0.5/x.png', 'favorite' => true],
+    ]];
+    make_products()->import_single_item_public($item2, 0, false, false);
+    TestRunner::assertSame(1, (int) \Alegra\Connector\Sync\Products::image_stats()['blocked'], 'host bloqueado ⇒ blocked');
+    TestRunner::assertSame(0, (int) get_post_meta(10, '_thumbnail_id', true), 'sin attachment');
 });
 
 exit(TestRunner::summary());
