@@ -2,6 +2,42 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.15] - 2026-10-13
+
+> **Nuevo "Borrador masivo (Reset total)" en Productos.** Elimina de una sola vez los
+> productos importados (`_alegra_item_id`), sus variaciones, TODAS sus imágenes
+> (archivos incluidos) y las referencias del plugin (metas, `Entity_Map`, tombstones),
+> dejando la base íntegra para reimportar limpio. **Operación IRREVERSIBLE.**
+
+### Added
+
+- **Borrador masivo (Reset total).** Botón danger en Productos con vista previa
+  read-only (conteos por tipo + imágenes deduplicadas + cuántos adjuntos se conservan),
+  confirmación escribiendo `BORRAR` **validada en el servidor**, y ejecución **por
+  lotes** con cursor por `product_id` (reanudable, nunca OFFSET), abortable
+  (kill switch / Detener) y con heartbeat. Al terminar reconcilia `Entity_Map`
+  (producto + adjunto) y limpia las lookup tables de WC.
+
+### Safety
+
+- **No toca Alegra.** Mientras borra, el wipe activa `set_syncing(true)`, así que
+  borrar un producto en WooCommerce NO dispara el push de borrado a Alegra.
+- **No bloquea el reimport.** Se desactiva el hook de tombstones durante el borrado y,
+  al cerrar, se borran los tombstones por **valor `_alegra_item_id`** (nunca por id de
+  post), de modo que una reimportación normal recrea los productos.
+- **Exclusión mutua real.** Usa el **mismo lock** que la importación de productos
+  (`alegra_sync_running_products`) y no arranca con el kill switch activo, con una
+  importación viva, o con `alegra_batch_state`/owner presentes.
+- **Borrado quirúrgico.** Solo borra productos con `_alegra_item_id` (+ variaciones) y
+  sus imágenes. Una imagen se conserva si la referencia un **término**, el **logo del
+  sitio**, el **placeholder de WC** o un post **fuera del set**; las compartidas entre
+  dos productos del wipe se borran una sola vez. **No** se tocan órdenes, clientes,
+  facturas, pagos, ajustes, cupones, categorías, productos no importados ni archivos
+  no-imagen.
+- **Export de seguridad** (admin-only, en `uploads/alegra-wipe/` con `.htaccess` +
+  `index.php` de denegación) generado al confirmar; **NO puede restaurar los archivos
+  de imagen** (se destruyen).
+
 ## [2.8.14] - 2026-10-13
 
 > **"Traer productos" deja de DUPLICAR imágenes: reconcile idempotente + borrado seguro.**
