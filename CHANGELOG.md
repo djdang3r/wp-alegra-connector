@@ -2,6 +2,56 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.17] - 2026-10-13
+
+> **Endurecimiento del "Borrador masivo": se elimina el falso "Error de conexión"**
+> y los riesgos de concurrencia/timeout en host compartido. La causa más probable del
+> error era que un `notice`/`deprecation` de WC o de un tercero (con
+> `display_errors=On`) se anteponía al JSON del chunk y rompía el `JSON.parse` de
+> jQuery **aunque el borrado hubiera funcionado**.
+
+### Fixed
+
+- **H6 — JSON siempre válido.** Los handlers del wipe (`preview`/`start`/`page` y la
+  descarga del backup) abren un buffer de salida y lo **descartan** antes de responder
+  (`wipe_send_success`/`wipe_send_error` + `Content-Type` limpio). Un echo de PHP
+  durante `$product->delete(true)` ya no corrompe la respuesta.
+- **H4 — sin workers duplicados.** Se quitó `ignore_user_abort(true)` del handler de
+  página (una desconexión detiene al worker; el cursor keyset hace la reanudación
+  segura) y se agregó un **mutex por run por chunk**: si ya está tomado, responde
+  `busy` sin borrar.
+- **H2 — sin cascadas ilimitadas.** El presupuesto de tiempo se chequea antes de cada
+  producto **y** de cada imagen; un producto variable borra sus variaciones **una por
+  una** (con presupuesto) antes del padre. Las imágenes se borran antes que su post,
+  así un corte deja todo reanudable y sin archivos huérfanos. El cursor solo avanza
+  cuando el producto terminó.
+- **H5 — cierre íntegro y reanudable.** El cierre de integridad tiene **guard de
+  completitud** + presupuesto de reloj; un reintento no rehace ni saltea (los rollups
+  se conservan hasta completar). Antes un timeout dejaba el run `running` y el lock
+  tomado, y el reintento omitía la limpieza de lookup tables.
+- **H7 — sin basura ni O(N²).** Al éxito se borran el backup (opción + archivo); la
+  limpieza de lookup tables cubre también las variaciones borradas; los rollups se
+  apendean en una sola operación (ya no `array_unique(array_merge(...))` por chunk).
+- **H8 — variaciones vivas.** `Entity_Map::reconcile_orphans()` ya no borra el mapeo
+  de una `product_variation` que sigue existiendo (`post_type IN (...)`).
+- **H9 — autocuración.** `Runs::mark_abandoned()` reclasifica también los runs
+  `wipe_products` colgados (antes solo `chunked_import`).
+- **H13 — guard corto.** El wipe setea `set_syncing(true, 30)` (TTL corto por chunk)
+  para que un fatal a mitad de chunk no deje el guard de importación 300 s.
+- **H14 — logo/placeholder a salvo.** `delete_replaced_image()` respeta el
+  `custom_logo` del tema y el placeholder de WC (paridad con el borrado masivo).
+
+### Added
+
+- **H10 — Reanudar borrado.** Un botón en el modal re-emite el chunk (`alegra_wipe_page`)
+  sobre el **mismo cursor del servidor**, sin reiniciar ni re-pedir `BORRAR`.
+- **H15 — Cancelar detiene.** Mientras corre, Cancelar pide un stop cooperativo
+  (`alegra_wipe_cancel`/`Runs::request_stop`) y el chunk aborta con `reason=stopped`.
+
+### Tests
+
+- T86.17 actualizado (H4) + T86.21–T86.30 nuevos (H2/H4/H5/H6/H8/H9/H10/H13/H14/H15).
+
 ## [2.8.16] - 2026-10-13
 
 > **Fix del "Borrador masivo": timeout del preview y errores de UI.** El preview

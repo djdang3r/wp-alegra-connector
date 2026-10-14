@@ -2363,7 +2363,11 @@ class Alegra_Mock_Wpdb
                 $id = (int) ($row['wc_entity_id'] ?? 0);
                 $exists = true;
                 if ($type === 'product') {
-                    $exists = alegra_stub_post_type($id) === 'product';
+                    // H8: product mappings can target product OR product_variation.
+                    $stub_type = alegra_stub_post_type($id);
+                    $exists = stripos($query, 'post_type in') !== false
+                        ? in_array($stub_type, ['product', 'product_variation'], true)
+                        : ($stub_type === 'product');
                 } elseif ($type === 'customer') {
                     $exists = isset($GLOBALS['wp_users'][$id]);
                 } elseif ($type === 'attachment') {
@@ -2387,7 +2391,13 @@ class Alegra_Mock_Wpdb
             if (preg_match("/status\s*=\s*'([^']+)'/", $query, $m)) {
                 $rows = array_values(array_filter($rows, fn ($r) => ($r['status'] ?? '') === $m[1]));
             }
-            if (preg_match("/run_type\s*=\s*'([^']+)'/", $query, $m)) {
+            if (preg_match("/run_type\s+IN\s*\(([^)]*)\)/i", $query, $mi)) {
+                $wanted = [];
+                foreach (explode(',', $mi[1]) as $part) {
+                    $wanted[trim($part, " '\t\n\r")] = true;
+                }
+                $rows = array_values(array_filter($rows, fn ($r) => isset($wanted[(string) ($r['run_type'] ?? '')])));
+            } elseif (preg_match("/run_type\s*=\s*'([^']+)'/", $query, $m)) {
                 $rows = array_values(array_filter($rows, fn ($r) => ($r['run_type'] ?? '') === $m[1]));
             }
             if (preg_match("/started_at\s*<\s*'([^']+)'/", $query, $m)) {

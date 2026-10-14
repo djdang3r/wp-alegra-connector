@@ -260,6 +260,10 @@ class Runs
      * The chunked import is multi-request: if the browser closes, no further
      * request arrives and the row stays `running` until mark_stale()'s 1h TTL.
      * A live cron/manual is a live request; if it dies, mark_stale() covers it.
+     *
+     * H9: `wipe_products` is also a browser-driven, multi-request run. When it
+     * crashes mid-wipe its `running` row blocks the next import/retry until the
+     * heartbeat TTL, so it must be reaped here too (self-healing).
      */
     public static function mark_abandoned(int $grace_seconds = 180): void
     {
@@ -270,7 +274,7 @@ class Runs
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT id FROM $table
-             WHERE status = 'running' AND run_type = 'chunked_import' AND started_at < %s
+             WHERE status = 'running' AND run_type IN ('chunked_import', 'wipe_products') AND started_at < %s
              LIMIT 50",
             $cutoff
         ));

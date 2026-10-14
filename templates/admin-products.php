@@ -443,6 +443,9 @@ if ($total_pages > 1) {
                 <span class="dashicons dashicons-download" style="font-size:14px;width:14px;height:14px;"></span>
                 <?php esc_html_e('Descargar backup', 'alegra-connector'); ?>
             </a>
+            <button type="button" class="ac-btn ac-wipe-resume" style="display:none;">
+                <?php esc_html_e('Reanudar borrado', 'alegra-connector'); ?>
+            </button>
             <button type="button" class="ac-btn ac-wipe-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
             <button type="button" class="ac-btn ac-btn-danger ac-wipe-confirm" disabled><?php esc_html_e('Borrar todo', 'alegra-connector'); ?></button>
         </div>

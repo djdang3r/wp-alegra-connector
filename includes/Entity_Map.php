@@ -143,8 +143,11 @@ class Entity_Map
         $table = $wpdb->prefix . 'alegra_entity_map';
 
         // [wc_entity_type, source table, id column, extra WHERE, stats key]
+        // H8: a surviving `product_variation` mapping must NOT be treated as an
+        // orphan. `product` mappings can point at either the parent `product` or
+        // a `product_variation`, so reconcile against BOTH post types.
         $checks = [
-            ['product',  $wpdb->posts, 'ID', "AND post_type = 'product'", 'products'],
+            ['product',  $wpdb->posts, 'ID', "AND post_type IN ('product', 'product_variation')", 'products'],
             ['customer', $wpdb->users, 'ID', '', 'customers'],
         ];
 

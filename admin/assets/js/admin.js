@@ -423,7 +423,16 @@
             var $bar      = $modal.find('.ac-wipe-bar-fill');
             var $log      = $modal.find('.ac-wipe-log');
             var $download = $modal.find('.ac-wipe-download');
+            var $resume   = $modal.find('.ac-wipe-resume');
             var running   = false;
+            var totals    = { products: 0, images: 0, skipped: 0 };
+            // A chunk can die mid-flight on a slow host (a non-JSON PHP fatal).
+            // The wipe is resumable via the server-side keyset cursor, so
+            // re-issuing the SAME chunk is safe: already-deleted products simply
+            // drop out of the set. Bounded so a truly dead backend still surfaces
+            // the error promptly.
+            var pageAttempts = 0;
+            var WIPE_PAGE_MAX_RETRIES = 3;
 
             function close() {
                 $modal.hide();
@@ -478,7 +487,7 @@
             // the destructive confirm.
             function resetBusy() {
                 running = false;
-                $cancel.text(S.cancel || 'Cancelar');
+                $cancel.prop('disabled', false).text(S.cancel || 'Cancelar');
             }
 
             $btn.on('click', function() {
@@ -531,27 +540,52 @@
             $cancel.on('click', function() {
                 // Allow closing whenever no chunk request is mid-flight. An
                 // errored run must NOT leave the modal permanently locked.
-                if (!running) { close(); }
+                if (!running) { close(); return; }
+
+                // H15: while a wipe is running, Cancelar requests a cooperative
+                // stop (Runs::request_stop); the chunk loop ends on the next poll.
+                $cancel.prop('disabled', true);
+                $log.text(S.wipeStopping || 'Deteniendo…');
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_wipe_cancel', _ajax_nonce: alegraConnector.nonce }
+                }).always(function() {
+                    $cancel.prop('disabled', false);
+                });
+            });
+
+            // H10: resume the SAME server-side keyset cursor. NEVER re-starts
+            // (which would require re-typing BORRAR and rebuild the id set).
+            $resume.on('click', function() {
+                if (running) { return; }
+                running = true;
+                pageAttempts = 0;
+                $confirm.prop('disabled', true);
+                $resume.hide();
+                $err.text('');
+                $progress.show();
+                $cancel.text(S.wipeRunning || 'Borrando…');
+                $log.text(S.wipeResuming || 'Reanudando el borrado…');
+                processPage();
             });
 
             $confirm.on('click', function() {
                 if (running) { return; }
                 running = true;
+                totals = { products: 0, images: 0, skipped: 0 };
+                pageAttempts = 0;
                 $confirm.prop('disabled', true);
+                $resume.hide();
                 $cancel.text(S.wipeRunning || 'Borrando…');
                 $err.text('');
                 $progress.show();
                 $bar.css('width', '2%').data('pct', 2);
+                startWipe();
+            });
 
-                var totals = { products: 0, images: 0, skipped: 0 };
-                // A chunk can die mid-flight on a slow host (a non-JSON PHP
-                // fatal). The wipe is resumable via the server-side keyset
-                // cursor, so re-issuing the SAME chunk is safe: already-deleted
-                // products simply drop out of the set. Bounded so a truly dead
-                // backend still surfaces the error promptly.
-                var pageAttempts = 0;
-                var WIPE_PAGE_MAX_RETRIES = 3;
-
+            function startWipe() {
                 $.ajax({
                     url: alegraConnector.ajaxUrl,
                     type: 'POST',
@@ -579,60 +613,69 @@
                     resetBusy();
                     $err.text(xhrMessage(xhr, S.connectionError));
                 });
+            }
 
-                function processPage() {
-                    $.ajax({
-                        url: alegraConnector.ajaxUrl,
-                        type: 'POST',
-                        dataType: 'json',
-                        data: { action: 'alegra_wipe_page', _ajax_nonce: alegraConnector.nonce }
-                    }).done(function(r) {
-                        if (!r || !r.success) {
-                            resetBusy();
-                            $err.text(bodyMessage(r, S.error));
-                            return;
-                        }
-                        pageAttempts = 0; // a healthy chunk clears the retry budget
-                        var d = r.data || {};
-                        totals.products += (d.products_deleted || 0);
-                        totals.images   += (d.images_deleted || 0);
-                        totals.skipped  += (d.images_skipped || 0);
-                        $log.text(fmt(S.wipeProgress, totals.products, totals.images, totals.skipped));
-                        var pct = Math.min(99, ($bar.data('pct') || 2) + 5);
-                        $bar.css('width', pct + '%').data('pct', pct);
-
-                        if (d.aborted) {
-                            resetBusy();
-                            $bar.css('width', '100%');
-                            $err.text((S.wipeAborted || 'Borrador detenido.') + ' ' + (d.reason || ''));
-                            return; // STOP — never re-call after abort.
-                        }
-                        if (d.done) {
-                            resetBusy();
-                            $bar.css('width', '100%');
-                            $log.text(fmt(S.wipeDone, totals.products, totals.images, totals.skipped));
-                            setTimeout(function() { location.reload(); }, 2500);
-                            return;
-                        }
-                        processPage();
-                    }).fail(function(xhr) {
-                        // .fail() covers both a transport error and a body
-                        // jQuery could not parse as JSON (a non-JSON PHP fatal).
-                        // Retry the SAME chunk with a short backoff; the server
-                        // cursor makes that idempotent. Only once the retries
-                        // are spent do we surface the real error — modal stays
-                        // open and Cancelar works. BORRAR is never re-armed.
-                        if (pageAttempts < WIPE_PAGE_MAX_RETRIES) {
-                            pageAttempts++;
-                            $log.text(fmt(S.wipeRetrying, pageAttempts, WIPE_PAGE_MAX_RETRIES));
-                            setTimeout(processPage, 1000 * pageAttempts);
-                            return;
-                        }
+            function processPage() {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_wipe_page', _ajax_nonce: alegraConnector.nonce }
+                }).done(function(r) {
+                    if (!r || !r.success) {
                         resetBusy();
-                        $err.text(xhrMessage(xhr, S.connectionError));
-                    });
-                }
-            });
+                        $err.text(bodyMessage(r, S.error));
+                        return;
+                    }
+                    pageAttempts = 0; // a healthy chunk clears the retry budget
+                    var d = r.data || {};
+                    totals.products += (d.products_deleted || 0);
+                    totals.images   += (d.images_deleted || 0);
+                    totals.skipped  += (d.images_skipped || 0);
+                    $log.text(fmt(S.wipeProgress, totals.products, totals.images, totals.skipped));
+                    var pct = Math.min(99, ($bar.data('pct') || 2) + 5);
+                    $bar.css('width', pct + '%').data('pct', pct);
+
+                    if (d.aborted) {
+                        resetBusy();
+                        $bar.css('width', '100%');
+                        $err.text((S.wipeAborted || 'Borrador detenido.') + ' ' + (d.reason || ''));
+                        return; // STOP — never re-call after abort.
+                    }
+                    if (d.done) {
+                        resetBusy();
+                        $bar.css('width', '100%');
+                        $log.text(fmt(S.wipeDone, totals.products, totals.images, totals.skipped));
+                        $resume.hide();
+                        setTimeout(function() { location.reload(); }, 2500);
+                        return;
+                    }
+                    // H4/H5: a concurrent chunk (busy) or an unfinished integrity
+                    // close (finalizing) is not an error — wait and poll again.
+                    if (d.busy || d.finalizing) {
+                        setTimeout(processPage, 700);
+                        return;
+                    }
+                    processPage();
+                }).fail(function(xhr) {
+                    // .fail() covers both a transport error and a body
+                    // jQuery could not parse as JSON (a non-JSON PHP fatal).
+                    // Retry the SAME chunk with a short backoff; the server
+                    // cursor makes that idempotent. Only once the retries
+                    // are spent do we surface the real error and offer a
+                    // manual resume — modal stays open and Cancelar works.
+                    // BORRAR is never re-armed.
+                    if (pageAttempts < WIPE_PAGE_MAX_RETRIES) {
+                        pageAttempts++;
+                        $log.text(fmt(S.wipeRetrying, pageAttempts, WIPE_PAGE_MAX_RETRIES));
+                        setTimeout(processPage, 1000 * pageAttempts);
+                        return;
+                    }
+                    resetBusy();
+                    $resume.show();
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                });
+            }
         },
 
         // -------------------------------------------------------------------

@@ -17186,13 +17186,20 @@ TestRunner::test('T86.16 ajax_wipe_start NO llama a wipe_preview (arranque livia
     \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
 });
 
-TestRunner::test('T86.17 los tres handlers de wipe elevan time limit / memoria / ignoran aborto', function (): void {
+TestRunner::test('T86.17 los handlers de wipe elevan time limit/memoria; preview+start ignoran aborto, page NO (H4)', function (): void {
     foreach (['ajax_wipe_preview', 'ajax_wipe_start', 'ajax_wipe_page'] as $m) {
         $src = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, $m);
         TestRunner::assertStringContains('set_time_limit', $src, $m . ' sube el límite de tiempo');
         TestRunner::assertStringContains('wp_raise_memory_limit', $src, $m . ' sube la memoria');
-        TestRunner::assertStringContains('ignore_user_abort', $src, $m . ' ignora el aborto del cliente');
     }
+    // H4: the page handler must NOT keep the worker alive after a client
+    // disconnect (concurrency hazard); preview/start still raise the ceiling.
+    $preview = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_wipe_preview');
+    $start   = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_wipe_start');
+    $page    = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'ajax_wipe_page');
+    TestRunner::assertStringContains('ignore_user_abort(true)', $preview, 'preview ignora el aborto del cliente');
+    TestRunner::assertStringContains('ignore_user_abort(true)', $start, 'start ignora el aborto del cliente');
+    TestRunner::assertStringNotContains('ignore_user_abort(true)', $page, 'H4: el page NO ignora el aborto');
 });
 
 TestRunner::test('T86.18 write_wipe_backup exporta TODOS los productos y es JSON válido (streaming)', function (): void {
@@ -17255,6 +17262,235 @@ TestRunner::test('T86.20 la UI reintenta un chunk fallido (mismo cursor) y sólo
     $retry = strpos($js, 'setTimeout(processPage');
     $reset = strrpos($js, '$err.text(xhrMessage(xhr, S.connectionError));');
     TestRunner::assertTrue($retry !== false && $reset !== false && $retry < $reset, 'primero reintenta, después muestra el error real');
+});
+
+echo "\nT86 — Bulk wipe (reset total) — hardening (H2/H4/H5/H6/H8/H9/H10/H13/H14/H15)\n";
+
+TestRunner::test('T86.21 H6: un echo de PHP durante el borrado no corrompe el JSON (ob limpiado)', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-h6' . $i);
+    }
+    // Simulate a WC/third-party notice printed mid-delete (display_errors=On).
+    add_action('woocommerce_delete_product', function () { echo "PHP Notice: boom\n"; });
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+
+    ob_start();
+    $resp = null;
+    try {
+        $admin->ajax_wipe_page();
+    } catch (\Alegra_Test_JSON_Response $e) {
+        $resp = $e;
+    }
+    $leaked = ob_get_clean();
+
+    TestRunner::assertTrue($resp !== null && $resp->success, 'H6: el handler responde JSON válido');
+    TestRunner::assertSame('', $leaked, 'H6: el output PHP se descartó antes del JSON');
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T86.22 H4: con el mutex del chunk tomado, el page responde busy y NO borra', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-h4' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $start = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    $run_id = (int) $start->payload['run_id'];
+
+    // A second worker already holds this run's chunk mutex.
+    $held = \Alegra\Connector\Sync\Controller::acquire_lock('alegra_wipe_chunk_' . $run_id, 60);
+    TestRunner::assertTrue(is_string($held) && $held !== '', 'mutex del chunk tomado');
+
+    $p = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    TestRunner::assertTrue((bool) ($p->payload['busy'] ?? false), 'H4: responde busy');
+    TestRunner::assertSame(0, (int) $p->payload['products_deleted'], 'H4: no borró nada con el mutex tomado');
+    TestRunner::assertTrue(wc_get_product(100) !== null, 'H4: el primer producto sigue vivo');
+
+    \Alegra\Connector\Sync\Controller::release_lock('alegra_wipe_chunk_' . $run_id, $held);
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T86.23 H5: el cierre tiene guard+presupuesto; un reintento no rehace ni saltea', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-fin');
+    \Alegra\Connector\Tombstone_Manager::create([
+        'alegra_id' => 'it-fin', 'alegra_type' => 'item', 'wc_post_id' => 10, 'reason' => 'bulk_wc',
+    ]);
+    \Alegra\Connector\Entity_Map::map('item', 'ghost-fin', 'product', 999999);
+    update_option('alegra_connector_wipe_alegra_ids', ['it-fin'], false);
+    update_option('alegra_connector_wipe_deleted_ids', [10], false);
+
+    // Budget 0 ⇒ does not complete: no guard, rollups kept for the retry.
+    $r1 = make_products()->wipe_finalize_integrity(['time_budget' => 0.0]);
+    TestRunner::assertFalse((bool) ($r1['complete'] ?? true), 'H5: presupuesto agotado ⇒ complete=false');
+    TestRunner::assertTrue(get_option('alegra_connector_wipe_alegra_ids', false) !== false, 'H5: rollups conservados');
+    TestRunner::assertFalse(get_option(\Alegra\Connector\Sync\Products::WIPE_FINALIZE_GUARD, false), 'H5: sin guard hasta completar');
+
+    // Retry with a budget: completes, sets the guard, drops the rollups.
+    $r2 = make_products()->wipe_finalize_integrity(['time_budget' => 30.0]);
+    TestRunner::assertTrue((bool) ($r2['complete'] ?? false), 'H5: el reintento completa');
+    TestRunner::assertTrue((bool) get_option(\Alegra\Connector\Sync\Products::WIPE_FINALIZE_GUARD, false), 'H5: guard seteado');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_wc_id('item', 'ghost-fin', 'product'), 'H5: el reintento no salteó la reconciliación');
+    TestRunner::assertFalse(get_option('alegra_connector_wipe_alegra_ids', false), 'H5: rollups limpiados al completar');
+
+    // Re-entry after completion: short-circuit (no destructive redo).
+    \Alegra\Connector\Tombstone_Manager::create([
+        'alegra_id' => 'it-late', 'alegra_type' => 'item', 'wc_post_id' => 11, 'reason' => 'bulk_wc',
+    ]);
+    \Alegra\Connector\Entity_Map::map('item', 'ghost-late', 'product', 999998);
+    $r3 = make_products()->wipe_finalize_integrity(['time_budget' => 30.0]);
+    TestRunner::assertTrue((bool) ($r3['complete'] ?? false), 'H5: re-entrada idempotente');
+    TestRunner::assertNotSame(null, \Alegra\Connector\Tombstone_Manager::exists_with_reason('item', 'it-late'), 'H5: re-entrada NO rehace (tombstone nuevo intacto)');
+    TestRunner::assertNotSame(null, \Alegra\Connector\Entity_Map::find_wc_id('item', 'ghost-late', 'product'), 'H5: re-entrada NO rehace la reconciliación');
+});
+
+TestRunner::test('T86.24 H8: un mapeo de una variación VIVA no se reconcilia como huérfano', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(20, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        21 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+    ]);
+    // A mapping row points at the SURVIVING variation (wc_entity_type 'product').
+    \Alegra\Connector\Entity_Map::map('item', 'it-var-map', 'product', 21);
+    // A genuinely orphan mapping to confirm reconcile still removes it.
+    \Alegra\Connector\Entity_Map::map('item', 'ghost-prod', 'product', 999999);
+
+    $removed = \Alegra\Connector\Entity_Map::reconcile_orphans();
+
+    TestRunner::assertNotSame(null, \Alegra\Connector\Entity_Map::find_wc_id('item', 'it-var-map', 'product'), 'H8: el mapeo de la variación viva sobrevive');
+    TestRunner::assertSame(null, \Alegra\Connector\Entity_Map::find_wc_id('item', 'ghost-prod', 'product'), 'H8: el huérfano real sí se reconcilia');
+    TestRunner::assertSame(1, (int) ($removed['products'] ?? 0), 'H8: sólo el huérfano real se contó');
+});
+
+TestRunner::test('T86.25 H9: un run wipe_products colgado se reclasifica (mark_abandoned)', function (): void {
+    alegra_test_reset();
+    $run_id = \Alegra\Connector\Runs::start('wipe_products');
+    foreach (($GLOBALS['alegra_db']['wp_alegra_runs'] ?? []) as $i => $row) {
+        if ((int) ($row['id'] ?? 0) === $run_id) {
+            $GLOBALS['alegra_db']['wp_alegra_runs'][$i]['started_at'] = '2000-01-01 00:00:00';
+        }
+    }
+    // A crashed worker leaves NO live heartbeat (forget clears the harness's
+    // per-request static cache so this mirrors a fresh request).
+    \Alegra\Connector\Heartbeat::forget($run_id);
+    \Alegra\Connector\Runs::mark_abandoned(180);
+    TestRunner::assertSame('stale', \Alegra\Connector\Runs::status($run_id), 'H9: el wipe colgado se reclasifica');
+});
+
+TestRunner::test('T86.26 H10: "Reanudar borrado" re-emite el page (mismo cursor), no el start', function (): void {
+    $js  = cfg2_source('admin/assets/js/admin.js');
+    $tpl = cfg2_source('templates/admin-products.php');
+    TestRunner::assertStringContains('ac-wipe-resume', $tpl, 'H10: botón Reanudar en el modal');
+    $pos = strpos($js, '$resume.on(');
+    $end = strpos($js, '$confirm.on(', $pos === false ? 0 : $pos);
+    TestRunner::assertTrue($pos !== false && $end !== false && $end > $pos, 'H10: hay handler de reanudar');
+    $body = substr($js, (int) $pos, (int) $end - (int) $pos);
+    TestRunner::assertStringContains('processPage', $body, 'H10: reanuda el loop del chunk');
+    TestRunner::assertStringNotContains("'alegra_wipe_start'", $body, 'H10: reanudar NO reinicia');
+});
+
+TestRunner::test('T86.27 H15: Cancelar durante el run pide stop y el chunk aborta con reason stopped', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 5; $i++) {
+        alegra_seed_linked_product(100 + $i, 'it-h15' . $i);
+    }
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $_POST['confirm'] = 'BORRAR';
+    $start = alegra_capture_json(fn () => $admin->ajax_wipe_start());
+    unset($_POST['confirm']);
+    $run_id = (int) $start->payload['run_id'];
+
+    $c = alegra_capture_json(fn () => $admin->ajax_wipe_cancel());
+    TestRunner::assertTrue($c->success, 'H15: el cancel responde ok');
+    TestRunner::assertTrue(\Alegra\Connector\Runs::should_stop($run_id), 'H15: se pidió stop al run');
+
+    $p = alegra_capture_json(fn () => $admin->ajax_wipe_page());
+    TestRunner::assertTrue((bool) ($p->payload['aborted'] ?? false), 'H15: el chunk aborta');
+    TestRunner::assertSame('stopped', (string) ($p->payload['reason'] ?? ''), 'H15: reason stopped');
+
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    TestRunner::assertStringContains('wp_ajax_alegra_wipe_cancel', $ctor, 'H15: acción de cancel registrada');
+    $js = cfg2_source('admin/assets/js/admin.js');
+    TestRunner::assertStringContains("'alegra_wipe_cancel'", $js, 'H15: la UI llama al cancel');
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T86.28 H13: el wipe setea set_syncing con TTL corto (no filtra 300s)', function (): void {
+    $src = alegra_method_source(\Alegra\Connector\Sync\Products::class, 'wipe_imported_products_chunk');
+    TestRunner::assertStringContains('set_syncing(true, 30)', $src, 'H13: TTL corto por chunk');
+    $pub = alegra_method_source(\Alegra\Connector\Public\Public_::class, 'set_syncing');
+    TestRunner::assertStringContains('int $ttl', $pub, 'H13: set_syncing acepta TTL');
+});
+
+TestRunner::test('T86.29 H14: delete_replaced_image nunca borra el logo ni el placeholder de WC', function (): void {
+    alegra_test_reset();
+    $products = make_products();
+    $logo = alegra_seed_plugin_image(8004, 'https://cdn3.alegra.com/logo.png');
+    set_theme_mod('custom_logo', $logo);
+    $ph = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/placeholder.png');
+    update_option('woocommerce_placeholder_image_id', $ph);
+
+    alegra_call_private($products, 'delete_replaced_image', $logo, 10);
+    alegra_call_private($products, 'delete_replaced_image', $ph, 10);
+    TestRunner::assertTrue(get_post($logo) !== null, 'H14: el logo sobrevive');
+    TestRunner::assertTrue(get_post($ph) !== null, 'H14: el placeholder sobrevive');
+
+    $plain = alegra_seed_plugin_image(8006, 'https://cdn3.alegra.com/plain.png');
+    alegra_call_private($products, 'delete_replaced_image', $plain, 10);
+    TestRunner::assertSame(null, get_post($plain), 'H14: una imagen plugin normal sí se borra');
+});
+
+TestRunner::test('T86.30 H2: las variaciones se borran con presupuesto, sin cascada y reanudables', function (): void {
+    alegra_test_reset();
+    // A "big" variable product: parent 200 + 6 imported variations.
+    $options = [];
+    $vars    = [];
+    for ($i = 201; $i <= 206; $i++) {
+        $options[] = 'C' . $i;
+        $vars[$i]  = ['variation_attributes' => ['attribute_color' => 'C' . $i]];
+    }
+    alegra_make_variable_product(200, ['color' => ['name' => 'Color', 'options' => $options]], $vars);
+    update_post_meta(200, '_alegra_item_id', 'it-big');
+    foreach (range(201, 206) as $i) {
+        update_post_meta($i, '_alegra_item_id', 'it-big-' . $i);
+        alegra_seed_plugin_image(9000 + $i, 'https://cdn3.alegra.com/v' . $i . '.png');
+        update_post_meta($i, '_thumbnail_id', 9000 + $i);
+    }
+    $wipe = array_merge([200], range(201, 206));
+
+    // Budget 0: at least one variation is deleted, the PARENT SURVIVES and the
+    // cursor does NOT advance past it → a resume re-processes the family.
+    $r1 = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => $wipe, 'time_budget' => 0.0]);
+    TestRunner::assertFalse((bool) $r1['aborted'], 'H2: presupuesto no es abort');
+    TestRunner::assertFalse((bool) $r1['done'], 'H2: quedan variaciones');
+    TestRunner::assertTrue((int) $r1['images_deleted'] >= 1, 'H2: borró al menos una imagen de variación');
+    TestRunner::assertTrue(wc_get_product(200) !== null, 'H2: el padre SOBREVIVE (sin cascada en un request)');
+    TestRunner::assertSame(0, (int) $r1['next_after_id'], 'H2: el cursor NO avanzó (reanudable)');
+    $survivors = 0;
+    foreach (range(201, 206) as $i) {
+        if (wc_get_product($i) !== null) { $survivors++; }
+    }
+    TestRunner::assertTrue($survivors >= 1, 'H2: quedan variaciones para el próximo chunk');
+
+    // Resume with a generous budget: finishes the parent + all variations.
+    $r2 = make_products()->wipe_imported_products_chunk((int) $r1['next_after_id'], 50, ['wipe_ids' => $wipe, 'time_budget' => 30.0]);
+    TestRunner::assertTrue((bool) $r2['done'], 'H2: la continuación termina');
+    TestRunner::assertSame(false, wc_get_product(200), 'H2: el padre se borra al final');
+    foreach (range(201, 206) as $i) {
+        TestRunner::assertSame(false, wc_get_product($i), 'H2: variación ' . $i . ' borrada');
+        TestRunner::assertSame(null, get_post(9000 + $i), 'H2: imagen de la variación ' . $i . ' borrada');
+    }
 });
 
 exit(TestRunner::summary());

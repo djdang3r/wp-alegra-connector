@@ -44,6 +44,15 @@ class Products
      */
     private const WC_PLACEHOLDER_OPTION = 'woocommerce_placeholder_image_id';
 
+    /**
+     * H5: completion guard for the bulk-wipe integrity close. Set once
+     * `wipe_finalize_integrity()` finishes; while set, a retry short-circuits
+     * instead of re-running (which would redo the destructive steps and, worse,
+     * skip the rollup-dependent cleanup already consumed). The admin start
+     * handler removes it when a NEW wipe begins.
+     */
+    public const WIPE_FINALIZE_GUARD = 'alegra_connector_wipe_finalize_complete';
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -2898,7 +2907,11 @@ class Products
      *  (a) plugin-created: it carries `_alegra_image_url`;
      *  (b) NOT referenced by another post as `_thumbnail_id`, nor inside another
      *      post's comma gallery (boundary-safe `FIND_IN_SET`, never LIKE '%id%');
-     *  (c) NOT referenced by any term `thumbnail_id` (conservative LIKE).
+     *  (c) NOT referenced by any term `thumbnail_id` (conservative LIKE);
+     *  (d) H14: NOT the theme `custom_logo`;
+     *  (e) H14: NOT the WC placeholder image.
+     * (d)/(e) mirror `wipe_attachment_verdict()` so the import rewrite path can
+     * never destroy the site logo or the shop placeholder.
      * On delete it also drops the `image`→attachment Entity_Map entry.
      */
     private function delete_replaced_image(int $attachment_id, int $product_id): void
@@ -2914,6 +2927,12 @@ class Products
         }
         if (self::attachment_referenced_by_term($attachment_id)) {
             return; // (c) used as a term thumbnail
+        }
+        if ((int) get_theme_mod('custom_logo') === $attachment_id) {
+            return; // (d) never delete the theme logo (H14)
+        }
+        if ((int) get_option(self::WC_PLACEHOLDER_OPTION) === $attachment_id) {
+            return; // (e) never delete the WC placeholder (H14)
         }
 
         $hash = (string) get_post_meta($attachment_id, '_alegra_image_url_hash', true);
@@ -3163,7 +3182,16 @@ class Products
      *        outside the wipe set (any member of the set is "internal").
      *  - H6: the chunk aborts on the kill switch or a requested stop.
      *
-     * @param array{run_id?:int,wipe_ids?:int[]} $opts
+     * H2: the ~20 s budget is enforced BEFORE each page item AND before each
+     * attachment deletion; a variable product's variations are deleted
+     * one-by-one (budget-gated) BEFORE the parent, so a single request never
+     * carries an unbounded `$product->delete(true)` cascade. Each object's
+     * attachments are deleted BEFORE the object itself, so an interrupted run
+     * leaves the object (and its meta) intact and the next chunk resumes with no
+     * orphan files. The keyset cursor only advances past a product once it (and
+     * its children) are fully gone.
+     *
+     * @param array{run_id?:int,wipe_ids?:int[],time_budget?:float} $opts
      * @return array{processed:int,products_deleted:int,images_deleted:int,images_skipped:int,next_after_id:int,done:bool,aborted:bool,reason:string}
      */
     public function wipe_imported_products_chunk(int $after_id, int $limit, array $opts = []): array
@@ -3221,22 +3249,26 @@ class Products
         $had_tombstone_hook = remove_action('before_delete_post', $tombstone_hook);
 
         // B1: suppress the WC delete → Alegra push for the whole chunk.
+        // H13: short TTL (re-set every chunk) so a mid-chunk fatal cannot leave
+        // the cross-process "import in progress" guard stuck for 5 minutes.
         if (!$was_syncing) {
-            \Alegra\Connector\Public\Public_::set_syncing(true);
+            \Alegra\Connector\Public\Public_::set_syncing(true, 30);
         }
 
-        $deleted_images  = [];
-        $alegra_ids      = [];
+        $deleted_images   = [];
+        $alegra_ids       = [];
         $deleted_products = [];
-        $deadline_hit    = false;
+        $last_complete    = $after_id;
+        $made_progress    = false;
+        $deadline_hit     = false;
 
         try {
             foreach ($ids as $product_id) {
                 $product_id = (int) $product_id;
 
-                // Budget check BETWEEN products: only after at least one has
-                // been processed, so progress (and the cursor) always advances.
-                if ($result['processed'] > 0 && microtime(true) >= $deadline) {
+                // Budget check BETWEEN page items: only after at least one
+                // deletion, so progress (and the cursor) always advances.
+                if ($made_progress && microtime(true) >= $deadline) {
                     $deadline_hit = true;
                     break;
                 }
@@ -3252,53 +3284,54 @@ class Products
                 if (!$product instanceof \WC_Product) {
                     // Already gone (e.g. a child deleted with its parent): advance
                     // the cursor without counting it.
-                    $result['next_after_id'] = $product_id;
+                    $last_complete = $product_id;
                     continue;
                 }
 
+                // H2: delete the variations one-by-one FIRST, so the parent's
+                // `delete(true)` can no longer carry an unbounded 100-cascade.
+                $children = ($product->is_type('variable') && method_exists($product, 'get_children'))
+                    ? array_values(array_map('intval', (array) $product->get_children()))
+                    : [];
+
+                $group_done = true;
+                foreach ($children as $child_id) {
+                    if ($made_progress && microtime(true) >= $deadline) {
+                        $group_done   = false;
+                        $deadline_hit = true;
+                        break;
+                    }
+                    $abort = self::wipe_abort_reason($run_id);
+                    if ($abort !== '') {
+                        $result['aborted'] = true;
+                        $result['reason']  = $abort;
+                        $group_done = false;
+                        break 2;
+                    }
+                    $child = wc_get_product($child_id);
+                    if (!$child instanceof \WC_Product) {
+                        continue;
+                    }
+                    if (!$this->wipe_delete_one($child, $child_id, $wipe_set, $deleted_images, $alegra_ids, $deleted_products, $result, $deadline, $made_progress)) {
+                        $group_done   = false;
+                        $deadline_hit = true;
+                        break;
+                    }
+                }
+                if (!$group_done) {
+                    break;
+                }
+
+                // The parent group: children are already gone, so this delete has
+                // no cascade. A false return means the budget tripped mid-images
+                // (the parent survives and the next chunk resumes it).
+                if (!$this->wipe_delete_one($product, $product_id, $wipe_set, $deleted_images, $alegra_ids, $deleted_products, $result, $deadline, $made_progress)) {
+                    $deadline_hit = true;
+                    break;
+                }
+
                 $result['processed']++;
-
-                // Collect BEFORE deleting: postmeta is gone afterwards.
-                $image_ids = $this->wipe_collect_image_ids($product);
-                $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
-                if ($alegra_id !== '') {
-                    $alegra_ids[] = $alegra_id;
-                }
-
-                // Drop the plugin's mapping rows for the product + its children.
-                \Alegra\Connector\Entity_Map::remove_by_wc('product', $product_id);
-                foreach ((array) $product->get_children() as $child_id) {
-                    \Alegra\Connector\Entity_Map::remove_by_wc('product', (int) $child_id);
-                }
-
-                // Delete the product (WC also removes its variations).
-                $product->delete(true);
-                $result['products_deleted']++;
-                $deleted_products[] = $product_id;
-
-                // Delete the collected attachments, at most once each (H5).
-                foreach ($image_ids as $att_id) {
-                    $att_id = (int) $att_id;
-                    if ($att_id <= 0 || isset($deleted_images[$att_id])) {
-                        continue;
-                    }
-                    $deleted_images[$att_id] = true;
-
-                    if ($this->wipe_attachment_verdict($att_id, $wipe_set) !== 'delete') {
-                        $result['images_skipped']++;
-                        continue;
-                    }
-
-                    $hash = (string) get_post_meta($att_id, '_alegra_image_url_hash', true);
-                    wp_delete_attachment($att_id, true);
-                    \Alegra\Connector\Entity_Map::remove_by_wc('attachment', $att_id);
-                    if ($hash !== '') {
-                        \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
-                    }
-                    $result['images_deleted']++;
-                }
-
-                $result['next_after_id'] = $product_id;
+                $last_complete = $product_id;
             }
         } finally {
             if (!$was_syncing) {
@@ -3309,23 +3342,12 @@ class Products
             }
         }
 
+        $result['next_after_id'] = $last_complete;
+
         // Persist the run-scoped rollups for the close/finalize step (B2 + L1).
-        if ($alegra_ids !== []) {
-            $existing = (array) get_option('alegra_connector_wipe_alegra_ids', []);
-            update_option(
-                'alegra_connector_wipe_alegra_ids',
-                array_values(array_unique(array_merge($existing, $alegra_ids))),
-                false
-            );
-        }
-        if ($deleted_products !== []) {
-            $existing = (array) get_option('alegra_connector_wipe_deleted_ids', []);
-            update_option(
-                'alegra_connector_wipe_deleted_ids',
-                array_values(array_unique(array_merge($existing, $deleted_products))),
-                false
-            );
-        }
+        // H7c: a single keyed append instead of an O(N²) unique+merge per chunk.
+        self::wipe_rollup_append('alegra_connector_wipe_alegra_ids', $alegra_ids);
+        self::wipe_rollup_append('alegra_connector_wipe_deleted_ids', $deleted_products);
 
         // A short page means the catalog was fully walked (keyset cursor). A
         // budget trip is a partial page too: the caller re-invokes the same
@@ -3333,6 +3355,103 @@ class Products
         $result['done'] = !$result['aborted'] && !$deadline_hit && count($ids) < $limit;
 
         return $result;
+    }
+
+    /**
+     * H2: delete ONE product/variation and its OWN images, budget-gated.
+     *
+     * Images are deleted BEFORE the post itself: if the budget trips mid-way the
+     * post (and its meta) survive, so the next chunk re-collects the remaining
+     * images — no orphan files and no lost progress. The caller only advances
+     * the keyset cursor once this returns true.
+     *
+     * @param array<int,true>     $wipe_set
+     * @param array<int,true>     $deleted_images
+     * @param string[]            $alegra_ids
+     * @param int[]               $deleted_products
+     * @param array<string,mixed> $result
+     * @return bool true when the object was fully deleted; false when the
+     *              deadline tripped first (caller must stop the chunk).
+     */
+    private function wipe_delete_one(
+        \WC_Product $product,
+        int $product_id,
+        array $wipe_set,
+        array &$deleted_images,
+        array &$alegra_ids,
+        array &$deleted_products,
+        array &$result,
+        float $deadline,
+        bool &$made_progress
+    ): bool {
+        $image_ids = self::product_image_refs($product);
+
+        // The object being deleted is "internal" even when it is NOT a member of
+        // the wipe set (e.g. a variation without its own `_alegra_item_id`):
+        // its own reference must not protect the attachment we are removing
+        // with it. A reference from any OTHER survivor still protects the file.
+        $verdict_set = $wipe_set;
+        $verdict_set[$product_id] = true;
+
+        foreach ($image_ids as $att_id) {
+            $att_id = (int) $att_id;
+            if ($att_id <= 0 || isset($deleted_images[$att_id])) {
+                continue;
+            }
+            // H2: per-attachment budget check. Stopping here leaves the post
+            // (and its meta) intact, so nothing is orphaned.
+            if ($made_progress && microtime(true) >= $deadline) {
+                return false;
+            }
+            $deleted_images[$att_id] = true;
+
+            if ($this->wipe_attachment_verdict($att_id, $verdict_set) !== 'delete') {
+                $result['images_skipped']++;
+                continue;
+            }
+
+            $hash = (string) get_post_meta($att_id, '_alegra_image_url_hash', true);
+            wp_delete_attachment($att_id, true);
+            \Alegra\Connector\Entity_Map::remove_by_wc('attachment', $att_id);
+            if ($hash !== '') {
+                \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
+            }
+            $result['images_deleted']++;
+            $made_progress = true;
+        }
+
+        $alegra_id = (string) get_post_meta($product_id, '_alegra_item_id', true);
+        if ($alegra_id !== '') {
+            $alegra_ids[] = $alegra_id;
+        }
+
+        \Alegra\Connector\Entity_Map::remove_by_wc('product', $product_id);
+        $product->delete(true);
+        $result['products_deleted']++;
+        $deleted_products[] = $product_id;
+        $made_progress = true;
+
+        return true;
+    }
+
+    /**
+     * H7c: append values to a set-valued option without rebuilding the array
+     * with `array_unique(array_merge(...))` on every chunk (which is O(N²) in
+     * the number of deleted products across the whole run).
+     */
+    private static function wipe_rollup_append(string $option, array $values): void
+    {
+        if ($values === []) {
+            return;
+        }
+        $set = [];
+        foreach ((array) get_option($option, []) as $existing) {
+            $set[(string) $existing] = true;
+        }
+        foreach ($values as $value) {
+            $set[(string) $value] = true;
+        }
+        update_option($option, array_keys($set), false);
     }
 
     /**
@@ -3437,9 +3556,19 @@ class Products
      *  - L1: force-clean the WC lookup tables for the deleted product ids.
      *  - Clear the wipe run options; clear the import cursor only when no owner.
      *
-     * @return array{tombstones_deleted:int,reconciled:array<string,int>,attachment_orphans:int,lookup_rows_deleted:int}
+     * H5: the close is BUDGETED and GUARDED. A big orphan table could otherwise
+     * run past the host timeout on the same request as the last chunk, leaving
+     * the run `running` + the lock held; a retry would then re-run the close
+     * AFTER `wipe_ids`/`wipe_deleted_ids` were consumed, skipping the
+     * rollup-dependent cleanup. Here the reconcile loop stops at the deadline and
+     * reports `complete=false` (options kept, nothing deleted prematurely); only
+     * a genuinely completed close records `WIPE_FINALIZE_GUARD` and drops the
+     * rollups. A retry then short-circuits (idempotent, no redo/skip).
+     *
+     * @param array{time_budget?:float} $opts
+     * @return array{tombstones_deleted:int,reconciled:array<string,int>,attachment_orphans:int,lookup_rows_deleted:int,complete:bool}
      */
-    public function wipe_finalize_integrity(): array
+    public function wipe_finalize_integrity(array $opts = []): array
     {
         global $wpdb;
 
@@ -3448,7 +3577,20 @@ class Products
             'reconciled'          => ['products' => 0, 'customers' => 0, 'orders' => 0],
             'attachment_orphans'  => 0,
             'lookup_rows_deleted' => 0,
+            'complete'            => false,
         ];
+
+        // H5: already completed in a previous request → idempotent no-op. Do NOT
+        // redo the destructive steps (they consumed their rollups already).
+        if ((bool) get_option(self::WIPE_FINALIZE_GUARD, false)) {
+            self::wipe_delete_rollup_options();
+            $report['complete'] = true;
+            return $report;
+        }
+
+        $time_budget = isset($opts['time_budget']) ? (float) $opts['time_budget'] : 15.0;
+        $deadline    = microtime(true) + max(0.0, $time_budget);
+        $exhausted   = false;
 
         // B2: tombstones are keyed by the Alegra id, not the post id.
         $alegra_ids = self::normalize_string_list(get_option('alegra_connector_wipe_alegra_ids', []));
@@ -3463,8 +3605,13 @@ class Products
         }
 
         // H3: product/customer orphans to exhaustion (keyset-free, batched).
+        // H5: wall-clock budget so a huge orphan set cannot blow the request.
         $guard = 0;
         do {
+            if (microtime(true) >= $deadline) {
+                $exhausted = true;
+                break;
+            }
             $round = \Alegra\Connector\Entity_Map::reconcile_orphans(1000);
             foreach ($round as $key => $count) {
                 $report['reconciled'][$key] = (int) ($report['reconciled'][$key] ?? 0) + (int) $count;
@@ -3472,20 +3619,27 @@ class Products
             $guard++;
         } while (array_sum($round) > 0 && $guard < 1000);
 
-        // H3: the explicit attachment pass.
-        $report['attachment_orphans'] = \Alegra\Connector\Entity_Map::reconcile_attachment_orphans(1000);
+        if (!$exhausted) {
+            // H3: the explicit attachment pass.
+            $report['attachment_orphans'] = \Alegra\Connector\Entity_Map::reconcile_attachment_orphans(1000);
 
-        // L1: WC lookup tables must carry no rows for the wiped ids.
-        $deleted_ids = self::normalize_id_list(get_option('alegra_connector_wipe_deleted_ids', []));
-        if ($deleted_ids !== []) {
-            $report['lookup_rows_deleted'] = $this->wipe_cleanup_lookup_tables($deleted_ids);
+            // L1: WC lookup tables must carry no rows for the wiped ids.
+            $deleted_ids = self::normalize_id_list(get_option('alegra_connector_wipe_deleted_ids', []));
+            if ($deleted_ids !== []) {
+                $report['lookup_rows_deleted'] = $this->wipe_cleanup_lookup_tables($deleted_ids);
+            }
         }
 
-        // Clear the wipe run options.
-        delete_option('alegra_connector_wipe_cursor');
-        delete_option('alegra_connector_wipe_ids');
-        delete_option('alegra_connector_wipe_alegra_ids');
-        delete_option('alegra_connector_wipe_deleted_ids');
+        if ($exhausted) {
+            // H5: keep the rollups + run options so the next poll RESUMES. The
+            // run must stay open — the caller must not finish/release it.
+            return $report;
+        }
+
+        // Truly complete: record the guard BEFORE dropping the rollups so a
+        // retry can never observe "guard unset + rollups gone".
+        update_option(self::WIPE_FINALIZE_GUARD, 1, false);
+        self::wipe_delete_rollup_options();
 
         // H1: only clear the shared import cursor when no chunked owner exists.
         if ((int) get_option('alegra_connector_products_chunk_owner', 0) <= 0) {
@@ -3494,7 +3648,19 @@ class Products
             delete_option('alegra_connector_products_chunk_owner');
         }
 
+        $report['complete'] = true;
         return $report;
+    }
+
+    /**
+     * H5: drop the run-scoped wipe options exactly once, on a completed close.
+     */
+    private static function wipe_delete_rollup_options(): void
+    {
+        delete_option('alegra_connector_wipe_cursor');
+        delete_option('alegra_connector_wipe_ids');
+        delete_option('alegra_connector_wipe_alegra_ids');
+        delete_option('alegra_connector_wipe_deleted_ids');
     }
 
     /**
@@ -3559,6 +3725,11 @@ class Products
      * The skip reasons here are BEST-EFFORT/cheap; the authoritative per-image
      * decision is still made at deletion time by `wipe_attachment_verdict()`.
      * Never writes anything.
+     *
+     * H11/H12 note: this is O(N) in the referenced-image count (two batched
+     * postmeta scans parsed in PHP, one reference map computed once). That is
+     * acceptable at the current scale; keyset-batch the scans only if the
+     * catalog grows past ~10k referenced images.
      *
      * @return array{products:int,variations:int,total_products:int,images:int,images_skipped:int,orders:int}
      */

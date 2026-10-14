@@ -429,15 +429,20 @@ class Public_
     /**
      * Set re-entrancy guard from outside (e.g., during import).
      * Uses transient for cross-process safety.
+     *
+     * H13: the transient TTL is caller-controlled. A long import can keep the
+     * default 300 s; a chunked flow whose worker may die mid-request (the bulk
+     * wipe) must pass a SHORT ttl and refresh it every chunk, so a fatal cannot
+     * leave the "import in progress" guard stuck for 5 minutes.
      */
-    public static function set_syncing(bool $syncing): void
+    public static function set_syncing(bool $syncing, int $ttl = 300): void
     {
         self::$is_syncing = $syncing;
 
         // AC-43: the docblock promised cross-process safety; make it real.
         // Importers call this so other PHP-FPM workers skip their WC hooks.
         if ($syncing) {
-            set_transient('alegra_import_in_progress', 1, 300);
+            set_transient('alegra_import_in_progress', 1, max(1, $ttl));
         } else {
             delete_transient('alegra_import_in_progress');
         }

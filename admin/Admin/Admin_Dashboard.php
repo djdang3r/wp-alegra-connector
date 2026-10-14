@@ -115,11 +115,12 @@ class Admin_Dashboard
         // task-15: non-destructive "Reparar imágenes" (Monitor panel), chunked.
         add_action('wp_ajax_alegra_repair_images', [$this, 'ajax_repair_images']);
         // Bulk wipe ("Borrador masivo / reset total"): preview + gated start +
-        // chunked page + admin-only backup download.
+        // chunked page + admin-only backup download + cooperative cancel.
         add_action('wp_ajax_alegra_wipe_preview', [$this, 'ajax_wipe_preview']);
         add_action('wp_ajax_alegra_wipe_start', [$this, 'ajax_wipe_start']);
         add_action('wp_ajax_alegra_wipe_page', [$this, 'ajax_wipe_page']);
         add_action('wp_ajax_alegra_wipe_download_backup', [$this, 'ajax_wipe_download_backup']);
+        add_action('wp_ajax_alegra_wipe_cancel', [$this, 'ajax_wipe_cancel']);
     }
 
     /**
@@ -1093,6 +1094,9 @@ class Admin_Dashboard
             'wipePreviewSkipped'    => __('%1$s imágenes protegidas/compartidas se conservarán; %2$s pedidos quedarán sin esos productos.', 'alegra-connector'),
             'wipeRunning'           => __('Borrando…', 'alegra-connector'),
             'wipeRetrying'          => __('Reintentando el borrado (%1$s/%2$s)…', 'alegra-connector'),
+            'wipeStopping'          => __('Deteniendo…', 'alegra-connector'),
+            'wipeResume'            => __('Reanudar borrado', 'alegra-connector'),
+            'wipeResuming'          => __('Reanudando el borrado…', 'alegra-connector'),
             'wipeProgress'          => __('Productos: %1$s · Imágenes: %2$s · Conservadas: %3$s', 'alegra-connector'),
             'wipeDone'              => __('Completado: %1$s productos y %2$s imágenes borrados (%3$s imágenes conservadas).', 'alegra-connector'),
             'wipeAborted'           => __('Borrador detenido:', 'alegra-connector'),
@@ -5860,13 +5864,75 @@ class Admin_Dashboard
     // =======================================================================
 
     /**
+     * H6: discard anything PHP printed since the handler started buffering.
+     *
+     * On a shared host (`display_errors=On`) a notice/deprecation emitted by WC
+     * or a third-party plugin during `$product->delete(true)` would otherwise be
+     * PREPENDED to the JSON body, so jQuery's `JSON.parse` fails and `.fail()`
+     * fires — the merchant sees "Error de conexión" EVEN WHEN THE DELETE
+     * SUCCEEDED. Every wipe handler opens an output buffer at the top and drops
+     * it right before answering.
+     */
+    private static function wipe_discard_output(): void
+    {
+        // ob_get_length() returns false when no buffer is active; when the
+        // handler's own buffer exists, always drop it (empty or not) so the
+        // request never leaves a dangling output buffer behind.
+        if (ob_get_length() !== false) {
+            ob_end_clean();
+        }
+    }
+
+    /**
+     * H6: send a JSON success with a clean body + explicit content type.
+     */
+    private static function wipe_send_success(array $data): void
+    {
+        self::wipe_discard_output();
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+        }
+        wp_send_json_success($data);
+    }
+
+    /**
+     * H6: send a JSON error with a clean body + explicit content type.
+     */
+    private static function wipe_send_error(array $data): void
+    {
+        self::wipe_discard_output();
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+        }
+        wp_send_json_error($data);
+    }
+
+    /**
+     * H7(a): on a SUCCESSFUL wipe, drop the safety export option AND its file.
+     *
+     * Decision: delete BOTH. Once the wipe completed, the snapshot has served
+     * its purpose (it cannot restore image files anyway) and leaving product
+     * data in `uploads/alegra-wipe/` forever is junk. An ABORTED wipe keeps the
+     * export (recovery safety) — only the success path calls this.
+     */
+    private static function wipe_cleanup_backup(): void
+    {
+        $file = (string) get_option('alegra_connector_wipe_backup_file', '');
+        delete_option('alegra_connector_wipe_backup_file');
+        if ($file !== '' && is_file($file)) {
+            @unlink($file);
+        }
+    }
+
+    /**
      * AJAX: READ-ONLY preview of the wipe (counts + blockers). Writes nothing.
      */
     public function ajax_wipe_preview(): void
     {
+        ob_start();
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
-            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
 
         // The preview is now bounded (constant # of queries), but a large
@@ -5893,7 +5959,7 @@ class Admin_Dashboard
             $blockers[] = 'chunk_owner';
         }
 
-        wp_send_json_success([
+        self::wipe_send_success([
             'preview'  => $preview,
             'blockers' => $blockers,
         ]);
@@ -5904,9 +5970,10 @@ class Admin_Dashboard
      */
     public function ajax_wipe_start(): void
     {
+        ob_start();
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
-            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
 
         // Start must be FAST: build the id set, take the lock, write the export,
@@ -5921,21 +5988,21 @@ class Admin_Dashboard
         // Server-side confirmation gate: never trust the UI checkbox alone.
         $confirm = isset($_POST['confirm']) ? strtoupper(trim((string) wp_unslash($_POST['confirm']))) : '';
         if ($confirm !== 'BORRAR') {
-            wp_send_json_error(['message' => __('Debés escribir BORRAR para confirmar el borrado.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('Debés escribir BORRAR para confirmar el borrado.', 'alegra-connector')]);
         }
 
         // H1 gates.
         if (\Alegra\Connector\Kill_Switch::is_active()) {
-            wp_send_json_error(['message' => __('El plugin está detenido (kill switch activo). Reactivalo antes de borrar.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('El plugin está detenido (kill switch activo). Reactivalo antes de borrar.', 'alegra-connector')]);
         }
         if (self::has_genuinely_live_run('products') || is_array(get_transient('alegra_batch_state')) || (int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
-            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
         }
 
         // H1: the SAME lock as the products import ⇒ real mutual exclusion.
         $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
         if ($lock === false) {
-            wp_send_json_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
         }
 
         // Build the payload INSIDE the try; send OUTSIDE it. In the execution
@@ -5958,6 +6025,9 @@ class Admin_Dashboard
                 update_option('alegra_connector_wipe_alegra_ids', [], false);
                 update_option('alegra_connector_wipe_deleted_ids', [], false);
                 update_option('alegra_connector_wipe_lock_token', (string) $lock, false);
+                // H5: a NEW wipe clears the previous run's finalize guard so the
+                // integrity close runs (and records the guard) for THIS run.
+                delete_option(Sync\Products::WIPE_FINALIZE_GUARD);
 
                 // M1: the safety export is written AFTER the gate, in a
                 // protected uploads subdir.
@@ -5996,10 +6066,10 @@ class Admin_Dashboard
             $error = __('No se pudo iniciar el borrador.', 'alegra-connector');
         }
 
-        if ($error !== '') {
-            wp_send_json_error(['message' => $error]);
+        if ($error !== '' || !is_array($payload)) {
+            self::wipe_send_error(['message' => $error !== '' ? $error : __('No se pudo iniciar el borrador.', 'alegra-connector')]);
         }
-        wp_send_json_success($payload);
+        self::wipe_send_success($payload);
     }
 
     /**
@@ -6119,6 +6189,7 @@ class Admin_Dashboard
      */
     public function ajax_wipe_download_backup(): void
     {
+        ob_start();
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
             wp_die(__('No tenés permisos.', 'alegra-connector'), 403);
@@ -6139,6 +6210,9 @@ class Admin_Dashboard
         if (function_exists('nocache_headers')) {
             nocache_headers();
         }
+        // H6: drop any notice/HTML already buffered so the downloaded file is
+        // byte-clean (a prepended warning would corrupt the JSON export).
+        self::wipe_discard_output();
         if (!headers_sent()) {
             header('Content-Type: application/json; charset=utf-8');
             header('Content-Disposition: attachment; filename="' . basename($file) . '"');
@@ -6149,12 +6223,19 @@ class Admin_Dashboard
 
     /**
      * AJAX: process one chunk of the wipe (M2: heartbeat + progress, abortable).
+     *
+     * H4: NO `ignore_user_abort()` — the wipe is chunked and resumable via the
+     * keyset cursor, so a client disconnect should STOP the worker instead of
+     * leaving a second worker deleting the same cursor concurrently. A short
+     * per-run chunk mutex serializes concurrent chunk requests.
+     * H6: output-buffered; the JSON body is always clean.
      */
     public function ajax_wipe_page(): void
     {
+        ob_start();
         check_ajax_referer('alegra_connector_nonce');
         if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
-            wp_send_json_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
         }
 
         // The delete path unlinks image files — the heaviest work in the plugin.
@@ -6162,19 +6243,19 @@ class Admin_Dashboard
         // fatal mid-request ("Error de conexión"). The chunk itself also
         // self-limits its work via a time budget (see
         // Products::wipe_imported_products_chunk), so this is just the ceiling.
+        // H4: deliberately NO ignore_user_abort() here (see the method docblock).
         @set_time_limit(300);
         wp_raise_memory_limit();
-        ignore_user_abort(true);
 
         $token = (string) get_option('alegra_connector_wipe_lock_token', '');
         if ($token === '') {
-            wp_send_json_error(['message' => __('No hay un borrador en curso.', 'alegra-connector')]);
+            self::wipe_send_error(['message' => __('No hay un borrador en curso.', 'alegra-connector')]);
         }
 
         // M2: the lock must still be ours; a lost lock aborts the run.
         if (!\Alegra\Connector\Sync\Controller::refresh_lock(self::WIPE_LOCK_KEY, $token, 300)) {
             $this->wipe_abort('lock_lost');
-            wp_send_json_success([
+            self::wipe_send_success([
                 'processed' => 0, 'products_deleted' => 0, 'images_deleted' => 0, 'images_skipped' => 0,
                 'next_after_id' => 0, 'done' => false, 'aborted' => true, 'reason' => 'lock_lost',
                 'message' => __('Se perdió el lock del borrador; se detuvo.', 'alegra-connector'),
@@ -6182,6 +6263,27 @@ class Admin_Dashboard
         }
 
         $run_id = (int) get_option('alegra_connector_wipe_run_id', 0);
+
+        // H4: per-run chunk mutex. Two concurrent requests on the same cursor
+        // would double-delete (and race the keyset). If another worker holds it,
+        // do NOTHING and let the client retry the same chunk.
+        $chunk_key  = 'alegra_wipe_chunk_' . $run_id;
+        $chunk_lock = \Alegra\Connector\Sync\Controller::acquire_lock($chunk_key, 60);
+        if ($chunk_lock === false) {
+            self::wipe_send_success([
+                'processed'        => 0,
+                'products_deleted' => 0,
+                'images_deleted'   => 0,
+                'images_skipped'   => 0,
+                'next_after_id'    => (int) get_option('alegra_connector_wipe_cursor', 0),
+                'done'             => false,
+                'aborted'          => false,
+                'busy'             => true,
+                'reason'           => '',
+                'message'          => __('Otro proceso está borrando; reintentando…', 'alegra-connector'),
+            ]);
+        }
+
         $cursor = max(0, (int) get_option('alegra_connector_wipe_cursor', 0));
 
         $products = new Sync\Products($this->api, $this->logger);
@@ -6199,12 +6301,41 @@ class Admin_Dashboard
             \Alegra\Connector\Runs::update_progress($run_id, (int) $result['processed'], 0);
         }
 
-        if (!empty($result['aborted'])) {
+        $aborted = !empty($result['aborted']);
+        $done    = !empty($result['done']);
+
+        // H5: run the integrity close with a guard; if it did not finish within
+        // its budget keep the run + rollups open and let the client poll again.
+        $report    = null;
+        $finalized = true;
+        if ($aborted || $done) {
+            $report    = $products->wipe_finalize_integrity();
+            $finalized = (bool) ($report['complete'] ?? true);
+        }
+
+        if (($aborted || $done) && !$finalized) {
+            \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+            self::wipe_send_success([
+                'processed'        => (int) $result['processed'],
+                'products_deleted' => (int) $result['products_deleted'],
+                'images_deleted'   => (int) $result['images_deleted'],
+                'images_skipped'   => (int) $result['images_skipped'],
+                'next_after_id'    => (int) $result['next_after_id'],
+                'done'             => false,
+                'aborted'          => false,
+                'finalizing'       => true,
+                'reason'           => '',
+                'report'           => $report,
+                'message'          => __('Finalizando la limpieza de integridad…', 'alegra-connector'),
+            ]);
+        }
+
+        if ($aborted) {
             // Close integrity even on a partial wipe: never leave tombstones that
-            // would block the re-import (B2).
-            $report = $products->wipe_finalize_integrity();
+            // would block the re-import (B2). The backup export is KEPT (safety).
             $this->wipe_abort((string) $result['reason']);
-            wp_send_json_success([
+            \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+            self::wipe_send_success([
                 'processed'        => (int) $result['processed'],
                 'products_deleted' => (int) $result['products_deleted'],
                 'images_deleted'   => (int) $result['images_deleted'],
@@ -6218,8 +6349,7 @@ class Admin_Dashboard
             ]);
         }
 
-        if (!empty($result['done'])) {
-            $report = $products->wipe_finalize_integrity();
+        if ($done) {
             if ($run_id > 0) {
                 \Alegra\Connector\Run_Context::finish($run_id, 'completed');
             }
@@ -6229,9 +6359,13 @@ class Admin_Dashboard
             delete_option('alegra_connector_wipe_lock_token');
             delete_option('alegra_connector_wipe_run_id');
 
+            // H7(a): the safety export served its purpose; delete option + file.
+            self::wipe_cleanup_backup();
+
             $this->log('warning', 'Bulk wipe completed', ['run_id' => $run_id, 'report' => $report]);
 
-            wp_send_json_success([
+            \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+            self::wipe_send_success([
                 'processed'        => (int) $result['processed'],
                 'products_deleted' => (int) $result['products_deleted'],
                 'images_deleted'   => (int) $result['images_deleted'],
@@ -6245,7 +6379,8 @@ class Admin_Dashboard
             ]);
         }
 
-        wp_send_json_success([
+        \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+        self::wipe_send_success([
             'processed'        => (int) $result['processed'],
             'products_deleted' => (int) $result['products_deleted'],
             'images_deleted'   => (int) $result['images_deleted'],
@@ -6255,6 +6390,34 @@ class Admin_Dashboard
             'aborted'          => false,
             'reason'           => '',
             'message'          => sprintf(__('Borrando… (%d procesados)', 'alegra-connector'), (int) $result['processed']),
+        ]);
+    }
+
+    /**
+     * AJAX: H15 — cooperative stop for a RUNNING wipe.
+     *
+     * The modal's Cancelar calls this while a run is in flight; the chunk loop
+     * observes `Runs::should_stop()` on its next check and reports
+     * `aborted`/`stopped`. Kept separate from the preview/start gates so it
+     * works even while the wipe owns the products lock.
+     */
+    public function ajax_wipe_cancel(): void
+    {
+        ob_start();
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        $run_id = (int) get_option('alegra_connector_wipe_run_id', 0);
+        if ($run_id > 0) {
+            \Alegra\Connector\Runs::request_stop($run_id);
+            $this->log('info', 'Bulk wipe stop requested', ['run_id' => $run_id]);
+        }
+
+        self::wipe_send_success([
+            'stopping' => true,
+            'message'  => __('Deteniendo el borrador…', 'alegra-connector'),
         ]);
     }
 
