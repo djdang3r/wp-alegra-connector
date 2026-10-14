@@ -132,9 +132,14 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_wipe_alegra_ids');
     delete_option('alegra_connector_wipe_deleted_ids');
     delete_option('alegra_connector_wipe_cursor');
+    delete_option('alegra_connector_wipe_orphan_cursor');
     delete_option('alegra_connector_wipe_lock_token');
     delete_option('alegra_connector_wipe_run_id');
     delete_option('alegra_connector_wipe_backup_file');
+    // Orphan plugin-image cleanup ("Limpiar imágenes huérfanas del plugin").
+    delete_option('alegra_connector_orphan_cursor');
+    delete_option('alegra_connector_orphan_lock_token');
+    delete_option('alegra_connector_orphan_run_id');
     delete_option('alegra_connector_import_time_budget');
     delete_option('alegra_connector_import_max_pages');
     delete_option('alegra_connector_chunked_page_budget');

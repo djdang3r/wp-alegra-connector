@@ -17688,4 +17688,356 @@ TestRunner::test('T86.37 (2.8.19) preview cuenta los parented (dedup) y el compa
     TestRunner::assertSame(1, (int) $res['images_deleted'], 'images_deleted=1 (sin doble borrado)');
 });
 
+TestRunner::test('T86.38 (2.8.19) full_wipe barre huérfanos del plugin sin padre; un wipe parcial no', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-full');
+
+    // Unattached plugin-signature orphan + a design orphan.
+    $f_o    = alegra_seed_real_file('alegra-77-');
+    $orphan = alegra_seed_orphan_attachment(8700, $f_o);
+    $f_d    = alegra_seed_real_file('design-');
+    $design = alegra_seed_orphan_attachment(8701, $f_d);
+
+    // Partial wipe (no full_wipe): the detached orphan survives.
+    make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+    TestRunner::assertTrue(get_post($orphan) !== null, 'wipe parcial NO toca el huérfano desprendido');
+
+    alegra_seed_linked_product(11, 'it-full2');
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [11], 'full_wipe' => true]);
+    TestRunner::assertSame(null, get_post($orphan), 'full_wipe barre el huérfano del plugin');
+    TestRunner::assertFalse(is_file($f_o), 'archivo del huérfano deslinkeado');
+    TestRunner::assertTrue(get_post($design) !== null, 'la imagen de diseño sobrevive');
+    TestRunner::assertTrue(is_file($f_d), 'archivo de diseño intacto');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'sólo el huérfano del plugin se borró');
+    TestRunner::assertTrue((bool) $res['done'], 'termina');
+});
+
+// ===========================================================================
+// === orphan plugin-image cleanup (2.8.19) =================================
+// ===========================================================================
+echo "\nT87 — Orphan plugin-image cleanup (Limpiar imágenes huérfanas del plugin)\n";
+
+/** Attachment VIVO sin padre (post_parent = 0) con `_wp_attached_file` y, si se
+ *  pasa, `_alegra_image_url` (marcador de creación del plugin). */
+function alegra_seed_orphan_attachment(int $id, string $file, string $url = ''): int
+{
+    alegra_make_live_attachment($id);
+    update_post_meta($id, '_wp_attached_file', $file);
+    if ($url !== '') {
+        update_post_meta($id, '_alegra_image_url', $url);
+        update_post_meta($id, '_alegra_image_url_hash', md5($url));
+        \Alegra\Connector\Entity_Map::map('image', md5($url), 'attachment', $id);
+    }
+    return $id;
+}
+
+/** Crea un archivo REAL en /tmp cuyo basename empieza con `$prefix`. */
+function alegra_seed_real_file(string $prefix): string
+{
+    $file = tempnam(sys_get_temp_dir(), $prefix);
+    file_put_contents($file, 'img');
+    return $file;
+}
+
+TestRunner::test('T87.1 orphan_preview cuenta SOLO huérfanos del plugin y es READ-ONLY', function (): void {
+    alegra_test_reset();
+
+    // (a) firma por FILENAME (`alegra-…`).
+    $f_orphan = alegra_seed_real_file('alegra-10-');
+    alegra_seed_orphan_attachment(8100, $f_orphan);
+
+    // (b) firma por `_alegra_image_url` (filename NO-alegra).
+    $f_url = alegra_seed_real_file('img-');
+    alegra_seed_orphan_attachment(8101, $f_url, 'https://cdn3.alegra.com/x.png');
+
+    // (c) DISEÑO: sin firma de filename y sin `_alegra_image_url`.
+    $f_design = alegra_seed_real_file('design-');
+    alegra_seed_orphan_attachment(8102, $f_design);
+
+    // (d) imagen del plugin adjunta a un producto VIVO ⇒ NO huérfana.
+    alegra_make_product(30, ['name' => 'LiveNIMP']);
+    $f_att    = alegra_seed_real_file('alegra-30-');
+    $attached = alegra_seed_orphan_attachment(8103, $f_att);
+    $GLOBALS['wp_posts'][$attached]->post_parent = 30;
+
+    $before  = serialize($GLOBALS['wp_postmeta']);
+    $preview = make_products()->orphan_preview();
+
+    TestRunner::assertSame(2, (int) $preview['count'], 'sólo los 2 huérfanos del plugin se cuentan');
+    TestRunner::assertSame(2, count($preview['sample']), 'la muestra lista 2 nombres');
+    TestRunner::assertSame($before, serialize($GLOBALS['wp_postmeta']), 'preview READ-ONLY (no muta postmeta)');
+});
+
+TestRunner::test('T87.2 orphan_cleanup_chunk borra huérfanos del plugin (post+archivo) y conserva el diseño', function (): void {
+    alegra_test_reset();
+    $f1 = alegra_seed_real_file('alegra-10-');
+    $o1 = alegra_seed_orphan_attachment(8100, $f1);
+    $f2 = alegra_seed_real_file('img-');
+    $o2 = alegra_seed_orphan_attachment(8101, $f2, 'https://cdn3.alegra.com/x.png');
+    $fd = alegra_seed_real_file('design-');
+    $d  = alegra_seed_orphan_attachment(8102, $fd);
+
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+
+    TestRunner::assertSame(null, get_post($o1), 'huérfano por filename borrado');
+    TestRunner::assertFalse(is_file($f1), 'archivo del huérfano filename deslinkeado');
+    TestRunner::assertSame(null, get_post($o2), 'huérfano por _alegra_image_url borrado');
+    TestRunner::assertTrue(get_post($d) !== null, 'imagen de DISEÑO (no-signature) conservada');
+    TestRunner::assertTrue(is_file($fd), 'archivo de diseño intacto');
+    TestRunner::assertSame(2, (int) $res['images_deleted'], '2 borradas');
+    TestRunner::assertSame(0, (int) $res['images_skipped'], 'la de diseño ni siquiera es candidata (no se cuenta)');
+    TestRunner::assertTrue((bool) $res['done'], 'una página corta termina');
+});
+
+TestRunner::test('T87.3 guards: huérfano del plugin referenciado/placeholder/logo/term NO se borra', function (): void {
+    alegra_test_reset();
+
+    $f_ref = alegra_seed_real_file('alegra-11-');
+    $ref   = alegra_seed_orphan_attachment(8110, $f_ref);
+    alegra_make_product(40, ['name' => 'Ref']);
+    update_post_meta(40, '_thumbnail_id', $ref);
+
+    $f_gal = alegra_seed_real_file('alegra-12-');
+    $gal   = alegra_seed_orphan_attachment(8111, $f_gal);
+    update_post_meta(40, '_product_image_gallery', (string) $gal);
+
+    $f_ph = alegra_seed_real_file('alegra-13-');
+    $ph   = alegra_seed_orphan_attachment(8112, $f_ph);
+    update_option('woocommerce_placeholder_image', $ph);
+
+    $f_logo = alegra_seed_real_file('alegra-14-');
+    $logo   = alegra_seed_orphan_attachment(8113, $f_logo);
+    set_theme_mod('custom_logo', $logo);
+
+    $f_term = alegra_seed_real_file('alegra-15-');
+    $term   = alegra_seed_orphan_attachment(8114, $f_term);
+    update_term_meta(500, 'thumbnail_id', $term);
+
+    $f_ok = alegra_seed_real_file('alegra-16-');
+    $ok   = alegra_seed_orphan_attachment(8115, $f_ok);
+
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+
+    TestRunner::assertTrue(get_post($ref) !== null, 'referenciado (thumbnail) conservado');
+    TestRunner::assertTrue(get_post($gal) !== null, 'referenciado (galería) conservado');
+    TestRunner::assertTrue(get_post($ph) !== null, 'placeholder conservado');
+    TestRunner::assertTrue(get_post($logo) !== null, 'logo conservado');
+    TestRunner::assertTrue(get_post($term) !== null, 'term thumbnail conservado');
+    TestRunner::assertSame(null, get_post($ok), 'el huérfano sin guards sí se borra (control)');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'sólo el control se borró');
+    TestRunner::assertSame(5, (int) $res['images_skipped'], '5 protegidos');
+});
+
+TestRunner::test('T87.4 una imagen del plugin adjunta a un producto VIVO NO se borra', function (): void {
+    alegra_test_reset();
+    alegra_make_product(30, ['name' => 'Live']);
+    $f   = alegra_seed_real_file('alegra-30-');
+    $att = alegra_seed_orphan_attachment(8120, $f);
+    $GLOBALS['wp_posts'][$att]->post_parent = 30;
+
+    $preview = make_products()->orphan_preview();
+    TestRunner::assertSame(0, (int) $preview['count'], 'con padre vivo no es huérfana');
+
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+    TestRunner::assertTrue(get_post($att) !== null, 'la imagen adjunta a un producto vivo sobrevive');
+    TestRunner::assertTrue(is_file($f), 'archivo intacto');
+    TestRunner::assertSame(0, (int) $res['images_deleted'], 'nada borrado');
+});
+
+TestRunner::test('T87.5 huérfano con padre BORRADO (post_parent a un post inexistente) se borra', function (): void {
+    alegra_test_reset();
+    alegra_make_product(50, ['name' => 'Deleted']);
+    $f   = alegra_seed_real_file('alegra-50-');
+    $att = alegra_seed_orphan_attachment(8130, $f);
+    $GLOBALS['wp_posts'][$att]->post_parent = 50;
+    wc_get_product(50)->delete(true);
+
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+    TestRunner::assertSame(null, get_post($att), 'el huérfano con padre borrado se elimina');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], '1 borrada');
+});
+
+TestRunner::test('T87.6 handlers AJAX: preview read-only, start exige BORRAR+run+lock, page borra y termina', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 3; $i++) {
+        $file = alegra_seed_real_file('alegra-' . (100 + $i) . '-');
+        alegra_seed_orphan_attachment(8200 + $i, $file);
+    }
+    $fd = alegra_seed_real_file('design-');
+    alegra_seed_orphan_attachment(8300, $fd);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+
+    $before = serialize($GLOBALS['wp_postmeta']);
+    $pv     = alegra_capture_json(fn () => $admin->ajax_orphan_preview());
+    TestRunner::assertTrue($pv->success, 'preview ok');
+    TestRunner::assertSame(3, (int) $pv->payload['preview']['count'], '3 huérfanos del plugin');
+    TestRunner::assertSame($before, serialize($GLOBALS['wp_postmeta']), 'preview read-only');
+
+    $_POST['confirm'] = 'NO';
+    $r1 = alegra_capture_json(fn () => $admin->ajax_orphan_start());
+    unset($_POST['confirm']);
+    TestRunner::assertFalse($r1->success, 'sin BORRAR se rechaza');
+
+    $_POST['confirm'] = 'BORRAR';
+    $ok = alegra_capture_json(fn () => $admin->ajax_orphan_start());
+    unset($_POST['confirm']);
+    TestRunner::assertTrue($ok->success, 'start ok');
+    $run_id = (int) $ok->payload['run_id'];
+    TestRunner::assertSame('running', \Alegra\Connector\Runs::status($run_id), 'run cleanup_orphan_images creado');
+    TestRunner::assertTrue(is_array(get_option('alegra_lock_alegra_sync_running_products', false)), 'lock del import tomado');
+
+    $deleted = 0;
+    $pages   = 0;
+    $last    = null;
+    do {
+        $last = alegra_capture_json(fn () => $admin->ajax_orphan_page());
+        $deleted += (int) $last->payload['images_deleted'];
+        $pages++;
+    } while (empty($last->payload['done']) && $pages < 20);
+
+    TestRunner::assertSame(3, $deleted, 'las 3 huérfanas del plugin se borraron');
+    TestRunner::assertTrue((bool) $last->payload['done'], 'el loop termina');
+    TestRunner::assertSame('completed', \Alegra\Connector\Runs::status($run_id), 'run completado');
+    TestRunner::assertTrue(get_post(8300) !== null, 'la imagen de diseño sobrevive al AJAX');
+    TestRunner::assertFalse(get_option('alegra_connector_orphan_run_id', false), 'run_id limpiado');
+    TestRunner::assertFalse(get_option('alegra_lock_alegra_sync_running_products', false), 'lock liberado');
+
+    \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+    \Alegra\Connector\Sync\Controller::reset_locks_for_testing();
+});
+
+TestRunner::test('T87.7 la UI de limpieza vive en el tab Avanzado de Configuración (ya no en Productos)', function (): void {
+    $settings = cfg2_source('templates/admin-settings.php');
+    TestRunner::assertStringContains('alegra-orphan-cleanup', $settings, 'botón en Configuración');
+    TestRunner::assertStringContains('alegra-orphan-modal', $settings, 'modal en Configuración');
+    TestRunner::assertStringContains('ac-orphan-confirm-input', $settings, 'input BORRAR');
+    TestRunner::assertStringContains('ac-orphan-list-all', $settings, 'toggle lista completa');
+    TestRunner::assertStringContains('diseño', $settings, 'avisa que no borra diseño');
+    TestRunner::assertStringContains('tab-advanced', $settings, 'existe el tab Avanzado');
+
+    // Placement proof: the button lives INSIDE #tab-advanced, i.e. after it.
+    $tab_pos    = strpos($settings, 'id="tab-advanced"');
+    $button_pos = strpos($settings, 'alegra-orphan-cleanup');
+    TestRunner::assertTrue($tab_pos !== false && $button_pos !== false && $button_pos > $tab_pos,
+        'el botón está dentro del bloque #tab-advanced');
+
+    // The button + modal were REMOVED from the Products page.
+    $products = cfg2_source('templates/admin-products.php');
+    TestRunner::assertTrue(strpos($products, 'alegra-orphan-cleanup') === false, 'el botón ya no está en Productos');
+    TestRunner::assertTrue(strpos($products, 'alegra-orphan-modal') === false, 'el modal ya no está en Productos');
+
+    $js = cfg2_source('admin/assets/js/admin.js');
+    TestRunner::assertStringContains('initOrphanCleanup', $js, 'init de la limpieza');
+    TestRunner::assertStringContains("'alegra_orphan_preview'", $js, 'llama al preview');
+    TestRunner::assertStringContains("'alegra_orphan_start'", $js, 'llama al start');
+    TestRunner::assertStringContains("'alegra_orphan_page'", $js, 'llama al page');
+    TestRunner::assertStringContains("'alegra_orphan_cancel'", $js, 'llama al cancel');
+    TestRunner::assertStringContains('full_list', $js, 'pide la lista completa de candidatos');
+    TestRunner::assertStringContains('d.aborted', $js, 'corta el loop si aborted');
+
+    // Scoping guard: the JSON/blocker helpers are LOCAL to each init function
+    // (not module-level), so initOrphanCleanup must define its own copies or it
+    // would throw a ReferenceError at runtime.
+    $start = strpos($js, 'initOrphanCleanup:');
+    $end   = strpos($js, 'initImportResidueBanner:', $start === false ? 0 : $start);
+    TestRunner::assertTrue($start !== false && $end !== false && $end > $start, 'hay bloque initOrphanCleanup');
+    $block = substr($js, (int) $start, (int) $end - (int) $start);
+    TestRunner::assertStringContains('function xhrMessage', $block, 'define xhrMessage local');
+    TestRunner::assertStringContains('function bodyMessage', $block, 'define bodyMessage local');
+    TestRunner::assertStringContains('function blockedMsg', $block, 'define blockedMsg local');
+
+    // The settings screen loads admin.js: enqueue_assets runs for any hook whose
+    // slug contains `alegra-connector` (the settings hook is
+    // `alegra-connector_page_alegra-connector-settings`), and localizes the
+    // `alegraConnector` object admin.js needs.
+    $enq = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, 'enqueue_assets');
+    TestRunner::assertStringContains("alegra-connector", $enq, 'enqueue scoped to plugin pages');
+    TestRunner::assertStringContains("'alegraConnector'", $enq, 'localiza el objeto alegraConnector');
+
+    $ctor = alegra_method_source(\Alegra\Connector\Admin\Admin_Dashboard::class, '__construct');
+    foreach (['alegra_orphan_preview', 'alegra_orphan_start', 'alegra_orphan_page', 'alegra_orphan_cancel'] as $act) {
+        TestRunner::assertStringContains('wp_ajax_' . $act, $ctor, 'acción registrada: ' . $act);
+    }
+
+    $strings = alegra_call_private_static(\Alegra\Connector\Admin\Admin_Dashboard::class, 'get_script_strings');
+    foreach (['orphanLoading', 'orphanPreview', 'orphanRunning', 'orphanProgress', 'orphanDone', 'orphanAborted', 'orphanListAll'] as $k) {
+        TestRunner::assertArrayHasKey($k, $strings, 'string ' . $k);
+    }
+});
+
+TestRunner::test('T87.10 firma endurecida: ^alegra-\\d+ rechaza alegra-promo/banner y acepta el patrón y el marcador', function (): void {
+    alegra_test_reset();
+
+    // (a) nombres estilo DISEÑO que NUNCA deben matchear la firma del plugin.
+    alegra_seed_orphan_attachment(9100, '2024/01/alegra-promo.jpg');
+    alegra_seed_orphan_attachment(9101, '2024/01/banner.jpg');
+    alegra_seed_orphan_attachment(9102, '2024/01/logo.png');
+
+    // (b) patrón REAL del plugin `alegra-<product_id>-<hash8>.<ext>` → candidato.
+    alegra_seed_orphan_attachment(9103, '2024/01/alegra-123-abcdef12.jpg');
+
+    // (c) firma por MARCADOR `_alegra_image_url` (filename NO matchea) → candidato.
+    alegra_seed_orphan_attachment(9104, '2024/01/foto.jpg', 'https://cdn3.alegra.com/p.png');
+
+    // (d) imagen del plugin con padre VIVO → firma sí, huérfana no.
+    alegra_make_product(30, ['name' => 'LiveNIMP']);
+    alegra_seed_orphan_attachment(9105, '2024/01/alegra-30-deadbeef.jpg');
+    $GLOBALS['wp_posts'][9105]->post_parent = 30;
+
+    $preview = make_products()->orphan_preview();
+    TestRunner::assertSame(2, (int) $preview['count'], 'solo el patrón alegra-<nid> y el marcador son candidatos');
+    TestRunner::assertSame(2, count($preview['sample']), 'la muestra lista 2 nombres');
+    TestRunner::assertSame([], $preview['all'], 'sin full_list no se devuelve la lista completa');
+
+    $full = make_products()->orphan_preview(true);
+    TestRunner::assertSame(2, count($full['all']), 'full_list trae todos los candidatos');
+    TestRunner::assertTrue(in_array('alegra-123-abcdef12.jpg', $full['all'], true), 'acepta alegra-123-abcdef12.jpg');
+    foreach ($full['all'] as $name) {
+        TestRunner::assertTrue(strpos($name, 'alegra-promo') === false, 'alegra-promo.jpg nunca es candidato');
+    }
+
+    // El chunk no borra nada que no matchee: sólo los 2 reales.
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+    TestRunner::assertSame(2, (int) $res['images_deleted'], 'solo 2 se borran');
+    TestRunner::assertTrue(get_post(9100) !== null, 'alegra-promo.jpg sobrevive');
+    TestRunner::assertTrue(get_post(9101) !== null, 'banner.jpg sobrevive');
+    TestRunner::assertTrue(get_post(9102) !== null, 'logo.png sobrevive');
+    TestRunner::assertTrue(get_post(9105) !== null, 'imagen con padre vivo sobrevive');
+});
+
+
+TestRunner::test('T87.8 el chunk se autolimita por presupuesto y reanuda por keyset (done=false, no aborted)', function (): void {
+    alegra_test_reset();
+    for ($i = 0; $i < 4; $i++) {
+        $file = alegra_seed_real_file('alegra-' . (200 + $i) . '-');
+        alegra_seed_orphan_attachment(8400 + $i, $file);
+    }
+
+    $r1 = make_products()->orphan_cleanup_chunk(0, 50, ['time_budget' => 0.0]);
+    TestRunner::assertFalse((bool) $r1['aborted'], 'presupuesto no es abort');
+    TestRunner::assertFalse((bool) $r1['done'], 'quedan huérfanas');
+    TestRunner::assertSame(1, (int) $r1['images_deleted'], 'procesa exactamente 1');
+    TestRunner::assertSame(8400, (int) $r1['next_after_id'], 'cursor keyset avanzó');
+
+    $r2 = make_products()->orphan_cleanup_chunk((int) $r1['next_after_id'], 50, ['time_budget' => 30.0]);
+    TestRunner::assertTrue((bool) $r2['done'], 'la continuación termina');
+    TestRunner::assertSame(3, (int) $r2['images_deleted'], 'borró las 3 restantes');
+});
+
+TestRunner::test('T87.9 el kill switch aborta el chunk sin borrar (aborted=true, reason kill_switch)', function (): void {
+    alegra_test_reset();
+    $f = alegra_seed_real_file('alegra-9-');
+    alegra_seed_orphan_attachment(8500, $f);
+    \Alegra\Connector\Kill_Switch::activate('test');
+    $res = make_products()->orphan_cleanup_chunk(0, 50);
+    \Alegra\Connector\Kill_Switch::deactivate();
+    \Alegra\Connector\Kill_Switch::reset_cache();
+
+    TestRunner::assertTrue((bool) $res['aborted'], 'aborta');
+    TestRunner::assertSame('kill_switch', (string) $res['reason'], 'reason kill_switch');
+    TestRunner::assertSame(0, (int) $res['images_deleted'], 'no borró');
+    TestRunner::assertTrue(get_post(8500) !== null, 'sigue viva');
+});
+
 exit(TestRunner::summary());

@@ -274,7 +274,7 @@ class Runs
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT id FROM $table
-             WHERE status = 'running' AND run_type IN ('chunked_import', 'wipe_products') AND started_at < %s
+             WHERE status = 'running' AND run_type IN ('chunked_import', 'wipe_products', 'cleanup_orphan_images') AND started_at < %s
              LIMIT 50",
             $cutoff
         ));

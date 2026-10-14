@@ -533,6 +533,22 @@ $ac_catalog = \Alegra\Connector\Billing_Fields::CATALOG;
 <div class="ac-tab-content" id="tab-advanced" style="display:none;">
 <h2><?php esc_html_e('Configuración Avanzada','alegra-connector');?></h2>
 
+<!-- 2.8.19: "Limpiar imágenes huérfanas del plugin" — advanced/danger action.
+     Moved here (from the Products page) at the merchant's request. -->
+<div class="ac-card" id="ac-orphan-cleanup-card" style="margin:6px 0 16px 0;border-left:4px solid var(--ac-danger);">
+<div class="ac-card-header"><h3 style="margin:0;"><?php esc_html_e('Mantenimiento: limpiar imágenes huérfanas del plugin','alegra-connector');?></h3></div>
+<div class="ac-notice warning" style="margin-bottom:12px;line-height:1.5;">
+    <strong><?php esc_html_e('Acción avanzada e irreversible.','alegra-connector');?></strong>
+    <?php esc_html_e('Elimina SOLO las imágenes creadas por el plugin (nombre alegra-<número> o marcador de Alegra) que quedaron huérfanas. NUNCA borra las imágenes de diseño de la tienda, el logo, el placeholder de WooCommerce, las miniaturas de categorías ni ninguna imagen referenciada por un post.','alegra-connector');?>
+</div>
+<p class="description" style="margin-bottom:10px;"><?php esc_html_e('Antes de eliminar se muestra el conteo exacto y una muestra (o la lista completa) de archivos. Tenés que escribir BORRAR para confirmar.','alegra-connector');?></p>
+<button type="button" class="ac-btn ac-btn-danger ac-btn-sm alegra-orphan-cleanup"
+        title="<?php esc_attr_e('Elimina SOLO las imágenes que creó el plugin (nombre alegra-<número> o marcador de Alegra) que quedaron huérfanas. No toca las imágenes de diseño de la tienda, el logo, el placeholder, las miniaturas de categorías ni ninguna imagen referenciada.','alegra-connector');?>">
+    <span class="dashicons dashicons-images-alt2" style="font-size:14px;width:14px;height:14px;"></span>
+    <?php esc_html_e('Limpiar imágenes huérfanas del plugin','alegra-connector');?>
+</button>
+</div>
+
 <table class="form-table">
 <!-- 2.8.x: reveal the 4 advanced sections (Importar, Documentación, Asistente,
      Reconciliación de stock) hidden by default. Stored INVERTED: checked = show
@@ -780,4 +796,40 @@ foreach ($ac_event_labels as $ac_slug => $ac_label): ?>
 
 </div>
 <?php submit_button(esc_html__('Guardar Cambios','alegra-connector'));?></form>
+
+<!-- Orphan plugin-image cleanup modal (2.8.19) -->
+<div id="alegra-orphan-modal" class="ac-modal-overlay" style="display:none;">
+    <div class="ac-modal">
+        <h2><?php esc_html_e('Limpiar imágenes huérfanas del plugin', 'alegra-connector'); ?></h2>
+
+        <div class="ac-notice error" role="alert" style="margin-bottom:12px;line-height:1.5;">
+            <strong><?php esc_html_e('OPERACIÓN IRREVERSIBLE.', 'alegra-connector'); ?></strong>
+            <?php esc_html_e('Se eliminarán SOLO las imágenes creadas por el plugin (nombre alegra-<número> o marcador de Alegra) que quedaron huérfanas. NUNCA se borran las imágenes de diseño de la tienda, el logo, el placeholder de WooCommerce, las miniaturas de categorías ni ninguna imagen referenciada por un post.', 'alegra-connector'); ?>
+        </div>
+
+        <p class="ac-orphan-counts" style="font-size:13px;color:var(--ac-text-secondary);min-height:18px;"></p>
+        <ul class="ac-orphan-sample" style="display:none;font-size:12px;color:var(--ac-text-muted);margin:6px 0;padding-left:18px;max-height:240px;overflow:auto;"></ul>
+        <a href="#" class="ac-orphan-list-all" style="display:none;font-size:12px;"><?php esc_html_e('Ver lista completa', 'alegra-connector'); ?></a>
+
+        <label style="display:block;margin-top:10px;font-size:13px;">
+            <span style="display:block;font-weight:600;margin-bottom:4px;"><?php esc_html_e('Para confirmar, escribí BORRAR:', 'alegra-connector'); ?></span>
+            <input type="text" class="ac-orphan-confirm-input" autocomplete="off" spellcheck="false"
+                   placeholder="BORRAR" style="width:100%;" />
+        </label>
+
+        <div class="ac-orphan-progress" style="display:none;margin-top:12px;">
+            <div style="height:8px;background:var(--ac-surface-alt);border-radius:4px;overflow:hidden;">
+                <div class="ac-orphan-bar-fill" style="height:100%;width:2%;background:var(--ac-danger);transition:width .3s;"></div>
+            </div>
+            <p class="ac-orphan-log" style="font-size:12px;color:var(--ac-text-muted);margin-top:6px;"></p>
+        </div>
+
+        <p class="ac-orphan-error" style="color:var(--ac-warning);font-size:12px;min-height:16px;margin-top:8px;"></p>
+
+        <div class="ac-modal-actions" style="margin-top:12px;display:flex;gap:10px;align-items:center;justify-content:flex-end;">
+            <button type="button" class="ac-btn ac-orphan-cancel"><?php esc_html_e('Cancelar', 'alegra-connector'); ?></button>
+            <button type="button" class="ac-btn ac-btn-danger ac-orphan-confirm" disabled><?php esc_html_e('Eliminar huérfanas', 'alegra-connector'); ?></button>
+        </div>
+    </div>
+</div>
 <?php include __DIR__ . '/footer.php'; ?></div>

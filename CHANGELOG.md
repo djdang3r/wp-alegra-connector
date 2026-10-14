@@ -9,6 +9,34 @@ All notable changes to Alegra Connector.
 > importadas se crean con `post_parent = producto` (`media_handle_sideload`) y
 > las que quedaron fuera de `_thumbnail_id`/galería (las "multiplicadas" de
 > reimports previos) sobrevivían al borrado y quedaban huérfanas en Medios.
+> Esta versión además agrega una **herramienta dedicada** para limpiar esos
+> huérfanos ya existentes sin tocar las imágenes de diseño de la tienda.
+
+### Added
+
+- **"Limpiar imágenes huérfanas del plugin" (Configuración → Avanzado).** Acción
+  avanzada de peligro que elimina **sólo** los adjuntos que cumplen TODO:
+  - **creados por el plugin** — `_alegra_image_url` presente **o** el basename de
+    `_wp_attached_file` matchea el patrón EXACTO `^alegra-\d+` (case-insensitive;
+    exige un **dígito** justo después de `alegra-`, que es el patrón
+    `alegra-<product_id>-<hash8>.<ext>` de `download_and_attach_image()`). Un
+    nombre como `alegra-promo.jpg` o `banner.jpg` **nunca** es candidato; **y**
+  - **huérfanos** — `post_parent = 0` **o** el padre ya no existe (producto
+    borrado); **y**
+  - **no protegidos** — no son el placeholder de WooCommerce (real + legacy), ni
+    el `custom_logo` del tema, ni la miniatura de ningún term, ni están
+    referenciados por ningún post como `_thumbnail_id` o dentro de una
+    `_product_image_gallery`.
+
+  Una imagen de diseño de la tienda **nunca** es candidata (su filename no matchea
+  y no tiene `_alegra_image_url`). Reutiliza la infraestructura del borrador: preview
+  **read-only** con el conteo exacto + muestra de filenames (y un toggle **"ver
+  lista completa"** que trae todos los candidatos, cap 2000), confirmación `BORRAR`
+  server-side, lock compartido con la importación + mutex de chunk, cursor keyset,
+  presupuesto de tiempo por chunk, un run `cleanup_orphan_images` y el guard de
+  salida JSON (ob buffer descartado). El botón y el modal viven ahora en el tab
+  **Avanzado** de Configuración (se movieron desde la página Productos a pedido
+  del comerciante); `admin.js` ya se encola y localiza en esa pantalla.
 
 ### Fixed
 
@@ -30,6 +58,13 @@ All notable changes to Alegra Connector.
 - **Preview consistente.** `wipe_preview()` cuenta los adjuntos parented
   (deduplicados) además de las refs, de modo que el merchant ve el número real
   de imágenes que el borrador va a eliminar.
+- **Un wipe FUTURO también barre los huérfanos desprendidos.** Además de los
+  adjuntos `post_parent IN (<grupo>)`, un wipe **completo** ahora recorre (con su
+  propio cursor keyset, presupuesto y guards) los adjuntos con la firma del
+  plugin que están **desprendidos** (`post_parent = 0` o padre inexistente) y
+  elimina los que pasan el mismo veredicto. Un wipe parcial/programático (sin
+  `full_wipe`) no los toca. Así, tras el reset, un eventual re-reset no vuelve a
+  dejar Medios con basura del plugin.
 
 ## [2.8.18] - 2026-10-14
 

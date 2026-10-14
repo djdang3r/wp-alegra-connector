@@ -65,6 +65,7 @@
             this.initShippingConfig();
             this.initImportResidueBanner();
             this.initBulkWipe();
+            this.initOrphanCleanup();
         },
 
         /**
@@ -673,6 +674,268 @@
                     }
                     resetBusy();
                     $resume.show();
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                });
+            }
+        },
+
+        // -------------------------------------------------------------------
+        // "Limpiar imágenes huérfanas del plugin". Preview is READ-ONLY; start
+        // requires typing BORRAR (also enforced server-side); the delete loop is
+        // chunked and STOP the instant the server reports aborted.
+        // -------------------------------------------------------------------
+        initOrphanCleanup: function() {
+            var $btn = $('.alegra-orphan-cleanup');
+            if (!$btn.length) { return; }
+
+            var $modal    = $('#alegra-orphan-modal');
+            var $counts   = $modal.find('.ac-orphan-counts');
+            var $sample   = $modal.find('.ac-orphan-sample');
+            var $listAll  = $modal.find('.ac-orphan-list-all');
+            var $input    = $modal.find('.ac-orphan-confirm-input');
+            var $confirm  = $modal.find('.ac-orphan-confirm');
+            var $cancel   = $modal.find('.ac-orphan-cancel');
+            var $err      = $modal.find('.ac-orphan-error');
+            var $progress = $modal.find('.ac-orphan-progress');
+            var $bar      = $modal.find('.ac-orphan-bar-fill');
+            var $log      = $modal.find('.ac-orphan-log');
+            var running   = false;
+            var deleted   = 0;
+            var processed = 0;
+            var attempts  = 0;
+            var MAX_RETRIES = 3;
+
+            // Render a list of filenames into the sample <ul> (shared by the
+            // 5-name preview and the "ver lista completa" full listing).
+            function renderSample(names, label) {
+                $sample.empty();
+                if (label) { $sample.append($('<li>').text(label)); }
+                (names || []).forEach(function(name) { $sample.append($('<li>').text(name)); });
+            }
+
+            function blockedMsg(blockers) {
+                if (!blockers || !blockers.length) { return ''; }
+                var map = {
+                    kill_switch: S.wipeBlockedKillSwitch,
+                    live_run:    S.wipeBlockedRunning,
+                    batch_state: S.wipeBlockedRunning,
+                    chunk_owner: S.wipeBlockedRunning
+                };
+                return blockers.map(function(b) { return map[b] || b; }).join(' ');
+            }
+
+            function xhrMessage(xhr, fallback) {
+                var msg = fallback || S.connectionError;
+                try {
+                    var t = xhr && xhr.responseText;
+                    if (t) {
+                        var j = JSON.parse(t);
+                        if (j && j.data && j.data.message) { return j.data.message; }
+                        if (j && j.message) { return j.message; }
+                    }
+                } catch (e) {}
+                return msg;
+            }
+
+            function bodyMessage(r, fallback) {
+                if (r && typeof r === 'object') {
+                    if (r.data && r.data.message) { return r.data.message; }
+                    if (r.message) { return r.message; }
+                }
+                return fallback || S.error;
+            }
+
+            function close() {
+                $modal.hide();
+                $('body').removeClass('ac-modal-open');
+            }
+
+            function resetBusy() {
+                running = false;
+                $cancel.prop('disabled', false).text(S.cancel || 'Cancelar');
+            }
+
+            function syncConfirm() {
+                var typed = String($input.val()).trim().toUpperCase() === 'BORRAR';
+                $confirm.prop('disabled', !typed);
+            }
+
+            $btn.on('click', function() {
+                if ($btn.prop('disabled')) { return; }
+                $err.text('');
+                $progress.hide();
+                $log.text('');
+                $sample.hide().empty();
+                $listAll.hide().text(S.orphanListAll || 'Ver lista completa');
+                $input.val('');
+                $confirm.prop('disabled', true);
+                $counts.text(S.orphanLoading || 'Buscando imágenes huérfanas del plugin…');
+                $modal.show();
+                $('body').addClass('ac-modal-open');
+                $btn.prop('disabled', true);
+
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_orphan_preview', _ajax_nonce: alegraConnector.nonce }
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        $counts.text('');
+                        $err.text(bodyMessage(r, S.error));
+                        return;
+                    }
+                    var d = r.data || {};
+                    var p = d.preview || {};
+                    var count = p.count || 0;
+                    if (count <= 0) {
+                        $counts.text(S.orphanPreviewNone || 'No se encontraron imágenes huérfanas del plugin.');
+                        $confirm.prop('disabled', true);
+                        return;
+                    }
+                    $counts.text(fmt(S.orphanPreview, count));
+                    if (p.sample && p.sample.length) {
+                        renderSample(p.sample, S.orphanSampleLabel || 'Ejemplos:');
+                        $sample.show();
+                    }
+                    if (count > (p.sample ? p.sample.length : 0)) {
+                        $listAll.text(S.orphanListAll || 'Ver lista completa').show();
+                    }
+                    var b = blockedMsg(d.blockers);
+                    if (b) {
+                        $err.text(b);
+                        $confirm.prop('disabled', true);
+                    }
+                }).fail(function(xhr) {
+                    $counts.text('');
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                }).always(function() {
+                    $btn.prop('disabled', false);
+                });
+            });
+
+            $input.on('input', syncConfirm);
+
+            // "Ver lista completa": re-run the READ-ONLY preview asking for the
+            // FULL filename list so the merchant can review every candidate
+            // before deleting. Still writes nothing.
+            $listAll.on('click', function(e) {
+                e.preventDefault();
+                $listAll.text(S.orphanListAllLoading || 'Cargando lista completa…');
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_orphan_preview', _ajax_nonce: alegraConnector.nonce, full_list: 1 }
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        $listAll.text(S.orphanListAll || 'Ver lista completa');
+                        $err.text(bodyMessage(r, S.error));
+                        return;
+                    }
+                    var all = (r.data && r.data.preview && r.data.preview.all) || [];
+                    renderSample(all, S.orphanListAllLabel || 'Lista completa de archivos a eliminar:');
+                    $sample.show();
+                    $listAll.hide();
+                }).fail(function(xhr) {
+                    $listAll.text(S.orphanListAll || 'Ver lista completa');
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                });
+            });
+
+            $cancel.on('click', function() {
+                if (!running) { close(); return; }
+                $cancel.prop('disabled', true);
+                $log.text(S.wipeStopping || 'Deteniendo…');
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_orphan_cancel', _ajax_nonce: alegraConnector.nonce }
+                }).always(function() {
+                    $cancel.prop('disabled', false);
+                });
+            });
+
+            $confirm.on('click', function() {
+                if (running) { return; }
+                running = true;
+                deleted = 0;
+                processed = 0;
+                attempts = 0;
+                $confirm.prop('disabled', true);
+                $cancel.text(S.orphanRunning || 'Limpiando…');
+                $err.text('');
+                $progress.show();
+                $bar.css('width', '2%').data('pct', 2);
+                startOrphan();
+            });
+
+            function startOrphan() {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_orphan_start', _ajax_nonce: alegraConnector.nonce, confirm: 'BORRAR' }
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        resetBusy();
+                        $err.text(bodyMessage(r, S.error));
+                        return;
+                    }
+                    processOrphanPage();
+                }).fail(function(xhr) {
+                    resetBusy();
+                    $err.text(xhrMessage(xhr, S.connectionError));
+                });
+            }
+
+            function processOrphanPage() {
+                $.ajax({
+                    url: alegraConnector.ajaxUrl,
+                    type: 'POST',
+                    dataType: 'json',
+                    data: { action: 'alegra_orphan_page', _ajax_nonce: alegraConnector.nonce }
+                }).done(function(r) {
+                    if (!r || !r.success) {
+                        resetBusy();
+                        $err.text(bodyMessage(r, S.error));
+                        return;
+                    }
+                    attempts = 0;
+                    var d = r.data || {};
+                    deleted   += (d.images_deleted || 0);
+                    processed += (d.processed || 0);
+                    $log.text(fmt(S.orphanProgress, processed, deleted, (processed - deleted)));
+                    var pct = Math.min(99, ($bar.data('pct') || 2) + 5);
+                    $bar.css('width', pct + '%').data('pct', pct);
+
+                    if (d.aborted) {
+                        resetBusy();
+                        $bar.css('width', '100%');
+                        $err.text((S.orphanAborted || 'Limpieza detenida:') + ' ' + (d.reason || ''));
+                        return;
+                    }
+                    if (d.done) {
+                        resetBusy();
+                        $bar.css('width', '100%');
+                        $log.text(fmt(S.orphanDone, deleted));
+                        setTimeout(function() { location.reload(); }, 2500);
+                        return;
+                    }
+                    if (d.busy) {
+                        setTimeout(processOrphanPage, 700);
+                        return;
+                    }
+                    processOrphanPage();
+                }).fail(function(xhr) {
+                    if (attempts < MAX_RETRIES) {
+                        attempts++;
+                        $log.text(fmt(S.wipeRetrying, attempts, MAX_RETRIES));
+                        setTimeout(processOrphanPage, 1000 * attempts);
+                        return;
+                    }
+                    resetBusy();
                     $err.text(xhrMessage(xhr, S.connectionError));
                 });
             }

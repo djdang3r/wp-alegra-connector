@@ -33,6 +33,13 @@ class Admin_Dashboard
      */
     private const WIPE_LOCK_KEY = 'alegra_sync_running_products';
 
+    /**
+     * Plugin-signature orphans examined per chunk by the "Limpiar imágenes
+     * huérfanas del plugin" tool. Larger than WIPE_CHUNK: an orphan delete is
+     * cheaper than a product delete (no cascade) — one post + one file.
+     */
+    private const ORPHAN_CHUNK = 50;
+
     /** Backup subdirectory (inside uploads) for the wipe safety export. */
     private const WIPE_BACKUP_DIR = 'alegra-wipe';
 
@@ -121,6 +128,13 @@ class Admin_Dashboard
         add_action('wp_ajax_alegra_wipe_page', [$this, 'ajax_wipe_page']);
         add_action('wp_ajax_alegra_wipe_download_backup', [$this, 'ajax_wipe_download_backup']);
         add_action('wp_ajax_alegra_wipe_cancel', [$this, 'ajax_wipe_cancel']);
+        // "Limpiar imágenes huérfanas del plugin": read-only preview + gated
+        // start + chunked delete + cooperative cancel. Same guards/infra as the
+        // bulk wipe, but it never touches products.
+        add_action('wp_ajax_alegra_orphan_preview', [$this, 'ajax_orphan_preview']);
+        add_action('wp_ajax_alegra_orphan_start', [$this, 'ajax_orphan_start']);
+        add_action('wp_ajax_alegra_orphan_page', [$this, 'ajax_orphan_page']);
+        add_action('wp_ajax_alegra_orphan_cancel', [$this, 'ajax_orphan_cancel']);
     }
 
     /**
@@ -1102,6 +1116,20 @@ class Admin_Dashboard
             'wipeAborted'           => __('Borrador detenido:', 'alegra-connector'),
             'wipeBlockedKillSwitch' => __('El plugin está detenido (kill switch). Reactivalo para borrar.', 'alegra-connector'),
             'wipeBlockedRunning'    => __('Hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector'),
+
+            // Orphan plugin-image cleanup ("Limpiar imágenes huérfanas del plugin").
+            'orphanLoading'         => __('Buscando imágenes huérfanas del plugin…', 'alegra-connector'),
+            'orphanPreview'         => __('Se eliminarán %1$s imágenes huérfanas del plugin. Se conservan las imágenes de diseño de la tienda y toda imagen referenciada.', 'alegra-connector'),
+            'orphanPreviewNone'     => __('No se encontraron imágenes huérfanas del plugin. No hay nada para limpiar.', 'alegra-connector'),
+            'orphanSampleLabel'     => __('Ejemplos:', 'alegra-connector'),
+            'orphanListAll'         => __('Ver lista completa', 'alegra-connector'),
+            'orphanListAllLoading'  => __('Cargando lista completa…', 'alegra-connector'),
+            'orphanListAllLabel'    => __('Lista completa de archivos a eliminar:', 'alegra-connector'),
+            'orphanRunning'         => __('Limpiando…', 'alegra-connector'),
+            'orphanProgress'        => __('Revisadas: %1$s · Eliminadas: %2$s · Conservadas: %3$s', 'alegra-connector'),
+            'orphanDone'            => __('Limpieza completada: %1$s imágenes huérfanas eliminadas.', 'alegra-connector'),
+            'orphanAborted'         => __('Limpieza detenida:', 'alegra-connector'),
+            'orphanNoPermission'    => __('No tenés permisos.', 'alegra-connector'),
 
             // D1 / REQ-CF-03: Consumidor Final (verificar/crear). Dueño único: T6.2.
             'cfVerifying'           => __('Verificando...', 'alegra-connector'),
@@ -6022,6 +6050,7 @@ class Admin_Dashboard
                 // Persist the authoritative set + reset the run-scoped rollups.
                 update_option('alegra_connector_wipe_ids', $wipe_ids, false);
                 update_option('alegra_connector_wipe_cursor', 0, false);
+                update_option('alegra_connector_wipe_orphan_cursor', 0, false);
                 update_option('alegra_connector_wipe_alegra_ids', [], false);
                 update_option('alegra_connector_wipe_deleted_ids', [], false);
                 update_option('alegra_connector_wipe_lock_token', (string) $lock, false);
@@ -6287,7 +6316,9 @@ class Admin_Dashboard
         $cursor = max(0, (int) get_option('alegra_connector_wipe_cursor', 0));
 
         $products = new Sync\Products($this->api, $this->logger);
-        $result = $products->wipe_imported_products_chunk($cursor, self::WIPE_CHUNK, ['run_id' => $run_id]);
+        // full_wipe: the UI always wipes ALL imported products, so the chunk
+        // also sweeps plugin-signature UNATTACHED orphans (B, 2.8.19).
+        $result = $products->wipe_imported_products_chunk($cursor, self::WIPE_CHUNK, ['run_id' => $run_id, 'full_wipe' => true]);
 
         // Persist the keyset cursor (never OFFSET).
         update_option('alegra_connector_wipe_cursor', (int) $result['next_after_id'], false);
@@ -6441,9 +6472,290 @@ class Admin_Dashboard
         delete_option('alegra_connector_wipe_lock_token');
         delete_option('alegra_connector_wipe_run_id');
         delete_option('alegra_connector_wipe_cursor');
+        delete_option('alegra_connector_wipe_orphan_cursor');
         delete_option('alegra_connector_wipe_ids');
         delete_option('alegra_connector_wipe_alegra_ids');
         delete_option('alegra_connector_wipe_deleted_ids');
+    }
+
+    // =======================================================================
+    // "Limpiar imágenes huérfanas del plugin".
+    //
+    // Targeted cleanup for the images the plugin created (`alegra-…` filename
+    // or `_alegra_image_url`) that the bulk wipe left behind as unattached
+    // orphans. Reuses the wipe's infra: read-only preview, server-side BORRAR,
+    // shared products lock + per-run chunk mutex, keyset cursor, wall-clock
+    // budget, a `cleanup_orphan_images` run and the JSON output guard.
+    // =======================================================================
+
+    /**
+     * AJAX: READ-ONLY preview — exact count of deletable plugin orphans + a
+     * small filename sample. Writes nothing.
+     */
+    public function ajax_orphan_preview(): void
+    {
+        ob_start();
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        @set_time_limit(120);
+        wp_raise_memory_limit();
+        ignore_user_abort(true);
+
+        $products = new Sync\Products($this->api, $this->logger);
+        $preview  = $products->orphan_preview(!empty($_POST['full_list']));
+
+        $blockers = [];
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            $blockers[] = 'kill_switch';
+        }
+        if (self::has_genuinely_live_run('products')) {
+            $blockers[] = 'live_run';
+        }
+        if (is_array(get_transient('alegra_batch_state'))) {
+            $blockers[] = 'batch_state';
+        }
+        if ((int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
+            $blockers[] = 'chunk_owner';
+        }
+
+        self::wipe_send_success([
+            'preview'  => $preview,
+            'blockers' => $blockers,
+        ]);
+    }
+
+    /**
+     * AJAX: start the orphan cleanup. Requires an exact server-side `BORRAR`,
+     * takes the SAME lock as the products import (mutual exclusion) and opens a
+     * `cleanup_orphan_images` run.
+     */
+    public function ajax_orphan_start(): void
+    {
+        ob_start();
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        @set_time_limit(120);
+        wp_raise_memory_limit();
+        ignore_user_abort(true);
+
+        $confirm = isset($_POST['confirm']) ? strtoupper(trim((string) wp_unslash($_POST['confirm']))) : '';
+        if ($confirm !== 'BORRAR') {
+            self::wipe_send_error(['message' => __('Debés escribir BORRAR para confirmar el borrado.', 'alegra-connector')]);
+        }
+
+        if (\Alegra\Connector\Kill_Switch::is_active()) {
+            self::wipe_send_error(['message' => __('El plugin está detenido (kill switch activo). Reactivalo antes de borrar.', 'alegra-connector')]);
+        }
+        if (self::has_genuinely_live_run('products') || is_array(get_transient('alegra_batch_state')) || (int) get_option('alegra_connector_products_chunk_owner', 0) > 0) {
+            self::wipe_send_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+        }
+
+        $lock = \Alegra\Connector\Sync\Controller::acquire_sync_lock_public('products');
+        if ($lock === false) {
+            self::wipe_send_error(['message' => __('Ya hay una importación en curso. Esperá a que termine o cancelala.', 'alegra-connector')]);
+        }
+
+        // Build inside the try, send outside it (wp_send_json throws in the
+        // harness, so a send inside try{} would be misreported as a failure).
+        $payload = null;
+        $error   = '';
+        try {
+            update_option('alegra_connector_orphan_cursor', 0, false);
+            update_option('alegra_connector_orphan_lock_token', (string) $lock, false);
+
+            $run_id = \Alegra\Connector\Run_Context::begin('cleanup_orphan_images', null, ['orphan' => true]);
+            update_option('alegra_connector_orphan_run_id', (int) $run_id, false);
+
+            $this->log('warning', 'Orphan image cleanup started', ['run_id' => $run_id]);
+
+            $payload = [
+                'run_id'  => (int) $run_id,
+                'chunk'   => self::ORPHAN_CHUNK,
+                'message' => __('Limpieza de imágenes huérfanas iniciada.', 'alegra-connector'),
+            ];
+        } catch (\Throwable $e) {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $lock);
+            \Alegra\Connector\Sync\Controller::force_release_sync_lock('products');
+            delete_option('alegra_connector_orphan_lock_token');
+            $this->log('error', 'Orphan image cleanup start failed', ['error' => $e->getMessage()]);
+            $error = __('No se pudo iniciar la limpieza.', 'alegra-connector');
+        }
+
+        if ($error !== '' || !is_array($payload)) {
+            self::wipe_send_error(['message' => $error !== '' ? $error : __('No se pudo iniciar la limpieza.', 'alegra-connector')]);
+        }
+        self::wipe_send_success($payload);
+    }
+
+    /**
+     * AJAX: one chunk of the orphan cleanup (heartbeat + progress, abortable).
+     * NO `ignore_user_abort()`: the run is resumable via its keyset cursor, so a
+     * client disconnect must STOP the worker instead of racing a second one.
+     * A short per-run chunk mutex serializes concurrent chunk requests.
+     */
+    public function ajax_orphan_page(): void
+    {
+        ob_start();
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        @set_time_limit(300);
+        wp_raise_memory_limit();
+
+        $token = (string) get_option('alegra_connector_orphan_lock_token', '');
+        if ($token === '') {
+            self::wipe_send_error(['message' => __('No hay una limpieza en curso.', 'alegra-connector')]);
+        }
+
+        if (!\Alegra\Connector\Sync\Controller::refresh_lock(self::WIPE_LOCK_KEY, $token, 300)) {
+            $this->orphan_abort('lock_lost');
+            self::wipe_send_success([
+                'processed' => 0, 'images_deleted' => 0, 'images_skipped' => 0,
+                'next_after_id' => 0, 'done' => false, 'aborted' => true, 'reason' => 'lock_lost',
+                'message' => __('Se perdió el lock de la limpieza; se detuvo.', 'alegra-connector'),
+            ]);
+        }
+
+        $run_id = (int) get_option('alegra_connector_orphan_run_id', 0);
+
+        $chunk_key  = 'alegra_orphan_chunk_' . $run_id;
+        $chunk_lock = \Alegra\Connector\Sync\Controller::acquire_lock($chunk_key, 60);
+        if ($chunk_lock === false) {
+            self::wipe_send_success([
+                'processed'      => 0,
+                'images_deleted' => 0,
+                'images_skipped' => 0,
+                'next_after_id'  => (int) get_option('alegra_connector_orphan_cursor', 0),
+                'done'           => false,
+                'aborted'        => false,
+                'busy'           => true,
+                'reason'         => '',
+                'message'        => __('Otro proceso está limpiando; reintentando…', 'alegra-connector'),
+            ]);
+        }
+
+        $cursor   = max(0, (int) get_option('alegra_connector_orphan_cursor', 0));
+        $products = new Sync\Products($this->api, $this->logger);
+        $result   = $products->orphan_cleanup_chunk($cursor, self::ORPHAN_CHUNK, ['run_id' => $run_id]);
+
+        update_option('alegra_connector_orphan_cursor', (int) $result['next_after_id'], false);
+
+        if ($run_id > 0) {
+            \Alegra\Connector\Heartbeat::set($run_id, [
+                'step'    => 'cleanup_orphan_images',
+                'message' => sprintf(__('Limpiando imágenes huérfanas… (%d revisadas)', 'alegra-connector'), (int) $result['processed']),
+            ]);
+            \Alegra\Connector\Runs::update_progress($run_id, (int) $result['processed'], 0);
+        }
+
+        $aborted = !empty($result['aborted']);
+        $done    = !empty($result['done']);
+
+        if ($aborted) {
+            $this->orphan_abort((string) $result['reason']);
+            \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+            self::wipe_send_success([
+                'processed'      => (int) $result['processed'],
+                'images_deleted' => (int) $result['images_deleted'],
+                'images_skipped' => (int) $result['images_skipped'],
+                'next_after_id'  => (int) $result['next_after_id'],
+                'done'           => false,
+                'aborted'        => true,
+                'reason'         => (string) $result['reason'],
+                'message'        => __('Limpieza detenida.', 'alegra-connector'),
+            ]);
+        }
+
+        if ($done) {
+            if ($run_id > 0) {
+                \Alegra\Connector\Run_Context::finish($run_id, 'completed');
+            }
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $token);
+            \Alegra\Connector\Sync\Controller::release_lock(self::WIPE_LOCK_KEY, $token);
+            delete_option('alegra_connector_orphan_lock_token');
+            delete_option('alegra_connector_orphan_run_id');
+            delete_option('alegra_connector_orphan_cursor');
+
+            $this->log('warning', 'Orphan image cleanup completed', ['run_id' => $run_id]);
+
+            \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+            self::wipe_send_success([
+                'processed'      => (int) $result['processed'],
+                'images_deleted' => (int) $result['images_deleted'],
+                'images_skipped' => (int) $result['images_skipped'],
+                'next_after_id'  => (int) $result['next_after_id'],
+                'done'           => true,
+                'aborted'        => false,
+                'reason'         => '',
+                'message'        => __('Limpieza de imágenes huérfanas completada.', 'alegra-connector'),
+            ]);
+        }
+
+        \Alegra\Connector\Sync\Controller::release_lock($chunk_key, $chunk_lock);
+        self::wipe_send_success([
+            'processed'      => (int) $result['processed'],
+            'images_deleted' => (int) $result['images_deleted'],
+            'images_skipped' => (int) $result['images_skipped'],
+            'next_after_id'  => (int) $result['next_after_id'],
+            'done'           => false,
+            'aborted'        => false,
+            'reason'         => '',
+            'message'        => sprintf(__('Limpiando… (%d revisadas)', 'alegra-connector'), (int) $result['processed']),
+        ]);
+    }
+
+    /**
+     * AJAX: cooperative stop for a RUNNING orphan cleanup.
+     */
+    public function ajax_orphan_cancel(): void
+    {
+        ob_start();
+        check_ajax_referer('alegra_connector_nonce');
+        if (!current_user_can('manage_woocommerce') || !current_user_can('delete_posts')) {
+            self::wipe_send_error(['message' => __('No tenés permisos.', 'alegra-connector')]);
+        }
+
+        $run_id = (int) get_option('alegra_connector_orphan_run_id', 0);
+        if ($run_id > 0) {
+            \Alegra\Connector\Runs::request_stop($run_id);
+            $this->log('info', 'Orphan image cleanup stop requested', ['run_id' => $run_id]);
+        }
+
+        self::wipe_send_success([
+            'stopping' => true,
+            'message'  => __('Deteniendo la limpieza…', 'alegra-connector'),
+        ]);
+    }
+
+    /**
+     * Abort the orphan cleanup: close the run, release the shared lock, drop
+     * the state.
+     */
+    private function orphan_abort(string $reason): void
+    {
+        $run_id = (int) get_option('alegra_connector_orphan_run_id', 0);
+        if ($run_id > 0) {
+            $status = $reason === 'stopped' ? 'cancelled' : 'failed';
+            \Alegra\Connector\Run_Context::finish($run_id, $status, $reason !== '' ? $reason : 'aborted');
+        }
+
+        $token = (string) get_option('alegra_connector_orphan_lock_token', '');
+        if ($token !== '') {
+            \Alegra\Connector\Sync\Controller::release_sync_lock_public('products', $token);
+            \Alegra\Connector\Sync\Controller::release_lock(self::WIPE_LOCK_KEY, $token);
+        }
+
+        delete_option('alegra_connector_orphan_lock_token');
+        delete_option('alegra_connector_orphan_run_id');
+        delete_option('alegra_connector_orphan_cursor');
     }
 
     /**

@@ -63,6 +63,13 @@ class Products
      */
     public const WIPE_FINALIZE_GUARD = 'alegra_connector_wipe_finalize_complete';
 
+    /**
+     * How many plugin-signature orphans the full-wipe sweep examines per chunk
+     * (B, 2.8.19). Small enough to stay inside the chunk's wall-clock budget
+     * while unlinking files; the keyset cursor makes it resumable.
+     */
+    private const WIPE_ORPHAN_CHUNK = 100;
+
     private ?API\Client $api;
     private ?Logger\Logger $logger;
 
@@ -3361,8 +3368,15 @@ class Products
             return $result;
         }
 
+        // B (2.8.19): a FULL wipe also sweeps plugin-signature UNATTACHED
+        // orphans after the products are walked, so a future reset reclaims
+        // images already orphaned (e.g. by a PM "delete permanently" or an
+        // older build). Partial/programmatic wipes opt out and only touch the
+        // group media. The sweep shares this chunk's budget + abort checks.
+        $full_wipe = !empty($opts['full_wipe']);
+
         $ids = $this->wipe_ids_page($after_id, $limit);
-        if (empty($ids)) {
+        if (empty($ids) && !$full_wipe) {
             $result['done'] = true;
             return $result;
         }
@@ -3386,6 +3400,7 @@ class Products
         $last_complete    = $after_id;
         $made_progress    = false;
         $deadline_hit     = false;
+        $orphans_done     = false;
 
         // H16: ids already deleted during this run (a variation removed as a
         // child of its parent, or an earlier chunk). `wc_get_product()` reads
@@ -3486,6 +3501,21 @@ class Products
                 $result['processed']++;
                 $last_complete = $product_id;
             }
+
+            // B (2.8.19): the full-wipe orphan sweep, inside the same
+            // try/finally so the tombstone + delete→Alegra push suppressions
+            // still hold while its attachments are unlinked. Only runs once the
+            // product catalog is walked (short page) so it never interleaves.
+            if ($full_wipe && !$result['aborted'] && !$deadline_hit && count($ids) < $limit) {
+                $this->wipe_sweep_orphan_signatures(
+                    $result,
+                    $deleted_images,
+                    $deadline,
+                    $made_progress,
+                    $orphans_done,
+                    $run_id
+                );
+            }
         } finally {
             if (!$was_syncing) {
                 \Alegra\Connector\Public\Public_::set_syncing(false);
@@ -3504,8 +3534,10 @@ class Products
 
         // A short page means the catalog was fully walked (keyset cursor). A
         // budget trip is a partial page too: the caller re-invokes the same
-        // keyset cursor (done=false, NOT aborted).
-        $result['done'] = !$result['aborted'] && !$deadline_hit && count($ids) < $limit;
+        // keyset cursor (done=false, NOT aborted). A full wipe is only done
+        // once BOTH the products and the orphan sweep are exhausted.
+        $products_done  = !$result['aborted'] && !$deadline_hit && count($ids) < $limit;
+        $result['done'] = $products_done && (!$full_wipe || $orphans_done);
 
         return $result;
     }
@@ -3831,6 +3863,7 @@ class Products
     private static function wipe_delete_rollup_options(): void
     {
         delete_option('alegra_connector_wipe_cursor');
+        delete_option('alegra_connector_wipe_orphan_cursor');
         delete_option('alegra_connector_wipe_ids');
         delete_option('alegra_connector_wipe_alegra_ids');
         delete_option('alegra_connector_wipe_deleted_ids');
@@ -4195,6 +4228,356 @@ class Products
         }
 
         return is_numeric($count) ? (int) $count : 0;
+    }
+
+    // =======================================================================
+    // Orphan plugin-image cleanup ("Limpiar imágenes huérfanas del plugin").
+    //
+    // The merchant case: the bulk wipe deleted the imported products but some
+    // images survived and were orphaned (`post_parent = 0`). This tool deletes
+    // ONLY attachments that satisfy ALL of:
+    //   (a) plugin-created — `_alegra_image_url` present OR the
+    //       `_wp_attached_file` basename matches `^alegra-\d+` (require a DIGIT
+    //       right after `alegra-`; the plugin writes
+    //       `alegra-<product_id>-<hash8>.<ext>`, see download_and_attach_image);
+    //   (b) orphan — `post_parent = 0` OR the parent post no longer exists;
+    //   (c) NOT protected — not the WC placeholder (real + legacy), not the
+    //       theme `custom_logo`, not any term `thumbnail_id`, and not referenced
+    //       by ANY post as `_thumbnail_id` or inside a `_product_image_gallery`.
+    //
+    // A filename that does NOT match the signature and has no `_alegra_image_url`
+    // is NEVER a candidate, so a store-design image can never be deleted. Reuses
+    // the wipe's verdict (`wipe_attachment_verdict`) so the guards cannot diverge.
+    // Chunked + keyset + budgeted + abortable.
+    // =======================================================================
+
+    /**
+     * True when the attachment carries the plugin's creation signature:
+     * `_alegra_image_url` present, OR the `_wp_attached_file` basename matches
+     * the plugin's EXACT naming pattern `alegra-<digits>…` (case-insensitive).
+     *
+     * The regex requires a DIGIT right after `alegra-` (the plugin names files
+     * `alegra-<product_id>-<hash8>.<ext>`, see download_and_attach_image), so a
+     * store-design image named e.g. `alegra-promo.jpg` is NEVER a candidate. The
+     * basename is derived from BOTH `/` and `\` separators so a Windows-style
+     * stored path still matches.
+     */
+    private static function attachment_has_plugin_signature(int $attachment_id): bool
+    {
+        if ($attachment_id <= 0) {
+            return false;
+        }
+        if ((string) get_post_meta($attachment_id, '_alegra_image_url', true) !== '') {
+            return true;
+        }
+        $file = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
+        if ($file === '') {
+            return false;
+        }
+        $base = basename(str_replace('\\', '/', $file));
+        return $base !== '' && preg_match('/^alegra-\d+/i', $base) === 1;
+    }
+
+    /**
+     * True when the attachment is orphaned: `post_parent = 0`, or its parent
+     * post no longer exists (the product was deleted). A LIVE parent — imported
+     * OR not — keeps the image.
+     */
+    private static function attachment_is_orphan(int $attachment_id): bool
+    {
+        $post = get_post($attachment_id);
+        if (!$post) {
+            return false;
+        }
+        $parent = (int) ($post->post_parent ?? 0);
+        if ($parent <= 0) {
+            return true;
+        }
+        return !self::attachment_parent_exists($parent);
+    }
+
+    /**
+     * True when the parent post id resolves to an existing post/product. Reads
+     * `get_post()` (production: products ARE `wp_posts`) and falls back to
+     * `wc_get_product()` so an environment whose products are not `wp_posts`
+     * rows (the execution harness) still sees a live parent.
+     */
+    private static function attachment_parent_exists(int $parent_id): bool
+    {
+        if ($parent_id <= 0) {
+            return false;
+        }
+        if (get_post($parent_id) !== null) {
+            return true;
+        }
+        if (function_exists('wc_get_product')) {
+            $product = wc_get_product($parent_id);
+            if ($product instanceof \WC_Product) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The authoritative delete verdict for the orphan-cleanup tool. `true` only
+     * when ALL hold: plugin signature + orphan + the wipe's protective guards
+     * with an EMPTY wipe set (so a reference from ANY post is external and
+     * protects the image). Reuses `wipe_attachment_verdict()` so the
+     * placeholder/logo/term/non-image/referenced guards can never diverge.
+     */
+    private function orphan_attachment_is_deletable(int $attachment_id): bool
+    {
+        if (!self::attachment_has_plugin_signature($attachment_id)) {
+            return false;
+        }
+        if (!self::attachment_is_orphan($attachment_id)) {
+            return false;
+        }
+        return $this->wipe_attachment_verdict($attachment_id, []) === 'delete';
+    }
+
+    /**
+     * Keyset page of the SIGNATURE attachments (candidate superset): entries
+     * that carry `_alegra_image_url` OR whose `_wp_attached_file` basename
+     * matches the plugin pattern `alegra-<digit>…` (the SQL mirror of
+     * `attachment_has_plugin_signature()`; the PHP check stays authoritative).
+     * `$limit <= 0` returns every candidate (read-only preview). ONE query;
+     * never per-id.
+     *
+     * @return int[]
+     */
+    private function orphan_candidate_ids(int $after_id, int $limit): array
+    {
+        global $wpdb;
+
+        $sql = "SELECT p.ID
+                FROM {$wpdb->posts} p
+                WHERE p.post_type = 'attachment'
+                  AND p.ID > %d
+                  AND (
+                       EXISTS (SELECT 1 FROM {$wpdb->postmeta} u
+                                WHERE u.post_id = p.ID
+                                  AND u.meta_key = '_alegra_image_url'
+                                  AND u.meta_value <> '')
+                    OR EXISTS (SELECT 1 FROM {$wpdb->postmeta} f
+                                WHERE f.post_id = p.ID
+                                  AND f.meta_key = '_wp_attached_file'
+                                  AND SUBSTRING_INDEX(f.meta_value, '/', -1) REGEXP '^alegra-[0-9]')
+                  )
+                ORDER BY p.ID ASC";
+
+        $args = [max(0, $after_id)];
+        if ($limit > 0) {
+            $sql   .= ' LIMIT %d';
+            $args[] = max(1, $limit);
+        }
+
+        $ids = $wpdb->get_col($wpdb->prepare($sql, ...$args));
+        return self::normalize_id_list($ids);
+    }
+
+    /**
+     * READ-ONLY preview for the orphan-cleanup tool: exact count of deletable
+     * plugin orphans + a small sample of filenames so the merchant verifies
+     * before deleting. When `$full` is true the response also carries the FULL
+     * list of candidate filenames (capped) so the merchant can review every row
+     * ("ver lista completa"). Writes nothing.
+     *
+     * @return array{count:int,scanned:int,sample:string[],all:string[]}
+     */
+    public function orphan_preview(bool $full = false): array
+    {
+        $candidates = $this->orphan_candidate_ids(0, 0);
+        $count      = 0;
+        $sample     = [];
+        $all        = [];
+        $all_cap    = 2000;
+
+        foreach ($candidates as $att_id) {
+            $att_id = (int) $att_id;
+            if (!$this->orphan_attachment_is_deletable($att_id)) {
+                continue;
+            }
+            $count++;
+            $name = self::attachment_display_name($att_id);
+            if (count($sample) < 5) {
+                $sample[] = $name;
+            }
+            if ($full && count($all) < $all_cap) {
+                $all[] = $name;
+            }
+        }
+
+        return [
+            'count'   => $count,
+            'scanned' => count($candidates),
+            'sample'  => $sample,
+            'all'     => $all,
+        ];
+    }
+
+    /**
+     * Human-readable label for a sample row: the attachment basename when
+     * available, else `#<id>`.
+     */
+    private static function attachment_display_name(int $attachment_id): string
+    {
+        $file = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
+        if ($file !== '') {
+            return basename(str_replace('\\', '/', $file));
+        }
+        return '#' . $attachment_id;
+    }
+
+    /**
+     * Delete one keyset page of deletable plugin orphans.
+     *
+     * Same safety model as the bulk wipe: a wall-clock budget per chunk
+     * (done=false, NOT aborted, when it trips), a keyset cursor that advances
+     * over EVERY examined candidate (so a page full of protected rows can never
+     * loop), an abort on kill switch / requested stop, and the shared
+     * `orphan_attachment_is_deletable()` verdict for every single row.
+     *
+     * @param array{run_id?:int,time_budget?:float} $opts
+     * @return array{processed:int,images_deleted:int,images_skipped:int,next_after_id:int,done:bool,aborted:bool,reason:string}
+     */
+    public function orphan_cleanup_chunk(int $after_id, int $limit, array $opts = []): array
+    {
+        $limit       = max(1, $limit);
+        $run_id      = (int) ($opts['run_id'] ?? 0);
+        $time_budget = isset($opts['time_budget']) ? (float) $opts['time_budget'] : 20.0;
+        $deadline    = microtime(true) + max(0.0, $time_budget);
+
+        $result = [
+            'processed'      => 0,
+            'images_deleted' => 0,
+            'images_skipped' => 0,
+            'next_after_id'  => $after_id,
+            'done'           => false,
+            'aborted'        => false,
+            'reason'         => '',
+        ];
+
+        $early = self::wipe_abort_reason($run_id);
+        if ($early !== '') {
+            $result['aborted'] = true;
+            $result['reason']  = $early;
+            return $result;
+        }
+
+        $ids = $this->orphan_candidate_ids($after_id, $limit);
+        if ($ids === []) {
+            $result['done'] = true;
+            return $result;
+        }
+
+        $last_complete = $after_id;
+        $made_progress = false;
+        $deadline_hit  = false;
+
+        foreach ($ids as $att_id) {
+            $att_id = (int) $att_id;
+
+            $abort = self::wipe_abort_reason($run_id);
+            if ($abort !== '') {
+                $result['aborted'] = true;
+                $result['reason']  = $abort;
+                break;
+            }
+            if ($made_progress && microtime(true) >= $deadline) {
+                $deadline_hit = true;
+                break;
+            }
+
+            $result['processed']++;
+
+            if (!$this->orphan_attachment_is_deletable($att_id)) {
+                $result['images_skipped']++;
+            } else {
+                $hash = (string) get_post_meta($att_id, '_alegra_image_url_hash', true);
+                wp_delete_attachment($att_id, true);
+                \Alegra\Connector\Entity_Map::remove_by_wc('attachment', $att_id);
+                if ($hash !== '') {
+                    \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
+                }
+                $result['images_deleted']++;
+            }
+
+            $last_complete = $att_id;
+            $made_progress = true;
+        }
+
+        $result['next_after_id'] = $last_complete;
+        $result['done']          = !$result['aborted'] && !$deadline_hit && count($ids) < $limit;
+
+        return $result;
+    }
+
+    /**
+     * B (2.8.19): the full-wipe orphan sweep. Walks the plugin-signature
+     * attachments that are UNATTACHED (`post_parent = 0` or a missing parent)
+     * and deletes the ones that pass `orphan_attachment_is_deletable()`, so a
+     * FUTURE full wipe also reclaims orphans left behind by PM screens or older
+     * builds. Uses its own keyset cursor option so it resumes across chunks,
+     * shares the chunk's wall-clock budget and abort checks, and never touches a
+     * referenced / protected / non-signature image (empty wipe set ⇒ any live
+     * reference from any post protects it).
+     *
+     * @param array<string,mixed> $result
+     * @param array<int,true>     $deleted_images
+     * @param bool                $orphans_done  set true when the sweep walked its last page
+     */
+    private function wipe_sweep_orphan_signatures(
+        array &$result,
+        array &$deleted_images,
+        float $deadline,
+        bool &$made_progress,
+        bool &$orphans_done,
+        int $run_id
+    ): void {
+        $after = max(0, (int) get_option('alegra_connector_wipe_orphan_cursor', 0));
+        $ids   = $this->orphan_candidate_ids($after, self::WIPE_ORPHAN_CHUNK);
+        if ($ids === []) {
+            $orphans_done = true;
+            return;
+        }
+
+        $last = $after;
+        foreach ($ids as $att_id) {
+            $att_id = (int) $att_id;
+
+            $abort = self::wipe_abort_reason($run_id);
+            if ($abort !== '') {
+                $result['aborted'] = true;
+                $result['reason']  = $abort;
+                break;
+            }
+            if ($made_progress && microtime(true) >= $deadline) {
+                break; // budget trip: NOT an abort; the caller reports done=false.
+            }
+
+            $last = $att_id;
+            if (isset($deleted_images[$att_id])) {
+                continue;
+            }
+            if (!$this->orphan_attachment_is_deletable($att_id)) {
+                continue;
+            }
+
+            $deleted_images[$att_id] = true;
+            $hash = (string) get_post_meta($att_id, '_alegra_image_url_hash', true);
+            wp_delete_attachment($att_id, true);
+            \Alegra\Connector\Entity_Map::remove_by_wc('attachment', $att_id);
+            if ($hash !== '') {
+                \Alegra\Connector\Entity_Map::remove('image', $hash, 'attachment');
+            }
+            $result['images_deleted']++;
+            $made_progress = true;
+        }
+
+        update_option('alegra_connector_wipe_orphan_cursor', $last, false);
+        $orphans_done = count($ids) < self::WIPE_ORPHAN_CHUNK;
     }
 
     /**

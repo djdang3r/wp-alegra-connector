@@ -922,6 +922,27 @@ function alegra_stub_post_type(int $id): string
     }
     return '';
 }
+/**
+ * Orphan-cleanup (2.8.19): does an attachment carry the plugin's creation
+ * signature? `_alegra_image_url` present, OR the `_wp_attached_file` basename
+ * matches the plugin pattern `^alegra-\d+` (case-insensitive; a DIGIT is
+ * required right after `alegra-`, so `alegra-promo.jpg` is NOT a match).
+ * Mirrors Products::attachment_has_plugin_signature() for the fake $wpdb
+ * emulation.
+ */
+function alegra_stub_attachment_has_signature(int $id): bool
+{
+    if (get_post_meta($id, '_alegra_image_url', true) !== '') {
+        return true;
+    }
+    $file = (string) get_post_meta($id, '_wp_attached_file', true);
+    if ($file === '') {
+        return false;
+    }
+    $base = basename(str_replace('\\', '/', $file));
+    return $base !== '' && preg_match('/^alegra-\d+/i', $base) === 1;
+}
+
 function get_theme_mod($name, $default = false)
 {
     return $GLOBALS['wp_theme_mods'][$name] ?? $default;
@@ -2301,6 +2322,37 @@ class Alegra_Mock_Wpdb
                 }
             }
             return $out;
+        }
+
+        // Orphan cleanup (2.8.19): the plugin-signature attachment keyset —
+        // `post_type = 'attachment'` with `_alegra_image_url` OR a
+        // `_wp_attached_file` basename `alegra-…`, filtered by `p.ID > N` and
+        // optional LIMIT. The DB would resolve the EXISTS pair + SUBSTRING_INDEX
+        // LIKE; the harness evaluates the same predicate in PHP.
+        if (strpos($query, '_alegra_image_url') !== false
+            && stripos($query, 'SUBSTRING_INDEX') !== false
+            && stripos($query, "post_type = 'attachment'") !== false) {
+            $after = 0;
+            if (preg_match('/p\.ID\s*>\s*(\d+)/', $query, $mc)) {
+                $after = (int) $mc[1];
+            }
+            $limit = 0;
+            if (preg_match('/LIMIT\s+(\d+)/i', $query, $ml)) {
+                $limit = (int) $ml[1];
+            }
+            $ids = [];
+            foreach (($GLOBALS['wp_posts'] ?? []) as $id => $post) {
+                if ((string) ($post->post_type ?? '') !== 'attachment') { continue; }
+                if ((int) $id <= $after) { continue; }
+                if (alegra_stub_attachment_has_signature((int) $id)) {
+                    $ids[] = (int) $id;
+                }
+            }
+            sort($ids);
+            if ($limit > 0) {
+                $ids = array_slice($ids, 0, $limit);
+            }
+            return array_map(static fn ($id) => (object) ['ID' => $id], $ids);
         }
 
         // Bulk-wipe (2.8.19): posts of ONE type whose `post_parent IN (…)` —

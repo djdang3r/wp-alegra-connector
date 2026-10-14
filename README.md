@@ -13,6 +13,7 @@ Version: 2.8.19 | PHP 8.0+ | WP 5.8+ | WC 6.0+
 Alegra Connector allows you to synchronize your WooCommerce store with the Alegra accounting system. Features include:
 
 * **Products Sync**: Synchronize products and services bidirectionally with images
+* **Media cleanup**: "Borrador masivo" (full reset) and a targeted "Limpiar imágenes huérfanas del plugin" tool that removes only the plugin-created (`alegra-…`) orphan images, never store-design or referenced media
 * **Customers Sync**: Keep your customers updated across both platforms (WC lookup table)
 * **Orders to Invoices**: Automatically (or manually) create invoices in Alegra from WooCommerce orders, as drafts by default so you can review them
 * **Customer identification**: Collect the document type/number (the only billing datum WooCommerce does not collect) and link each invoice to the right contact
