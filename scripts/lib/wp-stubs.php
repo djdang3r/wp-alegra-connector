@@ -2303,6 +2303,30 @@ class Alegra_Mock_Wpdb
             return $out;
         }
 
+        // Bulk-wipe (2.8.19): posts of ONE type whose `post_parent IN (…)` —
+        // the plugin's orphan/parented attachments (post_parent = product) and
+        // the variation children of a wiped product. WP-faithful: attachments
+        // and variations live in `wp_posts` in the harness.
+        if (stripos($query, 'post_parent IN') !== false
+            && preg_match("/post_type\s*=\s*'([^']+)'/", $query, $mt)
+            && preg_match('/post_parent\s+IN\s*\(([^)]*)\)/i', $query, $mp)) {
+            $type    = $mt[1];
+            $parents = [];
+            foreach (explode(',', $mp[1]) as $part) {
+                $part = (int) trim($part);
+                if ($part > 0) {
+                    $parents[$part] = true;
+                }
+            }
+            $out = [];
+            foreach (($GLOBALS['wp_posts'] ?? []) as $id => $post) {
+                if ((string) ($post->post_type ?? '') !== $type) { continue; }
+                if (!isset($parents[(int) ($post->post_parent ?? 0)])) { continue; }
+                $out[] = (object) ['ID' => (int) $id];
+            }
+            return $out;
+        }
+
         // Bulk-wipe preview: ONE termmeta scan for term `thumbnail_id` refs.
         if (strpos($query, 'termmeta') !== false
             && strpos($query, 'thumbnail_id') !== false

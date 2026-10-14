@@ -15874,6 +15874,21 @@ function alegra_seed_linked_product(int $pid, string $alegra_id): void
     \Alegra\Connector\Entity_Map::map('item', $alegra_id, 'product', $pid);
 }
 
+/** Attachment VIVO con `post_parent = $parent_id` (el plugin crea cada imagen
+ *  importada con `media_handle_sideload($file, $product_id)`, así que su media
+ *  vive parented aunque ya no esté en `_thumbnail_id`/galería). */
+function alegra_seed_parented_image(int $id, int $parent_id, string $url = ''): int
+{
+    alegra_make_live_attachment($id);
+    $GLOBALS['wp_posts'][$id]->post_parent = $parent_id;
+    if ($url !== '') {
+        update_post_meta($id, '_alegra_image_url', $url);
+        update_post_meta($id, '_alegra_image_url_hash', md5($url));
+        \Alegra\Connector\Entity_Map::map('image', md5($url), 'attachment', $id);
+    }
+    return $id;
+}
+
 TestRunner::test('T77.1 reconcile reemplaza (no mergea) y preserva ids merchant', function (): void {
     alegra_test_reset();
     update_option('alegra_connector_sync_images', true);
@@ -17583,6 +17598,94 @@ TestRunner::test('T86.33 H16 (2.8.18): una variación ya borrada NO se re-cuenta
     TestRunner::assertSame(3, (int) $res['processed'], 'procesa exactamente 3 ids');
     TestRunner::assertSame(false, wc_get_product(200), 'el padre se borró');
     TestRunner::assertSame(null, get_post(200), 'sin post remanente para el padre');
+});
+
+TestRunner::test('T86.34 (2.8.19) un adjunto parented SIN refs se borra (y su archivo) con el producto', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-orphan');
+
+    // El plugin crea cada imagen con `post_parent = producto`; ésta ya NO está
+    // en `_thumbnail_id`/galería (la imagen "multiplicada"/huérfana del merchant).
+    $att  = alegra_seed_parented_image(8001, 10, 'https://cdn3.alegra.com/orphan.png');
+    $file = tempnam(sys_get_temp_dir(), 'alegra-orphan-');
+    file_put_contents($file, 'img');
+    update_post_meta($att, '_wp_attached_file', $file);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+
+    TestRunner::assertSame(null, get_post($att), 'el adjunto parented sin refs se borró');
+    TestRunner::assertFalse(is_file($file), 'el archivo del adjunto se deslinkeó');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'images_deleted=1');
+    TestRunner::assertSame(1, (int) $res['products_deleted'], 'el producto se borró');
+});
+
+TestRunner::test('T86.35 (2.8.19) un adjunto parented a una VARIACIÓN se borra con el grupo', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(20, ['color' => ['name' => 'Color', 'options' => ['Rojo']]], [
+        21 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+    ]);
+    update_post_meta(20, '_alegra_item_id', 'it-v');
+    update_post_meta(21, '_alegra_item_id', 'it-v1');
+    // Sin refs en el padre ni en la variación: la imagen cuelga de la variación.
+    $att = alegra_seed_parented_image(8010, 21, 'https://cdn3.alegra.com/var-orphan.png');
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [20, 21]]);
+
+    TestRunner::assertSame(null, get_post($att), 'el adjunto de la variación se borró');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'images_deleted=1');
+    TestRunner::assertSame(false, wc_get_product(21), 'la variación se borró');
+});
+
+TestRunner::test('T86.36 (2.8.19) guards: un adjunto parented no-imagen/term/placeholder/logo/ajeno se conserva', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-guards');
+
+    $nonimg = alegra_seed_parented_image(8001, 10);
+    $GLOBALS['alegra_non_image_attachments'][8001] = true;
+
+    $termimg = alegra_seed_parented_image(8002, 10);
+    update_term_meta(500, 'thumbnail_id', 8002);
+
+    $ph = alegra_seed_parented_image(8003, 10);
+    update_option('woocommerce_placeholder_image', 8003);
+
+    $surv = alegra_seed_parented_image(8004, 10);
+    alegra_make_product(30, ['name' => 'Survivor']);
+    update_post_meta(30, '_thumbnail_id', 8004);
+
+    $logo = alegra_seed_parented_image(8005, 10);
+    set_theme_mod('custom_logo', 8005);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10]]);
+
+    TestRunner::assertTrue(get_post(8001) !== null, 'no-imagen conservado');
+    TestRunner::assertTrue(get_post(8002) !== null, 'term conservado');
+    TestRunner::assertTrue(get_post(8003) !== null, 'placeholder conservado');
+    TestRunner::assertTrue(get_post(8004) !== null, 'referenciado por un post ajeno conservado');
+    TestRunner::assertTrue(get_post(8005) !== null, 'logo del sitio conservado');
+    TestRunner::assertSame(0, (int) $res['images_deleted'], 'no se borró ninguna imagen');
+    TestRunner::assertSame(5, (int) $res['images_skipped'], '5 adjuntos parented protegidos');
+    TestRunner::assertTrue(wc_get_product(30) !== null, 'el producto ajeno sobrevive');
+});
+
+TestRunner::test('T86.37 (2.8.19) preview cuenta los parented (dedup) y el compartido se borra una vez', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-a');
+    alegra_seed_linked_product(11, 'it-b');
+    // 8001 cuelga del producto 10 y además es la featured del 11 (wiped): interno.
+    $shared = alegra_seed_parented_image(8001, 10, 'https://cdn3.alegra.com/shared-p.png');
+    update_post_meta(11, '_thumbnail_id', $shared);
+
+    $admin = new \Alegra\Connector\Admin\Admin_Dashboard(make_api(), make_logger());
+    $resp  = alegra_capture_json(fn () => $admin->ajax_wipe_preview());
+    TestRunner::assertTrue($resp->success, 'preview responde success');
+    $p = $resp->payload['preview'];
+    TestRunner::assertSame(2, (int) $p['products'], '2 productos');
+    TestRunner::assertSame(1, (int) $p['images'], 'el preview cuenta el adjunto parented (dedup, una vez)');
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10, 11]]);
+    TestRunner::assertSame(null, get_post($shared), 'el compartido se borró');
+    TestRunner::assertSame(1, (int) $res['images_deleted'], 'images_deleted=1 (sin doble borrado)');
 });
 
 exit(TestRunner::summary());

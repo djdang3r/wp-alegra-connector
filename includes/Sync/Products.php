@@ -3073,16 +3073,26 @@ class Products
      */
     public function wipe_collect_image_ids(\WC_Product $product): array
     {
-        $ids = self::product_image_refs($product);
+        $ids   = self::product_image_refs($product);
+        $group = [$product->get_id()];
 
         if (method_exists($product, 'get_children')) {
             foreach ((array) $product->get_children() as $child_id) {
-                $child = wc_get_product((int) $child_id);
+                $child_id = (int) $child_id;
+                $group[]  = $child_id;
+                $child = wc_get_product($child_id);
                 if ($child instanceof \WC_Product) {
                     $ids = array_merge($ids, self::product_image_refs($child));
                 }
             }
         }
+
+        // Every image this plugin imports is created with
+        // `post_parent = $product_id` (media_handle_sideload), so images that
+        // were superseded on a re-import are parented to a group member but are
+        // NO LONGER in `_thumbnail_id`/gallery. They are still the group's media
+        // and must be collected (batched IN, never per-id).
+        $ids = array_merge($ids, self::attachment_ids_by_parent($group));
 
         return self::normalize_id_list($ids);
     }
@@ -3097,7 +3107,8 @@ class Products
      */
     public function wipe_collect_image_ids_by_id(int $product_id): array
     {
-        $ids = self::product_image_refs_by_id($product_id);
+        $ids   = self::product_image_refs_by_id($product_id);
+        $group = [(int) $product_id];
 
         foreach ((array) get_children([
             'post_parent' => $product_id,
@@ -3106,8 +3117,14 @@ class Products
             'fields'      => 'ids',
             'numberposts' => -1,
         ]) as $child_id) {
-            $ids = array_merge($ids, self::product_image_refs_by_id((int) $child_id));
+            $child_id = (int) $child_id;
+            $group[]  = $child_id;
+            $ids = array_merge($ids, self::product_image_refs_by_id($child_id));
         }
+
+        // Parented attachments (see wipe_collect_image_ids): the plugin-created
+        // media of the whole group, whether or not still referenced.
+        $ids = array_merge($ids, self::attachment_ids_by_parent($group));
 
         return self::normalize_id_list($ids);
     }
@@ -3157,6 +3174,104 @@ class Products
         }
 
         return self::normalize_id_list($ids);
+    }
+
+    /**
+     * Batched: the attachment post ids whose `post_parent` is one of
+     * `$parent_ids`.
+     *
+     * Every image this plugin imports is created with
+     * `post_parent = $product_id` (`media_handle_sideload($file, $product_id)`),
+     * so an image superseded on a re-import (the historical "multiplied"
+     * attachments) is parented to the product but no longer present in
+     * `_thumbnail_id`/`_product_image_gallery`. It is STILL the product's media
+     * and must be wiped with it — otherwise it survives the wipe and is orphaned
+     * once the product is deleted. One query per chunk of ids, never per id.
+     *
+     * @param int[] $parent_ids
+     * @return int[]
+     */
+    private static function attachment_ids_by_parent(array $parent_ids): array
+    {
+        global $wpdb;
+
+        $parents = self::normalize_id_list($parent_ids);
+        if ($parents === []) {
+            return [];
+        }
+
+        $out = [];
+        foreach (array_chunk($parents, 500) as $chunk) {
+            $in_list = implode(',', $chunk);
+            $ids = $wpdb->get_col(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE post_type = 'attachment'
+                   AND post_parent IN ({$in_list})"
+            );
+            foreach ((array) $ids as $id) {
+                $id = (int) $id;
+                if ($id > 0) {
+                    $out[$id] = true;
+                }
+            }
+        }
+
+        return array_map('intval', array_keys($out));
+    }
+
+    /**
+     * Batched: the variation children (`post_parent` = a wiped product) of the
+     * given post ids. Mirrors `WC_Product::get_children()` for the read-only
+     * preview without hydrating a `WC_Product` per id.
+     *
+     * @param int[] $parent_ids
+     * @return int[]
+     */
+    private static function variation_children_ids(array $parent_ids): array
+    {
+        global $wpdb;
+
+        $parents = self::normalize_id_list($parent_ids);
+        if ($parents === []) {
+            return [];
+        }
+
+        $out = [];
+        foreach (array_chunk($parents, 500) as $chunk) {
+            $in_list = implode(',', $chunk);
+            $ids = $wpdb->get_col(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE post_type = 'product_variation'
+                   AND post_parent IN ({$in_list})"
+            );
+            foreach ((array) $ids as $id) {
+                $id = (int) $id;
+                if ($id > 0) {
+                    $out[$id] = true;
+                }
+            }
+        }
+
+        return array_map('intval', array_keys($out));
+    }
+
+    /**
+     * The parented attachments of a wipe set: for every wiped product GROUP
+     * (the product + its variation children) the attachments whose `post_parent`
+     * is a member. Deduplicated. Used by the read-only preview so the merchant's
+     * image count matches what the wipe actually deletes.
+     *
+     * @param int[] $wipe_ids
+     * @return int[]
+     */
+    private function wipe_parented_attachment_ids(array $wipe_ids): array
+    {
+        $group = array_merge(
+            self::normalize_id_list($wipe_ids),
+            self::variation_children_ids($wipe_ids)
+        );
+
+        return self::attachment_ids_by_parent($group);
     }
 
     /**
@@ -3422,14 +3537,34 @@ class Products
         float $deadline,
         bool &$made_progress
     ): bool {
-        $image_ids = self::product_image_refs($product);
+        // The product GROUP: this object plus its variations. Collect the refs
+        // (featured + gallery) of the object AND every attachment parented to a
+        // group member (`post_parent IN group`): the plugin parents every
+        // imported image to its product, so superseded/orphan attachments are
+        // not in the refs but are still this group's media (batched IN query).
+        $group_ids = [$product_id];
+        if (method_exists($product, 'get_children')) {
+            foreach ((array) $product->get_children() as $child_id) {
+                $group_ids[] = (int) $child_id;
+            }
+        }
 
-        // The object being deleted is "internal" even when it is NOT a member of
-        // the wipe set (e.g. a variation without its own `_alegra_item_id`):
-        // its own reference must not protect the attachment we are removing
-        // with it. A reference from any OTHER survivor still protects the file.
+        $image_ids = array_merge(
+            self::product_image_refs($product),
+            self::attachment_ids_by_parent($group_ids)
+        );
+
+        // Every member of the group is "internal" even when it is NOT a member
+        // of the wipe set (e.g. a variation without its own `_alegra_item_id`):
+        // a group member's reference must not protect the attachment we are
+        // removing with it. A reference from any OTHER survivor still protects
+        // the file.
         $verdict_set = $wipe_set;
-        $verdict_set[$product_id] = true;
+        foreach ($group_ids as $group_id) {
+            if ($group_id > 0) {
+                $verdict_set[$group_id] = true;
+            }
+        }
 
         foreach ($image_ids as $att_id) {
             $att_id = (int) $att_id;
@@ -3781,6 +3916,14 @@ class Products
 
         [$products, $variations] = $this->wipe_count_by_type();
         [$referenced_inside, $referenced_outside] = $this->wipe_image_reference_map($wipe_set);
+
+        // Parented attachments (post_parent = a wiped product/variation) are the
+        // group's media even when they are no longer in `_thumbnail_id`/gallery
+        // (the merchant's orphan case). Treat them as internal candidates so the
+        // preview's image count matches what the wipe actually deletes.
+        foreach ($this->wipe_parented_attachment_ids($wipe_ids) as $parented_id) {
+            $referenced_inside[(int) $parented_id] = true;
+        }
 
         return [
             'products'        => $products,

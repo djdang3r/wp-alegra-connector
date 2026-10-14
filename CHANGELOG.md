@@ -2,6 +2,35 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.19] - 2026-10-14
+
+> **Corrección del "Borrador masivo" detectada en producción (WP real):** el
+> wipe borraba los productos pero **no todas sus imágenes**. Las imágenes
+> importadas se crean con `post_parent = producto` (`media_handle_sideload`) y
+> las que quedaron fuera de `_thumbnail_id`/galería (las "multiplicadas" de
+> reimports previos) sobrevivían al borrado y quedaban huérfanas en Medios.
+
+### Fixed
+
+- **Imágenes parented/orfandadas fuera del borrado (pérdida de datos del reset).**
+  La recolección de imágenes del wipe leía sólo `_thumbnail_id` +
+  `_product_image_gallery` (`product_image_refs_by_id()`/`product_image_refs()`),
+  pero el plugin crea cada imagen importada con `post_parent = $product_id`. Los
+  adjuntos del producto que ya no están en esas refs (imágenes multiplicadas)
+  **nunca se recolectaban** → sobrevivían al wipe y quedaban huérfanos al
+  borrarse el producto. Ahora, por cada grupo (el producto + sus variaciones) se
+  recolectan además los adjuntos con `post_parent IN (<ids del grupo>)` con UNA
+  consulta batched (nunca por-id), tanto en el borrado
+  (`wipe_collect_image_ids`/`wipe_collect_image_ids_by_id`/`wipe_delete_one`)
+  como en el preview (`wipe_preview`). Se mantienen TODOS los guards existentes
+  (no-imagen, thumbnail de term, `custom_logo`, placeholder real/legacy de WC y
+  "referenciado por un post fuera del wipe set", set-aware) y el presupuesto de
+  tiempo (H2) se aplica por-adjunto; un adjunto compartido por dos productos del
+  wipe se borra una sola vez.
+- **Preview consistente.** `wipe_preview()` cuenta los adjuntos parented
+  (deduplicados) además de las refs, de modo que el merchant ve el número real
+  de imágenes que el borrador va a eliminar.
+
 ## [2.8.18] - 2026-10-14
 
 > **Correcciones del "Borrador masivo" detectadas en QA real (WP 6 + WooCommerce
