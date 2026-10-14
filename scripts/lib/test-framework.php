@@ -160,6 +160,10 @@ function alegra_test_reset(): void
     $GLOBALS['wp_cron']       = [];
     $GLOBALS['wc_orders']     = [];
     $GLOBALS['wc_products']   = [];
+    // 2.8.18 test hooks: a simulated WC stale object cache (bulk-wipe H16) and an
+    // "order tables missing" switch (orders-count HPOS best-effort).
+    $GLOBALS['alegra_stale_products'] = [];
+    $GLOBALS['alegra_order_tables_missing'] = false;
     $GLOBALS['wc_tax_rates']  = [];
     $GLOBALS['alegra_race']   = null;
     $GLOBALS['alegra_next_post_id'] = 1000;

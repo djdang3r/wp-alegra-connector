@@ -16781,7 +16781,8 @@ TestRunner::test('T86.3 H4/H5: no borra adjuntos de terms/logo/placeholder/ajeno
     alegra_seed_linked_product(14, 'it-e');
     update_post_meta(14, '_thumbnail_id', $logo);
     $ph = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/placeholder.png');
-    update_option('woocommerce_placeholder_image_id', $ph);
+    // The REAL WooCommerce option (WC core never reads `..._image_id`).
+    update_option('woocommerce_placeholder_image', $ph);
     alegra_seed_linked_product(15, 'it-f');
     update_post_meta(15, '_thumbnail_id', $ph);
 
@@ -17439,7 +17440,8 @@ TestRunner::test('T86.29 H14: delete_replaced_image nunca borra el logo ni el pl
     $logo = alegra_seed_plugin_image(8004, 'https://cdn3.alegra.com/logo.png');
     set_theme_mod('custom_logo', $logo);
     $ph = alegra_seed_plugin_image(8005, 'https://cdn3.alegra.com/placeholder.png');
-    update_option('woocommerce_placeholder_image_id', $ph);
+    // The REAL WooCommerce option (WC core never reads `..._image_id`).
+    update_option('woocommerce_placeholder_image', $ph);
 
     alegra_call_private($products, 'delete_replaced_image', $logo, 10);
     alegra_call_private($products, 'delete_replaced_image', $ph, 10);
@@ -17491,6 +17493,96 @@ TestRunner::test('T86.30 H2: las variaciones se borran con presupuesto, sin casc
         TestRunner::assertSame(false, wc_get_product($i), 'H2: variación ' . $i . ' borrada');
         TestRunner::assertSame(null, get_post(9000 + $i), 'H2: imagen de la variación ' . $i . ' borrada');
     }
+});
+
+TestRunner::test('T86.31 H16 (2.8.18): el placeholder REAL de WC se protege (y la clave legacy también)', function (): void {
+    alegra_test_reset();
+
+    // The REAL WC option key (WC core reads/writes `woocommerce_placeholder_image`;
+    // it NEVER reads `..._image_id`) plus the legacy key the plugin used to read.
+    $real   = alegra_seed_plugin_image(8100, 'https://cdn3.alegra.com/ph-real.png');
+    $legacy = alegra_seed_plugin_image(8101, 'https://cdn3.alegra.com/ph-legacy.png');
+    update_option('woocommerce_placeholder_image', $real);
+    update_option('woocommerce_placeholder_image_id', $legacy);
+
+    alegra_seed_linked_product(10, 'it-ph1');
+    update_post_meta(10, '_thumbnail_id', $real);
+    alegra_seed_linked_product(11, 'it-ph2');
+    update_post_meta(11, '_thumbnail_id', $legacy);
+
+    // The preview must count BOTH as skipped, else the count diverges from the
+    // authoritative deletion verdict.
+    $preview = make_products()->wipe_preview();
+    TestRunner::assertSame(2, (int) $preview['images_skipped'], 'el preview cuenta real+legacy como protegidos');
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [10, 11], 'time_budget' => 30.0]);
+    TestRunner::assertTrue(get_post($real) !== null, 'el placeholder REAL (woocommerce_placeholder_image) sobrevive al wipe');
+    TestRunner::assertTrue(get_post($legacy) !== null, 'la clave legacy (woocommerce_placeholder_image_id) también protege');
+    TestRunner::assertSame(0, (int) $res['images_deleted'], 'no se borró ninguna imagen de placeholder');
+
+    // The import rewrite path shares the same guard (H14).
+    $plain = alegra_seed_plugin_image(8102, 'https://cdn3.alegra.com/plain2.png');
+    alegra_call_private(make_products(), 'delete_replaced_image', $real, 10);
+    alegra_call_private(make_products(), 'delete_replaced_image', $legacy, 10);
+    TestRunner::assertTrue(get_post($real) !== null, 'delete_replaced_image no borra el placeholder REAL');
+    TestRunner::assertTrue(get_post($legacy) !== null, 'delete_replaced_image no borra la clave legacy');
+    alegra_call_private(make_products(), 'delete_replaced_image', $plain, 10);
+    TestRunner::assertSame(null, get_post($plain), 'una imagen plugin normal sí se borra');
+});
+
+TestRunner::test('T86.32 H16 (2.8.18): el conteo de órdenes usa el JOIN correcto (itemmeta no tiene order_id)', function (): void {
+    alegra_test_reset();
+    alegra_seed_linked_product(10, 'it-ord');
+    alegra_seed_linked_product(11, 'it-ord2');
+
+    // Legacy order tables (the harness emulates production's
+    // itemmeta→items JOIN on `order_item_id`).
+    $GLOBALS['alegra_db']['wp_woocommerce_order_items'] = [
+        ['order_item_id' => 61, 'order_id' => 238],
+        ['order_item_id' => 62, 'order_id' => 238],
+        ['order_item_id' => 63, 'order_id' => 239],
+        ['order_item_id' => 64, 'order_id' => 240],
+    ];
+    $GLOBALS['alegra_db']['wp_woocommerce_order_itemmeta'] = [
+        ['order_item_id' => 61, 'meta_key' => '_product_id',   'meta_value' => 10],
+        ['order_item_id' => 62, 'meta_key' => '_variation_id', 'meta_value' => 11],
+        ['order_item_id' => 63, 'meta_key' => '_product_id',   'meta_value' => 10],
+        ['order_item_id' => 64, 'meta_key' => '_product_id',   'meta_value' => 999], // unrelated line
+    ];
+
+    $preview = make_products()->wipe_preview();
+    TestRunner::assertSame(2, (int) $preview['orders'], 'cuenta 2 órdenes DISTINTAS (238, 239), no 0');
+
+    // Best-effort: when the order tables are absent (HPOS/custom), it degrades to
+    // 0 silently instead of emitting a DB error/notice.
+    $GLOBALS['alegra_order_tables_missing'] = true;
+    $preview2 = make_products()->wipe_preview();
+    TestRunner::assertSame(0, (int) $preview2['orders'], 'sin tablas de órdenes devuelve 0 sin error');
+    $GLOBALS['alegra_order_tables_missing'] = false;
+});
+
+TestRunner::test('T86.33 H16 (2.8.18): una variación ya borrada NO se re-cuenta por el cache stale de wc_get_product', function (): void {
+    alegra_test_reset();
+    alegra_make_variable_product(200, ['color' => ['name' => 'Color', 'options' => ['Rojo', 'Azul']]], [
+        201 => ['variation_attributes' => ['attribute_color' => 'Rojo']],
+        202 => ['variation_attributes' => ['attribute_color' => 'Azul']],
+    ]);
+    update_post_meta(200, '_alegra_item_id', 'it-var');
+    update_post_meta(201, '_alegra_item_id', 'it-var-1');
+    update_post_meta(202, '_alegra_item_id', 'it-var-2');
+
+    // Simulate WC's stale object cache: ghosts for variations the parent delete
+    // removes before the keyset loop reaches them (the 2.8.17 defect: a 4-post
+    // set reported products_deleted=6).
+    $GLOBALS['alegra_stale_products'][201] = new \WC_Product_Variation(201, ['parent_id' => 200]);
+    $GLOBALS['alegra_stale_products'][202] = new \WC_Product_Variation(202, ['parent_id' => 200]);
+
+    $res = make_products()->wipe_imported_products_chunk(0, 50, ['wipe_ids' => [200, 201, 202], 'time_budget' => 30.0]);
+
+    TestRunner::assertSame(3, (int) $res['products_deleted'], 'borra exactamente 3 posts, sin doble conteo');
+    TestRunner::assertSame(3, (int) $res['processed'], 'procesa exactamente 3 ids');
+    TestRunner::assertSame(false, wc_get_product(200), 'el padre se borró');
+    TestRunner::assertSame(null, get_post(200), 'sin post remanente para el padre');
 });
 
 exit(TestRunner::summary());

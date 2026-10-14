@@ -1735,6 +1735,13 @@ function wc_get_order($order_id)
 function wc_get_product($product_id)
 {
     $product_id = (int) $product_id;
+    // Simulate WooCommerce's object cache handing back a DELETED product: a test
+    // seeds `$GLOBALS['alegra_stale_products'][$id]` before the wipe to prove the
+    // chunk's H16 already-deleted guard skips the ghost instead of counting it
+    // twice (the real bug: a 4-post set reported products_deleted=6).
+    if (isset($GLOBALS['alegra_stale_products'][$product_id])) {
+        return $GLOBALS['alegra_stale_products'][$product_id];
+    }
     return $GLOBALS['wc_products'][$product_id] ?? false;
 }
 
@@ -2028,9 +2035,30 @@ class Alegra_Mock_Wpdb
     public string $termmeta = 'wp_termmeta';
     public int $insert_id = 0;
 
+    /**
+     * Mirrors $wpdb->last_error. Set by a failing emulated query (e.g. the
+     * orders-count JOIN when the order tables are absent) and cleared on a
+     * successful one, so production's `!empty($wpdb->last_error)` guard is
+     * exercised faithfully.
+     */
+    public string $last_error = '';
+
+    private bool $suppress_errors = false;
+
     public function get_charset_collate(): string
     {
         return '';
+    }
+
+    /**
+     * Mirrors wpdb::suppress_errors( $suppress = true ): returns the PREVIOUS
+     * state so callers can restore it.
+     */
+    public function suppress_errors($suppress = true)
+    {
+        $previous = $this->suppress_errors;
+        $this->suppress_errors = (bool) $suppress;
+        return $previous;
     }
 
     public function prepare($query, ...$args)
@@ -2053,6 +2081,51 @@ class Alegra_Mock_Wpdb
     {
         $query = (string) $query;
         $GLOBALS['alegra_dbread_count'] = ($GLOBALS['alegra_dbread_count'] ?? 0) + 1;
+        $this->last_error = '';
+
+        // Bulk-wipe preview: orders referencing the wiped products. Production
+        // joins `woocommerce_order_itemmeta` (oim) to `woocommerce_order_items`
+        // (oi) on `order_item_id` and counts DISTINCT `oi.order_id` — the
+        // itemmeta table has no `order_id` column. The harness emulates that
+        // join over the seeded `alegra_db` order tables.
+        if (strpos($query, 'woocommerce_order_itemmeta') !== false
+            && stripos($query, 'join') !== false) {
+            if (!empty($GLOBALS['alegra_order_tables_missing'])) {
+                $this->last_error = "Table '{$this->prefix}woocommerce_order_items' doesn't exist";
+                return null;
+            }
+            preg_match('/meta_value\s+IN\s*\(([^)]*)\)/i', $query, $mi);
+            $wanted = [];
+            if (!empty($mi[1])) {
+                foreach (explode(',', $mi[1]) as $part) {
+                    $part = (int) trim($part);
+                    if ($part > 0) {
+                        $wanted[$part] = true;
+                    }
+                }
+            }
+            $order_ids = [];
+            foreach (($GLOBALS['alegra_db']['wp_woocommerce_order_itemmeta'] ?? []) as $meta) {
+                $key = (string) ($meta['meta_key'] ?? '');
+                if ($key !== '_product_id' && $key !== '_variation_id') {
+                    continue;
+                }
+                if (!isset($wanted[(int) ($meta['meta_value'] ?? 0)])) {
+                    continue;
+                }
+                $item_id = (int) ($meta['order_item_id'] ?? 0);
+                foreach (($GLOBALS['alegra_db']['wp_woocommerce_order_items'] ?? []) as $item) {
+                    if ((int) ($item['order_item_id'] ?? 0) === $item_id) {
+                        $oid = (int) ($item['order_id'] ?? 0);
+                        if ($oid > 0) {
+                            $order_ids[$oid] = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            return (string) count($order_ids);
+        }
 
         if (strpos($query, 'option_name') !== false && preg_match("/option_name\s*=\s*'([^']+)'/", $query, $m)) {
             return array_key_exists($m[1], $GLOBALS['wp_options'])

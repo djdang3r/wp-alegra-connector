@@ -2,6 +2,38 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.18] - 2026-10-14
+
+> **Correcciones del "Borrador masivo" detectadas en QA real (WP 6 + WooCommerce
+> 11.2.1):** una pérdida de datos en la imagen placeholder de la tienda y dos
+> conteos incorrectos en el preview/progreso del borrado.
+
+### Fixed
+
+- **Placeholder de WooCommerce protegido (pérdida de datos).** El guard leía la
+  opción `woocommerce_placeholder_image_id`, que WooCommerce **nunca** usa; el
+  core guarda el placeholder en `woocommerce_placeholder_image`. El wipe borraba
+  la imagen placeholder real (adjunto + archivo) y dejaba la opción apuntando a un
+  adjunto inexistente. Ahora se lee la opción real y, de forma defensiva, también
+  la clave legacy: un adjunto se protege si es el valor de **cualquiera** de las
+  dos. Aplicado al veredicto del wipe (`wipe_attachment_verdict`), al camino de
+  import (`delete_replaced_image`) y al conteo del preview
+  (`wipe_count_skipped_images`), que ahora coinciden.
+- **Conteo de órdenes del preview.** `wipe_count_orders_referencing()` hacía
+  `SELECT COUNT(DISTINCT order_id)` sobre `woocommerce_order_itemmeta`, que **no
+  tiene** columna `order_id`: la consulta fallaba y el preview reportaba siempre
+  `orders: 0`. Ahora hace `INNER JOIN` con `woocommerce_order_items` por
+  `order_item_id` y cuenta `DISTINCT oi.order_id`; sigue siendo best-effort
+  (devuelve 0 si las tablas no existen / HPOS) y silencioso vía
+  `suppress_errors()` + `last_error`.
+- **Variaciones contadas dos veces.** Al borrar el padre, sus variaciones se
+  eliminan primero; cuando el cursor keyset volvía a pasar por esos ids, el cache
+  de objetos de WooCommerce devolvía el `WC_Product` **stale** del post ya
+  borrado y el wipe lo procesaba de nuevo, inflando `products_deleted` (un set de
+  4 posts reportaba 6). Ahora el chunk mantiene un set de ids ya borrados en la
+  corrida (sembrado del rollup, válido entre chunks) y saltea el "fantasma" antes
+  de instanciarlo.
+
 ## [2.8.17] - 2026-10-13
 
 > **Endurecimiento del "Borrador masivo": se elimina el falso "Error de conexión"**

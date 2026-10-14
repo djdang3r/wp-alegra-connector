@@ -38,11 +38,21 @@ class Products
     private const MAX_ITEM_VARIANTS = 100;
 
     /**
-     * The WC core option holding the placeholder image id. Referenced by the
-     * bulk wipe's image guard (H4). Kept as a constant so it is not mistaken
-     * for a plugin option by the uninstall audit.
+     * The WC core option holding the placeholder image id. WooCommerce (all
+     * supported versions, incl. 11.2.1) reads/writes this exact key
+     * (`woocommerce_placeholder_image`, see woocommerce/class-wc-install.php and
+     * the Products settings). Referenced by the bulk wipe's image guard (H4).
+     * Kept as a constant so it is not mistaken for a plugin option by the
+     * uninstall audit.
      */
-    private const WC_PLACEHOLDER_OPTION = 'woocommerce_placeholder_image_id';
+    private const WC_PLACEHOLDER_OPTION = 'woocommerce_placeholder_image';
+
+    /**
+     * Alternate/legacy key (never written by WC core) that older builds of this
+     * plugin and its tests used. Checked defensively alongside the real option so
+     * a store that set the placeholder under EITHER key never has it deleted.
+     */
+    private const WC_PLACEHOLDER_OPTION_LEGACY = 'woocommerce_placeholder_image_id';
 
     /**
      * H5: completion guard for the bulk-wipe integrity close. Set once
@@ -2931,7 +2941,7 @@ class Products
         if ((int) get_theme_mod('custom_logo') === $attachment_id) {
             return; // (d) never delete the theme logo (H14)
         }
-        if ((int) get_option(self::WC_PLACEHOLDER_OPTION) === $attachment_id) {
+        if (self::is_wc_placeholder_image($attachment_id)) {
             return; // (e) never delete the WC placeholder (H14)
         }
 
@@ -3262,6 +3272,20 @@ class Products
         $made_progress    = false;
         $deadline_hit     = false;
 
+        // H16: ids already deleted during this run (a variation removed as a
+        // child of its parent, or an earlier chunk). `wc_get_product()` reads
+        // through the WooCommerce object cache and can return the STALE object
+        // for one of these ghosts, so the keyset loop would "delete" it a second
+        // time and inflate the counters (a 4-post set reported 6). Seed from the
+        // run rollup so this also holds ACROSS chunks.
+        $already_deleted = [];
+        foreach ((array) get_option('alegra_connector_wipe_deleted_ids', []) as $done_id) {
+            $done_id = (int) $done_id;
+            if ($done_id > 0) {
+                $already_deleted[$done_id] = true;
+            }
+        }
+
         try {
             foreach ($ids as $product_id) {
                 $product_id = (int) $product_id;
@@ -3278,6 +3302,15 @@ class Products
                     $result['aborted'] = true;
                     $result['reason']  = $abort;
                     break;
+                }
+
+                // H16: never re-process an id that was already deleted this run
+                // (see $already_deleted). Skip the stale ghost, count it as
+                // handled and advance the keyset cursor.
+                if (isset($already_deleted[$product_id])) {
+                    $result['processed']++;
+                    $last_complete = $product_id;
+                    continue;
                 }
 
                 $product = wc_get_product($product_id);
@@ -3308,6 +3341,9 @@ class Products
                         $group_done = false;
                         break 2;
                     }
+                    if (isset($already_deleted[$child_id])) {
+                        continue;
+                    }
                     $child = wc_get_product($child_id);
                     if (!$child instanceof \WC_Product) {
                         continue;
@@ -3317,6 +3353,7 @@ class Products
                         $deadline_hit = true;
                         break;
                     }
+                    $already_deleted[$child_id] = true;
                 }
                 if (!$group_done) {
                     break;
@@ -3329,6 +3366,7 @@ class Products
                     $deadline_hit = true;
                     break;
                 }
+                $already_deleted[$product_id] = true;
 
                 $result['processed']++;
                 $last_complete = $product_id;
@@ -3498,7 +3536,7 @@ class Products
         if ((int) get_theme_mod('custom_logo') === $attachment_id) {
             return 'skip';
         }
-        if ((int) get_option(self::WC_PLACEHOLDER_OPTION) === $attachment_id) {
+        if (self::is_wc_placeholder_image($attachment_id)) {
             return 'skip';
         }
         if ($this->wipe_referenced_outside_set($attachment_id, $wipe_set)) {
@@ -3880,9 +3918,9 @@ class Products
             return 0;
         }
 
-        $term_thumbs = $this->wipe_term_thumbnail_ids();
-        $logo        = (int) get_theme_mod('custom_logo');
-        $placeholder = (int) get_option(self::WC_PLACEHOLDER_OPTION);
+        $term_thumbs     = $this->wipe_term_thumbnail_ids();
+        $logo            = (int) get_theme_mod('custom_logo');
+        $placeholder_ids = self::wc_placeholder_image_ids();
 
         // Prime the post cache so the per-candidate `wp_attachment_is_image()`
         // check does not issue one get_post query per image. Gated on the core
@@ -3897,7 +3935,7 @@ class Products
             if (isset($outside[$att])
                 || isset($term_thumbs[$att])
                 || ($logo > 0 && $att === $logo)
-                || ($placeholder > 0 && $att === $placeholder)
+                || isset($placeholder_ids[$att])
                 || !function_exists('wp_attachment_is_image')
                 || !wp_attachment_is_image($att)
             ) {
@@ -3937,8 +3975,49 @@ class Products
     }
 
     /**
+     * The attachment id(s) configured as the store-wide WooCommerce placeholder.
+     *
+     * WooCommerce stores it under `woocommerce_placeholder_image`; the
+     * `..._image_id` key is a legacy/alternate form never written by WC core.
+     * Both are collected (defensively) so a store that configured either is
+     * protected. Returned as a set for O(1) lookup in the hot verdict path.
+     *
+     * @return array<int,true>
+     */
+    private static function wc_placeholder_image_ids(): array
+    {
+        $out = [];
+        foreach ([self::WC_PLACEHOLDER_OPTION, self::WC_PLACEHOLDER_OPTION_LEGACY] as $option) {
+            $id = (int) get_option($option);
+            if ($id > 0) {
+                $out[$id] = true;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * True when `$attachment_id` is the store-wide WooCommerce placeholder image
+     * (under either the real or the legacy option key). Shared by both the wipe
+     * verdict and the import rewrite path so they can never diverge.
+     */
+    private static function is_wc_placeholder_image(int $attachment_id): bool
+    {
+        if ($attachment_id <= 0) {
+            return false;
+        }
+        return isset(self::wc_placeholder_image_ids()[$attachment_id]);
+    }
+
+    /**
      * Best-effort count of orders whose line items reference the wiped products.
-     * Read-only; returns 0 when the order-itemmeta table is unavailable (HPOS).
+     * Read-only; returns 0 when the order tables are unavailable (HPOS/custom
+     * order tables) so the preview never errors.
+     *
+     * `woocommerce_order_itemmeta` has NO `order_id` column — the order id lives
+     * in `woocommerce_order_items` and is reached by joining on `order_item_id`
+     * (the previous query selected a non-existent column, so it always errored
+     * and the preview reported `orders: 0`).
      *
      * @param int[] $product_ids
      */
@@ -3951,12 +4030,26 @@ class Products
             return 0;
         }
 
-        $in_list = implode(',', $ids);
+        $items_table = $wpdb->prefix . 'woocommerce_order_items';
+        $meta_table  = $wpdb->prefix . 'woocommerce_order_itemmeta';
+        $in_list     = implode(',', $ids);
+
+        // Suppress + inspect last_error so a missing table (HPOS / custom order
+        // tables) degrades to 0 silently instead of emitting a DB notice.
+        $previous = method_exists($wpdb, 'suppress_errors') ? $wpdb->suppress_errors(true) : null;
         $count = $wpdb->get_var(
-            "SELECT COUNT(DISTINCT order_id) FROM {$wpdb->prefix}woocommerce_order_itemmeta
-             WHERE meta_key IN ('_product_id', '_variation_id')
-               AND meta_value IN ({$in_list})"
+            "SELECT COUNT(DISTINCT oi.order_id)
+             FROM {$meta_table} oim
+             INNER JOIN {$items_table} oi ON oi.order_item_id = oim.order_item_id
+             WHERE oim.meta_key IN ('_product_id', '_variation_id')
+               AND oim.meta_value IN ({$in_list})"
         );
+        if (method_exists($wpdb, 'suppress_errors')) {
+            $wpdb->suppress_errors($previous);
+        }
+        if (!empty($wpdb->last_error)) {
+            return 0;
+        }
 
         return is_numeric($count) ? (int) $count : 0;
     }
