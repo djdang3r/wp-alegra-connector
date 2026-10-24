@@ -2,6 +2,56 @@
 
 All notable changes to Alegra Connector.
 
+## [2.8.20] - 2026-10-24
+
+> **Descuentos e impuestos de pedidos: bordes cubiertos sin romper el mapeo
+> estándar.** `price` sigue siendo el neto pre-descuento, `discount` un
+> porcentaje y `tax` una lista de ids; la reconciliación del total (0.01)
+> sigue igual por defecto. El plugin solo crea la factura en Alegra: NO emite
+> facturación electrónica (DIAN/CFDI/Hacienda) ni timbra.
+
+### Added
+
+- **Perfil de país (`includes/Country_Profile.php`).** Precedencia
+  `account_country` (nueva opción) → `company_country` (la que guarda el test de
+  conexión) → `CO`. `discount_payload()` devuelve un porcentaje numérico por
+  defecto; la estructura de Costa Rica (`{nature, discount}`) queda **diferida y
+  apagada**: solo se usa si configurás una naturaleza explícita. No hay llamadas
+  a `GET /company` por factura; la UI solo sugiere.
+- **Fee negativo → descuento distribuido.** El neto del recargo negativo se
+  reparte proporcionalmente al subtotal de las líneas de producto y se suma al
+  `discount` (nunca precios negativos). Se valida el total **incluyendo
+  impuestos**: si la tasa del fee no se puede representar 1:1 (tasas mixtas), la
+  factura se rechaza con `invoice_negative_fee_unsupported`, nota visible en el
+  pedido y estado permanente en la cola (no se reintenta en loop).
+- **Precio de oferta como descuento (opt-in, OFF por defecto).**
+  `alegra_connector_document_sale_as_discount`: al activarlo se envía el precio
+  regular y la diferencia (oferta + cupón) como porcentaje de descuento.
+- **Tolerancia de redondeo (opt-in, 0 por defecto).**
+  `alegra_connector_rounding_tolerance`: con 0 se mantiene el comportamiento
+  actual (bloquea > 0.01). Al activarla solo se tolera una diferencia de
+  redondeo de hasta 0.01 por línea, con nota en el pedido; un desajuste real
+  sigue bloqueando el pago.
+
+### Fixed
+
+- **Impuestos compuestos o no mapeables ya no se omiten en silencio.**
+  - `tax_rate_compound` ⇒ `invoice_tax_compound` (aviso + bloqueo seguro).
+  - Tasa con importe > 0 sin fila de rate ni mapeo ⇒ `invoice_tax_unmapped`.
+  - Una tasa 0 % real (importe 0) se sigue omitiendo en silencio.
+  - Los tres códigos nuevos (`invoice_negative_fee_unsupported`,
+    `invoice_tax_unmapped`, `invoice_tax_compound`) están en la lista permanente
+    de `Invoice_Failure`.
+- El mock del harness lee el descuento en formato objeto (CR) y
+  `alegra_seed_wc_tax_rate()` acepta `compound`.
+
+### Compatibility
+
+- Descuentos/impuestos siguen siendo **opcionales**: se envían solo cuando el
+  pedido los tiene.
+- Cupones, mapeo de impuestos estándar, envío, notas de crédito, pagos y la
+  reconciliación por defecto **no cambian**.
+
 ## [2.8.19] - 2026-10-14
 
 > **Corrección del "Borrador masivo" detectada en producción (WP real):** el
