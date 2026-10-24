@@ -18392,4 +18392,77 @@ TestRunner::test('T-DTX-17 Invoice_Failure marks the three new codes permanent',
     }
 });
 
+
+TestRunner::test('T-DTX-18 rounding tolerance OFF: a >0.01 difference still blocks (current behavior)', function (): void {
+    alegra_test_reset();
+    alegra_mock_seed_invoice('inv-round-off', [
+        'status' => 'open', 'total' => 100.02, 'balance' => 100.02,
+        'items' => [
+            ['id' => 'a', 'price' => 33.34, 'quantity' => 1],
+            ['id' => 'b', 'price' => 33.34, 'quantity' => 1],
+            ['id' => 'c', 'price' => 33.34, 'quantity' => 1],
+        ],
+    ]);
+    $order = make_payable_order(6030, 1, 'round-off@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-round-off'],
+    ]);
+
+    $result = alegra_call_private(make_orders(), 'assert_invoice_total_matches_order', $order, 'inv-round-off');
+    TestRunner::assertTrue(is_array($result), 'default stays strict');
+    TestRunner::assertSame('invoice_total_mismatch', $result['state'], 'drift blocks');
+    TestRunner::assertSame('1', (string) $order->get_meta('_alegra_invoice_total_mismatch', true), 'marker set');
+});
+
+TestRunner::test('T-DTX-19 rounding tolerance ON: a rounding-only difference is tolerated with a note', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_rounding_tolerance', 0.01);
+    alegra_mock_seed_invoice('inv-round-on', [
+        'status' => 'open', 'total' => 100.02, 'balance' => 100.02,
+        'items' => [
+            ['id' => 'a', 'price' => 33.34, 'quantity' => 1],
+            ['id' => 'b', 'price' => 33.34, 'quantity' => 1],
+            ['id' => 'c', 'price' => 33.34, 'quantity' => 1],
+        ],
+    ]);
+    $order = make_payable_order(6031, 1, 'round-on@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-round-on', '_alegra_invoice_total_mismatch' => '1'],
+    ]);
+
+    $result = alegra_call_private(make_orders(), 'assert_invoice_total_matches_order', $order, 'inv-round-on');
+    TestRunner::assertSame(null, $result, '0.02 over 3 lines (cap 0.03) is rounding');
+    TestRunner::assertSame('', (string) $order->get_meta('_alegra_invoice_total_mismatch', true), 'stale marker cleared');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('redondeo', strtolower($notes), 'the tolerance is documented on the order');
+});
+
+TestRunner::test('T-DTX-20 rounding tolerance ON still blocks a real mismatch and a 1-line rounding over the cap', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_rounding_tolerance', 0.01);
+
+    alegra_mock_seed_invoice('inv-round-real', [
+        'status' => 'open', 'total' => 100.50, 'balance' => 100.50,
+        'items' => [
+            ['id' => 'a', 'price' => 50.25, 'quantity' => 1],
+            ['id' => 'b', 'price' => 50.25, 'quantity' => 1],
+        ],
+    ]);
+    $order = make_payable_order(6032, 1, 'round-real@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-round-real'],
+    ]);
+    $result = alegra_call_private(make_orders(), 'assert_invoice_total_matches_order', $order, 'inv-round-real');
+    TestRunner::assertTrue(is_array($result), 'a real 0.50 mismatch still blocks');
+    TestRunner::assertSame('invoice_total_mismatch', $result['state'], 'real mismatch state');
+
+    alegra_mock_seed_invoice('inv-round-one', [
+        'status' => 'open', 'total' => 100.02, 'balance' => 100.02,
+        'items' => [['id' => 'a', 'price' => 100.02, 'quantity' => 1]],
+    ]);
+    $one = make_payable_order(6033, 1, 'round-one@example.test', 100.0, [
+        'meta' => ['_alegra_invoice_id' => 'inv-round-one'],
+    ]);
+    $r2 = alegra_call_private(make_orders(), 'assert_invoice_total_matches_order', $one, 'inv-round-one');
+    TestRunner::assertTrue(is_array($r2), 'one line allows only 0.01');
+    TestRunner::assertSame('invoice_total_mismatch', $r2['state'], 'over the per-line cap blocks');
+});
+
 exit(TestRunner::summary());

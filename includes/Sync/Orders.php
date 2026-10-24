@@ -3043,6 +3043,53 @@ class Orders
             return null;
         }
 
+        // Opt-in rounding tolerance (default 0 = historical strict behavior).
+        // Only a difference that can be explained by per-line rounding is
+        // tolerated: at most 0.01 per invoice line. A real mismatch always
+        // blocks.
+        $rounding_tolerance = (float) get_option('alegra_connector_rounding_tolerance', 0);
+        if ($rounding_tolerance > 0) {
+            $line_count = 0;
+            if (isset($invoice['items']) && is_array($invoice['items'])) {
+                $line_count = count($invoice['items']);
+            }
+            if ($line_count < 1) {
+                $line_count = count($order->get_items())
+                    + count($order->get_items('shipping'))
+                    + count($order->get_items('fee'));
+            }
+            $rounding_cap = max(1, $line_count) * 0.01;
+
+            if (abs($diff) <= $rounding_cap + 0.0000001) {
+                if ((string) $order->get_meta('_alegra_invoice_total_mismatch', true) === '1') {
+                    $order->delete_meta_data('_alegra_invoice_total_mismatch');
+                    $order->save();
+                }
+
+                $order->add_order_note(sprintf(
+                    /* translators: 1: invoice id, 2: difference, 3: order total, 4: invoice total. */
+                    __('[Alegra] Factura #%1$s: se toleró una diferencia de redondeo de %2$s (pedido %3$s vs factura %4$s). No se bloqueó el pago. Revisá la factura si la diferencia te preocupa.', 'alegra-connector'),
+                    $invoice_id,
+                    number_format($diff, 2, '.', ''),
+                    number_format($order_total, 2, '.', ''),
+                    number_format($invoice_total, 2, '.', '')
+                ));
+
+                if ($this->logger) {
+                    $this->logger->warning('Invoice total difference tolerated as rounding', [
+                        'order_id'      => (int) $order->get_id(),
+                        'invoice_id'    => $invoice_id,
+                        'order_total'   => $order_total,
+                        'invoice_total' => $invoice_total,
+                        'difference'    => $diff,
+                        'line_count'    => $line_count,
+                    ]);
+                }
+
+                return null;
+            }
+        }
+
         // Mismatch: BLOCK payment + record.
         $rounded_diff = number_format($diff, 2, '.', '');
         $message      = sprintf(
