@@ -475,6 +475,45 @@ class Admin_Dashboard
         return (string) get_option($option_name, '');
     }
 
+    /**
+     * Sanitize the explicit account country. Empty means "inherit", otherwise
+     * only letters are accepted (2-3 char ISO-ish code).
+     */
+    public static function sanitize_account_country($value): string
+    {
+        $value = strtoupper(trim((string) $value));
+        if ($value === '') {
+            return '';
+        }
+
+        if (!preg_match('/^[A-Z]{2,3}$/', $value)) {
+            add_settings_error(
+                'alegra_connector_settings',
+                'alegra_connector_account_country_invalid',
+                __('El país debe ser un código de 2 o 3 letras (ej: CO, CR) o vacío para heredar el país de la conexión.', 'alegra-connector'),
+                'error'
+            );
+            return (string) get_option(\Alegra\Connector\Country_Profile::OPTION_ACCOUNT_COUNTRY, '');
+        }
+
+        return $value;
+    }
+
+    /**
+     * Sanitize the opt-in rounding tolerance. 0 is the default (the historical
+     * 0.01 reconciliation); a positive value enables the rounding-only
+     * tolerance capped at the number of invoice lines × 0.01.
+     */
+    public static function sanitize_rounding_tolerance($value): float
+    {
+        $value = (float) $value;
+        if ($value < 0) {
+            return 0.0;
+        }
+
+        return round(min($value, 1.0), 4);
+    }
+
     public function register_settings(): void
     {
         register_setting('alegra_connector_settings', 'alegra_connector_email', ['sanitize_callback' => 'sanitize_email']);
@@ -626,6 +665,29 @@ class Admin_Dashboard
                 return in_array($value, $allowed, true) ? $value : 'draft';
             },
             'default' => 'draft',
+        ]);
+        // Country profile used for the invoice discount shape. The explicit
+        // option wins over the company country saved by the connection test;
+        // empty means "inherit". Colombia remains the default.
+        register_setting('alegra_connector_settings', \Alegra\Connector\Country_Profile::OPTION_ACCOUNT_COUNTRY, [
+            'sanitize_callback' => [self::class, 'sanitize_account_country'],
+            'default' => '',
+        ]);
+        // Optional Costa Rica fiscal nature. The object branch stays deferred and
+        // is only used when this value is explicitly configured.
+        register_setting('alegra_connector_settings', \Alegra\Connector\Country_Profile::OPTION_CR_DISCOUNT_NATURE, [
+            'sanitize_callback' => fn($v) => substr(sanitize_text_field((string) $v), 0, 20),
+            'default' => '',
+        ]);
+        // Opt-in: send the sale price as a discount instead of as the line price.
+        register_setting('alegra_connector_settings', 'alegra_connector_document_sale_as_discount', [
+            'sanitize_callback' => 'rest_sanitize_boolean',
+            'default' => false,
+        ]);
+        // Opt-in rounding tolerance. 0 keeps the current 0.01 reconciliation.
+        register_setting('alegra_connector_settings', 'alegra_connector_rounding_tolerance', [
+            'sanitize_callback' => [self::class, 'sanitize_rounding_tolerance'],
+            'default' => 0,
         ]);
         register_setting('alegra_connector_settings', 'alegra_connector_dry_run', [
             'sanitize_callback' => 'rest_sanitize_boolean',

@@ -394,12 +394,8 @@ class Billing_Fields
      */
     public static function is_colombia_account(): bool
     {
-        $country = strtoupper(trim((string) get_option('alegra_connector_company_country', '')));
-        if ($country !== '') {
-            return in_array($country, ['CO', 'COLOMBIA'], true);
-        }
-
-        return true;
+        // Single source of truth: account_country → company_country → CO.
+        return \Alegra\Connector\Country_Profile::is_colombia();
     }
 
     /**

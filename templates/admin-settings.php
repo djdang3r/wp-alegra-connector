@@ -502,6 +502,39 @@ $ac_resolution_mode = get_option('alegra_connector_customer_resolution_mode','au
 <div class="ac-notice warning" style="margin-top:8px;"><strong><?php esc_html_e('Importante (Colombia / DIAN):','alegra-connector');?></strong> <?php esc_html_e('El plugin NO emite las facturas ante la DIAN: nunca envía el timbrado electrónico (stamp.generateStamp). Aunque elijas "Abierta", la factura queda sin emitir electrónicamente en Alegra y debés emitirla/timbrarla manualmente desde Alegra.','alegra-connector');?></div>
 </td></tr>
 
+<!-- 1b-bis. Country profile (account_country > company_country > CO) -->
+<?php $ac_country_profile = \Alegra\Connector\Country_Profile::suggestion(); ?>
+<tr><th><label for="alegra_connector_account_country"><?php esc_html_e('País de la cuenta:','alegra-connector');?></label></th><td>
+<select id="alegra_connector_account_country" name="alegra_connector_account_country">
+<option value="" <?php selected(get_option(\Alegra\Connector\Country_Profile::OPTION_ACCOUNT_COUNTRY,''),'');?>><?php esc_html_e('Heredar del país de la conexión (recomendado)','alegra-connector');?></option>
+<?php foreach(['CO'=>'Colombia','CR'=>'Costa Rica','MX'=>'México','AR'=>'Argentina','CL'=>'Chile','PE'=>'Perú','EC'=>'Ecuador','PA'=>'Panamá','GT'=>'Guatemala','SV'=>'El Salvador','HN'=>'Honduras','NI'=>'Nicaragua','DO'=>'República Dominicana','VE'=>'Venezuela','US'=>'Estados Unidos','ES'=>'España'] as $ac_cc=>$ac_cc_label): ?>
+<option value="<?php echo esc_attr($ac_cc);?>" <?php selected(get_option(\Alegra\Connector\Country_Profile::OPTION_ACCOUNT_COUNTRY,''),$ac_cc);?>><?php echo esc_html($ac_cc_label.' ('.$ac_cc.')');?></option>
+<?php endforeach;?>
+</select>
+<p class="description"><?php echo esc_html(sprintf(__('País efectivo: %s. País detectado por la conexión: %s.','alegra-connector'), $ac_country_profile['country'], $ac_country_profile['detected'] !== '' ? $ac_country_profile['detected'] : '—'));?>
+<?php if(!$ac_country_profile['matches']):?> <strong><?php esc_html_e('El país efectivo no coincide con el detectado; revisá esta opción.','alegra-connector');?></strong><?php endif;?>
+<?php esc_html_e('Determina la forma del descuento en la factura. Colombia usa un porcentaje numérico.','alegra-connector');?></p>
+</td></tr>
+
+<!-- 1b-ter. Costa Rica discount nature (deferred/optional, empty by default) -->
+<tr><th><label for="alegra_connector_cr_discount_nature"><?php esc_html_e('Naturaleza del descuento (Costa Rica):','alegra-connector');?></label></th><td>
+<input type="text" id="alegra_connector_cr_discount_nature" name="alegra_connector_cr_discount_nature" value="<?php echo esc_attr(get_option(\Alegra\Connector\Country_Profile::OPTION_CR_DISCOUNT_NATURE,''));?>" class="small-text" maxlength="20" placeholder="<?php esc_attr_e('Vacío (descuento numérico)', 'alegra-connector');?>">
+<p class="description"><?php esc_html_e('Opcional y diferido: solo si Alegra te exige la estructura fiscal de Costa Rica. Vacío mantiene el descuento como porcentaje numérico.','alegra-connector');?></p>
+</td></tr>
+
+<!-- 1b-quater. Sale price as discount (opt-in, default OFF) -->
+<tr><th><?php esc_html_e('Precio de oferta:','alegra-connector');?></th><td>
+<input type="hidden" name="alegra_connector_document_sale_as_discount" value="0">
+<label><input type="checkbox" name="alegra_connector_document_sale_as_discount" value="1" <?php checked(get_option('alegra_connector_document_sale_as_discount',false));?>> <?php esc_html_e('Enviar el precio de oferta como descuento (precio de lista + % descuento)','alegra-connector');?></label>
+<p class="description"><?php esc_html_e('Desactivado (por defecto): el precio de oferta viaja como precio de la línea. Activado: se envía el precio regular y la diferencia (oferta + cupón) como porcentaje de descuento.','alegra-connector');?></p>
+</td></tr>
+
+<!-- 1b-quinquies. Opt-in rounding tolerance (default 0 = current behavior) -->
+<tr><th><label for="alegra_connector_rounding_tolerance"><?php esc_html_e('Tolerancia de redondeo:','alegra-connector');?></label></th><td>
+<input type="number" id="alegra_connector_rounding_tolerance" name="alegra_connector_rounding_tolerance" value="<?php echo esc_attr(get_option('alegra_connector_rounding_tolerance',0));?>" class="small-text" min="0" max="1" step="0.01">
+<p class="description"><?php esc_html_e('0 (por defecto): bloquea cualquier diferencia mayor a 0.01, como siempre. Mayor a 0: tolera SOLO diferencias de redondeo de hasta 0.01 por línea (con aviso en el pedido); una diferencia real sigue bloqueando.','alegra-connector');?></p>
+</td></tr>
+
 <!-- 1c. Dry run toggle -->
 <tr><th><?php esc_html_e('Modo de prueba:','alegra-connector');?></th><td>
 <label><input type="checkbox" name="alegra_connector_dry_run" value="1" <?php checked(get_option('alegra_connector_dry_run',false));?>> <strong><?php esc_html_e('Modo de prueba (Dry Run)','alegra-connector');?></strong></label>

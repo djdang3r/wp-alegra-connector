@@ -106,6 +106,10 @@ function alegra_connector_uninstall_options(): void
     delete_option('alegra_connector_shipping_item_type'); // Phase 1 Lane B: default type for "Crear ítem de envío"
     delete_option('alegra_connector_internal_item_ids'); // Lane C: helper-item allow-list
     delete_option('alegra_connector_hide_advanced_menus'); // 2.8.x: hide advanced admin sections
+    delete_option('alegra_connector_account_country'); // 2.8.20: explicit country profile
+    delete_option('alegra_connector_cr_discount_nature'); // 2.8.20: optional/deferred CR discount nature
+    delete_option('alegra_connector_document_sale_as_discount'); // 2.8.20: opt-in sale-as-discount
+    delete_option('alegra_connector_rounding_tolerance'); // 2.8.20: opt-in rounding tolerance
     delete_option('alegra_connector_warehouse_mapping');
     delete_option('alegra_connector_category_mapping');
     delete_option('alegra_connector_warehouse_enabled');

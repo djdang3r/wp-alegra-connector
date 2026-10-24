@@ -18040,4 +18040,74 @@ TestRunner::test('T87.9 el kill switch aborta el chunk sin borrar (aborted=true,
     TestRunner::assertTrue(get_post(8500) !== null, 'sigue viva');
 });
 
+// ===========================================================================
+// T-DTX — Order discounts & taxes (2.8.20)
+// ===========================================================================
+echo "\nT-DTX — Order discounts & taxes (2.8.20)\n";
+
+TestRunner::test('T-DTX-01 Country_Profile: account_country > company_country > CO', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame('CO', \Alegra\Connector\Country_Profile::country(), 'default is CO');
+    update_option('alegra_connector_company_country', 'mx');
+    TestRunner::assertSame('MX', \Alegra\Connector\Country_Profile::country(), 'company country is normalized');
+    update_option('alegra_connector_account_country', 'cr');
+    TestRunner::assertSame('CR', \Alegra\Connector\Country_Profile::country(), 'account country overrides company');
+    update_option('alegra_connector_account_country', '');
+    TestRunner::assertSame('MX', \Alegra\Connector\Country_Profile::country(), 'empty account inherits company');
+});
+
+TestRunner::test('T-DTX-02 Country_Profile::discount_payload: number by default, CR object only when configured', function (): void {
+    alegra_test_reset();
+    TestRunner::assertSame(12.5, \Alegra\Connector\Country_Profile::discount_payload(12.5), 'CO uses a numeric percentage');
+    update_option('alegra_connector_company_country', 'CR');
+    TestRunner::assertSame(12.5, \Alegra\Connector\Country_Profile::discount_payload(12.5), 'CR without nature stays numeric (deferred branch)');
+    update_option('alegra_connector_cr_discount_nature', '07');
+    TestRunner::assertSame(
+        ['nature' => '07', 'discount' => 12.5],
+        \Alegra\Connector\Country_Profile::discount_payload(12.5),
+        'CR with a configured nature returns the documented object'
+    );
+    TestRunner::assertSame(0.0, \Alegra\Connector\Country_Profile::discount_payload(0.0), 'zero => no payload');
+});
+
+TestRunner::test('T-DTX-03 country suggestion reports the stored value and never overrides it', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_company_country', 'CO');
+    update_option('alegra_connector_account_country', 'CR');
+    $s = \Alegra\Connector\Country_Profile::suggestion();
+    TestRunner::assertSame('CR', $s['country'], 'effective country');
+    TestRunner::assertSame('CO', $s['detected'], 'stored company country');
+    TestRunner::assertSame('account', $s['source'], 'explicit option wins');
+    TestRunner::assertFalse($s['matches'], 'mismatch is surfaced, not auto-corrected');
+    TestRunner::assertSame('CR', \Alegra\Connector\Country_Profile::country(), 'suggestion never changes the option');
+});
+
+TestRunner::test('T-DTX-04 invoice sends the numeric discount by default and omits it when zero', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-C1', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-country');
+
+    $discounted = alegra_make_order(9501, [
+        'total' => 90.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'country1@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-country'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 90])],
+    ]);
+    $r1 = make_orders()->create_invoice($discounted);
+    TestRunner::assertFalse(is_wp_error($r1), 'invoice with discount succeeds');
+    $body1 = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(10.0, $body1['items'][0]['discount'] ?? null, 'CO discount is a number');
+
+    $plain = alegra_make_order(9502, [
+        'total' => 100.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'country2@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-country'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100])],
+    ]);
+    $r2 = make_orders()->create_invoice($plain);
+    TestRunner::assertFalse(is_wp_error($r2), 'invoice without discount succeeds');
+    $body2 = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('discount', $body2['items'][0] ?? [], 'no discount field when there is none');
+});
+
 exit(TestRunner::summary());
