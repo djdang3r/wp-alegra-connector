@@ -2366,7 +2366,7 @@ class Orders
             }
 
             $percent = self::line_discount_percent($base, $new_net);
-            if ($percent >= 100) {
+            if ($percent > 100.0001) {
                 return $this->unsupported_negative_fee($order, $amount, (float) $order->get_total(), (float) $order->get_total());
             }
 
