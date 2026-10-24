@@ -1240,9 +1240,14 @@ function alegra_mock_body_total(mixed $body): float
     foreach (($body['items'] ?? []) as $item) {
         if (!is_array($item)) { continue; }
         $line = (float) ($item['price'] ?? 0) * (float) ($item['quantity'] ?? 0);
-        // `discount` is a percentage (post_invoices.md).
+        // `discount` is a percentage (post_invoices.md). Country profiles may
+        // send the object form `{nature, discount}` (Costa Rica), so read the
+        // numeric value from either shape.
         if (isset($item['discount'])) {
-            $line *= (1 - ((float) $item['discount'] / 100));
+            $discount = is_array($item['discount'])
+                ? (float) ($item['discount']['discount'] ?? 0)
+                : (float) $item['discount'];
+            $line *= (1 - ($discount / 100));
         }
         // `items[].tax` is a list of {id}; resolve each percentage from the
         // seeded tax catalog so the invoice total reflects the taxes.

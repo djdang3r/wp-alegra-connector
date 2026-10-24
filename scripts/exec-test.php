@@ -18465,4 +18465,120 @@ TestRunner::test('T-DTX-20 rounding tolerance ON still blocks a real mismatch an
     TestRunner::assertSame('invoice_total_mismatch', $r2['state'], 'over the per-line cap blocks');
 });
 
+
+TestRunner::test('T-DTX-21 matrix: fixed + cart discounts across multiple lines reconcile', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'A', 'sku' => 'SKU-MX1A', 'regular_price' => '100']);
+    alegra_make_product(11, ['name' => 'B', 'sku' => 'SKU-MX1B', 'regular_price' => '50']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-mx1a');
+    update_post_meta(11, '_alegra_item_id', '1t3m-mx1b');
+
+    $order = alegra_make_order(9540, [
+        'total' => 115.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'mx1@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-mx'],
+        'items' => [
+            new WC_Order_Item(['product_id' => 10, 'name' => 'A', 'quantity' => 1, 'subtotal' => 100, 'total' => 75]),
+            new WC_Order_Item(['product_id' => 11, 'name' => 'B', 'quantity' => 1, 'subtotal' => 50, 'total' => 40]),
+        ],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'line A net price');
+    TestRunner::assertEquals(25.0, $body['items'][0]['discount'] ?? null, 'fixed discount on A becomes 25%');
+    TestRunner::assertEquals(50.0, $body['items'][1]['price'] ?? null, 'line B net price');
+    TestRunner::assertEquals(20.0, $body['items'][1]['discount'] ?? null, 'fixed discount on B becomes 20%');
+    TestRunner::assertEquals(115.0, (float) ($result['total'] ?? 0), 'total reconciles');
+});
+
+TestRunner::test('T-DTX-22 matrix: shipping without tax is its own line and reconciles', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_shipping_map', ['flat_rate:13' => '999']);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-MX2', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-mx2');
+
+    $order = alegra_make_order(9541, [
+        'total' => 115.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'mx2@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-mx'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100])],
+        'shipping_items' => [new WC_Order_Item_Shipping(['name' => 'Envío', 'method_id' => 'flat_rate', 'instance_id' => '13', 'quantity' => 1, 'subtotal' => 15, 'total' => 15])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertCount(2, $body['items'] ?? [], 'product + shipping');
+    TestRunner::assertEquals(15.0, $body['items'][1]['price'] ?? null, 'shipping price');
+    TestRunner::assertArrayNotHasKey('tax', $body['items'][1] ?? [], 'no tax on tax-free shipping');
+    TestRunner::assertEquals(115.0, (float) ($result['total'] ?? 0), 'total reconciles');
+});
+
+TestRunner::test('T-DTX-23 matrix: multiple taxed lines with coupons reconcile', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_make_product(10, ['name' => 'A', 'sku' => 'SKU-MX3A', 'regular_price' => '100']);
+    alegra_make_product(11, ['name' => 'B', 'sku' => 'SKU-MX3B', 'regular_price' => '50']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-mx3a');
+    update_post_meta(11, '_alegra_item_id', '1t3m-mx3b');
+
+    $order = alegra_make_order(9542, [
+        'total' => 160.65, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'mx3@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-mx'],
+        'items' => [
+            new WC_Order_Item(['product_id' => 10, 'name' => 'A', 'quantity' => 1, 'subtotal' => 100, 'total' => 90, 'taxes' => ['total' => [1 => 17.1]]]),
+            new WC_Order_Item(['product_id' => 11, 'name' => 'B', 'quantity' => 1, 'subtotal' => 50, 'total' => 45, 'taxes' => ['total' => [1 => 8.55]]]),
+        ],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(10.0, $body['items'][0]['discount'] ?? null, 'A coupon %');
+    TestRunner::assertEquals(10.0, $body['items'][1]['discount'] ?? null, 'B coupon %');
+    TestRunner::assertSame(
+        $body['items'][0]['tax'][0]['id'] ?? null,
+        $body['items'][1]['tax'][0]['id'] ?? null,
+        'both lines share the resolved tax id'
+    );
+    TestRunner::assertEquals(160.65, (float) ($result['total'] ?? 0), 'total includes both taxes');
+});
+
+TestRunner::test('T-DTX-24 matrix: Costa Rica sends the numeric discount unless a nature is configured', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_company_country', 'CR');
+    alegra_make_product(10, ['name' => 'CR', 'sku' => 'SKU-MX4', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-mx4');
+
+    $make = static function (int $id, float $total): WC_Order {
+        return alegra_make_order($id, [
+            'total' => $total, 'currency' => 'CRC', 'payment_method' => 'bacs',
+            'billing' => ['country' => 'CR', 'email' => 'cr@example.test'],
+            'meta' => ['_billing_alegra_contact_id' => 'c0n-cr'],
+            'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'CR', 'quantity' => 1, 'subtotal' => 100, 'total' => $total])],
+        ]);
+    };
+
+    $plain = $make(9543, 90.0);
+    $r1 = make_orders()->create_invoice($plain);
+    TestRunner::assertFalse(is_wp_error($r1), 'CR without nature succeeds');
+    $body1 = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(10.0, $body1['items'][0]['discount'] ?? null, 'default CR is the numeric percentage');
+    TestRunner::assertEquals(90.0, (float) ($r1['total'] ?? 0), 'numeric payload reconciles');
+
+    update_option('alegra_connector_cr_discount_nature', '07');
+    $object = $make(9544, 90.0);
+    $r2 = make_orders()->create_invoice($object);
+    TestRunner::assertFalse(is_wp_error($r2), 'CR with nature succeeds');
+    $body2 = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    $cr_discount = $body2['items'][0]['discount'] ?? null;
+    TestRunner::assertTrue(is_array($cr_discount), 'configured CR sends the object shape');
+    TestRunner::assertSame('07', $cr_discount['nature'] ?? null, 'configured nature');
+    TestRunner::assertEquals(10.0, $cr_discount['discount'] ?? null, 'object discount percentage');
+    TestRunner::assertEquals(90.0, (float) ($r2['total'] ?? 0), 'the mock reads the object discount');
+});
+
 exit(TestRunner::summary());
