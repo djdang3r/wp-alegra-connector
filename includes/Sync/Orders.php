@@ -2462,6 +2462,9 @@ class Orders
     private function attach_line_taxes(array &$line, \WC_Order_Item $item): ?\WP_Error
     {
         $tax_ids = $this->map_item_taxes($item);
+        if (is_wp_error($tax_ids)) {
+            return $tax_ids;
+        }
         if ($tax_ids !== []) {
             $line['tax'] = [];
             foreach ($tax_ids as $tid) {
@@ -2547,7 +2550,10 @@ class Orders
                 'price'    => $total,
                 'quantity' => 1,
             ];
-            $this->attach_line_taxes($line, $ship_item);
+            $tax_error = $this->attach_line_taxes($line, $ship_item);
+            if (is_wp_error($tax_error)) {
+                return $tax_error;
+            }
             $lines[] = $line;
         }
 
@@ -2566,9 +2572,9 @@ class Orders
      * Best-effort: when the generic item cannot be resolved, the line is SKIPPED
      * (logged + order note) instead of aborting the whole invoice.
      *
-     * @return array<int, array<string, mixed>>
+     * @return array<int, array<string, mixed>>|\WP_Error
      */
-    private function build_fee_lines(\WC_Order $order): array
+    private function build_fee_lines(\WC_Order $order): array|\WP_Error
     {
         $lines = [];
 
@@ -2614,7 +2620,10 @@ class Orders
                 'price'       => $total,
                 'quantity'    => 1,
             ];
-            $this->attach_line_taxes($line, $fee_item);
+            $tax_error = $this->attach_line_taxes($line, $fee_item);
+            if (is_wp_error($tax_error)) {
+                return $tax_error;
+            }
             $lines[] = $line;
         }
 
@@ -3244,7 +3253,7 @@ class Orders
         ];
     }
 
-    private function map_item_taxes(\WC_Order_Item $item): array
+    private function map_item_taxes(\WC_Order_Item $item): array|\WP_Error
     {
         $tax_data = $item->get_taxes();
         if (empty($tax_data['total'])) {
@@ -3255,14 +3264,90 @@ class Orders
         $ids = [];
 
         foreach ($tax_data['total'] as $rate_id => $amount) {
-            // A zero-amount tax line carries no tax.
+            // A zero-amount tax line carries no tax: a real 0% rate (or an
+            // unused zero line) is skipped SILENTLY. Only a positive amount
+            // requires a resolvable rate.
             if ((float) $amount <= 0) {
                 continue;
             }
-            $resolved = $this->resolve_alegra_tax_id((string) $rate_id, $tax_mapping);
-            if ($resolved !== '') {
-                $ids[$resolved] = $resolved;
+
+            $rate_id = (string) $rate_id;
+            $rate = class_exists('\WC_Tax') ? \WC_Tax::_get_tax_rate((int) $rate_id) : [];
+            $mapped = isset($tax_mapping[$rate_id]) && (string) $tax_mapping[$rate_id] !== ''
+                ? (string) $tax_mapping[$rate_id]
+                : '';
+
+            // A missing WC rate row is a real configuration problem: there is
+            // no percentage to derive and, without an explicit mapping, the
+            // tax would be silently omitted (invoice total would drift).
+            if ($rate === [] || !isset($rate['tax_rate'])) {
+                if ($mapped !== '') {
+                    $ids[$mapped] = $mapped;
+                    continue;
+                }
+
+                return new \WP_Error(
+                    'invoice_tax_unmapped',
+                    sprintf(
+                        /* translators: %s: WooCommerce tax rate id. */
+                        __('No se pudo mapear el impuesto de WooCommerce (tasa #%s) a un impuesto de Alegra: la tasa ya no existe y no hay un mapeo configurado. Configurá el mapeo o corregí los impuestos del pedido antes de facturar.', 'alegra-connector'),
+                        $rate_id
+                    )
+                );
             }
+
+            // Compound taxes cannot be represented by Alegra's flat tax list.
+            // Refuse with a visible, permanent reason instead of sending a
+            // different total.
+            if (!empty($rate['tax_rate_compound'])) {
+                return new \WP_Error(
+                    'invoice_tax_compound',
+                    sprintf(
+                        /* translators: %s: WooCommerce tax rate id. */
+                        __('El impuesto de WooCommerce (tasa #%s) es compuesto (compound). Alegra no puede representar impuestos compuestos en una factura. Desactivá el impuesto compuesto o ajustá la tasa antes de facturar.', 'alegra-connector'),
+                        $rate_id
+                    )
+                );
+            }
+
+            if ($mapped !== '') {
+                $ids[$mapped] = $mapped;
+                continue;
+            }
+
+            $class = isset($rate['tax_rate_class']) ? (string) $rate['tax_rate_class'] : '';
+            $slug = sanitize_title($class);
+            if ($slug !== '' && isset($tax_mapping[$slug]) && (string) $tax_mapping[$slug] !== '') {
+                $mapped_by_class = (string) $tax_mapping[$slug];
+                $ids[$mapped_by_class] = $mapped_by_class;
+                continue;
+            }
+
+            $percentage = (float) $rate['tax_rate'];
+            if ($percentage <= 0) {
+                return new \WP_Error(
+                    'invoice_tax_unmapped',
+                    sprintf(
+                        /* translators: %s: WooCommerce tax rate id. */
+                        __('El impuesto de WooCommerce (tasa #%s) no tiene un porcentaje válido ni un mapeo a Alegra. Configurá el mapeo o corregí la tasa antes de facturar.', 'alegra-connector'),
+                        $rate_id
+                    )
+                );
+            }
+
+            $resolved = $this->resolve_alegra_tax_id($rate_id, $tax_mapping);
+            if ($resolved === '') {
+                return new \WP_Error(
+                    'invoice_tax_unmapped',
+                    sprintf(
+                        /* translators: %s: WooCommerce tax rate id. */
+                        __('No se pudo resolver el impuesto de WooCommerce (tasa #%s) en Alegra. Revisá el catálogo de impuestos o configurá el mapeo antes de facturar.', 'alegra-connector'),
+                        $rate_id
+                    )
+                );
+            }
+
+            $ids[$resolved] = $resolved;
         }
 
         return array_values($ids);

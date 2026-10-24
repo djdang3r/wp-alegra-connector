@@ -2508,11 +2508,12 @@ function alegra_clear_log(): void
 }
 
 /** Seed a WC tax rate so the invoice tax resolver can derive its percentage. */
-function alegra_seed_wc_tax_rate(int $rate_id, float $percentage, string $class = ''): void
+function alegra_seed_wc_tax_rate(int $rate_id, float $percentage, string $class = '', bool $compound = false): void
 {
     $GLOBALS['wc_tax_rates'][$rate_id] = [
-        'tax_rate'       => number_format($percentage, 4, '.', ''),
-        'tax_rate_class' => $class,
+        'tax_rate'          => number_format($percentage, 4, '.', ''),
+        'tax_rate_class'    => $class,
+        'tax_rate_compound' => $compound ? '1' : '0',
     ];
 }
 
@@ -18290,6 +18291,105 @@ TestRunner::test('T-DTX-12 sale price ON combines with a coupon and with tax', f
     TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'regular price is sent');
     TestRunner::assertEquals(28.0, $body['items'][0]['discount'] ?? null, 'sale + coupon = 28% discount');
     TestRunner::assertEquals(85.68, (float) ($result['total'] ?? 0), 'total includes tax');
+});
+
+
+TestRunner::test('T-DTX-13 an unmapped tax rate (missing WC rate row) is surfaced, never dropped', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Taxed', 'sku' => 'SKU-TX1', 'regular_price' => '119']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-tx1');
+
+    $order = alegra_make_order(9530, [
+        'total' => 119.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'tx1@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-tx'],
+        // rate 99 does not exist in WC and has no mapping.
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Taxed', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [99 => 19.0]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'missing rate row is an explicit error');
+    TestRunner::assertSame('invoice_tax_unmapped', (string) $result->get_error_code(), 'unmapped code');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('No se pudo mapear el impuesto', $notes, 'the merchant sees a clear note');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no invoice with a silently dropped tax');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('failed_permanent', $led['state'], 'permanent');
+    TestRunner::assertSame('data:invoice_tax_unmapped', $led['code'], 'permanent data code');
+});
+
+TestRunner::test('T-DTX-14 a real zero-rate tax (amount 0) and a zero-amount unknown rate are skipped silently', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 0.0);
+    alegra_make_product(10, ['name' => 'Zero', 'sku' => 'SKU-TX2', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-tx2');
+
+    $order = alegra_make_order(9531, [
+        'total' => 100.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'tx2@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-tx'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Zero', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 0.0, 99 => 0.0]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'zero-amount taxes are not a problem');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertArrayNotHasKey('tax', $body['items'][0] ?? [], 'no tax is sent');
+    TestRunner::assertEquals(100.0, (float) ($result['total'] ?? 0), 'total unchanged');
+});
+
+TestRunner::test('T-DTX-15 a compound tax rate is surfaced and blocks the invoice', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 10.0, '', true);
+    alegra_make_product(10, ['name' => 'Compound', 'sku' => 'SKU-TX3', 'regular_price' => '110']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-tx3');
+
+    $order = alegra_make_order(9532, [
+        'total' => 110.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'tx3@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-tx'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Compound', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 10.0]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'compound tax is not silently mapped');
+    TestRunner::assertSame('invoice_tax_compound', (string) $result->get_error_code(), 'compound code');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('compuesto', $notes, 'the merchant sees the compound reason');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no invoice is created');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('failed_permanent', $led['state'], 'permanent');
+    TestRunner::assertSame('data:invoice_tax_compound', $led['code'], 'permanent data code');
+});
+
+TestRunner::test('T-DTX-16 an explicit mapping resolves even when the WC rate row is gone', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_tax_mapping', ['99' => 'tax-mapped']);
+    alegra_mock_seed_tax('tax-mapped', ['name' => 'IVA 19%', 'percentage' => 19]);
+    alegra_make_product(10, ['name' => 'Mapped', 'sku' => 'SKU-TX4', 'regular_price' => '119']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-tx4');
+
+    $order = alegra_make_order(9533, [
+        'total' => 119.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'tx4@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-tx'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Mapped', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [99 => 19.0]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'explicit mapping is authoritative');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertSame('tax-mapped', $body['items'][0]['tax'][0]['id'] ?? null, 'the mapped id is used');
+    TestRunner::assertEquals(119.0, (float) ($result['total'] ?? 0), 'total includes the mapped tax');
+});
+
+TestRunner::test('T-DTX-17 Invoice_Failure marks the three new codes permanent', function (): void {
+    foreach (['invoice_negative_fee_unsupported', 'invoice_tax_unmapped', 'invoice_tax_compound'] as $code) {
+        $c = \Alegra\Connector\Sync\Invoice_Failure::classify(new \WP_Error($code, 'x'));
+        TestRunner::assertSame('failed_permanent', $c['state'], "$code ⇒ failed_permanent");
+        TestRunner::assertFalse($c['retriable'], "$code retriable=false");
+        TestRunner::assertSame('data:' . $code, $c['code'], "$code keeps data: prefix");
+    }
 });
 
 exit(TestRunner::summary());

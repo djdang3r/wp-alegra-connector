@@ -86,7 +86,7 @@ final class Invoice_Failure
             // Datos: permanentes. `draft_invoice_not_opened` se agrega (C9).
             $permanent = ['customer_unresolved', 'invoice_item_unlinked', 'invoice_no_items', 'invoice_shipping_unlinked',
                           'invoice_fee_unlinked', 'invoice_still_draft', 'draft_invoice_not_opened',
-                          'invoice_negative_fee_unsupported'];
+                          'invoice_negative_fee_unsupported', 'invoice_tax_unmapped', 'invoice_tax_compound'];
             if (in_array($code, $permanent, true)) {
                 return ['state' => 'failed_permanent', 'code' => 'data:' . $code, 'message' => $message, 'retriable' => false, 'persist' => true];
             }
