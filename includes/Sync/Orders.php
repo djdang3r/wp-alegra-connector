@@ -2168,23 +2168,7 @@ class Orders
             $subtotal = (float) $item_obj->get_subtotal();
             $line_total = (float) $item_obj->get_total();
             $quantity = (int) $item_obj->get_quantity();
-            $base_total = $subtotal;
-            $price = (float) ($subtotal / max(1, $quantity));
-
-            // Opt-in: send the regular/list price as `price` and move the sale
-            // discount (plus any coupon) into `discount`. OFF keeps the
-            // historical price = effective pre-coupon subtotal.
-            if ($sale_as_discount) {
-                $product = method_exists($item_obj, 'get_product') ? $item_obj->get_product() : false;
-                if ($product instanceof \WC_Product) {
-                    $regular = (float) $product->get_regular_price();
-                    $regular_total = $regular * max(1, $quantity);
-                    if ($regular > 0 && $regular_total > $subtotal + 0.0001) {
-                        $base_total = $regular_total;
-                        $price = $regular;
-                    }
-                }
-            }
+            [$base_total, $price] = self::line_price_basis($item_obj, $subtotal, $quantity, $sale_as_discount);
 
             $item_data = [
                 'id' => $alegra_item_id,
@@ -2272,6 +2256,44 @@ class Orders
             );
         }
         return $items;
+    }
+
+    /**
+     * Resolve the line price basis used to derive `price` and `discount`.
+     *
+     * OFF (default): basis = WC pre-coupon subtotal (the historical behavior;
+     * the sale price is already inside it).
+     * ON: basis = the product's regular/list price, so the sale difference is
+     * sent as a percentage discount and combines with any coupon.
+     *
+     * @return array{0: float, 1: float} [base total, unit price]
+     */
+    private static function line_price_basis(
+        \WC_Order_Item $item,
+        float $subtotal,
+        int $quantity,
+        bool $sale_as_discount
+    ): array {
+        $quantity = max(1, $quantity);
+        $base_total = $subtotal;
+        $price = (float) ($subtotal / $quantity);
+
+        if (!$sale_as_discount) {
+            return [$base_total, $price];
+        }
+
+        $product = method_exists($item, 'get_product') ? $item->get_product() : false;
+        if (!$product instanceof \WC_Product) {
+            return [$base_total, $price];
+        }
+
+        $regular = (float) $product->get_regular_price();
+        $regular_total = $regular * $quantity;
+        if ($regular > 0 && $regular_total > $subtotal + 0.0001) {
+            return [$regular_total, $regular];
+        }
+
+        return [$base_total, $price];
     }
 
     /**

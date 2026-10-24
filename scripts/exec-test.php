@@ -18228,4 +18228,68 @@ TestRunner::test('T-DTX-09 a negative fee without product lines is unsupported',
     TestRunner::assertSame('invoice_negative_fee_unsupported', (string) $result->get_error_code(), 'unsupported code');
 });
 
+
+TestRunner::test('T-DTX-10 sale price OFF (default): the sale price stays in the line price', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Sale', 'sku' => 'SKU-S1', 'regular_price' => '100', 'sale_price' => '80']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-sale1');
+
+    $order = alegra_make_order(9520, [
+        'total' => 80.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'sale1@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-sale'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Sale', 'quantity' => 1, 'subtotal' => 80, 'total' => 80])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(80.0, $body['items'][0]['price'] ?? null, 'sale price remains the line price');
+    TestRunner::assertArrayNotHasKey('discount', $body['items'][0] ?? [], 'no discount when the option is off');
+});
+
+TestRunner::test('T-DTX-11 sale price ON: regular price + discount equals the sale price', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_document_sale_as_discount', true);
+    alegra_make_product(10, ['name' => 'Sale', 'sku' => 'SKU-S2', 'regular_price' => '100', 'sale_price' => '80']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-sale2');
+
+    $order = alegra_make_order(9521, [
+        'total' => 80.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'sale2@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-sale'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Sale', 'quantity' => 1, 'subtotal' => 80, 'total' => 80])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'regular price is sent');
+    TestRunner::assertEquals(20.0, $body['items'][0]['discount'] ?? null, 'sale difference is a 20% discount');
+    TestRunner::assertEquals(80.0, (float) ($result['total'] ?? 0), 'total matches');
+});
+
+TestRunner::test('T-DTX-12 sale price ON combines with a coupon and with tax', function (): void {
+    alegra_test_reset();
+    update_option('alegra_connector_document_sale_as_discount', true);
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_make_product(10, ['name' => 'Sale', 'sku' => 'SKU-S3', 'regular_price' => '100', 'sale_price' => '80']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-sale3');
+
+    // Regular 100, sale 80, coupon 10% => effective net 72, tax 13.68.
+    $order = alegra_make_order(9522, [
+        'total' => 85.68, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'sale3@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-sale'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Sale', 'quantity' => 1, 'subtotal' => 80, 'total' => 72, 'taxes' => ['total' => [1 => 13.68]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'invoice succeeds');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'regular price is sent');
+    TestRunner::assertEquals(28.0, $body['items'][0]['discount'] ?? null, 'sale + coupon = 28% discount');
+    TestRunner::assertEquals(85.68, (float) ($result['total'] ?? 0), 'total includes tax');
+});
+
 exit(TestRunner::summary());
