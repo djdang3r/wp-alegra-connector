@@ -18110,4 +18110,122 @@ TestRunner::test('T-DTX-04 invoice sends the numeric discount by default and omi
     TestRunner::assertArrayNotHasKey('discount', $body2['items'][0] ?? [], 'no discount field when there is none');
 });
 
+
+TestRunner::test('T-DTX-05 negative fee without tax is distributed as a discount and the total matches', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-NF1', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-nf1');
+
+    $order = alegra_make_order(9510, [
+        'total' => 80.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'nf1@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-nf'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100])],
+        'fee_items' => [new WC_Order_Item(['name' => 'Descuento manual', 'quantity' => 1, 'subtotal' => -20, 'total' => -20])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'negative fee is representable without tax');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertCount(1, $body['items'] ?? [], 'the negative fee is not a separate line');
+    TestRunner::assertEquals(100.0, $body['items'][0]['price'] ?? null, 'price stays net pre-discount');
+    TestRunner::assertEquals(20.0, $body['items'][0]['discount'] ?? null, 'the negative fee becomes a 20% discount');
+    TestRunner::assertEquals(80.0, (float) ($result['total'] ?? 0), 'invoice total equals order total');
+});
+
+TestRunner::test('T-DTX-06 negative fee WITH a matching tax is representable and reconciles', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-NF2', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-nf2');
+
+    $order = alegra_make_order(9511, [
+        // 100 + 19 - 20 - 3.8 = 95.20
+        'total' => 95.20, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'nf2@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-nf'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100, 'taxes' => ['total' => [1 => 19.0]]])],
+        'fee_items' => [new WC_Order_Item(['name' => 'Descuento manual', 'quantity' => 1, 'subtotal' => -20, 'total' => -20, 'taxes' => ['total' => [1 => -3.8]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'negative fee with matching tax is representable');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertEquals(20.0, $body['items'][0]['discount'] ?? null, 'discount is the distributed net');
+    TestRunner::assertEquals(95.20, (float) ($result['total'] ?? 0), 'invoice total includes the tax effect');
+});
+
+TestRunner::test('T-DTX-07 non-representable negative fee with mixed taxes is surfaced as unsupported', function (): void {
+    alegra_test_reset();
+    alegra_seed_wc_tax_rate(1, 19.0);
+    alegra_seed_wc_tax_rate(2, 5.0);
+    alegra_make_product(10, ['name' => 'A', 'sku' => 'SKU-NF3A', 'regular_price' => '50']);
+    alegra_make_product(11, ['name' => 'B', 'sku' => 'SKU-NF3B', 'regular_price' => '50']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-nf3a');
+    update_post_meta(11, '_alegra_item_id', '1t3m-nf3b');
+
+    $order = alegra_make_order(9512, [
+        // 50+9.5 + 50+2.5 - 20 - 3.8 = 88.20; a distributed 20 discount yields
+        // 40*1.19 + 40*1.05 = 89.60, which cannot be reconciled.
+        'total' => 88.20, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'nf3@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-nf'],
+        'items' => [
+            new WC_Order_Item(['product_id' => 10, 'name' => 'A', 'quantity' => 1, 'subtotal' => 50, 'total' => 50, 'taxes' => ['total' => [1 => 9.5]]]),
+            new WC_Order_Item(['product_id' => 11, 'name' => 'B', 'quantity' => 1, 'subtotal' => 50, 'total' => 50, 'taxes' => ['total' => [2 => 2.5]]]),
+        ],
+        'fee_items' => [new WC_Order_Item(['name' => 'Descuento manual', 'quantity' => 1, 'subtotal' => -20, 'total' => -20, 'taxes' => ['total' => [1 => -3.8]]])],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'non-representable fee is an explicit error');
+    TestRunner::assertSame('invoice_negative_fee_unsupported', (string) $result->get_error_code(), 'specific error code');
+    $notes = implode("\n", $order->get_notes());
+    TestRunner::assertStringContains('no se puede representar', $notes, 'a clear order note is written');
+    TestRunner::assertStringContains('Recargo negativo', $notes, 'the note names the negative fee');
+    TestRunner::assertSame(0, alegra_mock_count('POST', '/invoices'), 'no malformed invoice is POSTed');
+    $led = \Alegra\Connector\Sync\Invoice_Failure::get($order);
+    TestRunner::assertSame('failed_permanent', $led['state'], 'unsupported is permanent, not a cron loop');
+    TestRunner::assertSame('data:invoice_negative_fee_unsupported', $led['code'], 'permanent data code');
+});
+
+TestRunner::test('T-DTX-08 a positive fee stays a line while the negative fee is distributed', function (): void {
+    alegra_test_reset();
+    alegra_make_product(10, ['name' => 'Widget', 'sku' => 'SKU-NF4', 'regular_price' => '100']);
+    update_post_meta(10, '_alegra_item_id', '1t3m-nf4');
+
+    $order = alegra_make_order(9513, [
+        'total' => 85.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'nf4@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-nf'],
+        'items' => [new WC_Order_Item(['product_id' => 10, 'name' => 'Widget', 'quantity' => 1, 'subtotal' => 100, 'total' => 100])],
+        'fee_items' => [
+            new WC_Order_Item(['name' => 'Recargo', 'quantity' => 1, 'subtotal' => 5, 'total' => 5]),
+            new WC_Order_Item(['name' => 'Descuento manual', 'quantity' => 1, 'subtotal' => -20, 'total' => -20]),
+        ],
+    ]);
+
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertFalse(is_wp_error($result), 'both fees are handled');
+    $body = alegra_mock_last_request('POST', '/invoices')['body'] ?? [];
+    TestRunner::assertCount(2, $body['items'] ?? [], 'product + positive fee only');
+    TestRunner::assertEquals(20.0, $body['items'][0]['discount'] ?? null, 'negative fee is a discount');
+    TestRunner::assertEquals(5.0, $body['items'][1]['price'] ?? null, 'positive fee remains a line');
+    TestRunner::assertEquals(85.0, (float) ($result['total'] ?? 0), 'total reconciles');
+});
+
+TestRunner::test('T-DTX-09 a negative fee without product lines is unsupported', function (): void {
+    alegra_test_reset();
+    $order = alegra_make_order(9514, [
+        'total' => -20.0, 'currency' => 'COP', 'payment_method' => 'bacs',
+        'billing' => ['country' => 'CO', 'email' => 'nf5@example.test'],
+        'meta' => ['_billing_alegra_contact_id' => 'c0n-nf'],
+        'items' => [],
+        'fee_items' => [new WC_Order_Item(['name' => 'Descuento manual', 'quantity' => 1, 'subtotal' => -20, 'total' => -20])],
+    ]);
+    $result = make_orders()->create_invoice($order);
+    TestRunner::assertInstanceOf(\WP_Error::class, $result, 'no base to discount from');
+    TestRunner::assertSame('invoice_negative_fee_unsupported', (string) $result->get_error_code(), 'unsupported code');
+});
+
 exit(TestRunner::summary());

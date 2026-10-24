@@ -2142,6 +2142,8 @@ class Orders
     private function prepare_invoice_items(\WC_Order $order): array|\WP_Error
     {
         $items = [];
+        $product_lines = [];
+        $sale_as_discount = (bool) get_option('alegra_connector_document_sale_as_discount', false);
 
         foreach ($order->get_items() as $item_obj) {
             $product_id = $item_obj->get_product_id();
@@ -2166,7 +2168,23 @@ class Orders
             $subtotal = (float) $item_obj->get_subtotal();
             $line_total = (float) $item_obj->get_total();
             $quantity = (int) $item_obj->get_quantity();
+            $base_total = $subtotal;
             $price = (float) ($subtotal / max(1, $quantity));
+
+            // Opt-in: send the regular/list price as `price` and move the sale
+            // discount (plus any coupon) into `discount`. OFF keeps the
+            // historical price = effective pre-coupon subtotal.
+            if ($sale_as_discount) {
+                $product = method_exists($item_obj, 'get_product') ? $item_obj->get_product() : false;
+                if ($product instanceof \WC_Product) {
+                    $regular = (float) $product->get_regular_price();
+                    $regular_total = $regular * max(1, $quantity);
+                    if ($regular > 0 && $regular_total > $subtotal + 0.0001) {
+                        $base_total = $regular_total;
+                        $price = $regular;
+                    }
+                }
+            }
 
             $item_data = [
                 'id' => $alegra_item_id,
@@ -2179,14 +2197,23 @@ class Orders
             // (a percentage, per post_invoices.md). Without it the invoice total
             // is HIGHER than the WooCommerce order total. `price` stays
             // pre-discount; Alegra applies the percentage.
-            $discount = self::line_discount_percent($subtotal, $line_total);
-            if ($discount > 0) {
-                $item_data['discount'] = $discount;
+            $discount = self::line_discount_percent($base_total, $line_total);
+            self::set_line_discount($item_data, $discount);
+
+            $tax_error = $this->attach_line_taxes($item_data, $item_obj);
+            if (is_wp_error($tax_error)) {
+                $this->note_invoice_input_error($order, $tax_error);
+                return $tax_error;
             }
 
-            $this->attach_line_taxes($item_data, $item_obj);
-
             $items[] = $item_data;
+            $product_lines[] = [
+                'index'    => count($items) - 1,
+                'base'     => $base_total,
+                'net'      => $line_total,
+                'subtotal' => $subtotal,
+                'tax'      => self::item_tax_total($item_obj),
+            ];
         }
 
         // BUG 2: `$order->get_items()` returns ONLY line_item rows, so shipping
@@ -2201,10 +2228,39 @@ class Orders
         // resolved).
         $shipping_lines = $this->build_shipping_lines($order);
         if (is_wp_error($shipping_lines)) {
+            $this->note_invoice_input_error($order, $shipping_lines);
             return $shipping_lines;
         }
-        $items = array_merge($items, $shipping_lines);
-        $items = array_merge($items, $this->build_fee_lines($order));
+        $fee_lines = $this->build_fee_lines($order);
+        if (is_wp_error($fee_lines)) {
+            $this->note_invoice_input_error($order, $fee_lines);
+            return $fee_lines;
+        }
+        $items = array_merge($items, $shipping_lines, $fee_lines);
+
+        // A negative fee is a net reduction of the order total. Alegra has no
+        // free negative line (items[].price must be positive) and cannot carry
+        // a negative fee, so distribute its NET across the product lines as an
+        // additional `discount` percentage. Validation runs BEFORE returning:
+        // when the fee tax cannot be represented by that distribution (mixed
+        // rates), the invoice is refused with a visible, permanent error
+        // instead of being created with a different total.
+        $negative_fee_total = 0.0;
+        foreach ($order->get_items('fee') as $fee_item) {
+            if (!$fee_item instanceof \WC_Order_Item) {
+                continue;
+            }
+            $fee_total = (float) $fee_item->get_total();
+            if ($fee_total < 0) {
+                $negative_fee_total += -$fee_total;
+            }
+        }
+        if ($negative_fee_total > 0) {
+            $negative_error = $this->distribute_negative_fee($order, $negative_fee_total, $items, $product_lines);
+            if (is_wp_error($negative_error)) {
+                return $negative_error;
+            }
+        }
 
         if ($items === []) {
             return new \WP_Error(
@@ -2219,11 +2275,169 @@ class Orders
     }
 
     /**
+     * Set or clear `items[].discount` using the country-aware payload shape.
+     *
+     * @param array<string, mixed> $line
+     */
+    private static function set_line_discount(array &$line, float $percent): void
+    {
+        $percent = round($percent, 4);
+        if ($percent > 0) {
+            $line['discount'] = \Alegra\Connector\Country_Profile::discount_payload($percent);
+            return;
+        }
+
+        unset($line['discount']);
+    }
+
+    /** @param \WC_Order_Item $item */
+    private static function item_tax_total(\WC_Order_Item $item): float
+    {
+        $taxes = $item->get_taxes();
+        $total = 0.0;
+        foreach ((array) ($taxes['total'] ?? []) as $amount) {
+            $total += (float) $amount;
+        }
+
+        return $total;
+    }
+
+    /**
+     * Distribute a negative fee (net) across product lines as a discount.
+     *
+     * The distribution is proportional to each line's pre-discount subtotal,
+     * exactly like a cart-level discount. The invoice total is then recomputed
+     * including taxes and compared against the WC order total; a difference
+     * greater than 0.01 means the fee's tax effect cannot be represented by
+     * that distribution (mixed tax rates) and the invoice is refused.
+     *
+     * @param array<int, array<string, mixed>> $items          Built invoice lines (modified in place).
+     * @param array<int, array<string, mixed>> $product_lines  Per-product metadata.
+     */
+    private function distribute_negative_fee(
+        \WC_Order $order,
+        float $amount,
+        array &$items,
+        array $product_lines
+    ): ?\WP_Error {
+        $subtotal_sum = 0.0;
+        foreach ($product_lines as $meta) {
+            $subtotal_sum += (float) $meta['subtotal'];
+        }
+
+        if ($product_lines === [] || $subtotal_sum <= 0) {
+            return $this->unsupported_negative_fee($order, $amount, (float) $order->get_total(), (float) $order->get_total());
+        }
+
+        if ($amount > $subtotal_sum + 0.0001) {
+            return $this->unsupported_negative_fee($order, $amount, (float) $order->get_total(), (float) $order->get_total());
+        }
+
+        $expected_product_total = 0.0;
+        foreach ($product_lines as $meta) {
+            $share = $amount * ((float) $meta['subtotal'] / $subtotal_sum);
+            $new_net = (float) $meta['net'] - $share;
+            $base = (float) $meta['base'];
+
+            if ($new_net < -0.0001 || $base <= 0) {
+                return $this->unsupported_negative_fee($order, $amount, (float) $order->get_total(), (float) $order->get_total());
+            }
+
+            $percent = self::line_discount_percent($base, $new_net);
+            if ($percent >= 100) {
+                return $this->unsupported_negative_fee($order, $amount, (float) $order->get_total(), (float) $order->get_total());
+            }
+
+            self::set_line_discount($items[(int) $meta['index']], $percent);
+
+            // Recompute the effective net from the ROUNDED percentage that is
+            // actually sent, then scale the line's WC tax proportionally.
+            $effective_net = $base * (1 - ($percent / 100));
+            $tax_after = (float) $meta['net'] != 0.0
+                ? ((float) $meta['tax'] * ($effective_net / (float) $meta['net']))
+                : (float) $meta['tax'];
+            $expected_product_total += $effective_net + $tax_after;
+        }
+
+        $expected = $expected_product_total;
+        foreach ($order->get_items('shipping') as $ship_item) {
+            if ($ship_item instanceof \WC_Order_Item && (float) $ship_item->get_total() > 0) {
+                $expected += (float) $ship_item->get_total() + self::item_tax_total($ship_item);
+            }
+        }
+        foreach ($order->get_items('fee') as $fee_item) {
+            if ($fee_item instanceof \WC_Order_Item && (float) $fee_item->get_total() > 0) {
+                $expected += (float) $fee_item->get_total() + self::item_tax_total($fee_item);
+            }
+        }
+
+        $order_total = (float) $order->get_total();
+        if (abs($expected - $order_total) > 0.01) {
+            return $this->unsupported_negative_fee($order, $amount, $expected, $order_total);
+        }
+
+        return null;
+    }
+
+    /**
+     * Refuse a negative fee that cannot be represented without changing the
+     * order total. The merchant gets a visible order note and the queue gets a
+     * permanent `data:invoice_negative_fee_unsupported` entry (never a retry
+     * loop).
+     */
+    private function unsupported_negative_fee(
+        \WC_Order $order,
+        float $amount,
+        float $expected,
+        float $order_total
+    ): \WP_Error {
+        $message = sprintf(
+            /* translators: 1: negative fee amount, 2: computed invoice total, 3: WC order total. */
+            __('Recargo negativo (%1$s): no se puede representar como descuento en la factura. La factura quedaría en %2$s y el pedido en %3$s (diferencia mayor a 0.01 por los impuestos). Revisá los impuestos del pedido o facturá manualmente.', 'alegra-connector'),
+            number_format($amount, 2, '.', ''),
+            number_format($expected, 2, '.', ''),
+            number_format($order_total, 2, '.', '')
+        );
+
+        $order->add_order_note('[Alegra] ' . $message);
+        if ($this->logger) {
+            $this->logger->error('Negative fee cannot be represented as a discount', [
+                'order_id'     => (int) $order->get_id(),
+                'fee_amount'   => $amount,
+                'expected'     => $expected,
+                'order_total'  => $order_total,
+            ]);
+        }
+
+        return new \WP_Error('invoice_negative_fee_unsupported', $message);
+    }
+
+    /**
+     * Surface an invoice-input error (tax/compound/unsupported) on the order.
+     */
+    private function note_invoice_input_error(\WC_Order $order, \WP_Error $error): void
+    {
+        $message = trim(wp_strip_all_tags((string) $error->get_error_message()));
+        if ($message === '') {
+            return;
+        }
+
+        $order->add_order_note('[Alegra] ' . $message);
+        if ($this->logger) {
+            $this->logger->error('Invoice input rejected', [
+                'order_id' => (int) $order->get_id(),
+                'code'     => (string) $error->get_error_code(),
+                'message'  => $message,
+            ]);
+        }
+    }
+
+    /**
      * Append the resolved Alegra taxes of a WC order item to an invoice line.
      *
      * @param array<string, mixed> $line
      */
-    private function attach_line_taxes(array &$line, \WC_Order_Item $item): void
+    private function attach_line_taxes(array &$line, \WC_Order_Item $item): ?\WP_Error
     {
         $tax_ids = $this->map_item_taxes($item);
         if ($tax_ids !== []) {
@@ -2232,6 +2446,8 @@ class Orders
                 $line['tax'][] = ['id' => $tid];
             }
         }
+
+        return null;
     }
 
     /**
